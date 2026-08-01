@@ -74,6 +74,19 @@ static void bencode_reject_check(void)
 	assert(benc_dict_find((const uint8_t *)"x", 1, "a", &v, &vlen));
 }
 
+static void bencode_depth_check(void)
+{
+	uint8_t deep[256];
+	const uint8_t *p, *end;
+	size_t i;
+
+	for (i = 0; i < sizeof(deep); i++)
+		deep[i] = 'l';
+	p = deep;
+	end = deep + sizeof(deep);
+	assert(benc_skip(&p, end) < 0);
+}
+
 static void sig_buffer_check(void)
 {
 	uint8_t buf[128];
@@ -146,6 +159,7 @@ int main(void)
 	sha1_check();
 	bencode_check();
 	bencode_reject_check();
+	bencode_depth_check();
 	sig_buffer_check();
 	vectors_check();
 	sign_roundtrip_check();
