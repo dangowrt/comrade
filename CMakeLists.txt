@@ -9,6 +9,22 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 add_compile_options(-Wall -Wextra)
 
+include(CheckCCompilerFlag)
+
+function(comrade_add_flag flag)
+	string(MAKE_C_IDENTIFIER "comrade_have_${flag}" var)
+	check_c_compiler_flag("${flag}" ${var})
+	if(${var})
+		add_compile_options("${flag}")
+	endif()
+endfunction()
+
+# Reproducible builds: forbid __DATE__/__TIME__ and strip the build path
+# from the binary so it does not identify the build host. Distributions
+# inject their own comprehensive prefix maps on top of this.
+comrade_add_flag(-Wdate-time)
+comrade_add_flag(-ffile-prefix-map=${CMAKE_SOURCE_DIR}=.)
+
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LIBSSH IMPORTED_TARGET libssh)
 find_package(LibJuice CONFIG QUIET)
