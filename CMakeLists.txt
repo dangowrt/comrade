@@ -125,6 +125,12 @@ if(BUILD_TESTING)
 
 endif()
 
+if(COMRADE_BUILD_TOOLS)
+	add_executable(comrade-sigprobe tools/sigprobe.c)
+	target_link_libraries(comrade-sigprobe comrade_dht comrade_token)
+
+endif()
+
 #
 # The tests wrap load-bearing calls -- socketpair, pthread_create, bind,
 # listen -- in assert(), and every distribution builds Release, which defines
