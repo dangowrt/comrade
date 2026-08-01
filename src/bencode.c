@@ -61,10 +61,12 @@ static int benc_digits(const uint8_t **p, const uint8_t *end, int64_t *out)
 	return 0;
 }
 
-int benc_skip(const uint8_t **p, const uint8_t *end)
+static int benc_skip_depth(const uint8_t **p, const uint8_t *end, int depth)
 {
 	int64_t num;
 
+	if (depth > BENC_MAX_DEPTH)
+		return -1;
 	if (*p >= end)
 		return -1;
 
@@ -83,7 +85,7 @@ int benc_skip(const uint8_t **p, const uint8_t *end)
 	case 'd':
 		(*p)++;
 		while (*p < end && **p != 'e') {
-			if (benc_skip(p, end))
+			if (benc_skip_depth(p, end, depth + 1))
 				return -1;
 		}
 		if (*p >= end)
@@ -98,6 +100,11 @@ int benc_skip(const uint8_t **p, const uint8_t *end)
 		*p += 1 + num;
 		return 0;
 	}
+}
+
+int benc_skip(const uint8_t **p, const uint8_t *end)
+{
+	return benc_skip_depth(p, end, 0);
 }
 
 int benc_dict_find(const uint8_t *dict, size_t dict_len, const char *key,

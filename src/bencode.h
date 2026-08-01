@@ -4,6 +4,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#define BENC_MAX_DEPTH 16
+
 struct benc_buf {
 	uint8_t *buf;
 	size_t len;
