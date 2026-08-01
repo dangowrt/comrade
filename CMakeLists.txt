@@ -48,8 +48,40 @@ endif()
 add_library(comrade_token STATIC src/base64.c src/token.c)
 target_include_directories(comrade_token PUBLIC src)
 
+set(COMRADE_HAVE_CRYPTO 0)
+if(MONOCYPHER_FOUND)
+	set(COMRADE_HAVE_CRYPTO 1)
+	add_library(comrade_crypto STATIC src/sha1.c src/bencode.c src/keys.c)
+	target_include_directories(comrade_crypto PUBLIC src)
+	if(TARGET PkgConfig::MONOCYPHER)
+		target_link_libraries(comrade_crypto PUBLIC PkgConfig::MONOCYPHER)
+	else()
+		target_include_directories(comrade_crypto PUBLIC ${MONOCYPHER_INCLUDE_DIR})
+		target_link_libraries(comrade_crypto PUBLIC ${MONOCYPHER_LIBRARY})
+	endif()
+endif()
+
+set(COMRADE_HAVE_DHT 0)
+if(COMRADE_HAVE_CRYPTO AND COMRADE_DHT_DIR AND EXISTS "${COMRADE_DHT_DIR}/dht.c")
+	set(COMRADE_HAVE_DHT 1)
+	add_library(comrade_dht STATIC
+		${COMRADE_DHT_DIR}/dht.c
+		src/bep44.c
+		src/dhtnode.c
+	)
+	target_include_directories(comrade_dht PUBLIC src ${COMRADE_DHT_DIR})
+	target_compile_definitions(comrade_dht PRIVATE _GNU_SOURCE)
+	set_source_files_properties(${COMRADE_DHT_DIR}/dht.c PROPERTIES
+		COMPILE_OPTIONS "-w")
+	target_link_libraries(comrade_dht PUBLIC comrade_crypto)
+endif()
+
 add_library(comrade_sig STATIC src/sig_bep44.c)
 target_include_directories(comrade_sig PUBLIC src)
+if(COMRADE_HAVE_DHT)
+	target_link_libraries(comrade_sig PUBLIC comrade_dht)
+	target_compile_definitions(comrade_sig PRIVATE COMRADE_HAVE_DHT=1)
+endif()
 
 add_library(comrade_nat STATIC src/nat.c)
 target_include_directories(comrade_nat PUBLIC src)
