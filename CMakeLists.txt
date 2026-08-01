@@ -123,6 +123,11 @@ if(BUILD_TESTING)
 	target_link_libraries(token_test comrade_token)
 	add_test(NAME token_test COMMAND token_test)
 
+	# Both exercise the BEP 44 engine alone, which needs no DHT library.
+	add_executable(bep44_test tests/bep44_test.c)
+	target_link_libraries(bep44_test comrade_bep44)
+	add_test(NAME bep44_test COMMAND bep44_test)
+
 endif()
 
 if(COMRADE_BUILD_TOOLS)
@@ -140,7 +145,7 @@ endif()
 #
 if(BUILD_TESTING)
 	foreach(t IN ITEMS
-		token_test)
+		token_test bep44_test)
 		if(TARGET ${t})
 			target_compile_options(${t} PRIVATE -UNDEBUG)
 		endif()
