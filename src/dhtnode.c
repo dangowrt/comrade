@@ -14,6 +14,7 @@
 #include "bep44.h"
 #include "dhtnode.h"
 #include "keys.h"
+#include "netmon.h"
 
 #define DHTNODE_SEED_INTERVAL_MS 1000
 #define DHTNODE_BOOTSTRAP_INTERVAL_MS 10000
@@ -39,6 +40,8 @@ struct dhtnode {
 	uint64_t next_seed_ms;
 	uint64_t next_bootstrap_ms;
 	int bootstrap_done;
+	struct netmon netmon;
+	unsigned netgen;
 };
 
 static uint64_t now_ms(void)
@@ -156,6 +159,7 @@ struct dhtnode *dhtnode_create(void)
 	if (!n->engine)
 		goto fail;
 
+	netmon_init(&n->netmon);
 	bootstrap_resolve(n);
 	n->next_bootstrap_ms = now_ms() + DHTNODE_BOOTSTRAP_INTERVAL_MS;
 	n->next_seed_ms = 0;
@@ -183,6 +187,11 @@ void dhtnode_free(struct dhtnode *n)
 struct bep44_engine *dhtnode_engine(struct dhtnode *n)
 {
 	return n->engine;
+}
+
+unsigned dhtnode_netgen(struct dhtnode *n)
+{
+	return n->netgen;
 }
 
 int dhtnode_ready(struct dhtnode *n)
@@ -230,10 +239,22 @@ static void packet_route(struct dhtnode *n, uint8_t *buf, size_t len,
 	n->next_dht_ms = now_ms() + (uint64_t)tosleep * 1000;
 }
 
+static void netchange(struct dhtnode *n)
+{
+	n->netgen++;
+	n->bootstrap_done = 0;
+	n->next_bootstrap_ms = 0;
+	n->next_seed_ms = 0;
+	n->next_dht_ms = 0;
+}
+
 static void housekeep(struct dhtnode *n)
 {
 	uint64_t now = now_ms();
 	int b44_timeout = 1000;
+
+	if (netmon_changed(&n->netmon, now))
+		netchange(n);
 
 	if (now >= n->next_dht_ms) {
 		time_t tosleep = 0;

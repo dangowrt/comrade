@@ -13,5 +13,6 @@ int dhtnode_prepare(struct dhtnode *n, struct pollfd *fds, int maxfds,
 		    int *timeout_ms);
 void dhtnode_dispatch(struct dhtnode *n, const struct pollfd *fds, int nfds);
 int dhtnode_ready(struct dhtnode *n);
+unsigned dhtnode_netgen(struct dhtnode *n);
 
 #endif
