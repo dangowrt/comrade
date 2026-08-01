@@ -86,6 +86,13 @@ target_link_libraries(comrade
 
 install(TARGETS comrade RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
+if(BUILD_TESTING)
+	add_executable(token_test tests/token_test.c)
+	target_link_libraries(token_test comrade_token)
+	add_test(NAME token_test COMMAND token_test)
+
+endif()
+
 #
 # The tests wrap load-bearing calls -- socketpair, pthread_create, bind,
 # listen -- in assert(), and every distribution builds Release, which defines
@@ -95,7 +102,7 @@ install(TARGETS comrade RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 #
 if(BUILD_TESTING)
 	foreach(t IN ITEMS
-)
+		token_test)
 		if(TARGET ${t})
 			target_compile_options(${t} PRIVATE -UNDEBUG)
 		endif()
