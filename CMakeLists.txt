@@ -155,6 +155,11 @@ if(BUILD_TESTING)
 	target_link_libraries(bep44_test comrade_bep44)
 	add_test(NAME bep44_test COMMAND bep44_test)
 
+	add_executable(natstream_test tests/natstream_test.c)
+	target_link_libraries(natstream_test comrade_nat comrade_stream)
+	add_test(NAME natstream_test COMMAND natstream_test)
+	set_tests_properties(natstream_test PROPERTIES TIMEOUT 60)
+
 endif()
 
 if(COMRADE_BUILD_TOOLS)
@@ -172,7 +177,7 @@ endif()
 #
 if(BUILD_TESTING)
 	foreach(t IN ITEMS
-		token_test netmon_test bep44_test)
+		token_test netmon_test bep44_test natstream_test)
 		if(TARGET ${t})
 			target_compile_options(${t} PRIVATE -UNDEBUG)
 		endif()
