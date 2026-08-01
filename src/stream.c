@@ -104,6 +104,16 @@ uint32_t stream_update(struct stream *s, uint32_t now_ms)
 	return next;
 }
 
+int stream_waitsnd(struct stream *s)
+{
+	int rc;
+
+	pthread_mutex_lock(&s->lock);
+	rc = ikcp_waitsnd(s->kcp);
+	pthread_mutex_unlock(&s->lock);
+	return rc;
+}
+
 void stream_set_output(struct stream *s, stream_output_fn *out, void *arg)
 {
 	pthread_mutex_lock(&s->lock);

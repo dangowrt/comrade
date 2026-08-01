@@ -16,6 +16,7 @@ int stream_recv(struct stream *s, uint8_t *data, size_t len);
 int stream_input(struct stream *s, const uint8_t *data, size_t len);
 
 uint32_t stream_update(struct stream *s, uint32_t now_ms);
+int stream_waitsnd(struct stream *s);
 void stream_set_output(struct stream *s, stream_output_fn *out, void *arg);
 
 #endif

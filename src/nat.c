@@ -124,6 +124,13 @@ int nat_failed(struct nat_agent *a)
 	return a->failed;
 }
 
+int nat_selected(struct nat_agent *a, char *local, size_t local_len,
+		 char *remote, size_t remote_len)
+{
+	return juice_get_selected_candidates(a->agent, local, local_len,
+					     remote, remote_len) == JUICE_ERR_SUCCESS ? 0 : -1;
+}
+
 void nat_log_level(int level)
 {
 	juice_set_log_level((juice_log_level_t)level);

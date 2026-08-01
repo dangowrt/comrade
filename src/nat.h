@@ -31,6 +31,8 @@ int nat_send(struct nat_agent *a, const uint8_t *data, size_t len);
 
 int nat_connected(struct nat_agent *a);
 int nat_failed(struct nat_agent *a);
+int nat_selected(struct nat_agent *a, char *local, size_t local_len,
+		 char *remote, size_t remote_len);
 
 void nat_log_level(int level);
 
