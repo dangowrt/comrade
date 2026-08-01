@@ -99,16 +99,23 @@ if(COMRADE_HAVE_DHT)
 	target_compile_definitions(comrade_sig PRIVATE COMRADE_HAVE_DHT=1)
 endif()
 
+find_package(Threads REQUIRED)
+
+set(COMRADE_HAVE_NAT 0)
 add_library(comrade_nat STATIC src/nat.c)
 target_include_directories(comrade_nat PUBLIC src)
 if(TARGET LibJuice::LibJuice)
 	target_link_libraries(comrade_nat PUBLIC LibJuice::LibJuice)
+	set(COMRADE_HAVE_NAT 1)
 endif()
 
+set(COMRADE_HAVE_STREAM 0)
 add_library(comrade_stream STATIC src/stream.c)
 target_include_directories(comrade_stream PUBLIC src)
+target_link_libraries(comrade_stream PUBLIC Threads::Threads)
 if(TARGET kcp::kcp)
 	target_link_libraries(comrade_stream PUBLIC kcp::kcp)
+	set(COMRADE_HAVE_STREAM 1)
 endif()
 
 add_library(comrade_ssh STATIC src/sshd.c src/sshc.c)
