@@ -166,6 +166,12 @@ if(COMRADE_BUILD_TOOLS)
 	add_executable(comrade-sigprobe tools/sigprobe.c)
 	target_link_libraries(comrade-sigprobe comrade_dht comrade_token)
 
+	add_executable(comrade-e2e tools/e2e.c)
+	target_link_libraries(comrade-e2e comrade_session)
+	if(COMRADE_STATIC)
+		target_link_options(comrade-e2e PRIVATE -static)
+	endif()
+
 endif()
 
 #
