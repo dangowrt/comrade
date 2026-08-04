@@ -7,6 +7,7 @@
 #include "base64.h"
 #include "bencode.h"
 #include "bep44.h"
+#include "candpolicy.h"
 #include "dhtnode.h"
 #include "keys.h"
 #include "nat.h"
@@ -32,6 +33,7 @@ static struct {
 	int family;
 	const char *stun_host;
 	uint16_t stun_port;
+	int log_level;
 	struct session_keys keys;
 
 	struct dhtnode *node;
@@ -58,6 +60,29 @@ static struct {
 	uint64_t linger_deadline;
 } g;
 
+static const struct {
+	const char *host;
+	uint16_t port;
+} stun_servers[] = {
+	{ "stun.linphone.org", 3478 },
+	{ "stun.sipgate.net", 3478 },
+	{ "stunserver.stunprotocol.org", 3478 },
+	{ "stun.nextcloud.com", 443 },
+	{ "stun.antisip.com", 3478 },
+	{ "stun.voipgate.com", 3478 },
+	{ "stun.cloudflare.com", 3478 },
+};
+
+static void stun_pick_default(void)
+{
+	uint8_t r = 0;
+	size_t n = sizeof(stun_servers) / sizeof(stun_servers[0]);
+
+	random_bytes(&r, 1);
+	g.stun_host = stun_servers[r % n].host;
+	g.stun_port = stun_servers[r % n].port;
+}
+
 static uint64_t now_ms(void)
 {
 	struct timespec ts;
@@ -76,48 +101,12 @@ static const char *get_salt(void)
 	return g.role_a ? "e2e-b" : "e2e-a";
 }
 
-static int cand_family(const char *line)
-{
-	const char *p = strstr(line, "candidate:");
-	int spaces = 0;
-
-	if (!p)
-		return 0;
-	for (p += 10; *p && *p != '\r' && *p != '\n'; p++) {
-		if (*p == ' ') {
-			if (++spaces == 4)
-				return strchr(p + 1, ':') &&
-				       strchr(p + 1, ':') < strchr(p + 1, ' ') ? 6 : 4;
-		}
-	}
-	return 0;
-}
-
 static void sdp_filter(const char *in, int family, char *out, size_t outlen)
 {
-	const char *line = in;
-	size_t o = 0;
+	struct cand_policy pol;
 
-	while (*line) {
-		const char *nl = strchr(line, '\n');
-		size_t len = nl ? (size_t)(nl - line + 1) : strlen(line);
-		int keep = 1;
-
-		if (strstr(line, "candidate:") && strstr(line, "candidate:") < line + len) {
-			int fam = cand_family(line);
-
-			if (fam && fam != family)
-				keep = 0;
-		}
-		if (keep && o + len < outlen) {
-			memcpy(out + o, line, len);
-			o += len;
-		}
-		if (!nl)
-			break;
-		line = nl + 1;
-	}
-	out[o] = '\0';
+	cand_policy_default(&pol);
+	cand_sdp_filter(in, family, &pol, out, outlen);
 }
 
 static void on_local_sdp(void *arg, const char *sdp)
@@ -132,6 +121,30 @@ static void on_nat_recv(void *arg, const uint8_t *data, size_t len)
 	(void)arg;
 	if (g.stream)
 		stream_input(g.stream, data, len);
+}
+
+static void on_nat_state(void *arg, int connected, int failed)
+{
+	(void)arg;
+	fprintf(stderr, "[e2e] ICE state change: connected=%d failed=%d at %llums\n",
+		connected, failed, (unsigned long long)now_ms());
+}
+
+static void dump_sdp(const char *label, const char *sdp)
+{
+	const char *line = sdp;
+
+	fprintf(stderr, "[e2e] %s:\n", label);
+	while (*line) {
+		const char *nl = strchr(line, '\n');
+		int len = nl ? (int)(nl - line) : (int)strlen(line);
+
+		if (strstr(line, "candidate:") && strstr(line, "candidate:") < line + len)
+			fprintf(stderr, "        %.*s\n", len, line);
+		if (!nl)
+			break;
+		line = nl + 1;
+	}
 }
 
 static int on_stream_output(void *arg, const uint8_t *data, size_t len)
@@ -237,10 +250,12 @@ int main(int argc, char **argv)
 	int timeout_s = 120;
 	int i;
 	size_t k;
+	const char *stun_arg = NULL;
 
 	memset(&g, 0, sizeof(g));
 	g.family = 6;
 	g.stun_port = 3478;
+	g.log_level = -1;
 
 	for (i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--secret") && i + 1 < argc)
@@ -250,19 +265,35 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--family") && i + 1 < argc)
 			g.family = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--stun") && i + 1 < argc)
-			g.stun_host = argv[++i];
+			stun_arg = argv[++i];
 		else if (!strcmp(argv[i], "--stun-port") && i + 1 < argc)
 			g.stun_port = (uint16_t)atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--timeout") && i + 1 < argc)
 			timeout_s = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--log") && i + 1 < argc)
+			g.log_level = atoi(argv[++i]);
 		else {
 			fprintf(stderr,
 				"usage: %s --secret <b64> --role {a|b} --family {4|6}\n"
-				"          [--stun host --stun-port p] [--timeout s]\n",
+				"          [--stun host|none --stun-port p] [--timeout s]\n"
+				"          [--log N]  (libjuice level: 0 verbose .. 5 fatal)\n"
+				"  --stun defaults to a random community STUN server;\n"
+				"         pass 'none' to force a direct (no-STUN) path.\n",
 				argv[0]);
 			return 2;
 		}
 	}
+	if (g.log_level >= 0)
+		nat_log_level(g.log_level);
+
+	if (!stun_arg)
+		stun_pick_default();
+	else if (strcmp(stun_arg, "none"))
+		g.stun_host = stun_arg;
+	if (g.stun_host)
+		fprintf(stderr, "[e2e] STUN: %s:%u\n", g.stun_host, g.stun_port);
+	else
+		fprintf(stderr, "[e2e] STUN: none (direct)\n");
 	if (!secret) {
 		fprintf(stderr, "error: --secret required\n");
 		return 2;
@@ -306,9 +337,10 @@ int main(int argc, char **argv)
 				struct nat_config cfg;
 
 				memset(&cfg, 0, sizeof(cfg));
-				cfg.stun_host = g.family == 4 ? g.stun_host : NULL;
+				cfg.stun_host = g.stun_host;
 				cfg.stun_port = g.stun_port;
 				cfg.on_local_sdp = on_local_sdp;
+				cfg.on_state = on_nat_state;
 				cfg.on_recv = on_nat_recv;
 				g.nat = nat_create(&cfg);
 				if (!g.nat || nat_gather(g.nat)) {
@@ -323,8 +355,10 @@ int main(int argc, char **argv)
 			if (g.have_local_sdp) {
 				char filtered[NAT_SDP_MAX];
 
+				dump_sdp("all gathered local candidates", g.local_sdp);
 				sdp_filter(g.local_sdp, g.family, filtered, sizeof(filtered));
 				strncpy(g.local_sdp, filtered, sizeof(g.local_sdp) - 1);
+				dump_sdp("published local candidates (filtered)", g.local_sdp);
 				st = ST_SIGNAL;
 				g.next_put_ms = 0;
 				g.next_get_ms = 0;
@@ -343,6 +377,7 @@ int main(int argc, char **argv)
 			if (g.have_peer_sdp && !g.remote_set) {
 				char filtered[NAT_SDP_MAX];
 
+				dump_sdp("peer candidates received", g.peer_sdp);
 				sdp_filter(g.peer_sdp, g.family, filtered, sizeof(filtered));
 				if (nat_set_remote_description(g.nat, filtered)) {
 					st = ST_FAIL;
