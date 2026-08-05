@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: AGPL-3.0-or-later */
+/* Copyright (C) 2026 Daniel Golle <daniel@makrotopia.org> */
+
 #include <ifaddrs.h>
 #include <net/if.h>
 #include <stdlib.h>

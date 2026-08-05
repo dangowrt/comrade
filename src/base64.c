@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: AGPL-3.0-or-later */
+/* Copyright (C) 2026 Daniel Golle <daniel@makrotopia.org> */
+
 #include "base64.h"
 
 static const char b64url_alphabet[] =

@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: AGPL-3.0-or-later */
+/* Copyright (C) 2026 Daniel Golle <daniel@makrotopia.org> */
+
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <string.h>
