@@ -172,6 +172,11 @@ if(BUILD_TESTING)
 	add_test(NAME natstream_test COMMAND natstream_test)
 	set_tests_properties(natstream_test PROPERTIES TIMEOUT 60)
 
+	add_executable(sshloop_test tests/sshloop_test.c)
+	target_link_libraries(sshloop_test comrade_ssh comrade_token Threads::Threads)
+	add_test(NAME sshloop_test COMMAND sshloop_test)
+	set_tests_properties(sshloop_test PROPERTIES TIMEOUT 30)
+
 endif()
 
 if(COMRADE_BUILD_TOOLS)
@@ -195,7 +200,8 @@ endif()
 #
 if(BUILD_TESTING)
 	foreach(t IN ITEMS
-		token_test netmon_test candpolicy_test bep44_test natstream_test)
+		token_test netmon_test candpolicy_test bep44_test natstream_test
+		sshloop_test)
 		if(TARGET ${t})
 			target_compile_options(${t} PRIVATE -UNDEBUG)
 		endif()
