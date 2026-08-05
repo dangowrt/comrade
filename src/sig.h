@@ -4,26 +4,37 @@
 #ifndef COMRADE_SIG_H
 #define COMRADE_SIG_H
 
+#include <poll.h>
 #include <stddef.h>
 #include <stdint.h>
 
 #include "token.h"
 
-struct sig_backend;
+/*
+ * Signalling over the DHT: a sealed publish/subscribe mailbox keyed by a
+ * channel name (the BEP 44 salt). Multiple channels run concurrently, which
+ * is what racing several connection paths in parallel needs. Values are
+ * sealed under K_sig derived from the rendezvous secret, so only token
+ * holders can read or write them; the DHT sees opaque blobs.
+ */
 
-struct sig_ops {
-	int (*open)(struct sig_backend *sb, const uint8_t rdv[TOKEN_RDV_LEN]);
-	int (*put)(struct sig_backend *sb, const char *salt,
-		   const uint8_t *val, size_t val_len);
-	int (*get)(struct sig_backend *sb, const char *salt,
-		   uint8_t *val, size_t *val_len);
-	void (*close)(struct sig_backend *sb);
-};
+#define SIG_MAX_VALUE 900
 
-struct sig_backend {
-	const struct sig_ops *ops;
-};
+struct sig;
 
-struct sig_backend *sig_bep44_create(void);
+typedef void sig_recv_cb(void *arg, const uint8_t *data, size_t len);
+
+struct sig *sig_create(const uint8_t rdv[TOKEN_RDV_LEN]);
+void sig_destroy(struct sig *s);
+
+int sig_prepare(struct sig *s, struct pollfd *fds, int maxfds, int *timeout_ms);
+void sig_dispatch(struct sig *s, const struct pollfd *fds, int nfds);
+int sig_ready(struct sig *s);
+
+/* Publish (and keep alive) a value on a channel; call again to update it. */
+int sig_publish(struct sig *s, const char *channel, const uint8_t *data, size_t len);
+
+/* Subscribe to a channel; cb fires each time the peer's value changes. */
+int sig_subscribe(struct sig *s, const char *channel, sig_recv_cb *cb, void *arg);
 
 #endif

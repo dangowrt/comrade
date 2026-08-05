@@ -92,11 +92,12 @@ if(COMRADE_HAVE_CRYPTO AND COMRADE_DHT_DIR AND EXISTS "${COMRADE_DHT_DIR}/dht.c"
 	target_link_libraries(comrade_dht PUBLIC comrade_crypto)
 endif()
 
-add_library(comrade_sig STATIC src/sig_bep44.c)
-target_include_directories(comrade_sig PUBLIC src)
+set(COMRADE_HAVE_SIG 0)
 if(COMRADE_HAVE_DHT)
+	set(COMRADE_HAVE_SIG 1)
+	add_library(comrade_sig STATIC src/sig_bep44.c)
+	target_include_directories(comrade_sig PUBLIC src)
 	target_link_libraries(comrade_sig PUBLIC comrade_dht)
-	target_compile_definitions(comrade_sig PRIVATE COMRADE_HAVE_DHT=1)
 endif()
 
 find_package(Threads REQUIRED)
@@ -133,11 +134,13 @@ add_executable(comrade src/main.c)
 target_link_libraries(comrade
 	comrade_host
 	comrade_ssh
-	comrade_sig
 	comrade_nat
 	comrade_stream
 	comrade_token
 )
+if(COMRADE_HAVE_SIG)
+	target_link_libraries(comrade comrade_sig)
+endif()
 
 install(TARGETS comrade RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
