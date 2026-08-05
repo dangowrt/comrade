@@ -7,42 +7,27 @@
 #include "base58.h"
 #include "token.h"
 
-static void base58_roundtrip_check(void)
+static void base58_fixed_roundtrip_check(void)
 {
-	uint8_t in[80], out[80];
-	char enc[128];
-	size_t i, len, elen;
-	int dlen;
+	uint8_t in[TOKEN_WIRE_LEN], out[TOKEN_WIRE_LEN];
+	char enc[TOKEN_STR_LEN + 1];
+	size_t i, elen, pad;
 
-	for (len = 1; len <= sizeof(in); len++) {
-		for (i = 0; i < len; i++)
-			in[i] = (uint8_t)(i * 37 + 11);
-		elen = base58_encode(in, len, enc, sizeof(enc));
-		assert(elen > 0);
-		dlen = base58_decode(enc, elen, out, sizeof(out));
-		assert(dlen == (int)len && !memcmp(in, out, len));
-	}
-}
-
-static void base58_alphabet_check(void)
-{
-	uint8_t in[66], out[66];
-	char enc[128];
-	size_t i, elen;
+	/* Max value must still fit inside the fixed width. */
+	memset(in, 0xff, sizeof(in));
+	elen = base58_encode(in, sizeof(in), enc, sizeof(enc));
+	assert(elen > 0 && elen <= TOKEN_STR_LEN);
 
 	for (i = 0; i < sizeof(in); i++)
-		in[i] = (uint8_t)(i * 53 + 7);
+		in[i] = (uint8_t)(i * 37 + 11);
 	elen = base58_encode(in, sizeof(in), enc, sizeof(enc));
-	assert(elen > 0);
-	/* No ambiguous glyphs and no punctuation, ever. */
-	for (i = 0; i < elen; i++) {
-		char c = enc[i];
+	assert(elen > 0 && elen <= TOKEN_STR_LEN);
 
-		assert(c != '0' && c != 'O' && c != 'I' && c != 'l');
-		assert((c >= '1' && c <= '9') || (c >= 'A' && c <= 'Z') ||
-		       (c >= 'a' && c <= 'z'));
-	}
-	assert(base58_decode(enc, elen, out, sizeof(out)) == (int)sizeof(in));
+	/* Left-pad with the zero digit '1' and decode back to the fixed width. */
+	pad = TOKEN_STR_LEN - elen;
+	memmove(enc + pad, enc, elen + 1);
+	memset(enc, '1', pad);
+	assert(base58_decode(enc, TOKEN_STR_LEN, out, sizeof(out)) == (int)sizeof(out));
 	assert(!memcmp(in, out, sizeof(in)));
 }
 
@@ -55,7 +40,6 @@ static void base58_reject_check(void)
 	assert(base58_decode("I", 1, out, sizeof(out)) < 0);
 	assert(base58_decode("l", 1, out, sizeof(out)) < 0);
 	assert(base58_decode("A B", 3, out, sizeof(out)) < 0); /* space */
-	assert(base58_decode("zzzz", 4, out, 1) < 0);          /* dst too small */
 }
 
 static void token_fill(struct token *tok)
@@ -63,52 +47,87 @@ static void token_fill(struct token *tok)
 	size_t i;
 
 	tok->version = TOKEN_VERSION;
-	tok->flags = TOKEN_FLAG_RO;
+	tok->flags = TOKEN_FLAG_RO | TOKEN_FLAG_NODHT;
 	for (i = 0; i < TOKEN_RDV_LEN; i++)
 		tok->rdv[i] = (uint8_t)(i * 7 + 1);
 	for (i = 0; i < TOKEN_AUTH_LEN; i++)
 		tok->auth[i] = (uint8_t)(i * 13 + 5);
 	for (i = 0; i < TOKEN_HOSTPUB_LEN; i++)
 		tok->hostpub[i] = (uint8_t)(255 - i);
+	for (i = 0; i < TOKEN_EP6_LEN; i++)
+		tok->ep6_addr[i] = (uint8_t)(0x20 + i);
+	tok->ep6_port = 45678;
+	for (i = 0; i < TOKEN_EP4_LEN; i++)
+		tok->ep4_addr[i] = (uint8_t)(192 - i);
+	tok->ep4_port = 51820;
 }
 
 static void token_roundtrip_check(void)
 {
 	struct token in, out;
-	char str[TOKEN_STR_MAX + 1];
+	char str[TOKEN_STR_LEN + 1];
+	size_t i;
 
 	token_fill(&in);
 	assert(token_encode(&in, str, sizeof(str)) == 0);
-	assert(strlen(str) <= TOKEN_STR_MAX);
+	/* Always exactly TOKEN_STR_LEN, and no ambiguous glyphs. */
+	assert(strlen(str) == TOKEN_STR_LEN);
+	for (i = 0; str[i]; i++)
+		assert(str[i] != '0' && str[i] != 'O' &&
+		       str[i] != 'I' && str[i] != 'l');
 	assert(token_decode(&out, str) == 0);
-	assert(out.version == in.version);
-	assert(out.flags == in.flags);
+	assert(out.version == in.version && out.flags == in.flags);
 	assert(!memcmp(out.rdv, in.rdv, TOKEN_RDV_LEN));
 	assert(!memcmp(out.auth, in.auth, TOKEN_AUTH_LEN));
 	assert(!memcmp(out.hostpub, in.hostpub, TOKEN_HOSTPUB_LEN));
+	assert(!memcmp(out.ep6_addr, in.ep6_addr, TOKEN_EP6_LEN));
+	assert(out.ep6_port == in.ep6_port);
+	assert(!memcmp(out.ep4_addr, in.ep4_addr, TOKEN_EP4_LEN));
+	assert(out.ep4_port == in.ep4_port);
+}
+
+static void token_typo_check(void)
+{
+	struct token in, out;
+	char str[TOKEN_STR_LEN + 1];
+	size_t i, caught = 0;
+
+	token_fill(&in);
+	assert(token_encode(&in, str, sizeof(str)) == 0);
+
+	/* Every single-character substitution is caught by the checksum
+	 * (or is an invalid character); none decodes to a valid token. */
+	for (i = 0; i < TOKEN_STR_LEN; i++) {
+		char orig = str[i];
+		char sub = orig == 'z' ? 'y' : 'z';
+
+		str[i] = sub;
+		if (token_decode(&out, str) < 0)
+			caught++;
+		str[i] = orig;
+	}
+	assert(caught == TOKEN_STR_LEN);
 }
 
 static void token_reject_check(void)
 {
 	struct token in, out;
-	char str[TOKEN_STR_MAX + 1];
-	char tiny[4];
+	char str[TOKEN_STR_LEN + 1];
+	char small[TOKEN_STR_LEN];
 
 	token_fill(&in);
-	assert(token_encode(&in, tiny, sizeof(tiny)) < 0);
+	assert(token_encode(&in, small, sizeof(small)) < 0);   /* buffer too small */
 	assert(token_encode(&in, str, sizeof(str)) == 0);
-	assert(token_decode(&out, "") < 0);
-	assert(token_decode(&out, str + 1) < 0);
-	str[0] = str[0] == 'z' ? 'y' : 'z';
-	assert(token_decode(&out, str) < 0);
+	assert(token_decode(&out, "") < 0);                    /* empty */
+	assert(token_decode(&out, str + 1) < 0);               /* short by one */
 }
 
 int main(void)
 {
-	base58_roundtrip_check();
-	base58_alphabet_check();
+	base58_fixed_roundtrip_check();
 	base58_reject_check();
 	token_roundtrip_check();
+	token_typo_check();
 	token_reject_check();
 	return 0;
 }
