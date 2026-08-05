@@ -4,8 +4,39 @@
 #ifndef COMRADE_SSHD_H
 #define COMRADE_SSHD_H
 
-struct token;
+#include <stdint.h>
 
-int sshd_run(const struct token *tok, int fd);
+#include "token.h"
+
+/*
+ * comrade SSH server. Runs a single session over an already-connected byte
+ * stream (a socketpair end that the caller bridges to the punched KCP path,
+ * or a bare fd for local tests). The host identity is an ephemeral ed25519
+ * key whose SHA-256 fingerprint the client pins from the token, so there is
+ * no trust-on-first-use and no MITM window. The only credential is the
+ * token's 16-byte auth secret, offered as an SSH password.
+ */
+
+struct sshd_opts {
+	void *hostkey;			/* ssh_key (private), from sshd_hostkey_new */
+	uint8_t auth[TOKEN_AUTH_LEN];	/* session password material */
+	const char *command;		/* /bin/sh -c argument; NULL => default */
+	int use_pty;			/* allocate a pty (interactive shell/tmux) */
+};
+
+/*
+ * Generate an ephemeral ed25519 host key and fill fp with its SHA-256
+ * fingerprint: the 32 bytes to place in token.hostpub for the client to pin.
+ * Returns an opaque ssh_key (free with sshd_hostkey_free) or NULL.
+ */
+void *sshd_hostkey_new(uint8_t fp[32]);
+void sshd_hostkey_free(void *hostkey);
+
+/*
+ * Serve exactly one SSH session on fd; blocks until the session ends.
+ * Returns 0 on a clean session, -1 on error. Does not take ownership of
+ * o->hostkey (imports a copy).
+ */
+int sshd_serve_fd(int fd, const struct sshd_opts *o);
 
 #endif

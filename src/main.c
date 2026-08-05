@@ -5,7 +5,6 @@
 #include <string.h>
 
 #include "host.h"
-#include "sshc.h"
 #include "token.h"
 
 static int usage(int ret)
@@ -26,7 +25,8 @@ static int session_connect(const char *arg)
 		return 1;
 	}
 
-	return sshc_run(&tok);
+	fprintf(stderr, "comrade: connecting is not implemented yet\n");
+	return 1;
 }
 
 int main(int argc, char **argv)

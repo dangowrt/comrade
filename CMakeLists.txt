@@ -119,11 +119,19 @@ if(TARGET kcp::kcp)
 	set(COMRADE_HAVE_STREAM 1)
 endif()
 
-add_library(comrade_ssh STATIC src/sshd.c src/sshc.c)
-target_include_directories(comrade_ssh PUBLIC src)
-target_link_libraries(comrade_ssh PUBLIC comrade_token)
+set(COMRADE_HAVE_SSH 0)
 if(LIBSSH_FOUND)
-	target_link_libraries(comrade_ssh PUBLIC PkgConfig::LIBSSH)
+	set(COMRADE_HAVE_SSH 1)
+	add_library(comrade_ssh STATIC src/sshd.c src/sshc.c)
+	target_include_directories(comrade_ssh PUBLIC src)
+	# The message-based libssh server API is deprecated in favour of the
+	# callback API but is clearer and fully functional; migrate later.
+	target_compile_options(comrade_ssh PRIVATE -Wno-deprecated-declarations)
+	target_link_libraries(comrade_ssh PUBLIC comrade_token PkgConfig::LIBSSH Threads::Threads)
+	find_library(COMRADE_UTIL util)
+	if(COMRADE_UTIL)
+		target_link_libraries(comrade_ssh PUBLIC ${COMRADE_UTIL})
+	endif()
 endif()
 
 add_library(comrade_host STATIC src/host.c)
@@ -133,9 +141,6 @@ target_link_libraries(comrade_host PUBLIC comrade_token)
 add_executable(comrade src/main.c)
 target_link_libraries(comrade
 	comrade_host
-	comrade_ssh
-	comrade_nat
-	comrade_stream
 	comrade_token
 )
 if(COMRADE_HAVE_SIG)
