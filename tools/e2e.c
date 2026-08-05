@@ -1,8 +1,12 @@
+#include <arpa/inet.h>
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 
 #include "base64.h"
 #include "bencode.h"
@@ -16,6 +20,14 @@
 
 #define E2E_PAYLOAD (64 * 1024)
 #define E2E_CONV 0x70326531
+/*
+ * Retry is driven by libjuice's own FAILED verdict (nat_failed), which it
+ * reaches after its full ICE negotiation (~tens of seconds). This is only a
+ * backstop against an agent that neither connects nor fails; it must stay
+ * well above the real-internet connect time or it would abort attempts that
+ * are still in progress.
+ */
+#define ICE_ATTEMPT_MS 90000
 
 enum state {
 	ST_WAIT_DHT,
@@ -58,6 +70,8 @@ static struct {
 	size_t rx_got;
 	int tx_sent;
 	uint64_t linger_deadline;
+	uint64_t ice_attempt_start;
+	int ice_attempt;
 } g;
 
 static const struct {
@@ -202,6 +216,95 @@ static void publish_offer(void)
 		  value, vb.len, ++g.put_seq, on_put, NULL);
 }
 
+/*
+ * Ask the kernel which local address it would source outbound packets from
+ * toward a generic global destination of the given family. UDP connect()
+ * sends no packet; it only triggers route and source-address selection, so
+ * this discloses nothing to any third party (unlike STUN). Used to bind the
+ * ICE agent to its real source so its host candidate matches what the peer
+ * will actually see, which is what the no-STUN path needs.
+ */
+static int source_addr(int family, char *out, size_t outlen)
+{
+	static const char *probe6 = "2001:db8::1";
+	static const char *probe4 = "192.0.2.1";
+	struct sockaddr_storage ss;
+	socklen_t slen = sizeof(ss);
+	int s, rc = -1;
+
+	s = socket(family, SOCK_DGRAM, 0);
+	if (s < 0)
+		return -1;
+
+	memset(&ss, 0, sizeof(ss));
+	if (family == AF_INET6) {
+		struct sockaddr_in6 *a = (struct sockaddr_in6 *)&ss;
+
+		a->sin6_family = AF_INET6;
+		a->sin6_port = htons(9);
+		if (inet_pton(AF_INET6, probe6, &a->sin6_addr) != 1 ||
+		    connect(s, (struct sockaddr *)a, sizeof(*a)))
+			goto out;
+	} else {
+		struct sockaddr_in *a = (struct sockaddr_in *)&ss;
+
+		a->sin_family = AF_INET;
+		a->sin_port = htons(9);
+		if (inet_pton(AF_INET, probe4, &a->sin_addr) != 1 ||
+		    connect(s, (struct sockaddr *)a, sizeof(*a)))
+			goto out;
+	}
+
+	memset(&ss, 0, sizeof(ss));
+	if (getsockname(s, (struct sockaddr *)&ss, &slen))
+		goto out;
+	if (family == AF_INET6)
+		rc = inet_ntop(AF_INET6, &((struct sockaddr_in6 *)&ss)->sin6_addr,
+			       out, outlen) ? 0 : -1;
+	else
+		rc = inet_ntop(AF_INET, &((struct sockaddr_in *)&ss)->sin_addr,
+			       out, outlen) ? 0 : -1;
+out:
+	close(s);
+	return rc;
+}
+
+static int nat_setup(void)
+{
+	static char bind_addr[64];
+	struct nat_config cfg;
+
+	memset(&cfg, 0, sizeof(cfg));
+	cfg.stun_host = g.stun_host;
+	cfg.stun_port = g.stun_port;
+	if (!g.stun_host) {
+		int af = g.family == 6 ? AF_INET6 : AF_INET;
+
+		if (!source_addr(af, bind_addr, sizeof(bind_addr))) {
+			cfg.bind_address = bind_addr;
+			fprintf(stderr,
+				"[e2e] no STUN: binding ICE to discovered source %s\n",
+				bind_addr);
+		}
+	}
+	cfg.on_local_sdp = on_local_sdp;
+	cfg.on_state = on_nat_state;
+	cfg.on_recv = on_nat_recv;
+
+	g.have_local_sdp = 0;
+	g.have_peer_sdp = 0;
+	g.remote_set = 0;
+	g.local_sdp[0] = '\0';
+	g.peer_sdp[0] = '\0';
+	g.next_put_ms = 0;
+	g.next_get_ms = 0;
+
+	g.nat = nat_create(&cfg);
+	if (!g.nat || nat_gather(g.nat))
+		return -1;
+	return 0;
+}
+
 static void pump_once(int timeout_cap_ms)
 {
 	struct pollfd fds[4];
@@ -334,16 +437,7 @@ int main(int argc, char **argv)
 		switch (st) {
 		case ST_WAIT_DHT:
 			if (dhtnode_ready(g.node)) {
-				struct nat_config cfg;
-
-				memset(&cfg, 0, sizeof(cfg));
-				cfg.stun_host = g.stun_host;
-				cfg.stun_port = g.stun_port;
-				cfg.on_local_sdp = on_local_sdp;
-				cfg.on_state = on_nat_state;
-				cfg.on_recv = on_nat_recv;
-				g.nat = nat_create(&cfg);
-				if (!g.nat || nat_gather(g.nat)) {
+				if (nat_setup()) {
 					st = ST_FAIL;
 					break;
 				}
@@ -384,7 +478,9 @@ int main(int argc, char **argv)
 					break;
 				}
 				g.remote_set = 1;
-				fprintf(stderr, "[e2e] remote set, running ICE...\n");
+				g.ice_attempt_start = now_ms();
+				fprintf(stderr, "[e2e] remote set, running ICE (attempt %d)...\n",
+					g.ice_attempt + 1);
 				st = ST_WAIT_ICE;
 			}
 			break;
@@ -393,10 +489,25 @@ int main(int argc, char **argv)
 				publish_offer();
 				g.next_put_ms = now_ms() + 4000;
 			}
-			if (nat_connected(g.nat))
+			if (nat_connected(g.nat)) {
 				st = ST_RUN;
-			else if (nat_failed(g.nat))
-				st = ST_FAIL;
+				break;
+			}
+			if (nat_failed(g.nat) ||
+			    now_ms() - g.ice_attempt_start > ICE_ATTEMPT_MS) {
+				g.ice_attempt++;
+				fprintf(stderr,
+					"[e2e] ICE attempt %d %s, re-gathering with fresh mappings...\n",
+					g.ice_attempt,
+					nat_failed(g.nat) ? "failed (libjuice gave up)"
+							  : "backstop timeout");
+				nat_destroy(g.nat);
+				g.nat = NULL;
+				if (nat_setup())
+					st = ST_FAIL;
+				else
+					st = ST_GATHER;
+			}
 			break;
 		case ST_RUN:
 			state_run_step();
