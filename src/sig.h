@@ -20,11 +20,20 @@
 
 #define SIG_MAX_VALUE 900
 
+/* Transports; combine with OR. */
+#define SIG_DHT		0x1	/* BitTorrent mainline DHT (internet-wide) */
+#define SIG_MCAST	0x2	/* link-local multicast (isolated LANs) */
+
 struct sig;
 
 typedef void sig_recv_cb(void *arg, const uint8_t *data, size_t len);
 
-struct sig *sig_create(const uint8_t rdv[TOKEN_RDV_LEN]);
+/*
+ * With both transports, multicast runs first and the DHT is not even
+ * engaged until a short grace elapses without a peer being discovered on
+ * the link, so a successful LAN discovery never touches the DHT.
+ */
+struct sig *sig_create(const uint8_t rdv[TOKEN_RDV_LEN], unsigned flags);
 void sig_destroy(struct sig *s);
 
 int sig_prepare(struct sig *s, struct pollfd *fds, int maxfds, int *timeout_ms);
