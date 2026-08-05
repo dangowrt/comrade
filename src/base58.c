@@ -61,15 +61,13 @@ size_t base58_encode(const uint8_t *src, size_t src_len, char *dst, size_t dst_l
 int base58_decode(const char *src, size_t src_len, uint8_t *dst, size_t dst_len)
 {
 	uint8_t b256[B256_BUF];
-	size_t zeros = 0, start, need, i, o = 0;
+	size_t start, sig, i;
 
 	if (src_len > BASE58_MAX_STR)
 		return -1;
-	while (zeros < src_len && src[zeros] == '1')
-		zeros++;
 
 	memset(b256, 0, sizeof(b256));
-	for (i = zeros; i < src_len; i++) {
+	for (i = 0; i < src_len; i++) {
 		int v = b58_value((unsigned char)src[i]);
 		size_t j = sizeof(b256);
 
@@ -85,13 +83,11 @@ int base58_decode(const char *src, size_t src_len, uint8_t *dst, size_t dst_len)
 	start = 0;
 	while (start < sizeof(b256) && b256[start] == 0)
 		start++;
-	need = zeros + (sizeof(b256) - start);
-	if (need > dst_len)
+	sig = sizeof(b256) - start;
+	if (sig > dst_len)
 		return -1;
 
-	for (i = 0; i < zeros; i++)
-		dst[o++] = 0;
-	for (i = start; i < sizeof(b256); i++)
-		dst[o++] = b256[i];
-	return (int)o;
+	memset(dst, 0, dst_len - sig);
+	memcpy(dst + (dst_len - sig), b256 + start, sig);
+	return (int)dst_len;
 }
