@@ -12,12 +12,10 @@
 #include <sys/socket.h>
 
 #include "base64.h"
-#include "bencode.h"
-#include "bep44.h"
 #include "candpolicy.h"
-#include "dhtnode.h"
 #include "keys.h"
 #include "nat.h"
+#include "sig.h"
 #include "stream.h"
 #include "token.h"
 
@@ -49,10 +47,8 @@ static struct {
 	const char *stun_host;
 	uint16_t stun_port;
 	int log_level;
-	struct session_keys keys;
 
-	struct dhtnode *node;
-	struct bep44_engine *engine;
+	struct sig *sig;
 	struct nat_agent *nat;
 	struct stream *stream;
 
@@ -61,10 +57,6 @@ static struct {
 
 	char peer_sdp[NAT_SDP_MAX];
 	volatile int have_peer_sdp;
-
-	int64_t put_seq;
-	uint64_t next_put_ms;
-	uint64_t next_get_ms;
 	int remote_set;
 
 	uint8_t *tx;
@@ -108,12 +100,12 @@ static uint64_t now_ms(void)
 	return (uint64_t)ts.tv_sec * 1000 + (uint64_t)(ts.tv_nsec / 1000000);
 }
 
-static const char *put_salt(void)
+static const char *put_channel(void)
 {
 	return g.role_a ? "e2e-a" : "e2e-b";
 }
 
-static const char *get_salt(void)
+static const char *get_channel(void)
 {
 	return g.role_a ? "e2e-b" : "e2e-a";
 }
@@ -147,6 +139,17 @@ static void on_nat_state(void *arg, int connected, int failed)
 		connected, failed, (unsigned long long)now_ms());
 }
 
+static void on_peer_offer(void *arg, const uint8_t *data, size_t len)
+{
+	(void)arg;
+	if (len >= sizeof(g.peer_sdp))
+		len = sizeof(g.peer_sdp) - 1;
+	memcpy(g.peer_sdp, data, len);
+	g.peer_sdp[len] = '\0';
+	g.have_peer_sdp = 1;
+	fprintf(stderr, "[e2e] peer offer received (%zu bytes)\n", len);
+}
+
 static void dump_sdp(const char *label, const char *sdp)
 {
 	const char *line = sdp;
@@ -168,55 +171,6 @@ static int on_stream_output(void *arg, const uint8_t *data, size_t len)
 {
 	(void)arg;
 	return nat_send(g.nat, data, len);
-}
-
-static void on_put(void *arg, int stored)
-{
-	(void)arg;
-	fprintf(stderr, "[e2e] offer stored on %d nodes\n", stored);
-}
-
-static void on_get(void *arg, const uint8_t *v, size_t v_len, int64_t seq)
-{
-	const uint8_t *sealed;
-	size_t sealed_len;
-	uint8_t plain[NAT_SDP_MAX];
-	int n;
-
-	(void)arg;
-	(void)seq;
-	if (!v || g.have_peer_sdp)
-		return;
-	if (benc_str_get(v, v_len, &sealed, &sealed_len))
-		return;
-	n = msg_open(plain, sizeof(plain) - 1, g.keys.sig_key, sealed, sealed_len);
-	if (n < 0)
-		return;
-	plain[n] = '\0';
-	memcpy(g.peer_sdp, plain, (size_t)n + 1);
-	g.have_peer_sdp = 1;
-	fprintf(stderr, "[e2e] peer offer received (%d bytes)\n", n);
-}
-
-static void publish_offer(void)
-{
-	uint8_t sealed[NAT_SDP_MAX + SEAL_OVERHEAD];
-	uint8_t value[BEP44_MAX_VALUE];
-	struct benc_buf vb;
-	int slen;
-
-	slen = msg_seal(sealed, sizeof(sealed), g.keys.sig_key,
-			(const uint8_t *)g.local_sdp, strlen(g.local_sdp));
-	if (slen < 0)
-		return;
-	benc_buf_init(&vb, value, sizeof(value));
-	benc_str_add(&vb, sealed, (size_t)slen);
-	if (vb.err) {
-		fprintf(stderr, "[e2e] offer too large for DHT value (%d sealed)\n", slen);
-		return;
-	}
-	bep44_put(g.engine, g.keys.bep44_sk, g.keys.bep44_pk, put_salt(),
-		  value, vb.len, ++g.put_seq, on_put, NULL);
 }
 
 /*
@@ -295,12 +249,8 @@ static int nat_setup(void)
 	cfg.on_recv = on_nat_recv;
 
 	g.have_local_sdp = 0;
-	g.have_peer_sdp = 0;
-	g.remote_set = 0;
 	g.local_sdp[0] = '\0';
-	g.peer_sdp[0] = '\0';
-	g.next_put_ms = 0;
-	g.next_get_ms = 0;
+	g.remote_set = 0;
 
 	g.nat = nat_create(&cfg);
 	if (!g.nat || nat_gather(g.nat))
@@ -313,11 +263,11 @@ static void pump_once(int timeout_cap_ms)
 	struct pollfd fds[4];
 	int timeout, nfds;
 
-	nfds = dhtnode_prepare(g.node, fds, 4, &timeout);
+	nfds = sig_prepare(g.sig, fds, 4, &timeout);
 	if (timeout > timeout_cap_ms)
 		timeout = timeout_cap_ms;
 	poll(fds, (nfds_t)nfds, timeout);
-	dhtnode_dispatch(g.node, fds, nfds);
+	sig_dispatch(g.sig, fds, nfds);
 }
 
 static void state_run_step(void)
@@ -409,7 +359,6 @@ int main(int argc, char **argv)
 		fprintf(stderr, "error: bad secret\n");
 		return 2;
 	}
-	keys_derive(&g.keys, rdv);
 
 	g.tx = malloc(E2E_PAYLOAD);
 	g.rx = malloc(E2E_PAYLOAD);
@@ -421,12 +370,12 @@ int main(int argc, char **argv)
 		g.rx_expect[k] = (uint8_t)((g.role_a ? 0xB0 : 0xA0) ^ (k * 131 + 7));
 	}
 
-	g.node = dhtnode_create();
-	if (!g.node) {
-		fprintf(stderr, "error: dhtnode_create failed\n");
+	g.sig = sig_create(rdv);
+	if (!g.sig) {
+		fprintf(stderr, "error: sig_create failed\n");
 		return 1;
 	}
-	g.engine = dhtnode_engine(g.node);
+	sig_subscribe(g.sig, get_channel(), on_peer_offer, NULL);
 
 	fprintf(stderr, "[e2e] role %s, family IPv%d, joining DHT...\n",
 		g.role_a ? "a" : "b", g.family);
@@ -439,7 +388,7 @@ int main(int argc, char **argv)
 
 		switch (st) {
 		case ST_WAIT_DHT:
-			if (dhtnode_ready(g.node)) {
+			if (sig_ready(g.sig)) {
 				if (nat_setup()) {
 					st = ST_FAIL;
 					break;
@@ -456,21 +405,12 @@ int main(int argc, char **argv)
 				sdp_filter(g.local_sdp, g.family, filtered, sizeof(filtered));
 				strncpy(g.local_sdp, filtered, sizeof(g.local_sdp) - 1);
 				dump_sdp("published local candidates (filtered)", g.local_sdp);
+				sig_publish(g.sig, put_channel(),
+					    (const uint8_t *)g.local_sdp, strlen(g.local_sdp));
 				st = ST_SIGNAL;
-				g.next_put_ms = 0;
-				g.next_get_ms = 0;
 			}
 			break;
 		case ST_SIGNAL:
-			if (now_ms() >= g.next_put_ms) {
-				publish_offer();
-				g.next_put_ms = now_ms() + 4000;
-			}
-			if (!g.have_peer_sdp && now_ms() >= g.next_get_ms) {
-				bep44_get(g.engine, g.keys.bep44_pk, get_salt(),
-					  on_get, NULL);
-				g.next_get_ms = now_ms() + 2000;
-			}
 			if (g.have_peer_sdp && !g.remote_set) {
 				char filtered[NAT_SDP_MAX];
 
@@ -488,10 +428,6 @@ int main(int argc, char **argv)
 			}
 			break;
 		case ST_WAIT_ICE:
-			if (now_ms() >= g.next_put_ms) {
-				publish_offer();
-				g.next_put_ms = now_ms() + 4000;
-			}
 			if (nat_connected(g.nat)) {
 				st = ST_RUN;
 				break;
@@ -549,7 +485,7 @@ int main(int argc, char **argv)
 		stream_destroy(g.stream);
 	if (g.nat)
 		nat_destroy(g.nat);
-	dhtnode_free(g.node);
+	sig_destroy(g.sig);
 	free(g.tx);
 	free(g.rx);
 	free(g.rx_expect);
