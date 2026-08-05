@@ -47,6 +47,7 @@ static struct {
 	const char *stun_host;
 	uint16_t stun_port;
 	int log_level;
+	unsigned sig_flags;
 
 	struct sig *sig;
 	struct nat_agent *nat;
@@ -312,6 +313,7 @@ int main(int argc, char **argv)
 	g.family = 6;
 	g.stun_port = 3478;
 	g.log_level = -1;
+	g.sig_flags = SIG_DHT;
 
 	for (i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--secret") && i + 1 < argc)
@@ -328,11 +330,16 @@ int main(int argc, char **argv)
 			timeout_s = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--log") && i + 1 < argc)
 			g.log_level = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--mcast"))
+			g.sig_flags |= SIG_MCAST;
+		else if (!strcmp(argv[i], "--no-dht"))
+			g.sig_flags &= ~SIG_DHT;
 		else {
 			fprintf(stderr,
 				"usage: %s --secret <b64> --role {a|b} --family {4|6}\n"
 				"          [--stun host|none --stun-port p] [--timeout s]\n"
 				"          [--log N]  (libjuice level: 0 verbose .. 5 fatal)\n"
+				"          [--mcast] [--no-dht]  (link-local multicast; LAN-only)\n"
 				"  --stun defaults to a random community STUN server;\n"
 				"         pass 'none' to force a direct (no-STUN) path.\n",
 				argv[0]);
@@ -370,15 +377,17 @@ int main(int argc, char **argv)
 		g.rx_expect[k] = (uint8_t)((g.role_a ? 0xB0 : 0xA0) ^ (k * 131 + 7));
 	}
 
-	g.sig = sig_create(rdv);
+	g.sig = sig_create(rdv, g.sig_flags);
 	if (!g.sig) {
 		fprintf(stderr, "error: sig_create failed\n");
 		return 1;
 	}
 	sig_subscribe(g.sig, get_channel(), on_peer_offer, NULL);
 
-	fprintf(stderr, "[e2e] role %s, family IPv%d, joining DHT...\n",
-		g.role_a ? "a" : "b", g.family);
+	fprintf(stderr, "[e2e] role %s, family IPv%d, signalling%s%s...\n",
+		g.role_a ? "a" : "b", g.family,
+		(g.sig_flags & SIG_MCAST) ? " mcast" : "",
+		(g.sig_flags & SIG_DHT) ? " dht" : "");
 
 	start = now_ms();
 	deadline = start + (uint64_t)timeout_s * 1000;
