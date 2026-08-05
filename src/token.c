@@ -3,7 +3,7 @@
 
 #include <string.h>
 
-#include "base64.h"
+#include "base58.h"
 #include "token.h"
 
 int token_encode(const struct token *tok, char *dest, size_t dest_len)
@@ -16,10 +16,7 @@ int token_encode(const struct token *tok, char *dest, size_t dest_len)
 	memcpy(&raw[2 + TOKEN_RDV_LEN], tok->auth, TOKEN_AUTH_LEN);
 	memcpy(&raw[2 + TOKEN_RDV_LEN + TOKEN_AUTH_LEN], tok->hostpub, TOKEN_HOSTPUB_LEN);
 
-	if (base64url_encode(raw, sizeof(raw), dest, dest_len) != TOKEN_STR_LEN)
-		return -1;
-
-	return 0;
+	return base58_encode(raw, sizeof(raw), dest, dest_len) ? 0 : -1;
 }
 
 int token_decode(struct token *tok, const char *src)
@@ -27,9 +24,9 @@ int token_decode(struct token *tok, const char *src)
 	uint8_t raw[TOKEN_RAW_LEN];
 	size_t len = strlen(src);
 
-	if (len != TOKEN_STR_LEN)
+	if (len == 0 || len > BASE58_MAX_STR)
 		return -1;
-	if (base64url_decode(src, len, raw, sizeof(raw)) != TOKEN_RAW_LEN)
+	if (base58_decode(src, len, raw, sizeof(raw)) != (int)TOKEN_RAW_LEN)
 		return -1;
 	if (raw[0] != TOKEN_VERSION)
 		return -1;

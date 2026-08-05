@@ -61,7 +61,7 @@ if(COMRADE_MISSING)
 	message(STATUS "Missing dependencies, tolerated while the modules using them are stubs:\n   ${COMRADE_MISSING_TEXT}")
 endif()
 
-add_library(comrade_token STATIC src/base64.c src/token.c)
+add_library(comrade_token STATIC src/base64.c src/base58.c src/token.c)
 target_include_directories(comrade_token PUBLIC src)
 
 set(COMRADE_HAVE_CRYPTO 0)
