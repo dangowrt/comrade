@@ -15,6 +15,7 @@ typedef void nat_cb_recv(void *arg, const uint8_t *data, size_t len);
 struct nat_config {
 	const char *stun_host;
 	uint16_t stun_port;
+	const char *bind_address;
 	nat_cb_local_sdp *on_local_sdp;
 	nat_cb_state *on_state;
 	nat_cb_recv *on_recv;

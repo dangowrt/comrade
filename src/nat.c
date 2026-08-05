@@ -71,6 +71,7 @@ struct nat_agent *nat_create(const struct nat_config *cfg)
 	jc.concurrency_mode = JUICE_CONCURRENCY_MODE_POLL;
 	jc.stun_server_host = cfg->stun_host;
 	jc.stun_server_port = cfg->stun_port;
+	jc.bind_address = cfg->bind_address;
 	jc.cb_state_changed = on_state_changed;
 	jc.cb_candidate = on_candidate;
 	jc.cb_gathering_done = on_gathering_done;
