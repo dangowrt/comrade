@@ -243,6 +243,7 @@ int sshd_serve_fd(int fd, const struct sshd_opts *o)
 	pid_t child = -1;
 	int to_child = -1, from_child = -1;
 	int want_pty = 0;
+	int gave_fd = 0;
 	int rc = -1;
 
 	if (!o || !o->hostkey)
@@ -262,6 +263,7 @@ int sshd_serve_fd(int fd, const struct sshd_opts *o)
 		goto out;
 	if (ssh_bind_accept_fd(bind, s, fd) != SSH_OK)
 		goto out;
+	gave_fd = 1;
 	if (ssh_handle_key_exchange(s) != SSH_OK)
 		goto out;
 	if (do_auth(s, password))
@@ -300,5 +302,12 @@ out:
 	}
 	if (bind)
 		ssh_bind_free(bind);
+	/*
+	 * ssh_bind_accept_fd adopts the fd, so libssh closes it above; close it
+	 * ourselves only if the session never got that far. Either way it ends
+	 * up closed, which signals end-of-session to the bridge.
+	 */
+	if (!gave_fd)
+		close(fd);
 	return rc;
 }

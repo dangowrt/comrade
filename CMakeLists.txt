@@ -119,6 +119,12 @@ if(TARGET kcp::kcp)
 	set(COMRADE_HAVE_STREAM 1)
 endif()
 
+if(COMRADE_HAVE_STREAM)
+	add_library(comrade_bridge STATIC src/sshbridge.c)
+	target_include_directories(comrade_bridge PUBLIC src)
+	target_link_libraries(comrade_bridge PUBLIC comrade_stream)
+endif()
+
 set(COMRADE_HAVE_SSH 0)
 if(LIBSSH_FOUND)
 	set(COMRADE_HAVE_SSH 1)

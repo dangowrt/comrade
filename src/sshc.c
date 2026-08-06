@@ -125,5 +125,12 @@ out:
 		ssh_disconnect(s);
 		ssh_free(s);
 	}
+	/*
+	 * libssh never closes an fd supplied via SSH_OPTIONS_FD; it is ours.
+	 * Closing it is also what signals end-of-session to the bridge on the
+	 * other end of the socketpair.
+	 */
+	if (sock >= 0)
+		close(sock);
 	return rc;
 }
