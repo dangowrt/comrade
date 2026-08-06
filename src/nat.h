@@ -19,6 +19,16 @@ struct nat_config {
 	const char *stun_host;
 	uint16_t stun_port;
 	const char *bind_address;
+	/*
+	 * A fixed local port and fixed ICE credentials keep this agent's
+	 * identity stable across restarts, so a re-gather after a failed punch
+	 * is transparent to the peer (same address:port, same STUN USERNAME)
+	 * and both sides keep hammering one target instead of chasing each
+	 * other's rotating ports. Zero / NULL means let libjuice choose.
+	 */
+	uint16_t bind_port;
+	const char *ice_ufrag;
+	const char *ice_pwd;
 	nat_cb_local_sdp *on_local_sdp;
 	nat_cb_state *on_state;
 	nat_cb_recv *on_recv;

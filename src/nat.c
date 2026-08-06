@@ -75,6 +75,10 @@ struct nat_agent *nat_create(const struct nat_config *cfg)
 	jc.stun_server_host = cfg->stun_host;
 	jc.stun_server_port = cfg->stun_port;
 	jc.bind_address = cfg->bind_address;
+	if (cfg->bind_port) {
+		jc.local_port_range_begin = cfg->bind_port;
+		jc.local_port_range_end = cfg->bind_port;
+	}
 	jc.cb_state_changed = on_state_changed;
 	jc.cb_candidate = on_candidate;
 	jc.cb_gathering_done = on_gathering_done;
@@ -86,6 +90,9 @@ struct nat_agent *nat_create(const struct nat_config *cfg)
 		free(a);
 		return NULL;
 	}
+	if (cfg->ice_ufrag && cfg->ice_pwd)
+		juice_set_local_ice_attributes(a->agent, cfg->ice_ufrag,
+					       cfg->ice_pwd);
 	return a;
 }
 
