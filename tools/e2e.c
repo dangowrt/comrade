@@ -97,19 +97,24 @@ static size_t ssh_rx_got;
 static int ssh_cli_rc;
 static int ssh_fd;			/* the ssh thread's socketpair end */
 
-/* Dual-stack servers first, so an IPv6 auto pick is likely to land on one
- * that answers over v6. stunserver.stunprotocol.org was dropped: it is
- * defunct and no longer resolves. */
+/*
+ * Independent operators only. This project is deliberately not built on
+ * big-tech infrastructure, so no Google/Cloudflare/Amazon/Microsoft/Apple
+ * STUN here even though they are the "reliable" pick; the truly clean path
+ * is the direct no-STUN traversal anyway. Dual-stack servers are listed
+ * first so an IPv6 auto pick lands on one that answers over v6. Keep this in
+ * sync with the always-online-stun validated lists so an independent default
+ * does not silently rot the way stunserver.stunprotocol.org did.
+ */
 static const struct {
 	const char *host;
 	uint16_t port;
 } stun_servers[] = {
-	{ "stun.cloudflare.com", 3478 },	/* dual-stack */
-	{ "stun.l.google.com", 19302 },		/* dual-stack */
-	{ "stun.nextcloud.com", 443 },		/* dual-stack */
-	{ "stun.antisip.com", 3478 },		/* dual-stack */
-	{ "stun.linphone.org", 3478 },
-	{ "stun.sipgate.net", 3478 },
+	{ "stun.nextcloud.com", 3478 },		/* dual-stack, open source */
+	{ "stun.framasoft.org", 3478 },		/* dual-stack, non-profit */
+	{ "stun.ipfire.org", 3478 },		/* dual-stack, open source */
+	{ "stun.freeswitch.org", 3478 },	/* open-source telephony */
+	{ "stun.sipthor.net", 3478 },		/* AG Projects, open-source SIP */
 	{ "stun.voipgate.com", 3478 },
 };
 
@@ -400,6 +405,7 @@ static int run_ssh(void)
 {
 	struct sshbridge *br;
 	pthread_t th;
+	char loc[256], rem[256];
 	int sp[2];
 	int done = 0;
 	uint64_t deadline = now_ms() + 30000;
@@ -423,13 +429,9 @@ static int run_ssh(void)
 		close(sp[1]);
 		return -1;
 	}
-	{
-		char loc[256], rem[256];
-
-		if (!nat_selected(g.nat, loc, sizeof(loc), rem, sizeof(rem)))
-			fprintf(stderr, "[e2e] selected pair:\n  local  %s\n  remote %s\n",
-				loc, rem);
-	}
+	if (!nat_selected(g.nat, loc, sizeof(loc), rem, sizeof(rem)))
+		fprintf(stderr, "[e2e] selected pair:\n  local  %s\n  remote %s\n",
+			loc, rem);
 
 	ssh_fd = sp[1];
 	if (pthread_create(&th, NULL,
@@ -483,12 +485,14 @@ static int run_ssh(void)
 
 int main(int argc, char **argv)
 {
+	static const char hx[] = "0123456789abcdef";
 	uint8_t rdv[TOKEN_RDV_LEN];
 	const char *secret = NULL;
 	enum state st = ST_WAIT_DHT;
 	uint64_t start, deadline;
 	int timeout_s = 120;
-	int i;
+	int i, j;
+	uint8_t rb[16];
 	size_t k;
 	const char *stun_arg = NULL;
 
@@ -555,28 +559,22 @@ int main(int argc, char **argv)
 		return 2;
 	}
 
-	{
-		static const char hx[] = "0123456789abcdef";
-		uint8_t rb[16];
-		int j;
-
-		random_bytes(rb, 4);
-		for (j = 0; j < 4; j++) {
-			g.ice_ufrag[j * 2] = hx[rb[j] >> 4];
-			g.ice_ufrag[j * 2 + 1] = hx[rb[j] & 0xf];
-		}
-		g.ice_ufrag[8] = '\0';
-		random_bytes(rb, 16);
-		for (j = 0; j < 16; j++) {
-			g.ice_pwd[j * 2] = hx[rb[j] >> 4];
-			g.ice_pwd[j * 2 + 1] = hx[rb[j] & 0xf];
-		}
-		g.ice_pwd[32] = '\0';
-		random_bytes(rb, 2);
-		g.bind_port = (uint16_t)(40000 + (((rb[0] << 8) | rb[1]) % 20000));
-		fprintf(stderr, "[e2e] stable ICE identity: port %u ufrag %s\n",
-			g.bind_port, g.ice_ufrag);
+	random_bytes(rb, 4);
+	for (j = 0; j < 4; j++) {
+		g.ice_ufrag[j * 2] = hx[rb[j] >> 4];
+		g.ice_ufrag[j * 2 + 1] = hx[rb[j] & 0xf];
 	}
+	g.ice_ufrag[8] = '\0';
+	random_bytes(rb, 16);
+	for (j = 0; j < 16; j++) {
+		g.ice_pwd[j * 2] = hx[rb[j] >> 4];
+		g.ice_pwd[j * 2 + 1] = hx[rb[j] & 0xf];
+	}
+	g.ice_pwd[32] = '\0';
+	random_bytes(rb, 2);
+	g.bind_port = (uint16_t)(40000 + (((rb[0] << 8) | rb[1]) % 20000));
+	fprintf(stderr, "[e2e] stable ICE identity: port %u ufrag %s\n",
+		g.bind_port, g.ice_ufrag);
 
 	g.tx = malloc(E2E_PAYLOAD);
 	g.rx = malloc(E2E_PAYLOAD);
