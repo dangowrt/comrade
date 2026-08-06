@@ -27,9 +27,12 @@ static void on_put(void *arg, int stored)
 	printf("put complete: stored on %d nodes\n", stored);
 }
 
-static void on_get(void *arg, const uint8_t *v, size_t v_len, int64_t seq)
+static void on_get(void *arg, const uint8_t *v, size_t v_len, int64_t seq,
+		   const struct sockaddr *node, socklen_t node_len)
 {
 	(void)arg;
+	(void)node;
+	(void)node_len;
 	get_done = 1;
 	if (v && v_len == want_len && !memcmp(v, want_val, v_len)) {
 		get_ok = 1;
