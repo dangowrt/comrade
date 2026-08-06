@@ -109,6 +109,68 @@ static void token_typo_check(void)
 	assert(caught == TOKEN_STR_LEN);
 }
 
+/* Every kind of token: all flag combinations (ro, nodht, per-family
+ * direct/rendezvous) crossed with endpoint presence (none, v6-only, v4-only,
+ * dual). Each must round-trip exactly, stay the fixed width, avoid ambiguous
+ * glyphs, and keep its checksum live. */
+static void token_kinds_check(void)
+{
+	struct token in, out;
+	char str[TOKEN_STR_LEN + 1];
+	unsigned flags;
+	int ep6p, ep4p;
+	size_t i;
+
+	for (flags = 0; flags < 16; flags++)
+		for (ep6p = 0; ep6p <= 1; ep6p++)
+			for (ep4p = 0; ep4p <= 1; ep4p++) {
+				memset(&in, 0, sizeof(in));
+				in.version = TOKEN_VERSION;
+				in.flags = (uint8_t)flags;
+				for (i = 0; i < TOKEN_RDV_LEN; i++)
+					in.rdv[i] = (uint8_t)(i + flags);
+				for (i = 0; i < TOKEN_AUTH_LEN; i++)
+					in.auth[i] = (uint8_t)(i * 3 + ep6p);
+				for (i = 0; i < TOKEN_HOSTPUB_LEN; i++)
+					in.hostpub[i] = (uint8_t)(i * 5 + ep4p);
+				if (ep6p) {
+					for (i = 0; i < TOKEN_EP6_LEN; i++)
+						in.ep6_addr[i] = (uint8_t)(0x20 + i);
+					in.ep6_port = 45678;
+				}
+				if (ep4p) {
+					for (i = 0; i < TOKEN_EP4_LEN; i++)
+						in.ep4_addr[i] = (uint8_t)(192 - i);
+					in.ep4_port = 51820;
+				}
+
+				assert(token_encode(&in, str, sizeof(str)) == 0);
+				assert(strlen(str) == TOKEN_STR_LEN);
+				for (i = 0; str[i]; i++)
+					assert(str[i] != '0' && str[i] != 'O' &&
+					       str[i] != 'I' && str[i] != 'l');
+
+				assert(token_decode(&out, str) == 0);
+				assert(out.version == in.version);
+				assert(out.flags == in.flags);
+				assert(!memcmp(out.rdv, in.rdv, TOKEN_RDV_LEN));
+				assert(!memcmp(out.auth, in.auth, TOKEN_AUTH_LEN));
+				assert(!memcmp(out.hostpub, in.hostpub,
+					       TOKEN_HOSTPUB_LEN));
+				assert(!memcmp(out.ep6_addr, in.ep6_addr,
+					       TOKEN_EP6_LEN));
+				assert(out.ep6_port == in.ep6_port);
+				assert(!memcmp(out.ep4_addr, in.ep4_addr,
+					       TOKEN_EP4_LEN));
+				assert(out.ep4_port == in.ep4_port);
+
+				/* the checksum is live for this kind too */
+				str[TOKEN_STR_LEN - 1] =
+					str[TOKEN_STR_LEN - 1] == 'z' ? 'y' : 'z';
+				assert(token_decode(&out, str) < 0);
+			}
+}
+
 static void token_reject_check(void)
 {
 	struct token in, out;
@@ -127,6 +189,7 @@ int main(void)
 	base58_fixed_roundtrip_check();
 	base58_reject_check();
 	token_roundtrip_check();
+	token_kinds_check();
 	token_typo_check();
 	token_reject_check();
 	return 0;
