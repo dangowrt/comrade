@@ -51,7 +51,13 @@ static struct {
 	const char *stun_host;
 	uint16_t stun_port;
 	int log_level;
+	int stun_auto;			/* rotate community STUN servers on retry */
 	unsigned sig_flags;
+
+	/* Stable ICE identity, reused across every retry (see nat_config). */
+	uint16_t bind_port;
+	char ice_ufrag[16];
+	char ice_pwd[40];
 
 	struct sig *sig;
 	struct nat_agent *nat;
@@ -91,27 +97,42 @@ static size_t ssh_rx_got;
 static int ssh_cli_rc;
 static int ssh_fd;			/* the ssh thread's socketpair end */
 
+/* Dual-stack servers first, so an IPv6 auto pick is likely to land on one
+ * that answers over v6. stunserver.stunprotocol.org was dropped: it is
+ * defunct and no longer resolves. */
 static const struct {
 	const char *host;
 	uint16_t port;
 } stun_servers[] = {
+	{ "stun.cloudflare.com", 3478 },	/* dual-stack */
+	{ "stun.l.google.com", 19302 },		/* dual-stack */
+	{ "stun.nextcloud.com", 443 },		/* dual-stack */
+	{ "stun.antisip.com", 3478 },		/* dual-stack */
 	{ "stun.linphone.org", 3478 },
 	{ "stun.sipgate.net", 3478 },
-	{ "stunserver.stunprotocol.org", 3478 },
-	{ "stun.nextcloud.com", 443 },
-	{ "stun.antisip.com", 3478 },
 	{ "stun.voipgate.com", 3478 },
-	{ "stun.cloudflare.com", 3478 },
 };
 
+/*
+ * Pick a STUN server, walking the list so successive calls (the retry path)
+ * rotate to a different server. A dead or unresponsive server therefore only
+ * costs one attempt, not the whole run.
+ */
 static void stun_pick_default(void)
 {
-	uint8_t r = 0;
-	size_t n = sizeof(stun_servers) / sizeof(stun_servers[0]);
+	static int idx = -1;
+	int n = (int)(sizeof(stun_servers) / sizeof(stun_servers[0]));
 
-	random_bytes(&r, 1);
-	g.stun_host = stun_servers[r % n].host;
-	g.stun_port = stun_servers[r % n].port;
+	if (idx < 0) {
+		uint8_t r = 0;
+
+		random_bytes(&r, 1);
+		idx = (int)r % n;
+	} else {
+		idx = (idx + 1) % n;
+	}
+	g.stun_host = stun_servers[idx].host;
+	g.stun_port = stun_servers[idx].port;
 }
 
 static uint64_t now_ms(void)
@@ -263,6 +284,11 @@ static int nat_setup(void)
 	static char bind_addr[64];
 	struct nat_config cfg;
 
+	if (g.stun_auto) {
+		stun_pick_default();
+		fprintf(stderr, "[e2e] STUN: %s:%u\n", g.stun_host, g.stun_port);
+	}
+
 	memset(&cfg, 0, sizeof(cfg));
 	cfg.stun_host = g.stun_host;
 	cfg.stun_port = g.stun_port;
@@ -276,6 +302,9 @@ static int nat_setup(void)
 				bind_addr);
 		}
 	}
+	cfg.bind_port = g.bind_port;
+	cfg.ice_ufrag = g.ice_ufrag;
+	cfg.ice_pwd = g.ice_pwd;
 	cfg.on_local_sdp = on_local_sdp;
 	cfg.on_state = on_nat_state;
 	cfg.on_recv = on_nat_recv;
@@ -507,10 +536,12 @@ int main(int argc, char **argv)
 		nat_log_level(g.log_level);
 
 	if (!stun_arg)
-		stun_pick_default();
+		g.stun_auto = 1;
 	else if (strcmp(stun_arg, "none"))
 		g.stun_host = stun_arg;
-	if (g.stun_host)
+	if (g.stun_auto)
+		fprintf(stderr, "[e2e] STUN: auto (rotating community servers)\n");
+	else if (g.stun_host)
 		fprintf(stderr, "[e2e] STUN: %s:%u\n", g.stun_host, g.stun_port);
 	else
 		fprintf(stderr, "[e2e] STUN: none (direct)\n");
@@ -522,6 +553,29 @@ int main(int argc, char **argv)
 	    (int)sizeof(rdv)) {
 		fprintf(stderr, "error: bad secret\n");
 		return 2;
+	}
+
+	{
+		static const char hx[] = "0123456789abcdef";
+		uint8_t rb[16];
+		int j;
+
+		random_bytes(rb, 4);
+		for (j = 0; j < 4; j++) {
+			g.ice_ufrag[j * 2] = hx[rb[j] >> 4];
+			g.ice_ufrag[j * 2 + 1] = hx[rb[j] & 0xf];
+		}
+		g.ice_ufrag[8] = '\0';
+		random_bytes(rb, 16);
+		for (j = 0; j < 16; j++) {
+			g.ice_pwd[j * 2] = hx[rb[j] >> 4];
+			g.ice_pwd[j * 2 + 1] = hx[rb[j] & 0xf];
+		}
+		g.ice_pwd[32] = '\0';
+		random_bytes(rb, 2);
+		g.bind_port = (uint16_t)(40000 + (((rb[0] << 8) | rb[1]) % 20000));
+		fprintf(stderr, "[e2e] stable ICE identity: port %u ufrag %s\n",
+			g.bind_port, g.ice_ufrag);
 	}
 
 	g.tx = malloc(E2E_PAYLOAD);
