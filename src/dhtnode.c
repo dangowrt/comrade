@@ -141,7 +141,7 @@ static void seed_from_dht(struct dhtnode *n)
 			       sizeof(sin6[i]));
 }
 
-struct dhtnode *dhtnode_create(void)
+static struct dhtnode *dhtnode_create_impl(int do_bootstrap)
 {
 	struct dhtnode *n = calloc(1, sizeof(*n));
 
@@ -163,13 +163,34 @@ struct dhtnode *dhtnode_create(void)
 		goto fail;
 
 	netmon_init(&n->netmon);
-	bootstrap_resolve(n);
-	n->next_bootstrap_ms = now_ms() + DHTNODE_BOOTSTRAP_INTERVAL_MS;
+	if (do_bootstrap) {
+		bootstrap_resolve(n);
+		n->next_bootstrap_ms = now_ms() + DHTNODE_BOOTSTRAP_INTERVAL_MS;
+	} else {
+		/* Rendezvous-only: no public routers, the caller injects the
+		 * one node it was handed via dhtnode_seed(). */
+		n->bootstrap_done = 1;
+	}
 	n->next_seed_ms = 0;
 	return n;
 fail:
 	dhtnode_free(n);
 	return NULL;
+}
+
+struct dhtnode *dhtnode_create(void)
+{
+	return dhtnode_create_impl(1);
+}
+
+struct dhtnode *dhtnode_create_seeded(void)
+{
+	return dhtnode_create_impl(0);
+}
+
+int dhtnode_seed(struct dhtnode *n, const struct sockaddr *sa, socklen_t len)
+{
+	return bep44_seed_add(n->engine, NULL, sa, len);
 }
 
 void dhtnode_free(struct dhtnode *n)
@@ -235,7 +256,7 @@ static void packet_route(struct dhtnode *n, uint8_t *buf, size_t len,
 
 	buf[len] = '\0';
 	if (is_bep44_reply(buf, len)) {
-		bep44_input(n->engine, buf, len);
+		bep44_input(n->engine, buf, len, from, fromlen);
 		return;
 	}
 	dht_periodic(buf, len, from, fromlen, &tosleep, dht_event, n);

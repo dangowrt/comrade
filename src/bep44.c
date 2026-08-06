@@ -80,6 +80,8 @@ struct b44_op {
 	uint16_t best_len;
 	int64_t best_seq;
 	uint8_t have_best;
+	struct sockaddr_storage best_node;	/* who first served the value */
+	socklen_t best_node_len;
 	struct b44_node nodes[B44_NODES_MAX];
 	uint8_t nnodes;
 	struct b44_req reqs[B44_REQS_MAX];
@@ -429,13 +431,17 @@ static void op_finish(struct b44_op *op)
 	uint16_t best_len = op->best_len;
 	int64_t best_seq = op->best_seq;
 	uint8_t have_best = op->have_best;
+	struct sockaddr_storage best_node = op->best_node;
+	socklen_t best_node_len = op->best_node_len;
 
 	memcpy(best, op->best, best_len);
 	op_free(e, op);
 	if (put_cb)
 		put_cb(arg, stored);
 	else if (get_cb)
-		get_cb(arg, have_best ? best : NULL, best_len, best_seq);
+		get_cb(arg, have_best ? best : NULL, best_len, best_seq,
+		       best_node_len ? (struct sockaddr *)&best_node : NULL,
+		       best_node_len);
 }
 
 static int store_start(struct b44_op *op)
@@ -500,7 +506,36 @@ static void op_step(struct b44_op *op)
 		op_finish(op);
 }
 
-static void value_check(struct b44_op *op, const uint8_t *rdict, size_t rlen)
+/* A node address worth handing on as a rendezvous hint: real family, and
+ * neither the address nor the port all-zero (bogus compact entries appear). */
+static int node_addr_usable(const struct sockaddr *sa, socklen_t len)
+{
+	if (sa->sa_family == AF_INET && len >= (socklen_t)sizeof(struct sockaddr_in)) {
+		const struct sockaddr_in *s = (const struct sockaddr_in *)sa;
+
+		return s->sin_port != 0 && s->sin_addr.s_addr != 0;
+	}
+	if (sa->sa_family == AF_INET6 && len >= (socklen_t)sizeof(struct sockaddr_in6)) {
+		const struct sockaddr_in6 *s = (const struct sockaddr_in6 *)sa;
+		static const uint8_t zero[16] = { 0 };
+
+		return s->sin6_port != 0 &&
+		       memcmp(&s->sin6_addr, zero, 16) != 0;
+	}
+	return 0;
+}
+
+static void record_best_node(struct b44_op *op, const struct sockaddr *sa,
+			     socklen_t salen)
+{
+	if (op->best_node_len || !sa || !node_addr_usable(sa, salen))
+		return;
+	memcpy(&op->best_node, sa, salen);
+	op->best_node_len = salen;
+}
+
+static void value_check(struct b44_op *op, const struct sockaddr *from,
+			socklen_t fromlen, const uint8_t *rdict, size_t rlen)
 {
 	const uint8_t *val;
 	size_t val_len;
@@ -529,16 +564,24 @@ static void value_check(struct b44_op *op, const uint8_t *rdict, size_t rlen)
 	if (!sigbuf_len || crypto_ed25519_check(sig, op->pk, sigbuf, sigbuf_len))
 		return;
 
-	if (op->have_best && seq <= op->best_seq)
+	if (op->have_best && seq <= op->best_seq) {
+		/* Same value already held; still adopt a usable node if the
+		 * first replier's address was bogus, so we end up with the
+		 * fastest *working* node. */
+		record_best_node(op, from, fromlen);
 		return;
+	}
 	memcpy(op->best, v, v_len);
 	op->best_len = (uint16_t)v_len;
 	op->best_seq = seq;
 	op->have_best = 1;
+	op->best_node_len = 0;
+	record_best_node(op, from, fromlen);
 }
 
 static void reply_handle(struct b44_op *op, struct b44_req *req,
-			 const uint8_t *buf, size_t len, int is_error)
+			 const uint8_t *buf, size_t len, int is_error,
+			 const struct sockaddr *from, socklen_t fromlen)
 {
 	struct b44_node *node = &op->nodes[req->node];
 	const uint8_t *rdict, *val;
@@ -596,12 +639,13 @@ static void reply_handle(struct b44_op *op, struct b44_req *req,
 	}
 
 	if (!op->is_put)
-		value_check(op, rdict, rlen);
+		value_check(op, from, fromlen, rdict, rlen);
 
 	op_step(op);
 }
 
-int bep44_input(struct bep44_engine *e, const uint8_t *buf, size_t len)
+int bep44_input(struct bep44_engine *e, const uint8_t *buf, size_t len,
+		const struct sockaddr *from, socklen_t fromlen)
 {
 	const uint8_t *val, *t, *y;
 	size_t val_len, t_len, y_len;
@@ -630,9 +674,21 @@ int bep44_input(struct bep44_engine *e, const uint8_t *buf, size_t len)
 		int i;
 
 		for (i = 0; i < B44_REQS_MAX; i++) {
+			struct b44_node *node;
+
 			if (!op->reqs[i].in_use || op->reqs[i].tid != tid)
 				continue;
-			reply_handle(op, &op->reqs[i], buf, len, is_error);
+			/* A reply counts only if it comes from the node the
+			 * request went to. Without this an off-path source that
+			 * guessed the linear tid could inject forged GET replies
+			 * and poison the op node set (mailbox values stay
+			 * Ed25519-verified regardless). */
+			node = &op->nodes[op->reqs[i].node];
+			if (fromlen != node->sslen ||
+			    memcmp(from, &node->ss, (size_t)node->sslen))
+				continue;
+			reply_handle(op, &op->reqs[i], buf, len, is_error,
+				     from, fromlen);
 			return 1;
 		}
 	}

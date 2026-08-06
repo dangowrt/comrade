@@ -192,13 +192,16 @@ static int deliver_to_sub(struct sig_sub *sub, const uint8_t *sealed, size_t len
 	return 1;
 }
 
-static void on_dht_get(void *arg, const uint8_t *v, size_t v_len, int64_t seq)
+static void on_dht_get(void *arg, const uint8_t *v, size_t v_len, int64_t seq,
+		       const struct sockaddr *node, socklen_t node_len)
 {
 	struct sig_sub *sub = arg;
 	const uint8_t *sealed;
 	size_t sealed_len;
 
 	(void)seq;
+	(void)node;
+	(void)node_len;
 	if (!v || benc_str_get(v, v_len, &sealed, &sealed_len))
 		return;
 	deliver_to_sub(sub, sealed, sealed_len);
