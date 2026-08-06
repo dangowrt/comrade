@@ -21,11 +21,24 @@
  *   ver(1) flags(1) R(16) A(16) hostpub(32)
  *   ep6_addr(16) ep6_port(2) ep4_addr(4) ep4_port(2)
  *
- * The endpoints are the host's own self-discovered reachable addresses (all
- * zero when a family is unavailable), letting a joiner connect without the
- * DHT by default. The token is one-way (host generates, client uses), so it
- * only ever carries the host's addresses; the host learns the client's from
- * the incoming connection.
+ * R is the rendezvous secret, A the session auth secret, hostpub the SHA-256
+ * fingerprint of the host's ephemeral SSH key (the client pins it, so there
+ * is no trust-on-first-use).
+ *
+ * The two endpoint slots (v6, v4) are per-family hints whose meaning is set
+ * independently by the flags:
+ *   - all-zero address: absent, nothing known for that family.
+ *   - direct (EPx_RDV clear): the host's own reachable endpoint. A directly
+ *     reachable host (public IP, permissive-firewall v6, or LAN) lets the
+ *     client connect server-model with no punch and the DHT untouched.
+ *   - rendezvous (EPx_RDV set): a DHT node holding the host's mailbox for
+ *     that family, like a tracker address in a magnet URI. The client
+ *     queries it directly for a fast lookup-free rendezvous while the host's
+ *     own address stays out of the token, which is the right posture for a
+ *     NATed host (it cannot be reached directly from a one-way token; the
+ *     client's address must reach it through the two-way DHT/mcast mailbox).
+ * The direct/rendezvous choice is one bit per family because a host is
+ * commonly v6-direct and v4-rendezvous (or v4-absent) at the same time.
  *
  * A CRC-32 over the payload is appended (wire form) so any transcription
  * typo is caught instantly on decode, before any network use. The wire form
@@ -43,6 +56,8 @@
 
 #define TOKEN_FLAG_RO		0x01	/* read-only credential */
 #define TOKEN_FLAG_NODHT	0x02	/* host is not on the DHT; do not query it */
+#define TOKEN_FLAG_EP6_RDV	0x04	/* ep6 slot is a rendezvous DHT node, not a direct endpoint */
+#define TOKEN_FLAG_EP4_RDV	0x08	/* ep4 slot is a rendezvous DHT node, not a direct endpoint */
 
 struct token {
 	uint8_t version;
