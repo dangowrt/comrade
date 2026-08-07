@@ -480,6 +480,8 @@ static int run_ssh(void)
 	pthread_join(th, NULL);
 	sshbridge_destroy(br);
 	close(sp[0]);	/* sp[1] is closed by the ssh module */
+	stream_destroy(g.stream);	/* fresh KCP per attempt so retries reset */
+	g.stream = NULL;
 
 	if (!done) {
 		fprintf(stderr, "[e2e] ssh session did not close in time\n");
@@ -729,7 +731,24 @@ int main(int argc, char **argv)
 			break;
 		case ST_RUN:
 			g.ssh_ok = (run_ssh() == 0);
-			st = g.ssh_ok ? ST_DONE : ST_FAIL;
+			if (g.ssh_ok) {
+				st = ST_DONE;
+			} else if (now_ms() + 10000 < deadline) {
+				/*
+				 * ICE reported a usable path but the peer is
+				 * not serving yet: the host still lacks our
+				 * answer, or our answer is still propagating
+				 * through the shared mailbox. Keep signalling
+				 * and re-check the path rather than giving up;
+				 * the reverse channel completes only if we stay
+				 * alive long enough for it.
+				 */
+				fprintf(stderr,
+					"[e2e] ssh attempt failed, peer not ready; retrying...\n");
+				st = ST_WAIT_ICE;
+			} else {
+				st = ST_FAIL;
+			}
 			break;
 		default:
 			break;
