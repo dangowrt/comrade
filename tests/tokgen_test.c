@@ -68,9 +68,37 @@ static void exhaustive(void)
 					       expected(addr, route, ack, proven));
 }
 
+/* The two families are decided independently; only both-NONE aborts. These
+ * mirror common real-world mixes. */
+static void host_cases(void)
+{
+	struct tokgen_facts global_proven = { 1, 1, 1, 1 };
+	struct tokgen_facts global_natted = { 1, 1, 1, 0 };
+	struct tokgen_facts linklocal_only = { 1, 0, 0, 0 };
+	struct tokgen_facts absent = { 0, 0, 0, 0 };
+	struct tokgen_result r;
+
+	/* Global v4 (behind NAT) and only link-local v6: both advertisable. */
+	assert(tokgen_decide_host(&global_natted, &linklocal_only, &r) == 0);
+	assert(r.v4 == TOK_ADVERT_RENDEZVOUS && r.v6 == TOK_ADVERT_ENDPOINT);
+
+	/* No v6 at all, global proven v4: still fine. */
+	assert(tokgen_decide_host(&global_proven, &absent, &r) == 0);
+	assert(r.v4 == TOK_ADVERT_ENDPOINT && r.v6 == TOK_ADVERT_NONE);
+
+	/* Only link-local v6, no v4 at all: fine, v6 endpoint over multicast. */
+	assert(tokgen_decide_host(&absent, &linklocal_only, &r) == 0);
+	assert(r.v4 == TOK_ADVERT_NONE && r.v6 == TOK_ADVERT_ENDPOINT);
+
+	/* Nothing on either family: the only abort. */
+	assert(tokgen_decide_host(&absent, &absent, &r) == -1);
+	assert(r.v4 == TOK_ADVERT_NONE && r.v6 == TOK_ADVERT_NONE);
+}
+
 int main(void)
 {
 	named_cases();
 	exhaustive();
+	host_cases();
 	return 0;
 }
