@@ -22,9 +22,9 @@ static int debug_on(void)
 #include "bep44.h"
 #include "sha1.h"
 
-#define B44_ALPHA 4
+#define B44_ALPHA 16
 #define B44_K 8
-#define B44_NODES_MAX 64
+#define B44_NODES_MAX 128
 #define B44_BOOTSTRAP_MAX 8
 #define B44_REQS_MAX (B44_ALPHA * 2)
 #define B44_REQ_TIMEOUT_MS 1500

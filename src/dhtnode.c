@@ -110,6 +110,16 @@ static void bootstrap_resolve(struct dhtnode *n)
 				dht_ping_node(ai->ai_addr, ai->ai_addrlen);
 			else if (ai->ai_family == AF_INET6 && n->s6 >= 0)
 				dht_ping_node(ai->ai_addr, ai->ai_addrlen);
+			else
+				continue;
+			/*
+			 * Seed the bep44 engine from the same routers, so its
+			 * lookups have responsive entry points at once and warm
+			 * toward the key in parallel, instead of waiting for the
+			 * jech table to confirm good nodes to hand over.
+			 */
+			bep44_bootstrap_add(n->engine, ai->ai_addr,
+					    ai->ai_addrlen);
 		}
 		freeaddrinfo(res);
 	}
