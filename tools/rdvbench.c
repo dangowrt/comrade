@@ -245,8 +245,8 @@ int main(int argc, char **argv)
 	n = dhtnode_create_seeded();
 	if (!n)
 		return 1;
-	if (dhtnode_seed(n, (struct sockaddr *)&fast_node, fast_node_len)) {
-		fprintf(stderr, "seed failed\n");
+	if (dhtnode_pin(n, (struct sockaddr *)&fast_node, fast_node_len)) {
+		fprintf(stderr, "pin failed\n");
 		dhtnode_free(n);
 		return 1;
 	}

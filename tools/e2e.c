@@ -23,7 +23,6 @@
 #include "stream.h"
 #include "token.h"
 
-#define E2E_PAYLOAD (64 * 1024)
 #define E2E_CONV 0x70326531
 /*
  * Retry is driven by libjuice's own FAILED verdict (nat_failed), which it
@@ -70,25 +69,21 @@ static struct {
 	volatile int have_peer_sdp;
 	int remote_set;
 
-	uint8_t *tx;
-	uint8_t *rx_expect;
-	uint8_t *rx;
-	size_t rx_got;
-	int tx_sent;
-	uint64_t linger_deadline;
 	uint64_t ice_attempt_start;
 	int ice_attempt;
 
-	/* SSH-over-stream mode (--ssh). */
-	int ssh_mode;
+	/*
+	 * The token drives everything: the host mints it (random rdv/auth and
+	 * an ephemeral host key whose fingerprint is hostpub) and prints it;
+	 * the client decodes it. rdv keys the signalling, auth the SSH
+	 * password, hostpub is the pinned host key. Same flow as production.
+	 */
 	int ssh_ok;
 	void *hostkey;			/* host: ephemeral ssh_key */
-	uint8_t auth[TOKEN_AUTH_LEN];	/* shared session secret */
-	uint8_t host_fp[32];		/* host key fingerprint */
-	volatile int have_fp;		/* client: fingerprint received */
+	struct token tok;
+	uint8_t auth[TOKEN_AUTH_LEN];
 } g;
 
-#define SSH_FP_CHANNEL "sshfp"
 #define SSH_NONCE 4096
 
 static uint8_t ssh_tx[SSH_NONCE];
@@ -196,16 +191,6 @@ static void on_peer_offer(void *arg, const uint8_t *data, size_t len)
 	g.peer_sdp[len] = '\0';
 	g.have_peer_sdp = 1;
 	fprintf(stderr, "[e2e] peer offer received (%zu bytes)\n", len);
-}
-
-static void on_host_fp(void *arg, const uint8_t *data, size_t len)
-{
-	(void)arg;
-	if (len != 32)
-		return;
-	memcpy(g.host_fp, data, 32);
-	g.have_fp = 1;
-	fprintf(stderr, "[e2e] host key fingerprint received\n");
 }
 
 static void dump_sdp(const char *label, const char *sdp)
@@ -336,33 +321,6 @@ static void pump_once(int timeout_cap_ms)
 	sig_dispatch(g.sig, fds, nfds);
 }
 
-static void state_run_step(void)
-{
-	int n;
-
-	if (!g.stream) {
-		char loc[256];
-		char rem[256];
-
-		g.stream = stream_create(E2E_CONV, on_stream_output, NULL);
-		if (!g.stream) {
-			g.tx = NULL;
-			return;
-		}
-		if (!nat_selected(g.nat, loc, sizeof(loc), rem, sizeof(rem)))
-			fprintf(stderr, "[e2e] selected pair:\n  local  %s\n  remote %s\n",
-				loc, rem);
-	}
-	if (!g.tx_sent) {
-		stream_send(g.stream, g.tx, E2E_PAYLOAD);
-		g.tx_sent = 1;
-	}
-	stream_update(g.stream, (uint32_t)now_ms());
-	while ((n = stream_recv(g.stream, g.rx + g.rx_got,
-				(int)(E2E_PAYLOAD - g.rx_got))) > 0)
-		g.rx_got += (size_t)n;
-}
-
 static void *ssh_srv_thread(void *p)
 {
 	struct sshd_opts o;
@@ -383,7 +341,7 @@ static void *ssh_cli_thread(void *p)
 
 	(void)p;
 	memset(&o, 0, sizeof(o));
-	memcpy(o.host_fp, g.host_fp, 32);
+	memcpy(o.host_fp, g.tok.hostpub, 32);
 	memcpy(o.auth, g.auth, sizeof(o.auth));
 	o.interactive = 0;
 	o.send = ssh_tx;
@@ -409,17 +367,6 @@ static int run_ssh(void)
 	int sp[2];
 	int done = 0;
 	uint64_t deadline = now_ms() + 30000;
-
-	if (!g.role_a) {
-		uint64_t fp_deadline = now_ms() + 15000;
-
-		while (!g.have_fp && now_ms() < fp_deadline)
-			pump_once(100);
-		if (!g.have_fp) {
-			fprintf(stderr, "[e2e] host fingerprint never arrived\n");
-			return -1;
-		}
-	}
 
 	if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp))
 		return -1;
@@ -486,8 +433,8 @@ static int run_ssh(void)
 int main(int argc, char **argv)
 {
 	static const char hx[] = "0123456789abcdef";
-	uint8_t rdv[TOKEN_RDV_LEN];
-	const char *secret = NULL;
+	char tokbuf[TOKEN_STR_LEN + 1];
+	const char *token_arg = NULL;
 	enum state st = ST_WAIT_DHT;
 	uint64_t start, deadline;
 	int timeout_s = 120;
@@ -497,17 +444,33 @@ int main(int argc, char **argv)
 	const char *stun_arg = NULL;
 
 	memset(&g, 0, sizeof(g));
-	g.family = 6;
+	g.family = 0;			/* gather every family and race */
 	g.stun_port = 3478;
 	g.log_level = -1;
 	g.sig_flags = SIG_DHT;
 
-	for (i = 1; i < argc; i++) {
-		if (!strcmp(argv[i], "--secret") && i + 1 < argc)
-			secret = argv[++i];
-		else if (!strcmp(argv[i], "--role") && i + 1 < argc)
-			g.role_a = !strcmp(argv[++i], "a");
-		else if (!strcmp(argv[i], "--family") && i + 1 < argc)
+	if (argc >= 2 && !strcmp(argv[1], "host")) {
+		g.role_a = 1;
+		i = 2;
+	} else if (argc >= 3 && !strcmp(argv[1], "client") && argv[2][0] != '-') {
+		g.role_a = 0;
+		token_arg = argv[2];
+		i = 3;
+	} else {
+		fprintf(stderr,
+			"usage: %s host    [--stun host|none] [--family 4|6] [opts]\n"
+			"       %s client <TOKEN>          [--stun ...]      [opts]\n"
+			"  opts: [--stun-port p] [--timeout s] [--log N]\n"
+			"        [--mcast] [--no-dht]  (link-local multicast; LAN-only)\n"
+			"  The host mints and prints a token; run client with it.\n"
+			"  Default gathers all families over rotating community STUN and\n"
+			"  races; --stun none forces a direct (no-STUN) path.\n",
+			argv[0], argv[0]);
+		return 2;
+	}
+
+	for (; i < argc; i++) {
+		if (!strcmp(argv[i], "--family") && i + 1 < argc)
 			g.family = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--stun") && i + 1 < argc)
 			stun_arg = argv[++i];
@@ -521,18 +484,8 @@ int main(int argc, char **argv)
 			g.sig_flags |= SIG_MCAST;
 		else if (!strcmp(argv[i], "--no-dht"))
 			g.sig_flags &= ~SIG_DHT;
-		else if (!strcmp(argv[i], "--ssh"))
-			g.ssh_mode = 1;
 		else {
-			fprintf(stderr,
-				"usage: %s --secret <b64> --role {a|b} --family {4|6}\n"
-				"          [--stun host|none --stun-port p] [--timeout s]\n"
-				"          [--log N]  (libjuice level: 0 verbose .. 5 fatal)\n"
-				"          [--mcast] [--no-dht]  (link-local multicast; LAN-only)\n"
-				"          [--ssh]  (run a real libssh session over the stream)\n"
-				"  --stun defaults to a random community STUN server;\n"
-				"         pass 'none' to force a direct (no-STUN) path.\n",
-				argv[0]);
+			fprintf(stderr, "unknown option: %s\n", argv[i]);
 			return 2;
 		}
 	}
@@ -549,15 +502,6 @@ int main(int argc, char **argv)
 		fprintf(stderr, "[e2e] STUN: %s:%u\n", g.stun_host, g.stun_port);
 	else
 		fprintf(stderr, "[e2e] STUN: none (direct)\n");
-	if (!secret) {
-		fprintf(stderr, "error: --secret required\n");
-		return 2;
-	}
-	if (base64url_decode(secret, strlen(secret), rdv, sizeof(rdv)) !=
-	    (int)sizeof(rdv)) {
-		fprintf(stderr, "error: bad secret\n");
-		return 2;
-	}
 
 	random_bytes(rb, 4);
 	for (j = 0; j < 4; j++) {
@@ -576,45 +520,43 @@ int main(int argc, char **argv)
 	fprintf(stderr, "[e2e] stable ICE identity: port %u ufrag %s\n",
 		g.bind_port, g.ice_ufrag);
 
-	g.tx = malloc(E2E_PAYLOAD);
-	g.rx = malloc(E2E_PAYLOAD);
-	g.rx_expect = malloc(E2E_PAYLOAD);
-	if (!g.tx || !g.rx || !g.rx_expect)
-		return 1;
-	for (k = 0; k < E2E_PAYLOAD; k++) {
-		g.tx[k] = (uint8_t)((g.role_a ? 0xA0 : 0xB0) ^ (k * 131 + 7));
-		g.rx_expect[k] = (uint8_t)((g.role_a ? 0xB0 : 0xA0) ^ (k * 131 + 7));
+	/* Mint (host) or decode (client) the token: the real one-way flow. */
+	if (g.role_a) {
+		g.tok.version = TOKEN_VERSION;
+		g.tok.flags = 0;
+		random_bytes(g.tok.rdv, TOKEN_RDV_LEN);
+		random_bytes(g.tok.auth, TOKEN_AUTH_LEN);
+		g.hostkey = sshd_hostkey_new(g.tok.hostpub);
+		if (!g.hostkey) {
+			fprintf(stderr, "error: host key generation failed\n");
+			return 1;
+		}
+		if (token_encode(&g.tok, tokbuf, sizeof(tokbuf))) {
+			fprintf(stderr, "error: token_encode failed\n");
+			return 1;
+		}
+		printf("COMRADE TOKEN: %s\n", tokbuf);
+		fflush(stdout);
+	} else if (token_decode(&g.tok, token_arg)) {
+		fprintf(stderr, "error: invalid token\n");
+		return 2;
 	}
+	memcpy(g.auth, g.tok.auth, TOKEN_AUTH_LEN);
+	for (k = 0; k < SSH_NONCE; k++)
+		ssh_tx[k] = (uint8_t)(k * 97 + 13);
 
-	g.sig = sig_create(rdv, g.sig_flags);
+	g.sig = sig_create(g.tok.rdv, g.sig_flags);
 	if (!g.sig) {
 		fprintf(stderr, "error: sig_create failed\n");
 		return 1;
 	}
 	sig_subscribe(g.sig, get_channel(), on_peer_offer, NULL);
 
-	if (g.ssh_mode) {
-		memcpy(g.auth, rdv, sizeof(g.auth));
-		if (g.role_a) {
-			g.hostkey = sshd_hostkey_new(g.host_fp);
-			if (!g.hostkey) {
-				fprintf(stderr, "error: host key generation failed\n");
-				return 1;
-			}
-			for (k = 0; k < SSH_NONCE; k++)
-				ssh_tx[k] = (uint8_t)(k * 97 + 13);
-		} else {
-			for (k = 0; k < SSH_NONCE; k++)
-				ssh_tx[k] = (uint8_t)(k * 97 + 13);
-			sig_subscribe(g.sig, SSH_FP_CHANNEL, on_host_fp, NULL);
-		}
-	}
-
-	fprintf(stderr, "[e2e] role %s, family IPv%d, signalling%s%s%s...\n",
-		g.role_a ? "a" : "b", g.family,
+	fprintf(stderr, "[e2e] %s, gathering %s, signalling%s%s...\n",
+		g.role_a ? "host" : "client",
+		g.family ? (g.family == 6 ? "IPv6" : "IPv4") : "all families",
 		(g.sig_flags & SIG_MCAST) ? " mcast" : "",
-		(g.sig_flags & SIG_DHT) ? " dht" : "",
-		g.ssh_mode ? " +ssh" : "");
+		(g.sig_flags & SIG_DHT) ? " dht" : "");
 
 	start = now_ms();
 	deadline = start + (uint64_t)timeout_s * 1000;
@@ -643,8 +585,6 @@ int main(int argc, char **argv)
 				dump_sdp("published local candidates (filtered)", g.local_sdp);
 				sig_publish(g.sig, put_channel(),
 					    (const uint8_t *)g.local_sdp, strlen(g.local_sdp));
-				if (g.ssh_mode && g.role_a)
-					sig_publish(g.sig, SSH_FP_CHANNEL, g.host_fp, 32);
 				st = ST_SIGNAL;
 			}
 			break;
@@ -687,50 +627,21 @@ int main(int argc, char **argv)
 			}
 			break;
 		case ST_RUN:
-			if (g.ssh_mode) {
-				g.ssh_ok = (run_ssh() == 0);
-				st = g.ssh_ok ? ST_DONE : ST_FAIL;
-				break;
-			}
-			state_run_step();
-			if (!g.stream) {
-				st = ST_FAIL;
-				break;
-			}
-			if (g.rx_got >= E2E_PAYLOAD) {
-				g.linger_deadline = now_ms() + 15000;
-				fprintf(stderr, "[e2e] received full payload, draining sent data...\n");
-				st = ST_LINGER;
-			}
-			break;
-		case ST_LINGER:
-			stream_update(g.stream, (uint32_t)now_ms());
-			if (stream_waitsnd(g.stream) == 0 ||
-			    now_ms() >= g.linger_deadline)
-				st = ST_DONE;
+			g.ssh_ok = (run_ssh() == 0);
+			st = g.ssh_ok ? ST_DONE : ST_FAIL;
 			break;
 		default:
 			break;
 		}
 	}
 
-	if (g.ssh_mode) {
-		if (st == ST_DONE && g.ssh_ok)
-			printf("E2E PASS role=%s family=%d ssh session over stream in %llums\n",
-			       g.role_a ? "a" : "b", g.family,
-			       (unsigned long long)(now_ms() - start));
-		else
-			printf("E2E FAIL role=%s family=%d state=%d (ssh)\n",
-			       g.role_a ? "a" : "b", g.family, st);
-	} else if (st == ST_DONE && !memcmp(g.rx, g.rx_expect, E2E_PAYLOAD)) {
-		printf("E2E PASS role=%s family=%d %zu bytes verified in %llums\n",
-		       g.role_a ? "a" : "b", g.family, (size_t)E2E_PAYLOAD,
+	if (st == ST_DONE && g.ssh_ok)
+		printf("E2E PASS %s ssh session in %llums\n",
+		       g.role_a ? "host" : "client",
 		       (unsigned long long)(now_ms() - start));
-		st = ST_DONE;
-	} else {
-		printf("E2E FAIL role=%s family=%d state=%d rx=%zu/%d\n",
-		       g.role_a ? "a" : "b", g.family, st, g.rx_got, E2E_PAYLOAD);
-	}
+	else
+		printf("E2E FAIL %s state=%d\n",
+		       g.role_a ? "host" : "client", st);
 
 	if (g.stream)
 		stream_destroy(g.stream);
@@ -739,8 +650,5 @@ int main(int argc, char **argv)
 	if (g.hostkey)
 		sshd_hostkey_free(g.hostkey);
 	sig_destroy(g.sig);
-	free(g.tx);
-	free(g.rx);
-	free(g.rx_expect);
 	return st == ST_DONE ? 0 : 1;
 }
