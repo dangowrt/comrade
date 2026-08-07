@@ -172,6 +172,10 @@ if(BUILD_TESTING)
 	target_link_libraries(candpolicy_test comrade_crypto)
 	add_test(NAME candpolicy_test COMMAND candpolicy_test)
 
+	add_executable(candpack_test tests/candpack_test.c)
+	target_link_libraries(candpack_test comrade_crypto)
+	add_test(NAME candpack_test COMMAND candpack_test)
+
 	# Both exercise the BEP 44 engine alone, which needs no DHT library.
 	add_executable(bep44_test tests/bep44_test.c)
 	target_link_libraries(bep44_test comrade_bep44)
@@ -226,8 +230,9 @@ endif()
 #
 if(BUILD_TESTING)
 	foreach(t IN ITEMS
-		token_test tokgen_test netmon_test candpolicy_test bep44_test
-		bep44_pin_test natstream_test sshloop_test sshkcp_test)
+		token_test tokgen_test netmon_test candpolicy_test candpack_test
+		bep44_test bep44_pin_test natstream_test sshloop_test
+		sshkcp_test)
 		if(TARGET ${t})
 			target_compile_options(${t} PRIVATE -UNDEBUG)
 		endif()
