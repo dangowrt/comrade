@@ -160,6 +160,10 @@ if(BUILD_TESTING)
 	target_link_libraries(token_test comrade_token)
 	add_test(NAME token_test COMMAND token_test)
 
+	add_executable(tokgen_test tests/tokgen_test.c)
+	target_link_libraries(tokgen_test comrade_token)
+	add_test(NAME tokgen_test COMMAND tokgen_test)
+
 	add_executable(netmon_test tests/netmon_test.c)
 	target_link_libraries(netmon_test comrade_crypto)
 	add_test(NAME netmon_test COMMAND netmon_test)
@@ -217,8 +221,8 @@ endif()
 #
 if(BUILD_TESTING)
 	foreach(t IN ITEMS
-		token_test netmon_test candpolicy_test bep44_test natstream_test
-		sshloop_test sshkcp_test)
+		token_test tokgen_test netmon_test candpolicy_test bep44_test
+		natstream_test sshloop_test sshkcp_test)
 		if(TARGET ${t})
 			target_compile_options(${t} PRIVATE -UNDEBUG)
 		endif()
