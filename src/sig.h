@@ -7,18 +7,25 @@
 #include <poll.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/socket.h>
 
 #include "token.h"
 
 /*
- * Signalling over the DHT: a sealed publish/subscribe mailbox keyed by a
- * channel name (the BEP 44 salt). Multiple channels run concurrently, which
- * is what racing several connection paths in parallel needs. Values are
- * sealed under K_sig derived from the rendezvous secret, so only token
- * holders can read or write them; the DHT sees opaque blobs.
+ * Signalling over a single shared rendezvous mailbox.
+ *
+ * The two peers meet at ONE DHT mutable item: a small container with two
+ * slots, the host's offer and the client's answer. Because a DHT stores a key
+ * on the nodes closest to it, two different keys live on different nodes, so a
+ * single shared key is the only way one rendezvous node can serve BOTH
+ * directions. Each peer writes its own slot with compare-and-swap so neither
+ * clobbers the other; a stale write loses the CAS and is retried after the
+ * next read. On a LAN, multicast carries the two slots directly instead, with
+ * no shared item.
  */
 
-#define SIG_MAX_VALUE 900
+#define SIG_MAX_VALUE 440		/* plaintext per slot; two sealed slots
+					 * plus framing fit one BEP44 value */
 
 /* Transports; combine with OR. */
 #define SIG_DHT		0x1	/* BitTorrent mainline DHT (internet-wide) */
@@ -29,21 +36,37 @@ struct sig;
 typedef void sig_recv_cb(void *arg, const uint8_t *data, size_t len);
 
 /*
- * With both transports, multicast runs first and the DHT is not even
- * engaged until a short grace elapses without a peer being discovered on
- * the link, so a successful LAN discovery never touches the DHT.
+ * is_host selects which slot is ours: the host writes the offer and reads the
+ * answer, the client the reverse. With both transports, multicast runs first
+ * and the DHT is engaged only after a grace elapses without a peer on the link.
  */
-struct sig *sig_create(const uint8_t rdv[TOKEN_RDV_LEN], unsigned flags);
+struct sig *sig_create(const uint8_t rdv[TOKEN_RDV_LEN], unsigned flags,
+		       int is_host);
 void sig_destroy(struct sig *s);
 
 int sig_prepare(struct sig *s, struct pollfd *fds, int maxfds, int *timeout_ms);
 void sig_dispatch(struct sig *s, const struct pollfd *fds, int nfds);
 int sig_ready(struct sig *s);
 
-/* Publish (and keep alive) a value on a channel; call again to update it. */
-int sig_publish(struct sig *s, const char *channel, const uint8_t *data, size_t len);
+/* Post our endpoints into our mailbox slot; kept alive and merged via CAS. */
+int sig_post(struct sig *s, const uint8_t *data, size_t len);
 
-/* Subscribe to a channel; cb fires each time the peer's value changes. */
-int sig_subscribe(struct sig *s, const char *channel, sig_recv_cb *cb, void *arg);
+/* cb fires when the peer's slot appears or changes. */
+int sig_subscribe(struct sig *s, sig_recv_cb *cb, void *arg);
+
+/*
+ * Rendezvous acceleration.
+ *
+ * sig_seed_node (client): plant a token's rendezvous node as a sticky DHT
+ * hint, queried first, with the global DHT bootstrapping alongside as fallback.
+ *
+ * sig_locate (host): start capturing the fastest node that serves the mailbox
+ * back (the node to embed in the token). The candidates are the nodes that
+ * stored our value; the get validates and ranks them, and sig_located returns
+ * the fastest once known.
+ */
+int sig_seed_node(struct sig *s, const struct sockaddr *sa, socklen_t len);
+int sig_locate(struct sig *s);
+int sig_located(struct sig *s, struct sockaddr *out, socklen_t *out_len);
 
 #endif
