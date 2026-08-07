@@ -33,6 +33,7 @@ static int debug_on(void)
 #define B44_MSG_MAX 1400
 #define B44_SEEDS_MAX 16
 #define B44_PINNED_MAX 8
+#define B44_RETAINED_MAX 8
 
 enum b44_node_state {
 	B44_NODE_FRESH,
@@ -77,6 +78,7 @@ struct b44_op {
 	uint8_t value[BEP44_MAX_VALUE];
 	uint16_t value_len;
 	int64_t seq;
+	int64_t cas;		/* compare-and-swap expected seq, -1 = none */
 	uint8_t best[BEP44_MAX_VALUE];
 	uint16_t best_len;
 	int64_t best_seq;
@@ -120,6 +122,13 @@ struct bep44_engine {
 	 */
 	struct b44_seed pinned[B44_PINNED_MAX];
 	int npinned;
+	/*
+	 * Closest nodes retained from finished lookups, in a ring the routing
+	 * cache does not touch (unlike seeds), so a get right after a put stays
+	 * converged instead of being cold.
+	 */
+	struct b44_seed retained[B44_RETAINED_MAX];
+	int retain_next;
 	struct b44_op *ops;
 };
 
@@ -386,6 +395,10 @@ static int put_send(struct b44_op *op, int node)
 
 	benc_buf_init(&b, msg, sizeof(msg));
 	benc_raw_add(&b, "d1:ad", 5);
+	if (op->cas >= 0) {
+		benc_key_add(&b, "cas");	/* sorts before "id" */
+		benc_int_add(&b, op->cas);
+	}
 	benc_key_add(&b, "id");
 	benc_str_add(&b, op->e->myid, 20);
 	benc_key_add(&b, "k");
@@ -412,6 +425,64 @@ static int put_send(struct b44_op *op, int node)
 	op->nodes[node].state = B44_NODE_STORE_INFLIGHT;
 	msg_send(op->e, &op->nodes[node].ss, op->nodes[node].sslen, msg, b.len);
 	return 0;
+}
+
+static int node_addr_usable(const struct sockaddr *sa, socklen_t len);
+
+static int id_nonzero(const uint8_t id[20])
+{
+	int i;
+
+	for (i = 0; i < 20; i++)
+		if (id[i])
+			return 1;
+	return 0;
+}
+
+static void retain_add(struct bep44_engine *e, const uint8_t id[20],
+		       const struct sockaddr *sa, socklen_t salen)
+{
+	struct b44_seed *r;
+	int i;
+
+	if ((size_t)salen > sizeof(r->ss))
+		return;
+	for (i = 0; i < B44_RETAINED_MAX; i++) {
+		r = &e->retained[i];
+		if (r->in_use && r->sslen == salen && !memcmp(&r->ss, sa, salen))
+			return;
+	}
+	r = &e->retained[e->retain_next];
+	e->retain_next = (e->retain_next + 1) % B44_RETAINED_MAX;
+	memset(r, 0, sizeof(*r));
+	if (id) {
+		memcpy(r->id, id, 20);
+		r->has_id = 1;
+	}
+	memcpy(&r->ss, sa, salen);
+	r->sslen = salen;
+	r->in_use = 1;
+}
+
+/*
+ * Keep the closest nodes that answered this op, so the next op to the same or
+ * a nearby target (a get right after a put, or the repeated gets a
+ * subscription makes) starts already converged instead of cold. They carry
+ * ids, so they rank by true distance and actually accelerate the next lookup.
+ */
+static void op_retain_nodes(struct bep44_engine *e, struct b44_op *op)
+{
+	int k, kept;
+
+	for (k = 0, kept = 0; k < op->nnodes && kept < 4; k++) {
+		struct b44_node *nd = &op->nodes[k];
+
+		if (nd->state != B44_NODE_REPLIED && nd->state != B44_NODE_STORED)
+			continue;
+		retain_add(e, id_nonzero(nd->id) ? nd->id : NULL,
+			   (struct sockaddr *)&nd->ss, nd->sslen);
+		kept++;
+	}
 }
 
 static void op_finish(struct b44_op *op)
@@ -446,6 +517,25 @@ static void op_finish(struct b44_op *op)
 	bep44_get_cb *get_cb = op->get_cb;
 	void *arg = op->cb_arg;
 	int stored = op->stored;
+
+	/*
+	 * For a put, the rendezvous node is the closest node that acknowledged
+	 * storing the value: known here, at store time, from the store itself,
+	 * so the host never needs a separate (cold) get to discover it.
+	 */
+	if (op->is_put && !op->best_node_len) {
+		int k;
+
+		for (k = 0; k < op->nnodes; k++) {
+			if (op->nodes[k].state != B44_NODE_STORED ||
+			    !node_addr_usable((struct sockaddr *)&op->nodes[k].ss,
+					      op->nodes[k].sslen))
+				continue;
+			memcpy(&op->best_node, &op->nodes[k].ss, op->nodes[k].sslen);
+			op->best_node_len = op->nodes[k].sslen;
+			break;
+		}
+	}
 	uint8_t best[BEP44_MAX_VALUE];
 	uint16_t best_len = op->best_len;
 	int64_t best_seq = op->best_seq;
@@ -454,9 +544,12 @@ static void op_finish(struct b44_op *op)
 	socklen_t best_node_len = op->best_node_len;
 
 	memcpy(best, op->best, best_len);
+	op_retain_nodes(e, op);
 	op_free(e, op);
 	if (put_cb)
-		put_cb(arg, stored);
+		put_cb(arg, stored,
+		       best_node_len ? (struct sockaddr *)&best_node : NULL,
+		       best_node_len);
 	else if (get_cb)
 		get_cb(arg, have_best ? best : NULL, best_len, best_seq,
 		       best_node_len ? (struct sockaddr *)&best_node : NULL,
@@ -784,6 +877,14 @@ static struct b44_op *op_create(struct bep44_engine *e, const uint8_t pk[32],
 			    (struct sockaddr *)&e->pinned[i].ss,
 			    e->pinned[i].sslen, 1);
 
+	for (i = 0; i < B44_RETAINED_MAX; i++) {
+		if (e->retained[i].in_use)
+			node_insert(op,
+				    e->retained[i].has_id ? e->retained[i].id : NULL,
+				    (struct sockaddr *)&e->retained[i].ss,
+				    e->retained[i].sslen, 0);
+	}
+
 	for (i = 0; i < B44_SEEDS_MAX; i++) {
 		if (e->seeds[i].in_use)
 			node_insert(op, e->seeds[i].has_id ? e->seeds[i].id : NULL,
@@ -856,7 +957,7 @@ int bep44_pin_add(struct bep44_engine *e, const uint8_t id[20],
 
 int bep44_put(struct bep44_engine *e, const uint8_t sk[64], const uint8_t pk[32],
 	      const char *salt, const uint8_t *v, size_t v_len, int64_t seq,
-	      bep44_put_cb *cb, void *arg)
+	      int64_t cas, bep44_put_cb *cb, void *arg)
 {
 	struct b44_op *op;
 
@@ -870,6 +971,7 @@ int bep44_put(struct bep44_engine *e, const uint8_t sk[64], const uint8_t pk[32]
 	memcpy(op->value, v, v_len);
 	op->value_len = (uint16_t)v_len;
 	op->seq = seq;
+	op->cas = cas;
 	op->put_cb = cb;
 	op->cb_arg = arg;
 	op_step(op);

@@ -257,7 +257,7 @@ static void dht_pump(struct sig *s, uint64_t now)
 		benc_str_add(&vb, p->sealed, p->sealed_len);
 		if (!vb.err)
 			bep44_put(s->engine, s->keys.bep44_sk, s->keys.bep44_pk,
-				  p->salt, value, vb.len, ++p->seq, NULL, NULL);
+				  p->salt, value, vb.len, ++p->seq, -1, NULL, NULL);
 		p->next_dht_ms = now + SIG_DHT_PUT_MS;
 	}
 	for (i = 0; i < SIG_MAX_CHAN; i++) {

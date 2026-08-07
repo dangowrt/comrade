@@ -13,7 +13,13 @@
 
 struct bep44_engine;
 
-typedef void bep44_put_cb(void *arg, int stored);
+/*
+ * On a put, node/node_len identify the closest node that acknowledged storing
+ * the value, known at store time: the rendezvous node a host embeds in a
+ * token without any separate get. NULL when nothing stored.
+ */
+typedef void bep44_put_cb(void *arg, int stored, const struct sockaddr *node,
+			  socklen_t node_len);
 /*
  * On a get, node/node_len identify the DHT node that first served the winning
  * value: proven to hold it and fastest to answer, so the right rendezvous
@@ -42,7 +48,7 @@ int bep44_input(struct bep44_engine *e, const uint8_t *buf, size_t len,
 int bep44_periodic(struct bep44_engine *e, int *timeout_ms);
 int bep44_put(struct bep44_engine *e, const uint8_t sk[64], const uint8_t pk[32],
 	      const char *salt, const uint8_t *v, size_t v_len, int64_t seq,
-	      bep44_put_cb *cb, void *arg);
+	      int64_t cas, bep44_put_cb *cb, void *arg);
 int bep44_get(struct bep44_engine *e, const uint8_t pk[32], const char *salt,
 	      bep44_get_cb *cb, void *arg);
 
