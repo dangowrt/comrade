@@ -21,6 +21,12 @@ struct dhtnode *dhtnode_create(void);
  */
 struct dhtnode *dhtnode_create_seeded(void);
 int dhtnode_seed(struct dhtnode *n, const struct sockaddr *sa, socklen_t len);
+/*
+ * Pin a rendezvous node: sticky (never aged or overwritten) and used on every
+ * DHT query. This is what sig_seed_node() plants from a token, alongside a
+ * normally-bootstrapping node so a stale hint falls back to the global DHT.
+ */
+int dhtnode_pin(struct dhtnode *n, const struct sockaddr *sa, socklen_t len);
 void dhtnode_free(struct dhtnode *n);
 struct bep44_engine *dhtnode_engine(struct dhtnode *n);
 int dhtnode_prepare(struct dhtnode *n, struct pollfd *fds, int maxfds,

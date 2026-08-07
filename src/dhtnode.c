@@ -193,6 +193,11 @@ int dhtnode_seed(struct dhtnode *n, const struct sockaddr *sa, socklen_t len)
 	return bep44_seed_add(n->engine, NULL, sa, len);
 }
 
+int dhtnode_pin(struct dhtnode *n, const struct sockaddr *sa, socklen_t len)
+{
+	return bep44_pin_add(n->engine, NULL, sa, len);
+}
+
 void dhtnode_free(struct dhtnode *n)
 {
 	if (!n)

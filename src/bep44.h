@@ -28,6 +28,15 @@ int bep44_bootstrap_add(struct bep44_engine *e, const struct sockaddr *sa,
 			socklen_t salen);
 int bep44_seed_add(struct bep44_engine *e, const uint8_t id[20],
 		   const struct sockaddr *sa, socklen_t salen);
+/*
+ * Pin a node (a token rendezvous hint) permanently: unlike a seed it is never
+ * overwritten and never aged, and it is injected into the initial node set of
+ * EVERY subsequent op, so it is tried on every query for the life of the
+ * engine (with the global DHT as fallback). id may be NULL (address only,
+ * which is all a token carries).
+ */
+int bep44_pin_add(struct bep44_engine *e, const uint8_t id[20],
+		  const struct sockaddr *sa, socklen_t salen);
 int bep44_input(struct bep44_engine *e, const uint8_t *buf, size_t len,
 		const struct sockaddr *from, socklen_t fromlen);
 int bep44_periodic(struct bep44_engine *e, int *timeout_ms);

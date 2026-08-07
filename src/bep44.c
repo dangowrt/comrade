@@ -32,6 +32,7 @@ static int debug_on(void)
 #define B44_TOKEN_MAX 40
 #define B44_MSG_MAX 1400
 #define B44_SEEDS_MAX 16
+#define B44_PINNED_MAX 8
 
 enum b44_node_state {
 	B44_NODE_FRESH,
@@ -110,6 +111,15 @@ struct bep44_engine {
 	int nbootstrap;
 	struct b44_seed seeds[B44_SEEDS_MAX];
 	int seed_next;
+	/*
+	 * Pinned nodes (rendezvous hints from a token). Unlike seeds, which are
+	 * a cycling ring the routing-table cache overwrites, pinned nodes are
+	 * never overwritten and never aged: they are injected into the initial
+	 * node set of EVERY op, so a token-supplied node is tried on every
+	 * query for the life of the engine, with the global DHT as fallback.
+	 */
+	struct b44_seed pinned[B44_PINNED_MAX];
+	int npinned;
 	struct b44_op *ops;
 };
 
@@ -211,13 +221,22 @@ static void dist_calc(uint8_t dist[20], const uint8_t id[20],
 }
 
 static int node_insert(struct b44_op *op, const uint8_t *id,
-		       const struct sockaddr *sa, socklen_t salen)
+		       const struct sockaddr *sa, socklen_t salen, int pinned)
 {
 	uint8_t dist[20];
 	int i, pos;
 
+	/*
+	 * Once a node's id is known it ranks by true XOR distance, pinned or
+	 * not (a rendezvous node is close to its target, so it sorts near the
+	 * front naturally). A pinned node whose id we have not learned yet is
+	 * ranked at distance zero so it is queried first and reveals its id;
+	 * an ordinary id-less node (routing cache) ranks last instead.
+	 */
 	if (id)
 		dist_calc(dist, id, op->target);
+	else if (pinned)
+		memset(dist, 0, sizeof(dist));
 	else
 		memset(dist, 0xff, sizeof(dist));
 
@@ -276,7 +295,7 @@ static void nodes_compact_add(struct b44_op *op, const uint8_t *data,
 			sin.sin_family = AF_INET;
 			memcpy(&sin.sin_addr, p + 20, 4);
 			memcpy(&sin.sin_port, p + 24, 2);
-			node_insert(op, p, (struct sockaddr *)&sin, sizeof(sin));
+			node_insert(op, p, (struct sockaddr *)&sin, sizeof(sin), 0);
 		} else {
 			struct sockaddr_in6 sin6;
 
@@ -284,7 +303,7 @@ static void nodes_compact_add(struct b44_op *op, const uint8_t *data,
 			sin6.sin6_family = AF_INET6;
 			memcpy(&sin6.sin6_addr, p + 20, 16);
 			memcpy(&sin6.sin6_port, p + 36, 2);
-			node_insert(op, p, (struct sockaddr *)&sin6, sizeof(sin6));
+			node_insert(op, p, (struct sockaddr *)&sin6, sizeof(sin6), 0);
 		}
 	}
 }
@@ -579,6 +598,33 @@ static void value_check(struct b44_op *op, const struct sockaddr *from,
 	record_best_node(op, from, fromlen);
 }
 
+/*
+ * Learn and store the id of a pinned node that just answered. A token only
+ * carries ip:port, so a rendezvous node starts id-less (front-ranked); once
+ * it replies we record its real id, and thereafter it ranks by true distance
+ * like any Kademlia node.
+ */
+static void pin_learn_id(struct bep44_engine *e, const struct sockaddr *from,
+			 socklen_t fromlen, const uint8_t *rdict, size_t rlen)
+{
+	const uint8_t *val, *id;
+	size_t val_len, id_len;
+	int i;
+
+	if (!from || benc_dict_find(rdict, rlen, "id", &val, &val_len) ||
+	    benc_str_get(val, val_len, &id, &id_len) || id_len != 20)
+		return;
+	for (i = 0; i < e->npinned; i++) {
+		struct b44_seed *p = &e->pinned[i];
+
+		if (p->has_id || p->sslen != fromlen ||
+		    memcmp(&p->ss, from, fromlen))
+			continue;
+		memcpy(p->id, id, 20);
+		p->has_id = 1;
+	}
+}
+
 static void reply_handle(struct b44_op *op, struct b44_req *req,
 			 const uint8_t *buf, size_t len, int is_error,
 			 const struct sockaddr *from, socklen_t fromlen)
@@ -611,6 +657,8 @@ static void reply_handle(struct b44_op *op, struct b44_req *req,
 		op_step(op);
 		return;
 	}
+
+	pin_learn_id(op->e, from, fromlen, rdict, rlen);
 
 	if (!benc_dict_find(rdict, rlen, "token", &val, &val_len)) {
 		const uint8_t *tok;
@@ -729,15 +777,22 @@ static struct b44_op *op_create(struct bep44_engine *e, const uint8_t pk[32],
 	op->start_ms = now_ms();
 	op->phase = B44_PHASE_LOOKUP;
 
+	/* Pinned (rendezvous) nodes go into every op first, so they are always
+	 * in the initial set and queried in the first round of every lookup. */
+	for (i = 0; i < e->npinned; i++)
+		node_insert(op, e->pinned[i].has_id ? e->pinned[i].id : NULL,
+			    (struct sockaddr *)&e->pinned[i].ss,
+			    e->pinned[i].sslen, 1);
+
 	for (i = 0; i < B44_SEEDS_MAX; i++) {
 		if (e->seeds[i].in_use)
 			node_insert(op, e->seeds[i].has_id ? e->seeds[i].id : NULL,
 				    (struct sockaddr *)&e->seeds[i].ss,
-				    e->seeds[i].sslen);
+				    e->seeds[i].sslen, 0);
 	}
 	for (i = 0; i < e->nbootstrap; i++)
 		node_insert(op, NULL, (struct sockaddr *)&e->bootstrap[i],
-			    e->bootstrap_len[i]);
+			    e->bootstrap_len[i], 0);
 
 	op->next = e->ops;
 	e->ops = op;
@@ -769,6 +824,33 @@ int bep44_seed_add(struct bep44_engine *e, const uint8_t id[20],
 	memcpy(&seed->ss, sa, salen);
 	seed->sslen = salen;
 	seed->in_use = 1;
+	return 0;
+}
+
+int bep44_pin_add(struct bep44_engine *e, const uint8_t id[20],
+		  const struct sockaddr *sa, socklen_t salen)
+{
+	struct b44_seed *p;
+	int i;
+
+	if ((size_t)salen > sizeof(p->ss))
+		return -1;
+	for (i = 0; i < e->npinned; i++) {
+		p = &e->pinned[i];
+		if (p->sslen == salen && !memcmp(&p->ss, sa, salen))
+			return 0;		/* already pinned */
+	}
+	if (e->npinned >= B44_PINNED_MAX)
+		return -1;			/* never evict an existing pin */
+	p = &e->pinned[e->npinned++];
+	memset(p, 0, sizeof(*p));
+	if (id) {
+		memcpy(p->id, id, 20);
+		p->has_id = 1;
+	}
+	memcpy(&p->ss, sa, salen);
+	p->sslen = salen;
+	p->in_use = 1;
 	return 0;
 }
 
