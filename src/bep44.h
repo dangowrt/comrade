@@ -52,6 +52,40 @@ int bep44_put(struct bep44_engine *e, const uint8_t sk[64], const uint8_t pk[32]
 int bep44_get(struct bep44_engine *e, const uint8_t pk[32], const char *salt,
 	      bep44_get_cb *cb, void *arg);
 
+/*
+ * Merge callback for bep44_update: cur/cur_len is the value currently stored
+ * (NULL if none). Write the value to store into out (up to max) and set
+ * *out_len. Return 0 to proceed with the put, non-zero to abort.
+ */
+typedef int bep44_merge_fn(void *arg, const uint8_t *cur, size_t cur_len,
+			   uint8_t *out, size_t *out_len, size_t max);
+
+/*
+ * Read-modify-write a mutable item the mainline way: get the current value and
+ * the responding nodes' write tokens, call merge to build the new value, and
+ * put it back onto those same token-bearing nodes with seq+1 and cas. The
+ * right primitive for a shared mailbox that two peers both update, and it
+ * reuses the tokens the get already earned instead of a second lookup.
+ */
+int bep44_update(struct bep44_engine *e, const uint8_t sk[64],
+		 const uint8_t pk[32], const char *salt, bep44_merge_fn *merge,
+		 void *merge_arg, bep44_put_cb *cb, void *arg);
+
+/*
+ * Direct (rendezvous) variants of get/update. They address only the pinned
+ * and retained nodes -- the shared rendezvous the host converged to once and
+ * put in the token -- and never converge toward the target again. Every query
+ * is still an ordinary compliant get/put to those foreign nodes; only our own
+ * redundant re-lookup is skipped. Use these on both ends after the rendezvous
+ * node is known, so a rendezvous costs a round-trip instead of a full lookup.
+ */
+int bep44_get_direct(struct bep44_engine *e, const uint8_t pk[32],
+		     const char *salt, bep44_get_cb *cb, void *arg);
+int bep44_update_direct(struct bep44_engine *e, const uint8_t sk[64],
+			const uint8_t pk[32], const char *salt,
+			bep44_merge_fn *merge, void *merge_arg,
+			bep44_put_cb *cb, void *arg);
+
 size_t bep44_sig_buffer(uint8_t *dst, size_t dst_len, const char *salt,
 			int64_t seq, const uint8_t *v, size_t v_len);
 void bep44_target(uint8_t target[20], const uint8_t pk[32], const char *salt);

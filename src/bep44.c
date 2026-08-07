@@ -70,6 +70,12 @@ struct b44_op {
 	struct b44_op *next;
 	struct bep44_engine *e;
 	uint8_t is_put;
+	uint8_t is_update;		/* get, then merge, then put on same nodes */
+	uint8_t direct;			/* rendezvous mode: talk only to the seeded
+					 * and pinned nodes, never converge toward
+					 * the target (no find_node expansion) */
+	bep44_merge_fn *merge;
+	void *merge_arg;
 	uint8_t phase;
 	uint8_t target[20];
 	uint8_t pk[32];
@@ -572,6 +578,28 @@ static int store_start(struct b44_op *op)
 	return sent;
 }
 
+/* Lookup done: let the caller merge its slot into the value we read, then
+ * store it back on those same token-bearing nodes -- standard get-then-put. */
+static void update_store(struct b44_op *op)
+{
+	uint8_t nv[BEP44_MAX_VALUE];
+	size_t nvlen = 0;
+
+	if (op->merge(op->merge_arg, op->have_best ? op->best : NULL,
+		      op->best_len, nv, &nvlen, sizeof(nv)) ||
+	    !nvlen || nvlen > BEP44_MAX_VALUE) {
+		op_finish(op);
+		return;
+	}
+	memcpy(op->value, nv, nvlen);
+	op->value_len = (uint16_t)nvlen;
+	op->seq = op->have_best ? op->best_seq + 1 : 1;
+	op->cas = op->have_best ? op->best_seq : -1;
+	op->is_put = 1;
+	if (!store_start(op))
+		op_finish(op);
+}
+
 static void op_step(struct b44_op *op)
 {
 	uint64_t now = now_ms();
@@ -605,6 +633,10 @@ static void op_step(struct b44_op *op)
 		}
 		if (inflight)
 			return;
+		if (op->is_update) {
+			update_store(op);
+			return;
+		}
 		if (!op->is_put) {
 			op_finish(op);
 			return;
@@ -764,14 +796,18 @@ static void reply_handle(struct b44_op *op, struct b44_req *req,
 		}
 	}
 
-	if (!benc_dict_find(rdict, rlen, "nodes", &val, &val_len)) {
+	/* A rendezvous op talks only to the nodes it was seeded/pinned with, so
+	 * it never grows toward the target: skip the returned closer nodes. */
+	if (!op->direct &&
+	    !benc_dict_find(rdict, rlen, "nodes", &val, &val_len)) {
 		const uint8_t *data;
 		size_t data_len;
 
 		if (!benc_str_get(val, val_len, &data, &data_len))
 			nodes_compact_add(op, data, data_len, AF_INET);
 	}
-	if (!benc_dict_find(rdict, rlen, "nodes6", &val, &val_len)) {
+	if (!op->direct &&
+	    !benc_dict_find(rdict, rlen, "nodes6", &val, &val_len)) {
 		const uint8_t *data;
 		size_t data_len;
 
@@ -853,7 +889,7 @@ int bep44_periodic(struct bep44_engine *e, int *timeout_ms)
 }
 
 static struct b44_op *op_create(struct bep44_engine *e, const uint8_t pk[32],
-				const char *salt)
+				const char *salt, int direct)
 {
 	struct b44_op *op;
 	int i;
@@ -864,6 +900,7 @@ static struct b44_op *op_create(struct bep44_engine *e, const uint8_t pk[32],
 	if (!op)
 		return NULL;
 	op->e = e;
+	op->direct = (uint8_t)(direct != 0);
 	memcpy(op->pk, pk, 32);
 	strcpy(op->salt, salt);
 	bep44_target(op->target, pk, salt);
@@ -885,15 +922,20 @@ static struct b44_op *op_create(struct bep44_engine *e, const uint8_t pk[32],
 				    e->retained[i].sslen, 0);
 	}
 
-	for (i = 0; i < B44_SEEDS_MAX; i++) {
-		if (e->seeds[i].in_use)
-			node_insert(op, e->seeds[i].has_id ? e->seeds[i].id : NULL,
-				    (struct sockaddr *)&e->seeds[i].ss,
-				    e->seeds[i].sslen, 0);
+	/* A direct op addresses only the shared rendezvous (pinned/retained)
+	 * nodes and never converges, so it skips the wider seed/bootstrap set. */
+	if (!direct) {
+		for (i = 0; i < B44_SEEDS_MAX; i++) {
+			if (e->seeds[i].in_use)
+				node_insert(op,
+					    e->seeds[i].has_id ? e->seeds[i].id : NULL,
+					    (struct sockaddr *)&e->seeds[i].ss,
+					    e->seeds[i].sslen, 0);
+		}
+		for (i = 0; i < e->nbootstrap; i++)
+			node_insert(op, NULL, (struct sockaddr *)&e->bootstrap[i],
+				    e->bootstrap_len[i], 0);
 	}
-	for (i = 0; i < e->nbootstrap; i++)
-		node_insert(op, NULL, (struct sockaddr *)&e->bootstrap[i],
-			    e->bootstrap_len[i], 0);
 
 	op->next = e->ops;
 	e->ops = op;
@@ -963,7 +1005,7 @@ int bep44_put(struct bep44_engine *e, const uint8_t sk[64], const uint8_t pk[32]
 
 	if (v_len > BEP44_MAX_VALUE)
 		return -1;
-	op = op_create(e, pk, salt);
+	op = op_create(e, pk, salt, 0);
 	if (!op)
 		return -1;
 	op->is_put = 1;
@@ -978,10 +1020,46 @@ int bep44_put(struct bep44_engine *e, const uint8_t sk[64], const uint8_t pk[32]
 	return 0;
 }
 
-int bep44_get(struct bep44_engine *e, const uint8_t pk[32], const char *salt,
-	      bep44_get_cb *cb, void *arg)
+static int update_impl(struct bep44_engine *e, const uint8_t sk[64],
+		       const uint8_t pk[32], const char *salt,
+		       bep44_merge_fn *merge, void *merge_arg, int direct,
+		       bep44_put_cb *cb, void *arg)
 {
-	struct b44_op *op = op_create(e, pk, salt);
+	struct b44_op *op = op_create(e, pk, salt, direct);
+
+	if (!op)
+		return -1;
+	/* Starts as a get (is_put stays 0 so the value is collected); at
+	 * lookup settle op_step merges and stores on the same nodes. */
+	op->is_update = 1;
+	memcpy(op->sk, sk, 64);
+	op->merge = merge;
+	op->merge_arg = merge_arg;
+	op->put_cb = cb;
+	op->cb_arg = arg;
+	op_step(op);
+	return 0;
+}
+
+int bep44_update(struct bep44_engine *e, const uint8_t sk[64],
+		 const uint8_t pk[32], const char *salt, bep44_merge_fn *merge,
+		 void *merge_arg, bep44_put_cb *cb, void *arg)
+{
+	return update_impl(e, sk, pk, salt, merge, merge_arg, 0, cb, arg);
+}
+
+int bep44_update_direct(struct bep44_engine *e, const uint8_t sk[64],
+			const uint8_t pk[32], const char *salt,
+			bep44_merge_fn *merge, void *merge_arg,
+			bep44_put_cb *cb, void *arg)
+{
+	return update_impl(e, sk, pk, salt, merge, merge_arg, 1, cb, arg);
+}
+
+static int get_impl(struct bep44_engine *e, const uint8_t pk[32],
+		    const char *salt, int direct, bep44_get_cb *cb, void *arg)
+{
+	struct b44_op *op = op_create(e, pk, salt, direct);
 
 	if (!op)
 		return -1;
@@ -989,4 +1067,16 @@ int bep44_get(struct bep44_engine *e, const uint8_t pk[32], const char *salt,
 	op->cb_arg = arg;
 	op_step(op);
 	return 0;
+}
+
+int bep44_get(struct bep44_engine *e, const uint8_t pk[32], const char *salt,
+	      bep44_get_cb *cb, void *arg)
+{
+	return get_impl(e, pk, salt, 0, cb, arg);
+}
+
+int bep44_get_direct(struct bep44_engine *e, const uint8_t pk[32],
+		     const char *salt, bep44_get_cb *cb, void *arg)
+{
+	return get_impl(e, pk, salt, 1, cb, arg);
 }
