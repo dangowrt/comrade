@@ -385,13 +385,14 @@ static void on_host_put(void *arg, int stored, const struct sockaddr *node,
 {
 	struct sig *s = arg;
 
-	(void)stored;
 	(void)node;
 	(void)node_len;
 	s->put_inflight = 0;
-	/* Give the validating gets a wide window to pick the rendezvous node
-	 * from the k-close nodes we just stored on before any re-store. */
-	s->next_put_ms = now_ms() + SIG_DHT_RESTORE_MS;
+	/* Only a store that found a home earns the wide window for the
+	 * validating gets to pick the rendezvous node; one that stored nowhere
+	 * retries at the normal cadence. */
+	if (stored > 0)
+		s->next_put_ms = now_ms() + SIG_DHT_RESTORE_MS;
 }
 
 static void dht_pump(struct sig *s, uint64_t now)
