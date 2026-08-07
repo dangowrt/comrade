@@ -48,3 +48,18 @@ enum tok_advert tokgen_decide(const struct tokgen_facts *f)
 		return TOK_ADVERT_ENDPOINT;
 	return TOK_ADVERT_NONE;
 }
+
+int tokgen_decide_host(const struct tokgen_facts *v4,
+		       const struct tokgen_facts *v6,
+		       struct tokgen_result *out)
+{
+	/* Each family stands on its own facts. */
+	out->v4 = tokgen_decide(v4);
+	out->v6 = tokgen_decide(v6);
+
+	/* Abort only when neither family has anything to advertise. A single
+	 * advertisable family is enough. */
+	if (out->v4 == TOK_ADVERT_NONE && out->v6 == TOK_ADVERT_NONE)
+		return -1;
+	return 0;
+}

@@ -44,4 +44,24 @@ struct tokgen_facts {
 
 enum tok_advert tokgen_decide(const struct tokgen_facts *f);
 
+/*
+ * The two families are decided entirely independently; the host aborts only
+ * when NEITHER can be advertised. Every other mix is normal and must be
+ * accepted: v4-only, v6-only, global on one family and link-local-only on
+ * the other, and so on.
+ */
+struct tokgen_result {
+	enum tok_advert v4;
+	enum tok_advert v6;
+};
+
+/*
+ * Decide both families from their own facts. Returns 0 when at least one
+ * family is advertisable, -1 only when both are TOK_ADVERT_NONE (the host has
+ * no connectivity of any kind and token generation must abort).
+ */
+int tokgen_decide_host(const struct tokgen_facts *v4,
+		       const struct tokgen_facts *v6,
+		       struct tokgen_result *out);
+
 #endif
