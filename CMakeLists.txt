@@ -177,6 +177,11 @@ if(BUILD_TESTING)
 	target_link_libraries(bep44_test comrade_bep44)
 	add_test(NAME bep44_test COMMAND bep44_test)
 
+	add_executable(bep44_pin_test tests/bep44_pin_test.c)
+	target_link_libraries(bep44_pin_test comrade_bep44)
+	add_test(NAME bep44_pin_test COMMAND bep44_pin_test)
+	set_tests_properties(bep44_pin_test PROPERTIES TIMEOUT 15)
+
 	add_executable(natstream_test tests/natstream_test.c)
 	target_link_libraries(natstream_test comrade_nat comrade_stream)
 	add_test(NAME natstream_test COMMAND natstream_test)
@@ -222,7 +227,7 @@ endif()
 if(BUILD_TESTING)
 	foreach(t IN ITEMS
 		token_test tokgen_test netmon_test candpolicy_test bep44_test
-		natstream_test sshloop_test sshkcp_test)
+		bep44_pin_test natstream_test sshloop_test sshkcp_test)
 		if(TARGET ${t})
 			target_compile_options(${t} PRIVATE -UNDEBUG)
 		endif()
