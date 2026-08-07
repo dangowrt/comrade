@@ -19,9 +19,12 @@ static int get_done, get_ok;
 static uint8_t want_val[64];
 static size_t want_len;
 
-static void on_put(void *arg, int stored)
+static void on_put(void *arg, int stored, const struct sockaddr *node,
+		   socklen_t node_len)
 {
 	(void)arg;
+	(void)node;
+	(void)node_len;
 	put_done = 1;
 	put_ok = stored;
 	printf("put complete: stored on %d nodes\n", stored);
@@ -142,7 +145,7 @@ int main(int argc, char **argv)
 	if (!mode_get_only) {
 		printf("putting sealed value (%zu bencoded bytes)...\n", vlen);
 		bep44_put(e, keys.bep44_sk, keys.bep44_pk, "offer",
-			  vbuf, vlen, 1, on_put, NULL);
+			  vbuf, vlen, 1, -1, on_put, NULL);
 		deadline = now_ms() + 30000;
 		while (!put_done && now_ms() < deadline)
 			pump(n, now_ms() + 200);

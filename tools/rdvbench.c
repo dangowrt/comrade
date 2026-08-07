@@ -51,9 +51,12 @@ static uint64_t now_ms(void)
 	return (uint64_t)ts.tv_sec * 1000 + (uint64_t)(ts.tv_nsec / 1000000);
 }
 
-static void on_put(void *arg, int stored)
+static void on_put(void *arg, int stored, const struct sockaddr *node,
+		   socklen_t node_len)
 {
 	(void)arg;
+	(void)node;
+	(void)node_len;
 	put_done = 1;
 	put_ok = stored;
 }
@@ -205,7 +208,7 @@ int main(int argc, char **argv)
 	       (unsigned long long)(now_ms() - start));
 	pump(n, now_ms() + 3000);
 	bep44_put(dhtnode_engine(n), keys.bep44_sk, keys.bep44_pk, "offer",
-		  vbuf, vlen, 1, on_put, NULL);
+		  vbuf, vlen, 1, -1, on_put, NULL);
 	deadline = now_ms() + 30000;
 	while (!put_done && now_ms() < deadline)
 		pump(n, now_ms() + 200);
