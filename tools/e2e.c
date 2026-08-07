@@ -82,6 +82,10 @@ static struct {
 	void *hostkey;			/* host: ephemeral ssh_key */
 	struct token tok;
 	uint8_t auth[TOKEN_AUTH_LEN];
+
+	/* Rendezvous (host): print the token once its rendezvous node is known. */
+	int token_printed;
+	uint64_t locate_deadline;
 } g;
 
 #define SSH_NONCE 4096
@@ -143,22 +147,87 @@ static uint64_t now_ms(void)
 	return (uint64_t)ts.tv_sec * 1000 + (uint64_t)(ts.tv_nsec / 1000000);
 }
 
-static const char *put_channel(void)
-{
-	return g.role_a ? "e2e-a" : "e2e-b";
-}
-
-static const char *get_channel(void)
-{
-	return g.role_a ? "e2e-b" : "e2e-a";
-}
-
 static void sdp_filter(const char *in, int family, char *out, size_t outlen)
 {
 	struct cand_policy pol;
 
 	cand_policy_default(&pol);
 	cand_sdp_filter(in, family, &pol, out, outlen);
+}
+
+/* Put a located rendezvous node into the token's endpoint slot for its
+ * family, with the RENDEZVOUS flag set. */
+static void token_set_rendezvous(struct token *t, const struct sockaddr *sa)
+{
+	if (sa->sa_family == AF_INET6) {
+		const struct sockaddr_in6 *a = (const struct sockaddr_in6 *)sa;
+
+		memcpy(t->ep6_addr, &a->sin6_addr, TOKEN_EP6_LEN);
+		t->ep6_port = ntohs(a->sin6_port);
+		t->flags |= TOKEN_FLAG_EP6_RDV;
+	} else if (sa->sa_family == AF_INET) {
+		const struct sockaddr_in *a = (const struct sockaddr_in *)sa;
+
+		memcpy(t->ep4_addr, &a->sin_addr, TOKEN_EP4_LEN);
+		t->ep4_port = ntohs(a->sin_port);
+		t->flags |= TOKEN_FLAG_EP4_RDV;
+	}
+}
+
+/* Client: plant every rendezvous node the token carries as a sticky DHT
+ * hint. Returns how many were seeded. */
+static int client_seed_rendezvous(void)
+{
+	int n = 0;
+
+	if (g.tok.flags & TOKEN_FLAG_EP6_RDV) {
+		struct sockaddr_in6 a;
+
+		memset(&a, 0, sizeof(a));
+		a.sin6_family = AF_INET6;
+		memcpy(&a.sin6_addr, g.tok.ep6_addr, TOKEN_EP6_LEN);
+		a.sin6_port = htons(g.tok.ep6_port);
+		if (!sig_seed_node(g.sig, (struct sockaddr *)&a, sizeof(a)))
+			n++;
+	}
+	if (g.tok.flags & TOKEN_FLAG_EP4_RDV) {
+		struct sockaddr_in a;
+
+		memset(&a, 0, sizeof(a));
+		a.sin_family = AF_INET;
+		memcpy(&a.sin_addr, g.tok.ep4_addr, TOKEN_EP4_LEN);
+		a.sin_port = htons(g.tok.ep4_port);
+		if (!sig_seed_node(g.sig, (struct sockaddr *)&a, sizeof(a)))
+			n++;
+	}
+	return n;
+}
+
+/* Host: print the token once its rendezvous node is located, or after a
+ * grace period without one (cold-DHT fallback). Called each loop iteration. */
+static void host_maybe_print_token(uint64_t now)
+{
+	char tokbuf[TOKEN_STR_LEN + 1];
+	struct sockaddr_storage ss;
+	socklen_t sl = sizeof(ss);
+
+	if (g.token_printed || !g.locate_deadline)
+		return;			/* wait until the locate has started */
+	if (sig_located(g.sig, (struct sockaddr *)&ss, &sl)) {
+		token_set_rendezvous(&g.tok, (struct sockaddr *)&ss);
+		fprintf(stderr, "[e2e] rendezvous node located, embedded in token\n");
+	} else if (now < g.locate_deadline) {
+		return;
+	} else {
+		fprintf(stderr, "[e2e] no rendezvous node in time; token uses cold DHT\n");
+	}
+	if (token_encode(&g.tok, tokbuf, sizeof(tokbuf))) {
+		fprintf(stderr, "error: token_encode failed\n");
+		return;
+	}
+	printf("COMRADE TOKEN: %s\n", tokbuf);
+	fflush(stdout);
+	g.token_printed = 1;
 }
 
 static void on_local_sdp(void *arg, const char *sdp)
@@ -531,12 +600,20 @@ int main(int argc, char **argv)
 			fprintf(stderr, "error: host key generation failed\n");
 			return 1;
 		}
-		if (token_encode(&g.tok, tokbuf, sizeof(tokbuf))) {
-			fprintf(stderr, "error: token_encode failed\n");
-			return 1;
+		/*
+		 * With the DHT, defer printing until a rendezvous node is
+		 * located and embedded (host_maybe_print_token); without it
+		 * (multicast only), there is nothing to locate, so print now.
+		 */
+		if (!(g.sig_flags & SIG_DHT)) {
+			if (token_encode(&g.tok, tokbuf, sizeof(tokbuf))) {
+				fprintf(stderr, "error: token_encode failed\n");
+				return 1;
+			}
+			printf("COMRADE TOKEN: %s\n", tokbuf);
+			fflush(stdout);
+			g.token_printed = 1;
 		}
-		printf("COMRADE TOKEN: %s\n", tokbuf);
-		fflush(stdout);
 	} else if (token_decode(&g.tok, token_arg)) {
 		fprintf(stderr, "error: invalid token\n");
 		return 2;
@@ -545,12 +622,20 @@ int main(int argc, char **argv)
 	for (k = 0; k < SSH_NONCE; k++)
 		ssh_tx[k] = (uint8_t)(k * 97 + 13);
 
-	g.sig = sig_create(g.tok.rdv, g.sig_flags);
+	g.sig = sig_create(g.tok.rdv, g.sig_flags, g.role_a);
 	if (!g.sig) {
 		fprintf(stderr, "error: sig_create failed\n");
 		return 1;
 	}
-	sig_subscribe(g.sig, get_channel(), on_peer_offer, NULL);
+	sig_subscribe(g.sig, on_peer_offer, NULL);
+	if (!g.role_a) {
+		int seeded = client_seed_rendezvous();
+
+		if (seeded)
+			fprintf(stderr,
+				"[e2e] seeded %d rendezvous node(s) from token\n",
+				seeded);
+	}
 
 	fprintf(stderr, "[e2e] %s, gathering %s, signalling%s%s...\n",
 		g.role_a ? "host" : "client",
@@ -563,6 +648,9 @@ int main(int argc, char **argv)
 
 	while (st != ST_DONE && st != ST_FAIL && now_ms() < deadline) {
 		pump_once(100);
+
+		if (g.role_a && !g.token_printed)
+			host_maybe_print_token(now_ms());
 
 		switch (st) {
 		case ST_WAIT_DHT:
@@ -583,8 +671,21 @@ int main(int argc, char **argv)
 				sdp_filter(g.local_sdp, g.family, filtered, sizeof(filtered));
 				strncpy(g.local_sdp, filtered, sizeof(g.local_sdp) - 1);
 				dump_sdp("published local candidates (filtered)", g.local_sdp);
-				sig_publish(g.sig, put_channel(),
-					    (const uint8_t *)g.local_sdp, strlen(g.local_sdp));
+				sig_post(g.sig, (const uint8_t *)g.local_sdp,
+					 strlen(g.local_sdp));
+				if (g.role_a && (g.sig_flags & SIG_DHT) &&
+				    !g.locate_deadline) {
+					sig_locate(g.sig);
+					/*
+					 * The token prints the instant a node
+					 * acks storing our value (event-driven,
+					 * as fast as the machine and link allow).
+					 * The only time bound is a last-resort
+					 * fallback tied to the user's own session
+					 * timeout, never a fixed magic number.
+					 */
+					g.locate_deadline = deadline - 15000;
+				}
 				st = ST_SIGNAL;
 			}
 			break;
