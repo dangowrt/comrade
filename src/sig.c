@@ -7,6 +7,7 @@
 
 #include "bencode.h"
 #include "bep44.h"
+#include "candpack.h"
 #include "dhtnode.h"
 #include "keys.h"
 #include "sig.h"
@@ -14,8 +15,11 @@
 
 #define SIG_SALT "m"			/* the one shared mailbox */
 #define SIG_SEALED_MAX (SIG_MAX_VALUE + SEAL_OVERHEAD)
-#define SIG_DHT_GET_MS 2000
-#define SIG_DHT_PUT_MS 4000
+#define SIG_SDP_MAX 4096		/* raw ICE description in/out of candpack */
+#define SIG_DHT_GET_MS 1000
+#define SIG_DHT_PUT_MS 1500
+#define SIG_DHT_RESTORE_MS 8000		/* re-store backoff while a store's
+					 * k-close nodes are being validated */
 #define SIG_MCAST_ANN_MS 1000
 #define SIG_DHT_GRACE_MS 2000
 
@@ -52,6 +56,7 @@ struct sig {
 	int have_last;
 
 	int locate;
+	int put_inflight;		/* a convergent host store is running */
 	struct sockaddr_storage rnode;
 	socklen_t rnode_len;
 
@@ -150,11 +155,22 @@ int sig_ready(struct sig *s)
 
 int sig_post(struct sig *s, const uint8_t *data, size_t len)
 {
-	int slen;
+	char sdp[SIG_SDP_MAX];
+	uint8_t packed[SIG_MAX_VALUE];
+	int plen, slen;
 
-	if (len > SIG_MAX_VALUE)
+	/* Publish only routable candidates, packed compactly: the DHT slot is
+	 * for crossing public networks, and same-segment peers meet over
+	 * multicast where the source address needs no publishing. */
+	if (len >= sizeof(sdp))
 		return -1;
-	slen = msg_seal(s->mine, sizeof(s->mine), s->keys.sig_key, data, len);
+	memcpy(sdp, data, len);
+	sdp[len] = '\0';
+	plen = candpack_encode(sdp, 1, packed, sizeof(packed));
+	if (plen <= 0)
+		return -1;
+	slen = msg_seal(s->mine, sizeof(s->mine), s->keys.sig_key, packed,
+			(size_t)plen);
 	if (slen < 0)
 		return -1;
 	s->mine_len = (size_t)slen;
@@ -200,7 +216,9 @@ int sig_located(struct sig *s, struct sockaddr *out, socklen_t *out_len)
 static void deliver_peer(struct sig *s, const uint8_t *sealed, size_t len)
 {
 	uint8_t plain[SIG_MAX_VALUE];
+	char sdp[SIG_SDP_MAX];
 	int n = msg_open(plain, sizeof(plain), s->keys.sig_key, sealed, len);
+	int slen;
 
 	if (n < 0)
 		return;
@@ -210,8 +228,11 @@ static void deliver_peer(struct sig *s, const uint8_t *sealed, size_t len)
 	memcpy(s->last_peer, plain, (size_t)n);
 	s->last_peer_len = (size_t)n;
 	s->have_last = 1;
+	slen = candpack_decode(plain, (size_t)n, sdp, sizeof(sdp));
+	if (slen < 0)
+		return;
 	if (s->cb)
-		s->cb(s->arg, plain, (size_t)n);
+		s->cb(s->arg, (const uint8_t *)sdp, (size_t)slen);
 }
 
 static size_t peer_sealed(struct sig *s, const uint8_t **out)
@@ -308,12 +329,17 @@ static void on_dht_get(void *arg, const uint8_t *v, size_t v_len, int64_t seq,
 	if (peer_len)
 		deliver_peer(s, peer, peer_len);
 
-	/* The value is signature-checked as ours, so the node that served it
-	 * is a validated rendezvous point; keep the first (fastest). */
+	/*
+	 * The value is signature-checked as ours, so the node that served it is
+	 * a validated, responsive, k-close rendezvous point. Keep the first
+	 * (fastest) and pin it: it goes in the token, and from now the host
+	 * reads the client's reply straight from it, no convergence.
+	 */
 	if (s->locate && !s->rnode_len && node && node_len &&
 	    (size_t)node_len <= sizeof(s->rnode)) {
 		memcpy(&s->rnode, node, node_len);
 		s->rnode_len = node_len;
+		bep44_pin_add(s->engine, NULL, node, node_len);
 	}
 }
 
@@ -331,31 +357,81 @@ static void on_mcast_recv(void *arg, const char *salt, const uint8_t *data,
 	}
 }
 
+/* Merge our slot into the value just read, preserving the peer's slot. */
+static int mailbox_merge(void *arg, const uint8_t *cur, size_t cur_len,
+			 uint8_t *out, size_t *out_len, size_t max)
+{
+	struct sig *s = arg;
+	size_t n;
+
+	if (cur)
+		container_parse(s, cur, cur_len);
+	n = container_build(s, out, max);
+	if (!n)
+		return -1;
+	*out_len = n;
+	return 0;
+}
+
+/*
+ * The convergent store finished (on the k-closest nodes). It does not pick the
+ * rendezvous node: a store acknowledgement does not prove a node will serve the
+ * value back, and the closest-stored node need not be closest to the key. The
+ * rendezvous node is chosen by the validating GET that follows (on_dht_get),
+ * which proves a k-close node both holds the value and answers.
+ */
+static void on_host_put(void *arg, int stored, const struct sockaddr *node,
+			socklen_t node_len)
+{
+	struct sig *s = arg;
+
+	(void)stored;
+	(void)node;
+	(void)node_len;
+	s->put_inflight = 0;
+	/* Give the validating gets a wide window to pick the rendezvous node
+	 * from the k-close nodes we just stored on before any re-store. */
+	s->next_put_ms = now_ms() + SIG_DHT_RESTORE_MS;
+}
+
 static void dht_pump(struct sig *s, uint64_t now)
 {
 	if (!dhtnode_ready(s->node))
 		return;
 	if (now >= s->next_get_ms) {
-		bep44_get(s->engine, s->keys.bep44_pk, SIG_SALT, on_dht_get, s);
+		/*
+		 * Read directly from the shared rendezvous node: the host from
+		 * the nodes it stored to, the client from the token's pinned
+		 * node. No convergence -- the host paid that once, up front.
+		 */
+		bep44_get_direct(s->engine, s->keys.bep44_pk, SIG_SALT,
+				 on_dht_get, s);
 		s->next_get_ms = now + SIG_DHT_GET_MS;
 	}
-	/*
-	 * Only the host writes before reading (it creates the mailbox); the
-	 * client waits until it has read the host's offer, so its first write
-	 * is a proper read-modify-write and never blindly clobbers the offer.
-	 */
-	if (s->have_mine && s->need_write && (s->have_cur || s->is_host) &&
-	    now >= s->next_put_ms) {
-		uint8_t value[BEP44_MAX_VALUE];
-		size_t vlen = container_build(s, value, sizeof(value));
-
-		if (vlen) {
-			int64_t seq = s->have_cur ? s->cur_seq + 1 : 1;
-			int64_t cas = s->have_cur ? s->cur_seq : -1;
-
-			bep44_put(s->engine, s->keys.bep44_sk, s->keys.bep44_pk,
-				  SIG_SALT, value, vlen, seq, cas, NULL, NULL);
+	if (now < s->next_put_ms)
+		return;
+	if (s->is_host) {
+		/*
+		 * One convergent store places the mailbox on the k-closest
+		 * nodes (idiomatic and discoverable) and yields the rendezvous
+		 * node for the token. It runs once, until that node is captured.
+		 */
+		if (s->have_mine && !s->rnode_len && !s->put_inflight) {
+			s->put_inflight = 1;
+			bep44_update(s->engine, s->keys.bep44_sk,
+				     s->keys.bep44_pk, SIG_SALT, mailbox_merge,
+				     s, on_host_put, s);
+			s->next_put_ms = now + SIG_DHT_PUT_MS;
 		}
+	} else if (s->have_mine && s->need_write && s->have_cur) {
+		/*
+		 * The client has read the host's offer; it writes its answer
+		 * straight to the pinned rendezvous node -- a round-trip, not a
+		 * lookup -- so it never clobbers the offer and never converges.
+		 */
+		bep44_update_direct(s->engine, s->keys.bep44_sk,
+				    s->keys.bep44_pk, SIG_SALT, mailbox_merge,
+				    s, NULL, NULL);
 		s->next_put_ms = now + SIG_DHT_PUT_MS;
 	}
 }
@@ -381,8 +457,13 @@ void sig_dispatch(struct sig *s, const struct pollfd *fds, int nfds)
 		mcast_pump(s, now);
 	}
 
+	/*
+	 * With no multicast in play there is nothing on the link to wait for,
+	 * so engage the DHT at once; only a combined session gives the link a
+	 * brief grace to answer before falling back to the DHT.
+	 */
 	if ((s->flags & SIG_DHT) && !s->dht_engaged && !s->mcast_delivered &&
-	    now - s->start_ms > SIG_DHT_GRACE_MS)
+	    (!(s->flags & SIG_MCAST) || now - s->start_ms > SIG_DHT_GRACE_MS))
 		engage_dht(s);
 
 	if (s->dht_engaged) {
