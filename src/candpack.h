@@ -16,16 +16,17 @@
  * tuples (type, family, priority, port, address) into a few bytes each and
  * rebuilds a description libjuice accepts.
  *
- * With routable_only set, non-routed candidate addresses (RFC1918, ULA,
- * link-local, loopback, overlay) are dropped: they never help a peer across
- * the public internet, and same-domain peers rendezvous over multicast
- * instead, so publishing them to the DHT only wastes the slot.
+ * With for_dht set, addresses that cannot help a peer off our own L2 segment
+ * (link-local, ULA, overlay, EUI-64, loopback) are dropped, since multicast
+ * covers same-segment peers. Private v4 (RFC1918/CGNAT) is kept: it lets the
+ * inner peer of a nested NAT punch to the outer peer's private address, which
+ * multicast cannot reach. The mailbox is sealed, so none of this is exposed to
+ * the public DHT. Without for_dht every gathered address is packed.
  */
 
 /* Pack an SDP description into out (up to max). Returns bytes written, -1 on
  * error, 0 if nothing packable (no ufrag/pwd). */
-int candpack_encode(const char *sdp, int routable_only, uint8_t *out,
-		    size_t max);
+int candpack_encode(const char *sdp, int for_dht, uint8_t *out, size_t max);
 
 /* Rebuild an SDP description from packed bytes into out (NUL-terminated, up to
  * max). Returns string length, or -1 on error. */

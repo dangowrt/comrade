@@ -159,9 +159,8 @@ int sig_post(struct sig *s, const uint8_t *data, size_t len)
 	uint8_t packed[SIG_MAX_VALUE];
 	int plen, slen;
 
-	/* Publish only routable candidates, packed compactly: the DHT slot is
-	 * for crossing public networks, and same-segment peers meet over
-	 * multicast where the source address needs no publishing. */
+	/* Pack for the DHT slot: global and shared-private (nested-NAT) reachable
+	 * candidates, dropping only what cannot help off our own L2 segment. */
 	if (len >= sizeof(sdp))
 		return -1;
 	memcpy(sdp, data, len);

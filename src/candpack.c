@@ -75,7 +75,7 @@ static int cred_value(const char *line, const char *key, char *out, size_t max)
 	return 1;
 }
 
-int candpack_encode(const char *sdp, int routable_only, uint8_t *out, size_t max)
+int candpack_encode(const char *sdp, int for_dht, uint8_t *out, size_t max)
 {
 	struct cand_policy pol;
 	char ufrag[257], pwd[257];
@@ -89,11 +89,27 @@ int candpack_encode(const char *sdp, int routable_only, uint8_t *out, size_t max
 	ufrag[0] = '\0';
 	pwd[0] = '\0';
 
-	pol.allow_private_v4 = routable_only ? 0 : 1;
-	pol.allow_ula = routable_only ? 0 : 1;
-	pol.allow_overlay = routable_only ? 0 : 1;
-	pol.allow_eui64 = routable_only ? 0 : 1;
-	pol.allow_linklocal = routable_only ? 0 : 1;
+	/*
+	 * A private v4 address (RFC1918/CGNAT) is kept for the DHT even though
+	 * it is useless across the open internet: when the two peers share a
+	 * private network through nested NAT -- one on the inner, one on the
+	 * outer side -- multicast cannot reach across the L3 boundary, but the
+	 * inner peer can still punch to the outer peer's private address, and
+	 * the outer peer learns the inner peer's source address from that
+	 * incoming check (libjuice peer-reflexive). What cannot help off our own
+	 * L2 segment (link-local, ULA, overlay, EUI-64) is dropped; multicast
+	 * covers same-segment peers. The mailbox is sealed, so nothing here is
+	 * exposed to the public DHT.
+	 */
+	if (for_dht) {
+		cand_policy_default(&pol);
+	} else {
+		pol.allow_private_v4 = 1;
+		pol.allow_ula = 1;
+		pol.allow_overlay = 1;
+		pol.allow_eui64 = 1;
+		pol.allow_linklocal = 1;
+	}
 
 	p = sdp;
 	while (next_line(&p, line, sizeof(line))) {
