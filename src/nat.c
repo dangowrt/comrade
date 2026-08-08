@@ -17,6 +17,7 @@ struct nat_agent {
 	int connected;
 	int failed;
 	int gathered;
+	int remote_set;
 };
 
 static void on_state_changed(juice_agent_t *agent, juice_state_t state, void *user)
@@ -115,9 +116,43 @@ int nat_local_description(struct nat_agent *a, char *sdp, size_t len)
 	return juice_get_local_description(a->agent, sdp, len) >= 0 ? 0 : -1;
 }
 
+/* Trickle every candidate line in sdp; libjuice ignores duplicates. */
+static void trickle_candidates(struct nat_agent *a, const char *sdp)
+{
+	const char *line = sdp;
+	const char *nl;
+	size_t n;
+	char buf[256];
+
+	while (line && *line) {
+		nl = strchr(line, '\n');
+		n = nl ? (size_t)(nl - line) : strlen(line);
+		if (!strncmp(line, "a=candidate:", 12) && n < sizeof(buf)) {
+			memcpy(buf, line, n);
+			buf[n] = '\0';
+			juice_add_remote_candidate(a->agent, buf);
+		}
+		if (!nl)
+			break;
+		line = nl + 1;
+	}
+}
+
+/*
+ * The first call sets the peer's credentials and candidates. Later calls carry
+ * the same credentials but fresh candidates (multicast delivers them one source
+ * at a time); add those by trickle rather than replacing the description.
+ */
 int nat_set_remote_description(struct nat_agent *a, const char *sdp)
 {
-	return juice_set_remote_description(a->agent, sdp) == JUICE_ERR_SUCCESS ? 0 : -1;
+	if (!a->remote_set) {
+		if (juice_set_remote_description(a->agent, sdp) != JUICE_ERR_SUCCESS)
+			return -1;
+		a->remote_set = 1;
+		return 0;
+	}
+	trickle_candidates(a, sdp);
+	return 0;
 }
 
 int nat_send(struct nat_agent *a, const uint8_t *data, size_t len)
