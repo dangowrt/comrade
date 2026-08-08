@@ -8,7 +8,7 @@
 #include "candpack.h"
 
 static const char *sdp =
-	"a=ice-ufrag:62739d41\n"
+	"a=ice-ufrag:abcdef01\n"
 	"a=ice-pwd:0123456789abcdef0123456789abcdef\n"
 	"a=candidate:4 1 UDP 2116025599 2001:db8::279 51790 typ host\n"
 	"a=candidate:1 1 UDP 2114977791 192.168.0.2 51790 typ host\n"
@@ -42,7 +42,7 @@ static void for_dht_check(void)
 	assert(r > 0);
 
 	/* ufrag/pwd preserved (libjuice rejects a description lacking them). */
-	assert(strstr(out, "a=ice-ufrag:62739d41\n"));
+	assert(strstr(out, "a=ice-ufrag:abcdef01\n"));
 	assert(strstr(out, "a=ice-pwd:0123456789abcdef0123456789abcdef\n"));
 
 	/* Global v6 host, public v4 srflx, AND the private v4 (RFC1918) that a
