@@ -245,7 +245,10 @@ static void drain(int s, sig_mcast_recv_cb *cb, void *arg)
 	char salt[MCAST_MAX_SALT + 1];
 
 	for (;;) {
-		ssize_t rc = recv(s, buf, sizeof(buf), 0);
+		struct sockaddr_storage src;
+		socklen_t srclen = sizeof(src);
+		ssize_t rc = recvfrom(s, buf, sizeof(buf), 0,
+				      (struct sockaddr *)&src, &srclen);
 		size_t salt_len, payload;
 
 		if (rc <= MCAST_MAGIC_LEN + 1)
@@ -259,7 +262,8 @@ static void drain(int s, sig_mcast_recv_cb *cb, void *arg)
 		memcpy(salt, buf + MCAST_MAGIC_LEN + 1, salt_len);
 		salt[salt_len] = '\0';
 		payload = (size_t)rc - MCAST_MAGIC_LEN - 1 - salt_len;
-		cb(arg, salt, buf + MCAST_MAGIC_LEN + 1 + salt_len, payload);
+		cb(arg, salt, buf + MCAST_MAGIC_LEN + 1 + salt_len, payload,
+		   (struct sockaddr *)&src, srclen);
 	}
 }
 

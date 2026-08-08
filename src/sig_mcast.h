@@ -7,6 +7,7 @@
 #include <poll.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/socket.h>
 
 /*
  * Link-local multicast signalling transport for isolated LANs with no DHT
@@ -19,7 +20,8 @@
 struct sig_mcast;
 
 typedef void sig_mcast_recv_cb(void *arg, const char *salt,
-			       const uint8_t *data, size_t len);
+			       const uint8_t *data, size_t len,
+			       const struct sockaddr *src, socklen_t srclen);
 
 struct sig_mcast *sig_mcast_open(void);
 void sig_mcast_close(struct sig_mcast *m);

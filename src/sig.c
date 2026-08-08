@@ -36,8 +36,10 @@ struct sig {
 	struct sig_mcast *mc;
 	int mcast_delivered;
 
-	uint8_t mine[SIG_SEALED_MAX];	/* our slot value, sealed */
+	uint8_t mine[SIG_SEALED_MAX];	/* our slot value, sealed (DHT) */
 	size_t mine_len;
+	uint8_t mcast_mine[SIG_SEALED_MAX];	/* our announcement, sealed (mcast) */
+	size_t mcast_mine_len;
 	int have_mine;
 
 	/* Last-seen container: each slot's sealed bytes (len 0 = absent). */
@@ -173,6 +175,17 @@ int sig_post(struct sig *s, const uint8_t *data, size_t len)
 	if (slen < 0)
 		return -1;
 	s->mine_len = (size_t)slen;
+
+	/* The multicast announcement carries only our credentials and port; the
+	 * peer reads our address from the packet source on the shared segment. */
+	plen = candpack_announce_encode(sdp, packed, sizeof(packed));
+	if (plen > 0) {
+		slen = msg_seal(s->mcast_mine, sizeof(s->mcast_mine),
+				s->keys.sig_key, packed, (size_t)plen);
+		if (slen > 0)
+			s->mcast_mine_len = (size_t)slen;
+	}
+
 	s->have_mine = 1;
 	s->need_write = 1;
 	s->next_put_ms = 0;
@@ -342,8 +355,32 @@ static void on_dht_get(void *arg, const uint8_t *v, size_t v_len, int64_t seq,
 	}
 }
 
+/*
+ * Open a multicast announcement and deliver the peer's description, its one
+ * host candidate reconstructed from the packet source. Re-announcements repeat
+ * the same candidate; libjuice de-duplicates it, so no dedup is needed here.
+ */
+static void deliver_peer_mcast(struct sig *s, const uint8_t *sealed, size_t len,
+			       const struct sockaddr *src, socklen_t srclen)
+{
+	uint8_t plain[SIG_MAX_VALUE];
+	char sdp[SIG_SDP_MAX];
+	int n = msg_open(plain, sizeof(plain), s->keys.sig_key, sealed, len);
+	int slen;
+
+	if (n < 0)
+		return;
+	slen = candpack_announce_decode(plain, (size_t)n, src, srclen, sdp,
+					sizeof(sdp));
+	if (slen < 0)
+		return;
+	if (s->cb)
+		s->cb(s->arg, (const uint8_t *)sdp, (size_t)slen);
+}
+
 static void on_mcast_recv(void *arg, const char *salt, const uint8_t *data,
-			  size_t len)
+			  size_t len, const struct sockaddr *src,
+			  socklen_t srclen)
 {
 	struct sig *s = arg;
 	char ps[2];
@@ -351,7 +388,7 @@ static void on_mcast_recv(void *arg, const char *salt, const uint8_t *data,
 	ps[0] = peer_slot(s);
 	ps[1] = '\0';
 	if (!strcmp(salt, ps)) {
-		deliver_peer(s, data, len);
+		deliver_peer_mcast(s, data, len, src, srclen);
 		s->mcast_delivered = 1;
 	}
 }
@@ -440,11 +477,11 @@ static void mcast_pump(struct sig *s, uint64_t now)
 {
 	char ms[2];
 
-	if (!s->have_mine || now < s->next_mcast_ms)
+	if (!s->have_mine || !s->mcast_mine_len || now < s->next_mcast_ms)
 		return;
 	ms[0] = my_slot(s);
 	ms[1] = '\0';
-	sig_mcast_send(s->mc, ms, s->mine, s->mine_len);
+	sig_mcast_send(s->mc, ms, s->mcast_mine, s->mcast_mine_len);
 	s->next_mcast_ms = now + SIG_MCAST_ANN_MS;
 }
 

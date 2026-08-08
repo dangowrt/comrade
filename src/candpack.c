@@ -3,6 +3,7 @@
 
 #define _GNU_SOURCE
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -182,6 +183,86 @@ int candpack_encode(const char *sdp, int for_dht, uint8_t *out, size_t max)
 
 	out[ncand_off] = (uint8_t)ncand;
 	return (int)o;
+}
+
+int candpack_announce_encode(const char *sdp, uint8_t *out, size_t max)
+{
+	char ufrag[257], pwd[257], line[512];
+	const char *p = sdp;
+	int port = -1, ul, pl;
+	size_t o = 0;
+
+	ufrag[0] = '\0';
+	pwd[0] = '\0';
+	while (next_line(&p, line, sizeof(line))) {
+		char f[33], tr[8], addr[64], ty[16];
+		int comp, pt;
+		unsigned prio;
+
+		cred_value(line, "a=ice-ufrag:", ufrag, sizeof(ufrag));
+		cred_value(line, "a=ice-pwd:", pwd, sizeof(pwd));
+		if (port < 0 && !strncmp(line, "a=candidate:", 12) &&
+		    sscanf(line + 12, "%32s %d %7s %u %63s %d typ %15s", f,
+			   &comp, tr, &prio, addr, &pt, ty) >= 7 &&
+		    pt > 0 && pt <= 65535)
+			port = pt;
+	}
+	if (!ufrag[0] || !pwd[0] || port < 0)
+		return 0;
+	ul = (int)strlen(ufrag);
+	pl = (int)strlen(pwd);
+	if (max < (size_t)(1 + 1 + ul + 1 + pl + 2))
+		return -1;
+	out[o++] = CANDPACK_VERSION;
+	out[o++] = (uint8_t)ul;
+	memcpy(out + o, ufrag, (size_t)ul);
+	o += (size_t)ul;
+	out[o++] = (uint8_t)pl;
+	memcpy(out + o, pwd, (size_t)pl);
+	o += (size_t)pl;
+	out[o++] = (uint8_t)((port >> 8) & 0xff);
+	out[o++] = (uint8_t)(port & 0xff);
+	return (int)o;
+}
+
+int candpack_announce_decode(const uint8_t *in, size_t in_len,
+			     const struct sockaddr *src, socklen_t srclen,
+			     char *out, size_t max)
+{
+	char ufrag[257], pwd[257], host[128];
+	size_t i = 0;
+	int ul, pl, port, r;
+
+	if (in_len < 1 || in[i++] != CANDPACK_VERSION)
+		return -1;
+	if (i >= in_len)
+		return -1;
+	ul = in[i++];
+	if (i + (size_t)ul >= in_len)
+		return -1;
+	memcpy(ufrag, in + i, (size_t)ul);
+	ufrag[ul] = '\0';
+	i += (size_t)ul;
+	pl = in[i++];
+	if (i + (size_t)pl + 2 > in_len)
+		return -1;
+	memcpy(pwd, in + i, (size_t)pl);
+	pwd[pl] = '\0';
+	i += (size_t)pl;
+	port = (in[i] << 8) | in[i + 1];
+
+	/* The address is the packet source; getnameinfo keeps the zone id a
+	 * link-local address needs, and libjuice resolves it with getaddrinfo. */
+	if (getnameinfo(src, srclen, host, sizeof(host), NULL, 0, NI_NUMERICHOST))
+		return -1;
+
+	r = snprintf(out, max,
+		     "a=ice-ufrag:%s\na=ice-pwd:%s\n"
+		     "a=candidate:0 1 UDP 2130706431 %s %d typ host\n",
+		     ufrag, pwd, host, port);
+	if (r < 0 || (size_t)r >= max)
+		return -1;
+	return r;
 }
 
 int candpack_decode(const uint8_t *in, size_t in_len, char *out, size_t max)
