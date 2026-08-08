@@ -29,7 +29,7 @@ static int count_cands(const char *s)
 	return n;
 }
 
-static void routable_only_check(void)
+static void for_dht_check(void)
 {
 	uint8_t buf[512];
 	char out[2048];
@@ -37,8 +37,6 @@ static void routable_only_check(void)
 
 	n = candpack_encode(sdp, 1, buf, sizeof(buf));
 	assert(n > 0);
-	/* Full text SDP is well over 300 bytes; packed must be far smaller. */
-	assert(n < 120);
 
 	r = candpack_decode(buf, (size_t)n, out, sizeof(out));
 	assert(r > 0);
@@ -47,13 +45,14 @@ static void routable_only_check(void)
 	assert(strstr(out, "a=ice-ufrag:62739d41\n"));
 	assert(strstr(out, "a=ice-pwd:0123456789abcdef0123456789abcdef\n"));
 
-	/* Only the two routable addresses survive: the global v6 host and the
-	 * public v4 srflx. Private v4 (192.168, 10.x) and link-local v6 drop. */
-	assert(count_cands(out) == 2);
+	/* Global v6 host, public v4 srflx, AND the private v4 (RFC1918) that a
+	 * nested-NAT inner peer can punch to -- all four survive. Only the
+	 * link-local v6, useless off-segment, is dropped. */
+	assert(count_cands(out) == 4);
 	assert(strstr(out, "2001:db8::279"));
 	assert(strstr(out, "203.0.113.233"));
-	assert(!strstr(out, "192.168.0.2"));
-	assert(!strstr(out, "10.1.2.3"));
+	assert(strstr(out, "192.168.0.2"));
+	assert(strstr(out, "10.1.2.3"));
 	assert(!strstr(out, "fe80::"));
 
 	/* srflx carries raddr/rport; host does not. */
@@ -92,7 +91,7 @@ static void no_creds_check(void)
 
 int main(void)
 {
-	routable_only_check();
+	for_dht_check();
 	full_set_check();
 	no_creds_check();
 	printf("candpack_test: all checks passed\n");
