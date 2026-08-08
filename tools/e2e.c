@@ -2,6 +2,7 @@
 /* Copyright (C) 2026 Daniel Golle <daniel@makrotopia.org> */
 
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <poll.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -15,6 +16,7 @@
 #include "base64.h"
 #include "candpolicy.h"
 #include "keys.h"
+#include "lanlink.h"
 #include "nat.h"
 #include "sig.h"
 #include "sshbridge.h"
@@ -60,6 +62,7 @@ static struct {
 
 	struct sig *sig;
 	struct nat_agent *nat;
+	struct lanlink *lan;		/* direct link-local bypass (mcast) */
 	struct stream *stream;
 
 	char local_sdp[NAT_SDP_MAX];
@@ -258,6 +261,31 @@ static void on_nat_recv(void *arg, const uint8_t *data, size_t len)
 		stream_input(g.stream, data, len);
 }
 
+/* The direct link-local transport feeds the same stream; KCP de-duplicates a
+ * packet that also arrives over ICE, so both paths can run at once. */
+static void on_lan_recv(void *arg, const uint8_t *data, size_t len)
+{
+	(void)arg;
+	if (g.stream)
+		stream_input(g.stream, data, len);
+}
+
+/* A link-local announcement proved a clear layer-2 path; point the direct
+ * transport at the peer. ICE keeps running on the routable candidates. */
+static void on_direct_peer(void *arg, const struct sockaddr *peer, socklen_t len)
+{
+	char host[128], serv[32];
+
+	(void)arg;
+	if (!g.lan)
+		return;
+	lanlink_set_peer(g.lan, peer, len);
+	if (!getnameinfo(peer, len, host, sizeof(host), serv, sizeof(serv),
+			 NI_NUMERICHOST | NI_NUMERICSERV))
+		fprintf(stderr, "[e2e] link-local direct path to [%s]:%s\n",
+			host, serv);
+}
+
 static void on_nat_state(void *arg, int connected, int failed)
 {
 	(void)arg;
@@ -304,10 +332,22 @@ static void dump_sdp(const char *label, const char *sdp)
 	}
 }
 
+/*
+ * Prefer the link-local direct path whenever it is up. On a shared segment it
+ * is the most stable link available -- the address does not change, there is no
+ * NAT binding to expire and no STUN mapping to lose -- and its announcement
+ * already proved it works, so it is always the right choice over ICE. Fall back
+ * to ICE only when there is no link-local peer. (Both paths are still received
+ * from, so the peer's own choice of path is honoured and KCP de-duplicates.)
+ */
 static int on_stream_output(void *arg, const uint8_t *data, size_t len)
 {
 	(void)arg;
-	return nat_send(g.nat, data, len);
+	if (g.lan && lanlink_have_peer(g.lan))
+		return lanlink_send(g.lan, data, len);
+	if (g.nat && nat_connected(g.nat))
+		return nat_send(g.nat, data, len);
+	return -1;
 }
 
 /*
@@ -405,14 +445,18 @@ static int nat_setup(void)
 
 static void pump_once(int timeout_cap_ms)
 {
-	struct pollfd fds[4];
-	int timeout, nfds;
+	struct pollfd fds[6];
+	int timeout, nfds, lnf = 0;
 
-	nfds = sig_prepare(g.sig, fds, 4, &timeout);
+	nfds = sig_prepare(g.sig, fds, 5, &timeout);
+	if (g.lan)
+		lnf = lanlink_prepare(g.lan, fds + nfds, 6 - nfds, &timeout);
 	if (timeout > timeout_cap_ms)
 		timeout = timeout_cap_ms;
-	poll(fds, (nfds_t)nfds, timeout);
+	poll(fds, (nfds_t)(nfds + lnf), timeout);
 	sig_dispatch(g.sig, fds, nfds);
+	if (g.lan)
+		lanlink_dispatch(g.lan, fds + nfds, lnf);
 }
 
 static void *ssh_srv_thread(void *p)
@@ -488,17 +532,23 @@ static int run_ssh(void)
 
 	while (!done && now_ms() < deadline) {
 		struct pollfd fds[8];
-		int timeout, nfds;
+		int timeout, nfds, lnf = 0, bidx;
 
-		nfds = sig_prepare(g.sig, fds, 6, &timeout);
+		nfds = sig_prepare(g.sig, fds, 5, &timeout);
+		if (g.lan)
+			lnf = lanlink_prepare(g.lan, fds + nfds, 8 - nfds - 1,
+					      &timeout);
 		if (timeout < 0 || timeout > 10)
 			timeout = 10;
-		fds[nfds].fd = sshbridge_fd(br);
-		fds[nfds].events = sshbridge_events(br);
-		fds[nfds].revents = 0;
-		poll(fds, (nfds_t)(nfds + 1), timeout);
+		bidx = nfds + lnf;
+		fds[bidx].fd = sshbridge_fd(br);
+		fds[bidx].events = sshbridge_events(br);
+		fds[bidx].revents = 0;
+		poll(fds, (nfds_t)(bidx + 1), timeout);
 		sig_dispatch(g.sig, fds, nfds);
-		if (sshbridge_pump(br, fds[nfds].revents, (uint32_t)now_ms()) < 0)
+		if (g.lan)
+			lanlink_dispatch(g.lan, fds + nfds, lnf);
+		if (sshbridge_pump(br, fds[bidx].revents, (uint32_t)now_ms()) < 0)
 			done = 1;
 	}
 
@@ -655,6 +705,18 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	sig_subscribe(g.sig, on_peer_offer, NULL);
+	/*
+	 * On a shared segment, stand up the direct link-local transport and let
+	 * sig announce its port and hand back the peer's link-local endpoint.
+	 * ICE still runs on the routable candidates; the two race.
+	 */
+	if (g.sig_flags & SIG_MCAST) {
+		g.lan = lanlink_create(on_lan_recv, NULL);
+		if (g.lan) {
+			sig_set_direct_port(g.sig, lanlink_port(g.lan));
+			sig_subscribe_direct(g.sig, on_direct_peer, NULL);
+		}
+	}
 	if (!g.role_a) {
 		int seeded = client_seed_rendezvous();
 
@@ -734,7 +796,10 @@ int main(int argc, char **argv)
 			}
 			break;
 		case ST_WAIT_ICE:
-			if (nat_connected(g.nat)) {
+			/* A ready direct link-local path is as good as an ICE
+			 * connection -- both feed the same stream. */
+			if (nat_connected(g.nat) ||
+			    (g.lan && lanlink_have_peer(g.lan))) {
 				st = ST_RUN;
 				break;
 			}
@@ -792,6 +857,8 @@ int main(int argc, char **argv)
 		stream_destroy(g.stream);
 	if (g.nat)
 		nat_destroy(g.nat);
+	if (g.lan)
+		lanlink_destroy(g.lan);
 	if (g.hostkey)
 		sshd_hostkey_free(g.hostkey);
 	sig_destroy(g.sig);
