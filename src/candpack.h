@@ -33,17 +33,4 @@ int candpack_encode(const char *sdp, int for_dht, uint8_t *out, size_t max);
  * max). Returns string length, or -1 on error. */
 int candpack_decode(const uint8_t *in, size_t in_len, char *out, size_t max);
 
-/*
- * Multicast announcement codec. On a shared segment a peer's address is the
- * packet source, so the announcement carries only the ICE credentials and
- * port, never an address. encode packs ufrag/pwd + the (identity-pinned) port
- * from the local description; decode rebuilds a description with one host
- * candidate at (src address, announced port), keeping the zone id link-local
- * needs. Returns bytes/length written, -1 on error, 0 if nothing to announce.
- */
-int candpack_announce_encode(const char *sdp, uint8_t *out, size_t max);
-int candpack_announce_decode(const uint8_t *in, size_t in_len,
-			     const struct sockaddr *src, socklen_t srclen,
-			     char *out, size_t max);
-
 #endif

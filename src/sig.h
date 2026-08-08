@@ -55,6 +55,19 @@ int sig_post(struct sig *s, const uint8_t *data, size_t len);
 int sig_subscribe(struct sig *s, sig_recv_cb *cb, void *arg);
 
 /*
+ * Link-local direct bypass (multicast only). Our own direct-transport port is
+ * carried in the announcement; when the peer's announcement arrives from a
+ * link-local source -- proving a clear layer-2 path that needs no ICE -- cb
+ * fires with the peer's endpoint (that source address, keeping its zone id,
+ * and the announced direct port). ICE still runs on the routable candidates in
+ * the same announcement; the two race and whichever carries KCP first wins.
+ */
+typedef void sig_direct_cb(void *arg, const struct sockaddr *peer,
+			   socklen_t len);
+void sig_set_direct_port(struct sig *s, uint16_t port);
+int sig_subscribe_direct(struct sig *s, sig_direct_cb *cb, void *arg);
+
+/*
  * Rendezvous acceleration.
  *
  * sig_seed_node (client): plant a token's rendezvous node as a sticky DHT

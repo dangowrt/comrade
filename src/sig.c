@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 /* Copyright (C) 2026 Daniel Golle <daniel@makrotopia.org> */
 
+#include <netinet/in.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -53,6 +54,9 @@ struct sig {
 
 	sig_recv_cb *cb;
 	void *arg;
+	uint16_t direct_port;		/* our direct-transport port, announced */
+	sig_direct_cb *direct_cb;	/* fires on a link-local announcement */
+	void *direct_arg;
 	uint8_t last_peer[SIG_MAX_VALUE];
 	size_t last_peer_len;
 	int have_last;
@@ -159,6 +163,7 @@ int sig_post(struct sig *s, const uint8_t *data, size_t len)
 {
 	char sdp[SIG_SDP_MAX];
 	uint8_t packed[SIG_MAX_VALUE];
+	uint8_t mc[2 + SIG_MAX_VALUE];
 	int plen, slen;
 
 	/* Pack for the DHT slot: global and shared-private (nested-NAT) reachable
@@ -176,15 +181,19 @@ int sig_post(struct sig *s, const uint8_t *data, size_t len)
 		return -1;
 	s->mine_len = (size_t)slen;
 
-	/* The multicast announcement carries only our credentials and port; the
-	 * peer reads our address from the packet source on the shared segment. */
-	plen = candpack_announce_encode(sdp, packed, sizeof(packed));
-	if (plen > 0) {
-		slen = msg_seal(s->mcast_mine, sizeof(s->mcast_mine),
-				s->keys.sig_key, packed, (size_t)plen);
-		if (slen > 0)
-			s->mcast_mine_len = (size_t)slen;
-	}
+	/*
+	 * The multicast announcement is the same routable candpack for ICE, with
+	 * our direct-transport port prepended. On a shared segment the peer takes
+	 * our address from the packet source; the port lets it reach our direct
+	 * transport for the link-local bypass.
+	 */
+	mc[0] = (uint8_t)(s->direct_port >> 8);
+	mc[1] = (uint8_t)s->direct_port;
+	memcpy(mc + 2, packed, (size_t)plen);
+	slen = msg_seal(s->mcast_mine, sizeof(s->mcast_mine), s->keys.sig_key,
+			mc, (size_t)plen + 2);
+	if (slen > 0)
+		s->mcast_mine_len = (size_t)slen;
 
 	s->have_mine = 1;
 	s->need_write = 1;
@@ -197,6 +206,18 @@ int sig_subscribe(struct sig *s, sig_recv_cb *cb, void *arg)
 {
 	s->cb = cb;
 	s->arg = arg;
+	return 0;
+}
+
+void sig_set_direct_port(struct sig *s, uint16_t port)
+{
+	s->direct_port = port;
+}
+
+int sig_subscribe_direct(struct sig *s, sig_direct_cb *cb, void *arg)
+{
+	s->direct_cb = cb;
+	s->direct_arg = arg;
 	return 0;
 }
 
@@ -355,27 +376,55 @@ static void on_dht_get(void *arg, const uint8_t *v, size_t v_len, int64_t seq,
 	}
 }
 
+static int addr_is_link_local(const struct sockaddr *sa)
+{
+	if (sa->sa_family == AF_INET6) {
+		const struct sockaddr_in6 *s6 = (const struct sockaddr_in6 *)sa;
+
+		return IN6_IS_ADDR_LINKLOCAL(&s6->sin6_addr);
+	}
+	if (sa->sa_family == AF_INET) {
+		const struct sockaddr_in *s4 = (const struct sockaddr_in *)sa;
+		const uint8_t *b = (const uint8_t *)&s4->sin_addr;
+
+		return b[0] == 169 && b[1] == 254;
+	}
+	return 0;
+}
+
 /*
- * Open a multicast announcement and deliver the peer's description, its one
- * host candidate reconstructed from the packet source. Re-announcements repeat
- * the same candidate; libjuice de-duplicates it, so no dedup is needed here.
+ * Open a multicast announcement: the peer's direct port (2 bytes) followed by
+ * the routable candpack. Deliver the candidates to ICE as usual; and when the
+ * announcement arrived from a link-local source -- a clear layer-2 path libjuice
+ * will not touch -- hand the caller the peer's direct endpoint (that source,
+ * zone id kept, at the announced port) for the bypass.
  */
 static void deliver_peer_mcast(struct sig *s, const uint8_t *sealed, size_t len,
 			       const struct sockaddr *src, socklen_t srclen)
 {
-	uint8_t plain[SIG_MAX_VALUE];
+	uint8_t plain[2 + SIG_MAX_VALUE];
 	char sdp[SIG_SDP_MAX];
+	struct sockaddr_storage ep;
 	int n = msg_open(plain, sizeof(plain), s->keys.sig_key, sealed, len);
 	int slen;
+	uint16_t dport;
 
-	if (n < 0)
+	if (n < 3)
 		return;
-	slen = candpack_announce_decode(plain, (size_t)n, src, srclen, sdp,
-					sizeof(sdp));
-	if (slen < 0)
-		return;
-	if (s->cb)
+	dport = (uint16_t)((plain[0] << 8) | plain[1]);
+	slen = candpack_decode(plain + 2, (size_t)n - 2, sdp, sizeof(sdp));
+	if (slen >= 0 && s->cb)
 		s->cb(s->arg, (const uint8_t *)sdp, (size_t)slen);
+
+	if (s->direct_cb && dport && addr_is_link_local(src) &&
+	    (size_t)srclen <= sizeof(ep)) {
+		memcpy(&ep, src, srclen);
+		if (ep.ss_family == AF_INET6)
+			((struct sockaddr_in6 *)&ep)->sin6_port = htons(dport);
+		else
+			((struct sockaddr_in *)&ep)->sin_port = htons(dport);
+		s->direct_cb(s->direct_arg, (struct sockaddr *)&ep, srclen);
+	}
 }
 
 static void on_mcast_recv(void *arg, const char *salt, const uint8_t *data,
