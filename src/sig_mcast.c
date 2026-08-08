@@ -27,6 +27,8 @@ struct sig_mcast {
 	int s4;
 	int s6;
 	unsigned ifidx[MCAST_MAX_IF];
+	uint8_t ifhas4[MCAST_MAX_IF];	/* interface carries a v4 address */
+	uint8_t ifhas6[MCAST_MAX_IF];	/* interface carries a v6 address */
 	int nif;
 };
 
@@ -41,24 +43,41 @@ static void set_nonblock(int s)
 static void collect_ifaces(struct sig_mcast *m)
 {
 	struct ifaddrs *ifa, *p;
+	unsigned idx;
+	int i, slot, fam;
 
 	if (getifaddrs(&ifa))
 		return;
-	for (p = ifa; p && m->nif < MCAST_MAX_IF; p = p->ifa_next) {
-		unsigned idx;
-		int i, dup = 0;
-
+	/* One getifaddrs entry per interface address, so an interface appears
+	 * once per family. Record, per interface, which families it carries, so
+	 * a send never goes out a family the interface lacks (its source would
+	 * be the unspecified address). */
+	for (p = ifa; p; p = p->ifa_next) {
+		if (!p->ifa_addr)
+			continue;
 		if (!(p->ifa_flags & IFF_UP) || !(p->ifa_flags & IFF_MULTICAST) ||
 		    (p->ifa_flags & IFF_LOOPBACK))
+			continue;
+		fam = p->ifa_addr->sa_family;
+		if (fam != AF_INET && fam != AF_INET6)
 			continue;
 		idx = if_nametoindex(p->ifa_name);
 		if (!idx)
 			continue;
+		slot = -1;
 		for (i = 0; i < m->nif; i++)
 			if (m->ifidx[i] == idx)
-				dup = 1;
-		if (!dup)
-			m->ifidx[m->nif++] = idx;
+				slot = i;
+		if (slot < 0) {
+			if (m->nif >= MCAST_MAX_IF)
+				continue;
+			slot = m->nif++;
+			m->ifidx[slot] = idx;
+		}
+		if (fam == AF_INET)
+			m->ifhas4[slot] = 1;
+		else
+			m->ifhas6[slot] = 1;
 	}
 	freeifaddrs(ifa);
 }
@@ -191,7 +210,7 @@ int sig_mcast_send(struct sig_mcast *m, const char *salt,
 	if (!n)
 		return -1;
 	for (i = 0; i < m->nif; i++) {
-		if (m->s4 >= 0) {
+		if (m->s4 >= 0 && m->ifhas4[i]) {
 			struct sockaddr_in d;
 			struct ip_mreqn mif;
 
@@ -205,7 +224,7 @@ int sig_mcast_send(struct sig_mcast *m, const char *salt,
 			if (sendto(m->s4, buf, n, 0, (struct sockaddr *)&d, sizeof(d)) > 0)
 				sent = 1;
 		}
-		if (m->s6 >= 0) {
+		if (m->s6 >= 0 && m->ifhas6[i]) {
 			struct sockaddr_in6 d;
 			unsigned idx = m->ifidx[i];
 
