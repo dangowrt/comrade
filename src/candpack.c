@@ -251,6 +251,24 @@ int candpack_announce_decode(const uint8_t *in, size_t in_len,
 	i += (size_t)pl;
 	port = (in[i] << 8) | in[i + 1];
 
+	/*
+	 * A peer that announces on a family it has no address for sends from the
+	 * unspecified address (0.0.0.0 or ::); that yields an unusable candidate,
+	 * so reject it rather than hand libjuice a bogus 0.0.0.0 host candidate.
+	 */
+	if (src->sa_family == AF_INET) {
+		if (((const struct sockaddr_in *)src)->sin_addr.s_addr == 0)
+			return -1;
+	} else if (src->sa_family == AF_INET6) {
+		static const uint8_t zero6[16] = { 0 };
+		const struct sockaddr_in6 *s6 = (const struct sockaddr_in6 *)src;
+
+		if (!memcmp(&s6->sin6_addr, zero6, 16))
+			return -1;
+	} else {
+		return -1;
+	}
+
 	/* The address is the packet source; getnameinfo keeps the zone id a
 	 * link-local address needs, and libjuice resolves it with getaddrinfo. */
 	if (getnameinfo(src, srclen, host, sizeof(host), NULL, 0, NI_NUMERICHOST))
