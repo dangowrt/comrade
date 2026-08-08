@@ -205,13 +205,33 @@ static int client_seed_rendezvous(void)
 
 /* Host: print the token once its rendezvous node is located, or after a
  * grace period without one (cold-DHT fallback). Called each loop iteration. */
-static void host_maybe_print_token(uint64_t now)
+static void print_token(void)
 {
 	char tokbuf[TOKEN_STR_LEN + 1];
+
+	if (token_encode(&g.tok, tokbuf, sizeof(tokbuf))) {
+		fprintf(stderr, "error: token_encode failed\n");
+		return;
+	}
+	printf("COMRADE TOKEN: %s\n", tokbuf);
+	fflush(stdout);
+	g.token_printed = 1;
+}
+
+static void host_maybe_print_token(uint64_t now)
+{
 	struct sockaddr_storage ss;
 	socklen_t sl = sizeof(ss);
 
-	if (g.token_printed || !g.locate_deadline)
+	if (g.token_printed)
+		return;
+	/* A mcast-only host has no DHT rendezvous node to embed; its token is
+	 * complete as soon as it is minted. */
+	if (!(g.sig_flags & SIG_DHT)) {
+		print_token();
+		return;
+	}
+	if (!g.locate_deadline)
 		return;			/* wait until the locate has started */
 	if (sig_located(g.sig, (struct sockaddr *)&ss, &sl)) {
 		token_set_rendezvous(&g.tok, (struct sockaddr *)&ss);
@@ -221,13 +241,7 @@ static void host_maybe_print_token(uint64_t now)
 	} else {
 		fprintf(stderr, "[e2e] no rendezvous node in time; token uses cold DHT\n");
 	}
-	if (token_encode(&g.tok, tokbuf, sizeof(tokbuf))) {
-		fprintf(stderr, "error: token_encode failed\n");
-		return;
-	}
-	printf("COMRADE TOKEN: %s\n", tokbuf);
-	fflush(stdout);
-	g.token_printed = 1;
+	print_token();
 }
 
 static void on_local_sdp(void *arg, const char *sdp)
@@ -253,6 +267,8 @@ static void on_nat_state(void *arg, int connected, int failed)
 
 static void on_peer_offer(void *arg, const uint8_t *data, size_t len)
 {
+	char filtered[NAT_SDP_MAX];
+
 	(void)arg;
 	if (len >= sizeof(g.peer_sdp))
 		len = sizeof(g.peer_sdp) - 1;
@@ -260,6 +276,15 @@ static void on_peer_offer(void *arg, const uint8_t *data, size_t len)
 	g.peer_sdp[len] = '\0';
 	g.have_peer_sdp = 1;
 	fprintf(stderr, "[e2e] peer offer received (%zu bytes)\n", len);
+	/*
+	 * The first description is set by the state machine; anything after it
+	 * is a fresh candidate arriving on its own (multicast announces one
+	 * source at a time), so trickle it into the already-primed agent.
+	 */
+	if (g.nat && g.remote_set) {
+		sdp_filter(g.peer_sdp, g.family, filtered, sizeof(filtered));
+		nat_set_remote_description(g.nat, filtered);
+	}
 }
 
 static void dump_sdp(const char *label, const char *sdp)
