@@ -12,8 +12,17 @@
 #include "sig.h"
 #endif
 
+/* CLI splash wordmark, ready for the interactive UX work. 7-bit ASCII. */
+static const char comrade_splash[] =
+" ______ _______ _______ ______ _______ _____  _______\n"
+"|      |       |   |   |   __ \\   _   |     \\|    ___|\n"
+"|   ---|   -   |       |      <       |  --  |    ___|\n"
+"|______|_______|__|_|__|___|__|___|___|_____/|_______|\n"
+"-=[ no server ]=--=[ no relay ]=--=[ just a punched p2p link ]=-\n";
+
 static int usage(int ret)
 {
+	(void)comrade_splash;
 	fprintf(stderr,
 		"usage: comrade            start a shared session\n"
 		"       comrade <token>    connect to a shared session\n"
