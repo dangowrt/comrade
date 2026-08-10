@@ -81,7 +81,9 @@ int sig_subscribe_direct(struct sig *s, sig_direct_cb *cb, void *arg);
  */
 int sig_seed_node(struct sig *s, const struct sockaddr *sa, socklen_t len);
 int sig_locate(struct sig *s);
-int sig_located(struct sig *s, struct sockaddr *out, socklen_t *out_len);
+/* The located rendezvous node for `family` (4 or 6), if one has been captured. */
+int sig_located(struct sig *s, int family, struct sockaddr *out,
+		socklen_t *out_len);
 
 /* The up, multicast-capable interfaces this signaller services (view only). */
 int sig_link_ifaces(struct sig *s, struct sig_mcast_if *out, int max);

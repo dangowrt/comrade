@@ -30,6 +30,13 @@
  * catches an agent that neither connects nor fails.
  */
 #define ICE_ATTEMPT_MS 90000
+/*
+ * Once the first rendezvous node is located, wait this long for the other
+ * reachable family before minting anyway, so a dual-stack host mints a
+ * both-family token when it can, without a family that never converges
+ * holding the invite back.
+ */
+#define RDV_MINT_GRACE_MS 8000
 
 enum state {
 	ST_WAIT_DHT,
@@ -62,7 +69,10 @@ struct sess {
 
 	uint64_t ice_attempt_start;
 	int ice_attempt;
-	int rendezvous_announced;
+	int expect4, expect6;		/* host has DHT reach on this family */
+	int minted4, minted6;		/* family's rendezvous node is in the token */
+	int mcast_minted;		/* multicast-only: token published */
+	uint64_t first_rnode_ms;	/* when the first family was located */
 
 	uint64_t start_ms;		/* observer: session start, for escalation */
 	int escalated;			/* observer: client warned of DHT warm */
@@ -476,32 +486,84 @@ static int run_ssh(struct sess *s)
 	return s->ssh_cli_rc;
 }
 
-/* Host: advertise the rendezvous once, via the located DHT node or (multicast
- * only) immediately, so the caller can publish the token. */
+/* Note which DHT families this host can reach, from its own candidates: any v4
+ * candidate implies the v4 DHT (reachable outbound, NAT or not); a v6 one needs
+ * global scope, since the v6 DHT is not reachable from a ULA or link-local. */
+static void update_expect(struct sess *s)
+{
+	const char *p = s->local_sdp;
+	char addr[64];
+
+	while ((p = strstr(p, "a=candidate:")) != NULL) {
+		if (sscanf(p, "a=candidate:%*s %*d %*s %*u %63s", addr) == 1) {
+			if (!strchr(addr, ':'))
+				s->expect4 = 1;
+			else if (addr_scope(addr) == NET_SCOPE_GLOBAL)
+				s->expect6 = 1;
+		}
+		p += 12;
+	}
+}
+
+/*
+ * Host rendezvous minting. Each family's node is located independently; report
+ * both to the view as they arrive, and embed a family in the token the moment
+ * it is ready. Hold the token until every reachable family is located (v4+v6 is
+ * ideal, so a v4-only peer and a v6-only peer can both reach), but never past
+ * the grace, so one slow family cannot block a usable single-family invite. A
+ * family found after minting upgrades the token in place.
+ */
 static void maybe_announce_rendezvous(struct sess *s)
 {
-	struct sockaddr_storage ss;
-	socklen_t sl = sizeof(ss);
+	const struct session_obs *o = s->cfg->obs;
+	struct sockaddr_storage a4, a6;
+	socklen_t l4 = sizeof(a4), l6 = sizeof(a6);
+	int have4, have6, all, grace;
 
-	if (!s->cfg->is_host || s->rendezvous_announced || !s->cfg->on_rendezvous)
+	if (!s->cfg->is_host || !s->cfg->on_rendezvous)
 		return;
-	if (!(s->cfg->sig_flags & SIG_DHT)) {
-		s->cfg->on_rendezvous(s->cfg->arg, NULL, 0);
-		s->rendezvous_announced = 1;
+	if (!(s->cfg->sig_flags & SIG_DHT)) {		/* nothing to locate */
+		if (!s->mcast_minted) {
+			s->cfg->on_rendezvous(s->cfg->arg, NULL, 0);
+			s->mcast_minted = 1;
+		}
 		return;
 	}
-	if (sig_located(s->sig, (struct sockaddr *)&ss, &sl)) {
-		const struct session_obs *o = s->cfg->obs;
 
-		if (o && o->rendezvous) {
-			char b[80];
+	update_expect(s);
+	have4 = sig_located(s->sig, 4, (struct sockaddr *)&a4, &l4);
+	have6 = sig_located(s->sig, 6, (struct sockaddr *)&a6, &l6);
 
-			addr_str((struct sockaddr *)&ss, b, sizeof(b));
-			o->rendezvous(o->arg,
-				      ss.ss_family == AF_INET6 ? 6 : 4, b, 1);
+	if (o && o->rendezvous) {			/* fill the view's rows */
+		char b[80];
+
+		if (have4) {
+			addr_str((struct sockaddr *)&a4, b, sizeof(b));
+			o->rendezvous(o->arg, 4, b, 1);
 		}
-		s->cfg->on_rendezvous(s->cfg->arg, (struct sockaddr *)&ss, sl);
-		s->rendezvous_announced = 1;
+		if (have6) {
+			addr_str((struct sockaddr *)&a6, b, sizeof(b));
+			o->rendezvous(o->arg, 6, b, 1);
+		}
+	}
+
+	if (!have4 && !have6)
+		return;
+	if (!s->first_rnode_ms)
+		s->first_rnode_ms = now_ms();
+
+	all = (!s->expect4 || have4) && (!s->expect6 || have6);
+	grace = now_ms() - s->first_rnode_ms > RDV_MINT_GRACE_MS;
+	if (!all && !grace)
+		return;
+
+	if (have4 && !s->minted4) {
+		s->cfg->on_rendezvous(s->cfg->arg, (struct sockaddr *)&a4, l4);
+		s->minted4 = 1;
+	}
+	if (have6 && !s->minted6) {
+		s->cfg->on_rendezvous(s->cfg->arg, (struct sockaddr *)&a6, l6);
+		s->minted6 = 1;
 	}
 }
 

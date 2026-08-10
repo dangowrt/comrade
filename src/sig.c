@@ -23,6 +23,9 @@
 					 * k-close nodes are being validated */
 #define SIG_MCAST_ANN_MS 1000
 #define SIG_DHT_GRACE_MS 2000
+#define SIG_LOCATE_BOTH_MS 20000	/* keep re-storing after the first family
+					 * is captured, so the second's DHT (once
+					 * converged) also gets the value to serve */
 
 struct sig {
 	unsigned flags;
@@ -63,8 +66,11 @@ struct sig {
 
 	int locate;
 	int put_inflight;		/* a convergent host store is running */
-	struct sockaddr_storage rnode;
-	socklen_t rnode_len;
+	struct sockaddr_storage rnode4;	/* rendezvous node per family: captured */
+	socklen_t rnode4_len;		/* independently as each family's DHT */
+	struct sockaddr_storage rnode6;	/* serves the value back */
+	socklen_t rnode6_len;
+	uint64_t first_locate_ms;	/* when the first family was captured */
 
 	uint64_t next_get_ms;
 	uint64_t next_put_ms;
@@ -236,12 +242,16 @@ int sig_locate(struct sig *s)
 	return 0;
 }
 
-int sig_located(struct sig *s, struct sockaddr *out, socklen_t *out_len)
+int sig_located(struct sig *s, int family, struct sockaddr *out,
+		socklen_t *out_len)
 {
-	if (!s->locate || !s->rnode_len || *out_len < s->rnode_len)
+	const struct sockaddr_storage *r = family == 6 ? &s->rnode6 : &s->rnode4;
+	socklen_t rl = family == 6 ? s->rnode6_len : s->rnode4_len;
+
+	if (!s->locate || !rl || *out_len < rl)
 		return 0;
-	memcpy(out, &s->rnode, s->rnode_len);
-	*out_len = s->rnode_len;
+	memcpy(out, r, rl);
+	*out_len = rl;
 	return 1;
 }
 
@@ -372,14 +382,28 @@ static void on_dht_get(void *arg, const uint8_t *v, size_t v_len, int64_t seq,
 	/*
 	 * The value is signature-checked as ours, so the node that served it is
 	 * a validated, responsive, k-close rendezvous point. Keep the first
-	 * (fastest) and pin it: it goes in the token, and from now the host
-	 * reads the client's reply straight from it, no convergence.
+	 * (fastest) of EACH family and pin it: a dual-stack client may live
+	 * behind only one family, so both go in the token. The v4 and v6 DHTs
+	 * converge independently, so capturing per family here -- rather than
+	 * the first node of any family -- lets both be found within one session.
 	 */
-	if (s->locate && !s->rnode_len && node && node_len &&
-	    (size_t)node_len <= sizeof(s->rnode)) {
-		memcpy(&s->rnode, node, node_len);
-		s->rnode_len = node_len;
-		bep44_pin_add(s->engine, NULL, node, node_len);
+	if (s->locate && node && node_len && (size_t)node_len <= sizeof(s->rnode4)) {
+		int captured = 0;
+
+		if (node->sa_family == AF_INET6 && !s->rnode6_len) {
+			memcpy(&s->rnode6, node, node_len);
+			s->rnode6_len = node_len;
+			captured = 1;
+		} else if (node->sa_family == AF_INET && !s->rnode4_len) {
+			memcpy(&s->rnode4, node, node_len);
+			s->rnode4_len = node_len;
+			captured = 1;
+		}
+		if (captured) {
+			bep44_pin_add(s->engine, NULL, node, node_len);
+			if (!s->first_locate_ms)
+				s->first_locate_ms = now_ms();
+		}
 	}
 }
 
@@ -505,11 +529,18 @@ static void dht_pump(struct sig *s, uint64_t now)
 		return;
 	if (s->is_host) {
 		/*
-		 * One convergent store places the mailbox on the k-closest
-		 * nodes (idiomatic and discoverable) and yields the rendezvous
-		 * node for the token. It runs once, until that node is captured.
+		 * The convergent store places the mailbox on the k-closest
+		 * nodes (idiomatic and discoverable) and yields a rendezvous
+		 * node per family for the token. It repeats until both families
+		 * are captured -- the v6 DHT often converges later than the v4,
+		 * so an early store may miss its k-closest nodes -- but stops a
+		 * bounded time after the first, so a single-family host does not
+		 * re-store forever chasing a family it cannot reach.
 		 */
-		if (s->have_mine && !s->rnode_len && !s->put_inflight) {
+		if (s->have_mine && (!s->rnode4_len || !s->rnode6_len) &&
+		    (!s->first_locate_ms ||
+		     now - s->first_locate_ms < SIG_LOCATE_BOTH_MS) &&
+		    !s->put_inflight) {
 			s->put_inflight = 1;
 			bep44_update(s->engine, s->keys.bep44_sk,
 				     s->keys.bep44_pk, SIG_SALT, mailbox_merge,

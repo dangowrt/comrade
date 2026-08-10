@@ -106,12 +106,21 @@ static void bootstrap_resolve(struct dhtnode *n)
 				&hints, &res))
 			continue;
 		for (ai = res; ai; ai = ai->ai_next) {
-			if (ai->ai_family == AF_INET && n->s4 >= 0)
+			if (ai->ai_family == AF_INET && n->s4 >= 0) {
 				dht_ping_node(ai->ai_addr, ai->ai_addrlen);
-			else if (ai->ai_family == AF_INET6 && n->s6 >= 0)
+			} else if (ai->ai_family == AF_INET6 && n->s6 >= 0) {
+				const struct sockaddr_in6 *a6 =
+					(const struct sockaddr_in6 *)ai->ai_addr;
+
+				/* A v4-only router's AAAA is a v4-mapped address,
+				 * not a real v6 node; adding it only pollutes the
+				 * (small) v6 bootstrap set and slows convergence. */
+				if (IN6_IS_ADDR_V4MAPPED(&a6->sin6_addr))
+					continue;
 				dht_ping_node(ai->ai_addr, ai->ai_addrlen);
-			else
+			} else {
 				continue;
+			}
 			/*
 			 * Seed the bep44 engine from the same routers, so its
 			 * lookups have responsive entry points at once and warm
