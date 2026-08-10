@@ -17,6 +17,41 @@
  * connect+SSH core the e2e test harness and the product CLI both build on.
  */
 
+/*
+ * MVC seam. session_run is the controller: it drives the model (sig/nat/...)
+ * and publishes semantic progress here, knowing nothing about how -- or
+ * whether -- it is drawn. A view (src/ui.c) subscribes; the e2e harness passes
+ * none. Every field is optional; a NULL callback is simply skipped.
+ */
+enum {					/* net path kinds for obs.net */
+	SESSION_NET_DIRECT,		/* locally gathered host candidate */
+	SESSION_NET_STUN,		/* server-reflexive, learnt via STUN */
+	SESSION_NET_LINK		/* link-local multicast segment */
+};
+enum {					/* peer lifecycle for obs.peer */
+	SESSION_PEER_SEEN,		/* mailbox read: peer endpoints known */
+	SESSION_PEER_PUNCHING,		/* negotiating a path */
+	SESSION_PEER_LIVE		/* a path carries the session */
+};
+
+struct session_obs {
+	void *arg;
+	/* A local network path became available (family: 4 or 6). */
+	void (*net)(void *arg, int kind, int family, const char *addr);
+	/* A per-family rendezvous node: located (host) or seeded (client). */
+	void (*rendezvous)(void *arg, int family, const char *addr, int ready);
+	/* The invite token is minted and ready to share (host). */
+	void (*token)(void *arg, const char *token_str);
+	/* The peer advanced to `state` (SESSION_PEER_*); addr may be "". */
+	void (*peer)(void *arg, int state, const char *addr);
+	/* The client had to fall back from a seeded node to a full DHT warm. */
+	void (*escalate)(void *arg, const char *why);
+	/* A path is up and the session is about to seize the terminal. */
+	void (*established)(void *arg);
+	/* Periodic heartbeat, ~10/s: advance spinners, repaint. */
+	void (*tick)(void *arg);
+};
+
 struct session_cfg {
 	int is_host;
 	struct token tok;		/* rdv/auth/hostpub, and (client) the
@@ -41,6 +76,9 @@ struct session_cfg {
 	 */
 	void (*on_rendezvous)(void *arg, const struct sockaddr *sa, socklen_t len);
 	void *arg;
+
+	/* Progress observer (the view); NULL for a headless run. */
+	const struct session_obs *obs;
 
 	/* Client only. */
 	int interactive;		/* bridge the local terminal */

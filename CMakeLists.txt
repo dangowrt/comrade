@@ -151,13 +151,18 @@ if(COMRADE_HAVE_SIG AND COMRADE_HAVE_NAT AND COMRADE_HAVE_STREAM AND COMRADE_HAV
 	target_link_libraries(comrade_session PUBLIC
 		comrade_sig comrade_nat comrade_lanlink comrade_stream comrade_ssh
 		comrade_bridge comrade_token comrade_crypto)
+
+	# The view: the only module that draws to the terminal (MVC).
+	add_library(comrade_ui STATIC src/ui.c)
+	target_include_directories(comrade_ui PUBLIC src)
+	target_link_libraries(comrade_ui PUBLIC comrade_token)
 endif()
 
 add_library(comrade_host STATIC src/host.c)
 target_include_directories(comrade_host PUBLIC src)
 target_link_libraries(comrade_host PUBLIC comrade_token)
 if(COMRADE_HAVE_SESSION)
-	target_link_libraries(comrade_host PUBLIC comrade_session)
+	target_link_libraries(comrade_host PUBLIC comrade_session comrade_ui)
 	target_compile_definitions(comrade_host PRIVATE COMRADE_HAVE_SESSION=1)
 endif()
 
@@ -167,7 +172,7 @@ target_link_libraries(comrade
 	comrade_token
 )
 if(COMRADE_HAVE_SESSION)
-	target_link_libraries(comrade comrade_session)
+	target_link_libraries(comrade comrade_session comrade_ui)
 	target_compile_definitions(comrade PRIVATE COMRADE_HAVE_SESSION=1)
 endif()
 

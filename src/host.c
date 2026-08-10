@@ -7,8 +7,9 @@
 
 #ifndef COMRADE_HAVE_SESSION
 
-int host_run(void)
+int host_run(int ui_mode)
 {
+	(void)ui_mode;
 	fprintf(stderr, "comrade: built without the session stack\n");
 	return 1;
 }
@@ -25,6 +26,7 @@ int host_show(void)
 #include <dirent.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -38,14 +40,17 @@ int host_show(void)
 #include "sig.h"
 #include "sshd.h"
 #include "token.h"
+#include "ui.h"
 
 /*
  * The host is tmate-like. It runs a private, randomly-named tmux server so
- * concurrent comrade hosts never collide on a session, and so a remote client can
- * never reach the operator's own tmux. A backgrounded connection service
+ * concurrent comrade hosts never collide on a session, and so a remote client
+ * can never reach the operator's own tmux. A backgrounded connection service
  * (setsid, so it outlives the foreground) serves that session over the punched
- * link and records the current token; the foreground prints the token and
- * attaches. Detaching leaves the service running; `comrade` again re-attaches a
+ * link and records the current token; because that service is detached from
+ * the terminal, it streams its progress to the foreground over a pipe, where
+ * the view (src/ui.c) renders the dashboard and waits for the operator to
+ * enter. Detaching leaves the service running; `comrade` again re-attaches a
  * live session, and a session ends when its tmux server dies.
  */
 
@@ -55,6 +60,7 @@ struct svc {
 	struct token tok;
 	char sock[512];
 	char tokfile[512];
+	struct session_obs obs;		/* view-event emitter to the foreground */
 };
 
 /* Per-user runtime directory for comrade session state; created if absent. */
@@ -209,17 +215,19 @@ static void on_rendezvous(void *arg, const struct sockaddr *sa, socklen_t len)
 		dprintf(fd, "%s\n", tokbuf);
 		close(fd);
 	}
+	ui_emitter_token(&v->obs, tokbuf);	/* show it in the foreground */
 }
 
 /* The backgrounded connection service: serve the shared tmux over the punched
  * link, again after each client, until the tmux server is gone. */
-static void run_service(struct svc *v, void *hostkey)
+static void run_service(struct svc *v, void *hostkey, int wfd)
 {
 	char cmd[600];
 	struct session_cfg cfg;
 	int devnull;
 
 	setsid();
+	signal(SIGPIPE, SIG_IGN);	/* foreground may exec away mid-session */
 	devnull = open("/dev/null", O_RDWR);
 	if (devnull >= 0) {
 		dup2(devnull, STDIN_FILENO);
@@ -229,6 +237,8 @@ static void run_service(struct svc *v, void *hostkey)
 			close(devnull);
 	}
 	snprintf(cmd, sizeof(cmd), "tmux -S %s attach -t comrade", v->sock);
+
+	ui_emitter(&v->obs, wfd);	/* progress -> the foreground view */
 
 	memset(&cfg, 0, sizeof(cfg));
 	cfg.is_host = 1;
@@ -243,6 +253,7 @@ static void run_service(struct svc *v, void *hostkey)
 	cfg.use_pty = 1;
 	cfg.on_rendezvous = on_rendezvous;
 	cfg.arg = v;
+	cfg.obs = &v->obs;
 
 	while (tmux_alive(v->sock))
 		session_run(&cfg);
@@ -250,13 +261,14 @@ static void run_service(struct svc *v, void *hostkey)
 	_exit(0);
 }
 
-static int start_new(void)
+static int start_new(int ui_mode)
 {
 	struct svc v;
 	char id[ID_LEN + 1];
 	void *hostkey;
+	struct ui *ui;
 	pid_t pid;
-	int waited;
+	int pfd[2], enter;
 
 	memset(&v, 0, sizeof(v));
 	gen_id(id);
@@ -283,52 +295,43 @@ static int start_new(void)
 		}
 	}
 
+	/* Close-on-exec so neither the tmux we exec into nor the service's tmux
+	 * helpers inherit the pipe; the service ignores the resulting SIGPIPE. */
+	if (pipe(pfd)) {
+		fprintf(stderr, "comrade: pipe failed\n");
+		return 1;
+	}
+	fcntl(pfd[0], F_SETFD, FD_CLOEXEC);
+	fcntl(pfd[1], F_SETFD, FD_CLOEXEC);
+
 	pid = fork();
 	if (pid < 0) {
 		fprintf(stderr, "comrade: fork failed\n");
 		return 1;
 	}
-	if (pid == 0)
-		run_service(&v, hostkey);	/* never returns */
+	if (pid == 0) {
+		close(pfd[0]);
+		run_service(&v, hostkey, pfd[1]);	/* never returns */
+	}
+	close(pfd[1]);
 	sshd_hostkey_free(hostkey);		/* the service has its own copy */
 
-	/* Wait for the service to publish and record the token, then show it and
-	 * pause: attaching hands the terminal to tmux, which clears the screen,
-	 * so the token must be seen and copied before we attach. */
-	printf("comrade: establishing the session rendezvous...\n");
-	fflush(stdout);
-	for (waited = 0; waited < 600; waited++) {
-		char tok[TOKEN_STR_LEN + 8];
-		FILE *f = fopen(v.tokfile, "r");
+	/* The view renders the service's progress and blocks until the operator
+	 * enters (playing the zap) or the service exits. */
+	ui = ui_create(UI_ROLE_HOST, ui_mode);
+	enter = ui ? ui_host_wait(ui, pfd[0]) : 0;
+	ui_destroy(ui);
+	close(pfd[0]);
 
-		if (f) {
-			if (fgets(tok, sizeof(tok), f))
-				printf("\n  Share this token to invite a peer:\n\n"
-				       "    %s\n", tok);
-			fclose(f);
-			break;
-		}
-		usleep(100000);
+	if (!enter) {
+		fprintf(stderr, "comrade: session ended before you entered "
+			"(token: `comrade show`)\n");
+		return 1;
 	}
-	if (waited >= 600) {
-		fprintf(stderr,
-			"comrade: rendezvous not ready; get the token later with "
-			"`comrade show`\n");
-	} else if (isatty(STDIN_FILENO)) {
-		int c;
-
-		printf("\n  (re-show it any time with `comrade show`)\n"
-		       "  Press Enter to enter the shared session... ");
-		fflush(stdout);
-		while ((c = getchar()) != '\n' && c != EOF)
-			;
-	}
-
-	fflush(stdout);				/* exec does not flush stdio */
 	return attach(id);			/* foreground; execs tmux */
 }
 
-int host_run(void)
+int host_run(int ui_mode)
 {
 	char id[ID_LEN + 1];
 
@@ -337,7 +340,7 @@ int host_run(void)
 			" (its token: `comrade show`)\n");
 		return attach(id);
 	}
-	return start_new();
+	return start_new(ui_mode);
 }
 
 int host_show(void)

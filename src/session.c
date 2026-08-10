@@ -64,6 +64,12 @@ struct sess {
 	int ice_attempt;
 	int rendezvous_announced;
 
+	uint64_t start_ms;		/* observer: session start, for escalation */
+	int net_reported;		/* observer: local paths published once */
+	int escalated;			/* observer: client warned of DHT warm */
+	int peer_state;			/* observer: highest SESSION_PEER_* sent */
+	int established_fired;		/* observer: established sent once */
+
 	int ssh_fd;			/* the ssh thread's socketpair end */
 	int ssh_cli_rc;
 };
@@ -74,6 +80,67 @@ static uint64_t now_ms(void)
 
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return (uint64_t)ts.tv_sec * 1000 + (uint64_t)(ts.tv_nsec / 1000000);
+}
+
+/* "addr:port" of a sockaddr into out. */
+static void addr_str(const struct sockaddr *sa, char *out, size_t n)
+{
+	char host[64];
+
+	out[0] = '\0';
+	if (sa->sa_family == AF_INET6) {
+		const struct sockaddr_in6 *a = (const struct sockaddr_in6 *)sa;
+
+		if (inet_ntop(AF_INET6, &a->sin6_addr, host, sizeof(host)))
+			snprintf(out, n, "%s:%u", host, ntohs(a->sin6_port));
+	} else if (sa->sa_family == AF_INET) {
+		const struct sockaddr_in *a = (const struct sockaddr_in *)sa;
+
+		if (inet_ntop(AF_INET, &a->sin_addr, host, sizeof(host)))
+			snprintf(out, n, "%s:%u", host, ntohs(a->sin_port));
+	}
+}
+
+/* First candidate address in an SDP into out; 1 if found. */
+static int sdp_first_addr(const char *sdp, char *out, size_t n)
+{
+	const char *p = strstr(sdp, "a=candidate:");
+	char addr[64];
+
+	if (!p)
+		return 0;
+	if (sscanf(p, "a=candidate:%*s %*d %*s %*u %63s", addr) != 1)
+		return 0;
+	snprintf(out, n, "%s", addr);
+	return 1;
+}
+
+/* Publish each local ICE candidate to the observer as a net path (once). */
+static void obs_report_net(struct sess *s)
+{
+	const struct session_obs *o = s->cfg->obs;
+	const char *p = s->local_sdp;
+
+	if (!o || !o->net)
+		return;
+	while ((p = strstr(p, "a=candidate:")) != NULL) {
+		char addr[64], typ[16];
+		int kind;
+
+		if (sscanf(p, "a=candidate:%*s %*d %*s %*u %63s %*d typ %15s",
+			   addr, typ) == 2) {
+			if (!strcmp(typ, "host"))
+				kind = SESSION_NET_DIRECT;
+			else if (!strcmp(typ, "srflx"))
+				kind = SESSION_NET_STUN;
+			else
+				kind = -1;
+			if (kind >= 0)
+				o->net(o->arg, kind,
+				       strchr(addr, ':') ? 6 : 4, addr);
+		}
+		p += 12;
+	}
 }
 
 /* Keep only candidate lines of the requested family (0 = all). */
@@ -88,6 +155,7 @@ static void sdp_filter(const char *in, int family, char *out, size_t outlen)
 /* Plant the token's rendezvous node(s) as sticky DHT hints (client). */
 static int client_seed_rendezvous(struct sess *s)
 {
+	const struct session_obs *o = s->cfg->obs;
 	const struct token *t = &s->cfg->tok;
 	int n = 0;
 
@@ -98,8 +166,15 @@ static int client_seed_rendezvous(struct sess *s)
 		a.sin6_family = AF_INET6;
 		memcpy(&a.sin6_addr, t->ep6_addr, TOKEN_EP6_LEN);
 		a.sin6_port = htons(t->ep6_port);
-		if (!sig_seed_node(s->sig, (struct sockaddr *)&a, sizeof(a)))
+		if (!sig_seed_node(s->sig, (struct sockaddr *)&a, sizeof(a))) {
 			n++;
+			if (o && o->rendezvous) {
+				char b[80];
+
+				addr_str((struct sockaddr *)&a, b, sizeof(b));
+				o->rendezvous(o->arg, 6, b, 0);
+			}
+		}
 	}
 	if (t->flags & TOKEN_FLAG_EP4_RDV) {
 		struct sockaddr_in a;
@@ -108,8 +183,15 @@ static int client_seed_rendezvous(struct sess *s)
 		a.sin_family = AF_INET;
 		memcpy(&a.sin_addr, t->ep4_addr, TOKEN_EP4_LEN);
 		a.sin_port = htons(t->ep4_port);
-		if (!sig_seed_node(s->sig, (struct sockaddr *)&a, sizeof(a)))
+		if (!sig_seed_node(s->sig, (struct sockaddr *)&a, sizeof(a))) {
 			n++;
+			if (o && o->rendezvous) {
+				char b[80];
+
+				addr_str((struct sockaddr *)&a, b, sizeof(b));
+				o->rendezvous(o->arg, 4, b, 0);
+			}
+		}
 	}
 	return n;
 }
@@ -378,6 +460,15 @@ static void maybe_announce_rendezvous(struct sess *s)
 		return;
 	}
 	if (sig_located(s->sig, (struct sockaddr *)&ss, &sl)) {
+		const struct session_obs *o = s->cfg->obs;
+
+		if (o && o->rendezvous) {
+			char b[80];
+
+			addr_str((struct sockaddr *)&ss, b, sizeof(b));
+			o->rendezvous(o->arg,
+				      ss.ss_family == AF_INET6 ? 6 : 4, b, 1);
+		}
 		s->cfg->on_rendezvous(s->cfg->arg, (struct sockaddr *)&ss, sl);
 		s->rendezvous_announced = 1;
 	}
@@ -423,18 +514,42 @@ int session_run(const struct session_cfg *cfg)
 		if (s.lan) {
 			sig_set_direct_port(s.sig, lanlink_port(s.lan));
 			sig_subscribe_direct(s.sig, on_direct_peer, &s);
+			if (cfg->obs && cfg->obs->net)
+				cfg->obs->net(cfg->obs->arg, SESSION_NET_LINK,
+					      0, "link-local multicast");
 		}
 	}
 	if (!cfg->is_host)
 		client_seed_rendezvous(&s);
 
-	deadline = now_ms() + (uint64_t)cfg->connect_timeout_s * 1000;
+	s.start_ms = now_ms();
+	deadline = s.start_ms + (uint64_t)cfg->connect_timeout_s * 1000;
 
 	while (st != ST_DONE && st != ST_FAIL && now_ms() < deadline) {
 		char filtered[NAT_SDP_MAX];
+		const struct session_obs *o = cfg->obs;
 
 		pump_once(&s, 100);
 		maybe_announce_rendezvous(&s);
+		if (o) {
+			if (o->tick)
+				o->tick(o->arg);
+			if (o->escalate && !cfg->is_host && !s.escalated &&
+			    st == ST_WAIT_DHT && now_ms() - s.start_ms > 3000) {
+				o->escalate(o->arg, "rendezvous node quiet -- "
+					    "warming the full DHT");
+				s.escalated = 1;
+			}
+			if (o->peer && s.have_peer_sdp &&
+			    s.peer_state < SESSION_PEER_SEEN) {
+				char b[64];
+
+				b[0] = '\0';
+				sdp_first_addr(s.peer_sdp, b, sizeof(b));
+				o->peer(o->arg, SESSION_PEER_SEEN, b);
+				s.peer_state = SESSION_PEER_SEEN;
+			}
+		}
 
 		switch (st) {
 		case ST_WAIT_DHT:
@@ -451,6 +566,10 @@ int session_run(const struct session_cfg *cfg)
 					   sizeof(filtered));
 				strncpy(s.local_sdp, filtered,
 					sizeof(s.local_sdp) - 1);
+				if (!s.net_reported) {
+					obs_report_net(&s);
+					s.net_reported = 1;
+				}
 				sig_post(s.sig, (const uint8_t *)s.local_sdp,
 					 strlen(s.local_sdp));
 				if (cfg->is_host && (cfg->sig_flags & SIG_DHT))
@@ -468,12 +587,22 @@ int session_run(const struct session_cfg *cfg)
 				}
 				s.remote_set = 1;
 				s.ice_attempt_start = now_ms();
+				if (o && o->peer &&
+				    s.peer_state < SESSION_PEER_PUNCHING) {
+					o->peer(o->arg, SESSION_PEER_PUNCHING, "");
+					s.peer_state = SESSION_PEER_PUNCHING;
+				}
 				st = ST_WAIT_ICE;
 			}
 			break;
 		case ST_WAIT_ICE:
 			if (nat_connected(s.nat) ||
 			    (s.lan && lanlink_have_peer(s.lan))) {
+				if (o && o->peer &&
+				    s.peer_state < SESSION_PEER_LIVE) {
+					o->peer(o->arg, SESSION_PEER_LIVE, "");
+					s.peer_state = SESSION_PEER_LIVE;
+				}
 				st = ST_RUN;
 				break;
 			}
@@ -489,6 +618,10 @@ int session_run(const struct session_cfg *cfg)
 			}
 			break;
 		case ST_RUN:
+			if (o && o->established && !s.established_fired) {
+				o->established(o->arg);
+				s.established_fired = 1;
+			}
 			if (run_ssh(&s) == 0) {
 				st = ST_DONE;
 			} else if (now_ms() + 10000 < deadline) {

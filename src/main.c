@@ -6,9 +6,9 @@
 
 #include "host.h"
 #include "token.h"
+#include "ui.h"			/* UI_* enums used by main() in every build */
 
 #ifdef COMRADE_HAVE_SESSION
-#include "session.h"
 #include "sig.h"
 #endif
 
@@ -30,10 +30,13 @@ static int usage(int ret)
 	return ret;
 }
 
-static int session_connect(const char *arg)
+static int session_connect(const char *arg, int ui_mode)
 {
 #ifdef COMRADE_HAVE_SESSION
 	struct session_cfg cfg;
+	struct session_obs obs;
+	struct ui *u;
+	int rc;
 
 	memset(&cfg, 0, sizeof(cfg));
 	if (token_decode(&cfg.tok, arg)) {
@@ -47,7 +50,14 @@ static int session_connect(const char *arg)
 	cfg.log_level = -1;
 	cfg.connect_timeout_s = 120;
 	cfg.interactive = 1;
-	if (session_run(&cfg)) {
+	u = ui_create(UI_ROLE_CLIENT, ui_mode);	/* the view drives the dashboard */
+	if (u) {
+		ui_bind(u, &obs);
+		cfg.obs = &obs;
+	}
+	rc = session_run(&cfg);
+	ui_destroy(u);
+	if (rc) {
 		fprintf(stderr, "comrade: could not connect to the session\n");
 		return 1;
 	}
@@ -55,6 +65,7 @@ static int session_connect(const char *arg)
 #else
 	struct token tok;
 
+	(void)ui_mode;
 	if (token_decode(&tok, arg))
 		fprintf(stderr, "comrade: invalid token\n");
 	fprintf(stderr, "comrade: built without the session stack\n");
@@ -64,14 +75,26 @@ static int session_connect(const char *arg)
 
 int main(int argc, char **argv)
 {
-	if (argc == 1)
-		return host_run();
-	if (argc != 2)
-		return usage(1);
-	if (!strcmp(argv[1], "-h") || !strcmp(argv[1], "--help"))
-		return usage(0);
-	if (!strcmp(argv[1], "show"))
-		return host_show();
+	int ui_mode = UI_AUTO;
+	const char *pos = NULL;
+	int i;
 
-	return session_connect(argv[1]);
+	for (i = 1; i < argc; i++) {
+		if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help"))
+			return usage(0);
+		if (!strcmp(argv[i], "-v") || !strcmp(argv[i], "--verbose"))
+			ui_mode = UI_VERBOSE;
+		else if (argv[i][0] == '-')
+			return usage(1);
+		else if (!pos)
+			pos = argv[i];
+		else
+			return usage(1);
+	}
+
+	if (!pos)
+		return host_run(ui_mode);
+	if (!strcmp(pos, "show"))
+		return host_show();
+	return session_connect(pos, ui_mode);
 }
