@@ -292,24 +292,39 @@ static int start_new(void)
 		run_service(&v, hostkey);	/* never returns */
 	sshd_hostkey_free(hostkey);		/* the service has its own copy */
 
-	/* Wait for the service to publish and record the token, then show it. */
-	for (waited = 0; waited < 400; waited++) {
+	/* Wait for the service to publish and record the token, then show it and
+	 * pause: attaching hands the terminal to tmux, which clears the screen,
+	 * so the token must be seen and copied before we attach. */
+	printf("comrade: establishing the session rendezvous...\n");
+	fflush(stdout);
+	for (waited = 0; waited < 600; waited++) {
 		char tok[TOKEN_STR_LEN + 8];
 		FILE *f = fopen(v.tokfile, "r");
 
 		if (f) {
 			if (fgets(tok, sizeof(tok), f))
-				printf("comrade session token (share out of band):\n\n"
+				printf("\n  Share this token to invite a peer:\n\n"
 				       "    %s\n", tok);
 			fclose(f);
-			fflush(stdout);
 			break;
 		}
 		usleep(100000);
 	}
-	if (waited >= 400)
-		fprintf(stderr, "comrade: warning: no token yet; run `comrade show`\n");
+	if (waited >= 600) {
+		fprintf(stderr,
+			"comrade: rendezvous not ready; get the token later with "
+			"`comrade show`\n");
+	} else if (isatty(STDIN_FILENO)) {
+		int c;
 
+		printf("\n  (re-show it any time with `comrade show`)\n"
+		       "  Press Enter to enter the shared session... ");
+		fflush(stdout);
+		while ((c = getchar()) != '\n' && c != EOF)
+			;
+	}
+
+	fflush(stdout);				/* exec does not flush stdio */
 	return attach(id);			/* foreground; execs tmux */
 }
 
@@ -317,8 +332,11 @@ int host_run(void)
 {
 	char id[ID_LEN + 1];
 
-	if (find_live(id))
+	if (find_live(id)) {
+		fprintf(stderr, "comrade: re-attaching to your running session"
+			" (its token: `comrade show`)\n");
 		return attach(id);
+	}
 	return start_new();
 }
 
