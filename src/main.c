@@ -7,6 +7,11 @@
 #include "host.h"
 #include "token.h"
 
+#ifdef COMRADE_HAVE_SESSION
+#include "session.h"
+#include "sig.h"
+#endif
+
 static int usage(int ret)
 {
 	fprintf(stderr,
@@ -18,15 +23,34 @@ static int usage(int ret)
 
 static int session_connect(const char *arg)
 {
-	struct token tok;
+#ifdef COMRADE_HAVE_SESSION
+	struct session_cfg cfg;
 
-	if (token_decode(&tok, arg)) {
+	memset(&cfg, 0, sizeof(cfg));
+	if (token_decode(&cfg.tok, arg)) {
 		fprintf(stderr, "comrade: invalid token\n");
 		return 1;
 	}
+	/* Race the LAN (multicast) and the DHT: whichever reaches the host wins. */
+	cfg.sig_flags = SIG_DHT | SIG_MCAST;
+	cfg.stun_port = 3478;
+	cfg.stun_auto = 1;
+	cfg.log_level = -1;
+	cfg.connect_timeout_s = 120;
+	cfg.interactive = 1;
+	if (session_run(&cfg)) {
+		fprintf(stderr, "comrade: could not connect to the session\n");
+		return 1;
+	}
+	return 0;
+#else
+	struct token tok;
 
-	fprintf(stderr, "comrade: connecting is not implemented yet\n");
+	if (token_decode(&tok, arg))
+		fprintf(stderr, "comrade: invalid token\n");
+	fprintf(stderr, "comrade: built without the session stack\n");
 	return 1;
+#endif
 }
 
 int main(int argc, char **argv)

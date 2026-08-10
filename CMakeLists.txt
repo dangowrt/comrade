@@ -143,17 +143,32 @@ if(LIBSSH_FOUND)
 	endif()
 endif()
 
+set(COMRADE_HAVE_SESSION 0)
+if(COMRADE_HAVE_SIG AND COMRADE_HAVE_NAT AND COMRADE_HAVE_STREAM AND COMRADE_HAVE_SSH)
+	set(COMRADE_HAVE_SESSION 1)
+	add_library(comrade_session STATIC src/session.c)
+	target_include_directories(comrade_session PUBLIC src)
+	target_link_libraries(comrade_session PUBLIC
+		comrade_sig comrade_nat comrade_lanlink comrade_stream comrade_ssh
+		comrade_bridge comrade_token comrade_crypto)
+endif()
+
 add_library(comrade_host STATIC src/host.c)
 target_include_directories(comrade_host PUBLIC src)
 target_link_libraries(comrade_host PUBLIC comrade_token)
+if(COMRADE_HAVE_SESSION)
+	target_link_libraries(comrade_host PUBLIC comrade_session)
+	target_compile_definitions(comrade_host PRIVATE COMRADE_HAVE_SESSION=1)
+endif()
 
 add_executable(comrade src/main.c)
 target_link_libraries(comrade
 	comrade_host
 	comrade_token
 )
-if(COMRADE_HAVE_SIG)
-	target_link_libraries(comrade comrade_sig)
+if(COMRADE_HAVE_SESSION)
+	target_link_libraries(comrade comrade_session)
+	target_compile_definitions(comrade PRIVATE COMRADE_HAVE_SESSION=1)
 endif()
 
 install(TARGETS comrade RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
