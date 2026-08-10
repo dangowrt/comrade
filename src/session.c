@@ -65,7 +65,6 @@ struct sess {
 	int rendezvous_announced;
 
 	uint64_t start_ms;		/* observer: session start, for escalation */
-	int net_reported;		/* observer: local paths published once */
 	int escalated;			/* observer: client warned of DHT warm */
 	int peer_state;			/* observer: highest SESSION_PEER_* sent */
 	int established_fired;		/* observer: established sent once */
@@ -115,7 +114,38 @@ static int sdp_first_addr(const char *sdp, char *out, size_t n)
 	return 1;
 }
 
-/* Publish each local ICE candidate to the observer as a net path (once). */
+/* Classify a bare address string by reachability scope. */
+static int addr_scope(const char *addr)
+{
+	unsigned char b[16];
+
+	if (strchr(addr, ':')) {
+		if (inet_pton(AF_INET6, addr, b) != 1)
+			return NET_SCOPE_GLOBAL;
+		if (b[0] == 0xfe && (b[1] & 0xc0) == 0x80)	/* fe80::/10 */
+			return NET_SCOPE_LAN;
+		if ((b[0] & 0xfe) == 0xfc)			/* fc00::/7 ULA */
+			return NET_SCOPE_LAN;
+		return NET_SCOPE_GLOBAL;
+	}
+	if (inet_pton(AF_INET, addr, b) != 1)
+		return NET_SCOPE_GLOBAL;
+	if (b[0] == 10 || (b[0] == 192 && b[1] == 168) ||
+	    (b[0] == 172 && b[1] >= 16 && b[1] <= 31) ||
+	    (b[0] == 169 && b[1] == 254))
+		return NET_SCOPE_LAN;
+	if (b[0] == 100 && b[1] >= 64 && b[1] <= 127)
+		return NET_SCOPE_CGNAT;
+	return NET_SCOPE_GLOBAL;
+}
+
+/*
+ * Publish each local ICE candidate to the observer, classified by scope (LAN /
+ * CGNAT / global) and how it was learnt (direct host candidate, or srflx via
+ * STUN). Re-run as candidates trickle in -- srflx arrive a round-trip after the
+ * host ones -- and let the view de-duplicate, so STUN paths and the NAT verdict
+ * they imply appear the moment they are known.
+ */
 static void obs_report_net(struct sess *s)
 {
 	const struct session_obs *o = s->cfg->obs;
@@ -125,19 +155,20 @@ static void obs_report_net(struct sess *s)
 		return;
 	while ((p = strstr(p, "a=candidate:")) != NULL) {
 		char addr[64], typ[16];
-		int kind;
+		int via, fam;
 
 		if (sscanf(p, "a=candidate:%*s %*d %*s %*u %63s %*d typ %15s",
 			   addr, typ) == 2) {
 			if (!strcmp(typ, "host"))
-				kind = SESSION_NET_DIRECT;
+				via = NET_VIA_DIRECT;
 			else if (!strcmp(typ, "srflx"))
-				kind = SESSION_NET_STUN;
+				via = NET_VIA_STUN;
 			else
-				kind = -1;
-			if (kind >= 0)
-				o->net(o->arg, kind,
-				       strchr(addr, ':') ? 6 : 4, addr);
+				via = -1;
+			if (via >= 0) {
+				fam = strchr(addr, ':') ? 6 : 4;
+				o->net(o->arg, fam, addr_scope(addr), via, addr);
+			}
 		}
 		p += 12;
 	}
@@ -514,9 +545,14 @@ int session_run(const struct session_cfg *cfg)
 		if (s.lan) {
 			sig_set_direct_port(s.sig, lanlink_port(s.lan));
 			sig_subscribe_direct(s.sig, on_direct_peer, &s);
-			if (cfg->obs && cfg->obs->net)
-				cfg->obs->net(cfg->obs->arg, SESSION_NET_LINK,
-					      0, "link-local multicast");
+			if (cfg->obs && cfg->obs->link) {
+				struct sig_mcast_if ifs[16];
+				int ni = sig_link_ifaces(s.sig, ifs, 16), k;
+
+				for (k = 0; k < ni; k++)
+					cfg->obs->link(cfg->obs->arg, ifs[k].name,
+						       ifs[k].has4, ifs[k].has6);
+			}
 		}
 	}
 	if (!cfg->is_host)
@@ -532,6 +568,8 @@ int session_run(const struct session_cfg *cfg)
 		pump_once(&s, 100);
 		maybe_announce_rendezvous(&s);
 		if (o) {
+			if (o->net && s.have_local_sdp)
+				obs_report_net(&s);	/* view de-dups */
 			if (o->tick)
 				o->tick(o->arg);
 			if (o->escalate && !cfg->is_host && !s.escalated &&
@@ -566,10 +604,6 @@ int session_run(const struct session_cfg *cfg)
 					   sizeof(filtered));
 				strncpy(s.local_sdp, filtered,
 					sizeof(s.local_sdp) - 1);
-				if (!s.net_reported) {
-					obs_report_net(&s);
-					s.net_reported = 1;
-				}
 				sig_post(s.sig, (const uint8_t *)s.local_sdp,
 					 strlen(s.local_sdp));
 				if (cfg->is_host && (cfg->sig_flags & SIG_DHT))

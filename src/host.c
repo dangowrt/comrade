@@ -261,6 +261,18 @@ static void run_service(struct svc *v, void *hostkey, int wfd)
 	_exit(0);
 }
 
+/* Abort path: stop the detached service and drop its tmux session and state. */
+static void teardown(pid_t svc, const char *sock, const char *tokfile)
+{
+	char *k[] = { "tmux", "-S", (char *)sock, "kill-server", NULL };
+
+	kill(svc, SIGTERM);
+	waitpid(svc, NULL, 0);
+	run_wait(k);
+	unlink(tokfile);
+	unlink(sock);
+}
+
 static int start_new(int ui_mode)
 {
 	struct svc v;
@@ -317,18 +329,22 @@ static int start_new(int ui_mode)
 	sshd_hostkey_free(hostkey);		/* the service has its own copy */
 
 	/* The view renders the service's progress and blocks until the operator
-	 * enters (playing the zap) or the service exits. */
+	 * enters (1, playing the zap), aborts (-1), or the service exits (0). */
 	ui = ui_create(UI_ROLE_HOST, ui_mode);
 	enter = ui ? ui_host_wait(ui, pfd[0]) : 0;
 	ui_destroy(ui);
 	close(pfd[0]);
 
-	if (!enter) {
-		fprintf(stderr, "comrade: session ended before you entered "
-			"(token: `comrade show`)\n");
-		return 1;
+	if (enter == 1)
+		return attach(id);		/* foreground; execs tmux */
+	if (enter < 0) {			/* operator aborted */
+		teardown(pid, v.sock, v.tokfile);
+		fprintf(stderr, "comrade: aborted.\n");
+		return 0;
 	}
-	return attach(id);			/* foreground; execs tmux */
+	fprintf(stderr, "comrade: session ended before you entered "
+		"(token: `comrade show`)\n");
+	return 1;
 }
 
 int host_run(int ui_mode)

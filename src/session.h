@@ -23,10 +23,14 @@
  * whether -- it is drawn. A view (src/ui.c) subscribes; the e2e harness passes
  * none. Every field is optional; a NULL callback is simply skipped.
  */
-enum {					/* net path kinds for obs.net */
-	SESSION_NET_DIRECT,		/* locally gathered host candidate */
-	SESSION_NET_STUN,		/* server-reflexive, learnt via STUN */
-	SESSION_NET_LINK		/* link-local multicast segment */
+enum {					/* address scope for obs.net */
+	NET_SCOPE_LAN,			/* RFC1918 / ULA / link-local */
+	NET_SCOPE_CGNAT,		/* 100.64/10 carrier-grade NAT */
+	NET_SCOPE_GLOBAL		/* globally routable */
+};
+enum {					/* how a path was learnt, for obs.net */
+	NET_VIA_DIRECT,			/* locally gathered host candidate */
+	NET_VIA_STUN			/* server-reflexive, learnt via STUN */
 };
 enum {					/* peer lifecycle for obs.peer */
 	SESSION_PEER_SEEN,		/* mailbox read: peer endpoints known */
@@ -36,8 +40,11 @@ enum {					/* peer lifecycle for obs.peer */
 
 struct session_obs {
 	void *arg;
-	/* A local network path became available (family: 4 or 6). */
-	void (*net)(void *arg, int kind, int family, const char *addr);
+	/* A local path (family 4/6), classified by scope and how it was learnt;
+	 * the pair fixes the label, e.g. GLOBAL+STUN is "global, behind NAT". */
+	void (*net)(void *arg, int family, int scope, int via, const char *addr);
+	/* An up multicast interface being serviced, and the families it has. */
+	void (*link)(void *arg, const char *ifname, int have4, int have6);
 	/* A per-family rendezvous node: located (host) or seeded (client). */
 	void (*rendezvous)(void *arg, int family, const char *addr, int ready);
 	/* The invite token is minted and ready to share (host). */

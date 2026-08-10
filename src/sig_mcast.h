@@ -19,12 +19,22 @@
 
 struct sig_mcast;
 
+/* An up, multicast-capable interface being serviced, and the families it has. */
+struct sig_mcast_if {
+	char name[32];
+	int has4;
+	int has6;
+};
+
 typedef void sig_mcast_recv_cb(void *arg, const char *salt,
 			       const uint8_t *data, size_t len,
 			       const struct sockaddr *src, socklen_t srclen);
 
 struct sig_mcast *sig_mcast_open(void);
 void sig_mcast_close(struct sig_mcast *m);
+
+/* Copy up to max serviced interfaces into out; returns how many. */
+int sig_mcast_ifaces(struct sig_mcast *m, struct sig_mcast_if *out, int max);
 
 int sig_mcast_prepare(struct sig_mcast *m, struct pollfd *fds, int maxfds);
 void sig_mcast_dispatch(struct sig_mcast *m, const struct pollfd *fds, int nfds,

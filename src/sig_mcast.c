@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <ifaddrs.h>
 #include <net/if.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -183,6 +184,21 @@ void sig_mcast_close(struct sig_mcast *m)
 	if (m->s6 >= 0)
 		close(m->s6);
 	free(m);
+}
+
+int sig_mcast_ifaces(struct sig_mcast *m, struct sig_mcast_if *out, int max)
+{
+	int i, n = 0;
+
+	for (i = 0; i < m->nif && n < max; i++) {
+		if (!if_indextoname(m->ifidx[i], out[n].name))
+			snprintf(out[n].name, sizeof(out[n].name), "if%u",
+				 m->ifidx[i]);
+		out[n].has4 = m->ifhas4[i];
+		out[n].has6 = m->ifhas6[i];
+		n++;
+	}
+	return n;
 }
 
 static size_t pkt_build(uint8_t *buf, size_t buflen, const char *salt,

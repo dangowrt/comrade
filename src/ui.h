@@ -39,8 +39,9 @@ void ui_emitter_token(const struct session_obs *obs, const char *token_str);
 
 /*
  * ui_host_wait: foreground side. Render events read from fd until the operator
- * commits to entering (ENTER/SPACE, which plays the zap) or the pipe closes.
- * Returns 1 if they chose to enter, 0 otherwise.
+ * acts. Returns 1 to enter (ENTER/SPACE, which plays the zap), -1 to abort
+ * (ESC / Ctrl-C / SIGTERM -- the caller tears the service down), or 0 if the
+ * pipe closed first. The terminal is restored on every path.
  */
 int ui_host_wait(struct ui *u, int fd);
 

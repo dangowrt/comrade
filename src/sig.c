@@ -245,6 +245,13 @@ int sig_located(struct sig *s, struct sockaddr *out, socklen_t *out_len)
 	return 1;
 }
 
+int sig_link_ifaces(struct sig *s, struct sig_mcast_if *out, int max)
+{
+	if (!s->mc)
+		return 0;
+	return sig_mcast_ifaces(s->mc, out, max);
+}
+
 /* Open the peer's sealed slot and deliver it once, de-duplicated. */
 static void deliver_peer(struct sig *s, const uint8_t *sealed, size_t len)
 {

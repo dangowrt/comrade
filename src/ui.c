@@ -11,6 +11,7 @@
  */
 
 #include <poll.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,6 +23,11 @@
 
 #include "ui.h"
 
+/* Set by SIGINT/SIGTERM while the host foreground waits, so it aborts cleanly
+ * (terminal restored, service torn down) instead of dying mid-raw-mode. */
+static volatile sig_atomic_t ui_abort_flag;
+static void ui_on_signal(int n) { (void)n; ui_abort_flag = 1; }
+
 #define RST "\033[0m"
 #define GRN "\033[32m"
 #define BGR "\033[92m"
@@ -32,7 +38,8 @@
 #define WHT "\033[97m"
 #define DIM "\033[90m"
 
-struct netrow { int kind; int family; char addr[80]; };
+struct netrow { int family; int scope; int via; char addr[80]; };
+struct linkrow { char name[32]; int has4, has6; };
 struct rdvrow { int family; int ready; char addr[80]; };
 struct peerrow { int state; char addr[80]; };
 
@@ -47,8 +54,10 @@ struct ui {
 	int dirty;
 	int cursor_hidden;
 
-	struct netrow net[8];
+	struct netrow net[12];
 	int nnet;
+	struct linkrow link[8];
+	int nlink;
 	struct rdvrow rdv[2];
 	int nrdv;
 	char token[256];
@@ -134,6 +143,24 @@ static const char *tag(int ready)
 	return ready ? BGR "[ ready ]" RST : YEL "[  ..  ]" RST;
 }
 
+/* Colour + text for a path's classification (scope crossed with how learnt). */
+static void net_label(int scope, int via, const char **color, const char **text)
+{
+	if (scope == NET_SCOPE_LAN) {
+		*color = DIM;
+		*text = "LAN";
+	} else if (scope == NET_SCOPE_CGNAT) {
+		*color = YEL;
+		*text = via == NET_VIA_STUN ? "CGNAT (NAT)" : "CGNAT";
+	} else if (via == NET_VIA_STUN) {
+		*color = BYE;
+		*text = "GLOBAL (NAT)";
+	} else {
+		*color = BGR;
+		*text = "GLOBAL (open)";
+	}
+}
+
 static void draw(struct ui *u)
 {
 	static const char spc[] = "|/-\\";
@@ -163,18 +190,23 @@ static void draw(struct ui *u)
 	line("");
 
 	line(CYN "NETWORK" RST);
-	if (!u->nnet)
+	if (!u->nnet && !u->nlink)
 		line(DIM "  probing ..." RST);
 	for (i = 0; i < u->nnet; i++) {
 		struct netrow *n = &u->net[i];
-		const char *lbl = n->kind == SESSION_NET_LINK ? "LINK" :
-				  n->family == 6 ? "IPv6" : "IPv4";
-		const char *desc = n->kind == SESSION_NET_DIRECT ? "direct" :
-				   n->kind == SESSION_NET_STUN ? "via STUN" :
-				   "multicast";
+		const char *col, *txt;
 
-		line("  " DIM "%s" RST "  " CYN "%-34s" RST DIM "%-10s" RST "%s",
-		     lbl, n->addr, desc, tag(1));
+		net_label(n->scope, n->via, &col, &txt);
+		line("  " DIM "%s" RST "  " CYN "%-40s" RST "%s%s" RST,
+		     n->family == 6 ? "IPv6" : "IPv4", n->addr, col, txt);
+	}
+	for (i = 0; i < u->nlink; i++) {
+		struct linkrow *l = &u->link[i];
+
+		line("  " DIM "LINK" RST "  " CYN "%-40s" RST DIM "multicast  "
+		     RST "%s%s", l->name,
+		     l->has4 ? BGR "v4 " RST : DIM "-- " RST,
+		     l->has6 ? BGR "v6" RST : DIM "--" RST);
 	}
 	line("");
 
@@ -197,12 +229,29 @@ static void draw(struct ui *u)
 	line("");
 
 	if (u->role == UI_ROLE_HOST) {
-		line(CYN "INVITE" RST DIM
-		     "  (share this line; v4-only and v6-only both work)" RST);
-		if (u->have_token)
+		int r4 = 0, r6 = 0, j;
+
+		for (j = 0; j < u->nrdv; j++)
+			if (u->rdv[j].ready) {
+				if (u->rdv[j].family == 4)
+					r4 = 1;
+				else
+					r6 = 1;
+			}
+		line(CYN "INVITE" RST);
+		if (u->have_token) {
 			line("  " WHT "$ comrade %s" RST, u->token);
-		else
-			line(DIM "  minting the invite ..." RST);
+			if (r4 && r6)
+				line("  " BGR "reachable over IPv4 and IPv6" RST);
+			else if (r4)
+				line("  " YEL "IPv4 only" RST DIM
+				     " -- IPv6-only peers cannot reach" RST);
+			else if (r6)
+				line("  " RED "! IPv6 only" RST DIM
+				     " -- IPv4-only peers cannot connect" RST);
+		} else {
+			line(DIM "  minting once a rendezvous node is ready ..." RST);
+		}
 		line("");
 
 		line(CYN "PEERS" RST);
@@ -305,26 +354,56 @@ static void zap(struct ui *u, int snow)
 
 /* ---- model updates (shared by the inline client and the host foreground) --- */
 
-static void um_net(struct ui *u, int kind, int family, const char *addr)
+static const char *scope_word(int scope, int via)
+{
+	if (scope == NET_SCOPE_LAN)
+		return "lan";
+	if (scope == NET_SCOPE_CGNAT)
+		return via == NET_VIA_STUN ? "cgnat-nat" : "cgnat";
+	return via == NET_VIA_STUN ? "global-nat" : "global-open";
+}
+
+static void um_net(struct ui *u, int family, int scope, int via, const char *addr)
 {
 	int i;
 
 	if (!u->anim) {
-		vlog(u, "net    %s %s %s", kind == SESSION_NET_LINK ? "link" :
-		     family == 6 ? "ipv6" : "ipv4", addr,
-		     kind == SESSION_NET_DIRECT ? "direct ready" :
-		     kind == SESSION_NET_STUN ? "via-stun ready" : "ready");
+		vlog(u, "net    %s %-40s %s", family == 6 ? "ipv6" : "ipv4",
+		     addr, scope_word(scope, via));
 		return;
 	}
-	for (i = 0; i < u->nnet; i++)
-		if (u->net[i].kind == kind && u->net[i].family == family &&
+	for (i = 0; i < u->nnet; i++)		/* de-dup trickled candidates */
+		if (u->net[i].family == family && u->net[i].via == via &&
 		    !strcmp(u->net[i].addr, addr))
 			return;
-	if (u->nnet < 8) {
-		u->net[u->nnet].kind = kind;
+	if (u->nnet < 12) {
 		u->net[u->nnet].family = family;
+		u->net[u->nnet].scope = scope;
+		u->net[u->nnet].via = via;
 		snprintf(u->net[u->nnet].addr, sizeof(u->net[0].addr), "%s", addr);
 		u->nnet++;
+		u->dirty = 1;
+	}
+}
+
+static void um_link(struct ui *u, const char *name, int has4, int has6)
+{
+	int i;
+
+	if (!u->anim) {
+		vlog(u, "link   %s %s%s%s", name, has4 ? "v4" : "",
+		     has4 && has6 ? "+" : "", has6 ? "v6" : "");
+		return;
+	}
+	for (i = 0; i < u->nlink; i++)
+		if (!strcmp(u->link[i].name, name))
+			return;
+	if (u->nlink < 8) {
+		snprintf(u->link[u->nlink].name, sizeof(u->link[0].name), "%s",
+			 name);
+		u->link[u->nlink].has4 = has4;
+		u->link[u->nlink].has6 = has6;
+		u->nlink++;
 		u->dirty = 1;
 	}
 }
@@ -411,7 +490,11 @@ static void um_live(struct ui *u)
 
 /* ---- observer callbacks (client inline; also reused by the foreground) ---- */
 
-static void cb_net(void *a, int k, int f, const char *ad) { um_net(a, k, f, ad); }
+static void cb_net(void *a, int f, int sc, int v, const char *ad)
+{
+	um_net(a, f, sc, v, ad);
+}
+static void cb_link(void *a, const char *n, int h4, int h6) { um_link(a, n, h4, h6); }
 static void cb_rdv(void *a, int f, const char *ad, int rd) { um_rdv(a, f, rd, ad); }
 static void cb_token(void *a, const char *t) { um_token(a, t); }
 static void cb_peer(void *a, int s, const char *ad) { um_peer(a, s, ad); }
@@ -448,6 +531,7 @@ void ui_bind(struct ui *u, struct session_obs *obs)
 	memset(obs, 0, sizeof(*obs));
 	obs->arg = u;
 	obs->net = cb_net;
+	obs->link = cb_link;
 	obs->rendezvous = cb_rdv;
 	obs->token = cb_token;
 	obs->peer = cb_peer;
@@ -458,9 +542,13 @@ void ui_bind(struct ui *u, struct session_obs *obs)
 
 /* ---- host service side: serialise events to the foreground pipe ---- */
 
-static void em_net(void *a, int k, int f, const char *ad)
+static void em_net(void *a, int f, int sc, int v, const char *ad)
 {
-	dprintf(((struct ui_emit *)a)->fd, "N %d %d %s\n", k, f, ad);
+	dprintf(((struct ui_emit *)a)->fd, "N %d %d %d %s\n", f, sc, v, ad);
+}
+static void em_link(void *a, const char *n, int h4, int h6)
+{
+	dprintf(((struct ui_emit *)a)->fd, "I %d %d %s\n", h4, h6, n);
 }
 static void em_rdv(void *a, int f, const char *ad, int rd)
 {
@@ -494,6 +582,7 @@ void ui_emitter(struct session_obs *obs, int fd)
 	e->fd = fd;
 	obs->arg = e;
 	obs->net = em_net;
+	obs->link = em_link;
 	obs->rendezvous = em_rdv;
 	obs->token = em_token;
 	obs->peer = em_peer;
@@ -512,13 +601,17 @@ void ui_emitter_token(const struct session_obs *obs, const char *token_str)
 
 static void feed(struct ui *u, char *ln)
 {
-	int a, b;
+	int a, b, c;
 	char s[160];
 
 	switch (ln[0]) {
 	case 'N':
-		if (sscanf(ln + 1, "%d %d %79[^\n]", &a, &b, s) == 3)
-			um_net(u, a, b, s);
+		if (sscanf(ln + 1, "%d %d %d %79[^\n]", &a, &b, &c, s) == 4)
+			um_net(u, a, b, c, s);
+		break;
+	case 'I':
+		if (sscanf(ln + 1, "%d %d %31[^\n]", &a, &b, s) == 3)
+			um_link(u, s, a, b);
 		break;
 	case 'R':
 		if (sscanf(ln + 1, "%d %d %79[^\n]", &a, &b, s) == 3)
@@ -575,7 +668,14 @@ static void raw_off(struct ui *u)
 int ui_host_wait(struct ui *u, int fd)
 {
 	char buf[1024];
-	int len = 0, enter = 0, eof = 0, stdin_ok = 1;
+	int len = 0, result = 0, eof = 0, stdin_ok = 1;
+	struct sigaction sa, oint, oterm;
+
+	ui_abort_flag = 0;
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = ui_on_signal;		/* no SA_RESTART: poll gets EINTR */
+	sigaction(SIGINT, &sa, &oint);
+	sigaction(SIGTERM, &sa, &oterm);
 
 	raw_on(u);
 	repaint(u);
@@ -590,6 +690,10 @@ int ui_host_wait(struct ui *u, int fd)
 		fds[1].revents = 0;
 		poll(fds, 2, 100);
 
+		if (ui_abort_flag) {		/* Ctrl-C / SIGTERM */
+			result = -1;
+			break;
+		}
 		/* POLLHUP without POLLIN signals the service closed the pipe. */
 		if (fds[0].revents & (POLLIN | POLLHUP | POLLERR)) {
 			int got = (int)read(fd, buf + len, sizeof(buf) - 1 - len);
@@ -613,11 +717,14 @@ int ui_host_wait(struct ui *u, int fd)
 			char c;
 			int got = (int)read(STDIN_FILENO, &c, 1);
 
-			if (got == 0)
+			if (got == 0) {
 				stdin_ok = 0;		/* EOF: stop watching it */
-			else if (got == 1 &&
-				 (c == '\r' || c == '\n' || c == ' ')) {
-				enter = 1;
+			} else if (got == 1 && c == 27) {	/* ESC */
+				result = -1;
+				break;
+			} else if (got == 1 &&
+				   (c == '\r' || c == '\n' || c == ' ')) {
+				result = 1;
 				break;
 			}
 		}
@@ -634,9 +741,15 @@ int ui_host_wait(struct ui *u, int fd)
 		}
 	}
 	raw_off(u);
-	if (enter)
+	sigaction(SIGINT, &oint, NULL);
+	sigaction(SIGTERM, &oterm, NULL);
+	if (result == 1) {
 		zap(u, 0);
-	return enter;
+	} else if (u->anim) {
+		fputs(RST "\033[2J\033[H", stdout);	/* clean screen on abort */
+		fflush(stdout);
+	}
+	return result;
 }
 
 /* ---- lifecycle ---- */
