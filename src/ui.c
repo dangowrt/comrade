@@ -143,8 +143,14 @@ static const char *tag(int ready)
 	return ready ? BGR "[ ready ]" RST : YEL "[  ..  ]" RST;
 }
 
-/* Colour + text for a path's classification (scope crossed with how learnt). */
-static void net_label(int scope, int via, const char **color, const char **text)
+/*
+ * Colour + text for a path's classification. A srflx global address means NAT
+ * only when the family has no direct global path; when it does (fam_open, e.g.
+ * a v6 host with a stable address plus a STUN-seen privacy address) the srflx
+ * is that reflexive/privacy source, not NAT.
+ */
+static void net_label(int scope, int via, int fam_open, const char **color,
+		      const char **text)
 {
 	if (scope == NET_SCOPE_LAN) {
 		*color = DIM;
@@ -152,12 +158,15 @@ static void net_label(int scope, int via, const char **color, const char **text)
 	} else if (scope == NET_SCOPE_CGNAT) {
 		*color = YEL;
 		*text = via == NET_VIA_STUN ? "CGNAT (NAT)" : "CGNAT";
-	} else if (via == NET_VIA_STUN) {
-		*color = BYE;
-		*text = "GLOBAL (NAT)";
-	} else {
+	} else if (via == NET_VIA_DIRECT) {
 		*color = BGR;
 		*text = "GLOBAL (open)";
+	} else if (fam_open) {
+		*color = CYN;
+		*text = "GLOBAL (via STUN)";
+	} else {
+		*color = BYE;
+		*text = "GLOBAL (NAT)";
 	}
 }
 
@@ -192,13 +201,26 @@ static void draw(struct ui *u)
 	line(CYN "NETWORK" RST);
 	if (!u->nnet && !u->nlink)
 		line(DIM "  probing ..." RST);
-	for (i = 0; i < u->nnet; i++) {
-		struct netrow *n = &u->net[i];
-		const char *col, *txt;
+	{
+		int open4 = 0, open6 = 0, j;	/* a direct global path per family */
 
-		net_label(n->scope, n->via, &col, &txt);
-		line("  " DIM "%s" RST "  " CYN "%-40s" RST "%s%s" RST,
-		     n->family == 6 ? "IPv6" : "IPv4", n->addr, col, txt);
+		for (j = 0; j < u->nnet; j++)
+			if (u->net[j].via == NET_VIA_DIRECT &&
+			    u->net[j].scope == NET_SCOPE_GLOBAL) {
+				if (u->net[j].family == 6)
+					open6 = 1;
+				else
+					open4 = 1;
+			}
+		for (i = 0; i < u->nnet; i++) {
+			struct netrow *n = &u->net[i];
+			const char *col, *txt;
+
+			net_label(n->scope, n->via, n->family == 6 ? open6 : open4,
+				  &col, &txt);
+			line("  " DIM "%s" RST "  " CYN "%-40s" RST "%s%s" RST,
+			     n->family == 6 ? "IPv6" : "IPv4", n->addr, col, txt);
+		}
 	}
 	for (i = 0; i < u->nlink; i++) {
 		struct linkrow *l = &u->link[i];

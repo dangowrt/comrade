@@ -346,6 +346,18 @@ out:
 	return rc;
 }
 
+/*
+ * Independent community STUN servers for stun_auto, rotated across re-gathers
+ * so one being down does not sink NAT discovery. No big-tech defaults.
+ * TODO: source the hourly-validated set from the always-online-stun project at
+ * build time rather than hardcoding.
+ */
+static const char *stun_auto_servers[] = {
+	"stun.nextcloud.com",
+	"stun.ipfire.org",
+	"stun.sipgate.net",
+};
+
 static int nat_setup(struct sess *s)
 {
 	static char bind_addr[64];
@@ -354,7 +366,13 @@ static int nat_setup(struct sess *s)
 	memset(&cfg, 0, sizeof(cfg));
 	cfg.stun_host = s->cfg->stun_host;
 	cfg.stun_port = s->cfg->stun_port;
-	if (!s->cfg->stun_host && !(s->cfg->sig_flags & SIG_MCAST)) {
+	if (!cfg.stun_host && s->cfg->stun_auto) {
+		int n = (int)(sizeof(stun_auto_servers) /
+			      sizeof(stun_auto_servers[0]));
+
+		cfg.stun_host = stun_auto_servers[s->ice_attempt % n];
+	}
+	if (!cfg.stun_host && !(s->cfg->sig_flags & SIG_MCAST)) {
 		int af = s->cfg->family == 4 ? AF_INET : AF_INET6;
 
 		if (!source_addr(af, bind_addr, sizeof(bind_addr)))
