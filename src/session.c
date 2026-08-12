@@ -230,6 +230,33 @@ static int client_seed_rendezvous(struct sess *s)
 	return n;
 }
 
+/* Host: if the token already carries rendezvous nodes -- a persisted anchor
+ * from a previous idle attempt -- adopt and reinforce them instead of locating
+ * fresh ones, so the shared token stays valid and the node does not churn. */
+static void host_seed_anchor(struct sess *s)
+{
+	const struct token *t = &s->cfg->tok;
+
+	if (t->flags & TOKEN_FLAG_EP6_RDV) {
+		struct sockaddr_in6 a;
+
+		memset(&a, 0, sizeof(a));
+		a.sin6_family = AF_INET6;
+		memcpy(&a.sin6_addr, t->ep6_addr, TOKEN_EP6_LEN);
+		a.sin6_port = htons(t->ep6_port);
+		sig_reinforce(s->sig, 6, (struct sockaddr *)&a, sizeof(a));
+	}
+	if (t->flags & TOKEN_FLAG_EP4_RDV) {
+		struct sockaddr_in a;
+
+		memset(&a, 0, sizeof(a));
+		a.sin_family = AF_INET;
+		memcpy(&a.sin_addr, t->ep4_addr, TOKEN_EP4_LEN);
+		a.sin_port = htons(t->ep4_port);
+		sig_reinforce(s->sig, 4, (struct sockaddr *)&a, sizeof(a));
+	}
+}
+
 /*
  * "v6 direct": a host reaches its own global v6 at the address the kernel
  * sources outbound from, which we learn without STUN via source_addr's connect
@@ -704,6 +731,8 @@ int session_run(const struct session_cfg *cfg)
 	}
 	if (!cfg->is_host)
 		client_seed_rendezvous(&s);
+	else
+		host_seed_anchor(&s);
 
 	s.start_ms = now_ms();
 	deadline = s.start_ms + (uint64_t)cfg->connect_timeout_s * 1000;

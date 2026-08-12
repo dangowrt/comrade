@@ -256,6 +256,29 @@ int sig_located(struct sig *s, int family, struct sockaddr *out,
 	return 1;
 }
 
+int sig_reinforce(struct sig *s, int family, const struct sockaddr *sa,
+		  socklen_t len)
+{
+	struct sockaddr_storage *r = family == 6 ? &s->rnode6 : &s->rnode4;
+	socklen_t *rl = family == 6 ? &s->rnode6_len : &s->rnode4_len;
+
+	if ((size_t)len > sizeof(*r))
+		return -1;
+	if (!s->dht_engaged && engage_dht(s))
+		return -1;
+	if (bep44_pin_add(s->engine, NULL, sa, len))
+		return -1;
+	memcpy(r, sa, len);		/* adopt it as the located rendezvous, ... */
+	*rl = len;
+	s->locate = 1;			/* ... so sig_located returns it and the get
+					 * never re-captures a different one. A
+					 * still-missing family is located as usual;
+					 * once none is missing, dht_pump reinforces. */
+	if (!s->first_locate_ms)	/* bound any locate of a missing family */
+		s->first_locate_ms = now_ms();
+	return 0;
+}
+
 int sig_link_ifaces(struct sig *s, struct sig_mcast_if *out, int max)
 {
 	if (!s->mc)
@@ -544,18 +567,20 @@ static void dht_pump(struct sig *s, uint64_t now)
 		return;
 	if (s->is_host) {
 		/*
-		 * The convergent store places the mailbox on the k-closest
-		 * nodes (idiomatic and discoverable) and yields a rendezvous
-		 * node per family for the token. It repeats until both families
-		 * are captured -- the v6 DHT often converges later than the v4,
-		 * so an early store may miss its k-closest nodes -- but stops a
-		 * bounded time after the first, so a single-family host does not
-		 * re-store forever chasing a family it cannot reach.
+		 * A reachable family with no anchor yet is still being located:
+		 * the convergent store places the mailbox on its k-closest nodes
+		 * (idiomatic and discoverable) and the validating get captures
+		 * one as the anchor. It repeats until that family is captured --
+		 * the v6 DHT converges later than v4, so an early store misses
+		 * its k-closest -- but stops a bounded time after the first
+		 * capture, so a single-family host does not chase a family it
+		 * cannot reach. An already-anchored family is never re-located.
 		 */
-		if (s->have_mine && (!s->rnode4_len || !s->rnode6_len) &&
-		    (!s->first_locate_ms ||
-		     now - s->first_locate_ms < SIG_LOCATE_BOTH_MS) &&
-		    !s->put_inflight) {
+		int locating = (!s->rnode4_len || !s->rnode6_len) &&
+			       (!s->first_locate_ms ||
+				now - s->first_locate_ms < SIG_LOCATE_BOTH_MS);
+
+		if (s->have_mine && locating && !s->put_inflight) {
 			s->put_inflight = 1;
 			if (s->rdv_stage < 2)
 				s->rdv_stage = 2;	/* placing the mailbox */
@@ -563,12 +588,25 @@ static void dht_pump(struct sig *s, uint64_t now)
 				     s->keys.bep44_pk, SIG_SALT, mailbox_merge,
 				     s, on_host_put, s);
 			s->next_put_ms = now + SIG_DHT_PUT_MS;
+		} else if (s->have_mine && (s->rnode4_len || s->rnode6_len) &&
+			   s->need_write) {
+			/*
+			 * Locating done: keep the anchor warm with a direct
+			 * store -- a round-trip to the pinned node, no
+			 * convergence -- but only when it no longer carries our
+			 * offer (need_write is the GET-driven forget signal), so
+			 * the token never churns and the mailbox never expires.
+			 */
+			bep44_update_direct(s->engine, s->keys.bep44_sk,
+					    s->keys.bep44_pk, SIG_SALT,
+					    mailbox_merge, s, NULL, NULL);
+			s->next_put_ms = now + SIG_DHT_PUT_MS;
 		}
 	} else if (s->have_mine && s->need_write && s->have_cur) {
 		/*
-		 * The client has read the host's offer; it writes its answer
-		 * straight to the pinned rendezvous node -- a round-trip, not a
-		 * lookup -- so it never clobbers the offer and never converges.
+		 * The client writes its answer straight to the pinned rendezvous
+		 * node once it has read the offer -- a round-trip, not a lookup,
+		 * so it never clobbers the offer and never converges.
 		 */
 		bep44_update_direct(s->engine, s->keys.bep44_sk,
 				    s->keys.bep44_pk, SIG_SALT, mailbox_merge,

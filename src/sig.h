@@ -81,6 +81,11 @@ int sig_subscribe_direct(struct sig *s, sig_direct_cb *cb, void *arg);
  */
 int sig_seed_node(struct sig *s, const struct sockaddr *sa, socklen_t len);
 int sig_locate(struct sig *s);
+/* Host: adopt an already-known rendezvous node (from a persisted token) as the
+ * located anchor and keep it warm with the direct store, instead of locating a
+ * fresh one -- so the token stays stable across idle re-attempts. */
+int sig_reinforce(struct sig *s, int family, const struct sockaddr *sa,
+		  socklen_t len);
 /* The located rendezvous node for `family` (4 or 6), if one has been captured. */
 int sig_located(struct sig *s, int family, struct sockaddr *out,
 		socklen_t *out_len);

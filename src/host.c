@@ -255,8 +255,12 @@ static void run_service(struct svc *v, void *hostkey, int wfd)
 	cfg.arg = v;
 	cfg.obs = &v->obs;
 
-	while (tmux_alive(v->sock))
+	while (tmux_alive(v->sock)) {
+		cfg.tok = v->tok;	/* carry the located anchor forward, so the
+					 * next idle attempt reinforces it rather
+					 * than locating (and churning) a new one */
 		session_run(&cfg);
+	}
 	unlink(v->tokfile);
 	_exit(0);
 }
