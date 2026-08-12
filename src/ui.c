@@ -216,19 +216,12 @@ static void draw(struct ui *u)
 	for (i = 0; i < u->nrdv; i++) {
 		struct rdvrow *r = &u->rdv[i];
 
-		if (u->role == UI_ROLE_HOST) {
-			if (r->ready)
-				line("  " DIM "v%d" RST "  " BGR "[ ready ]"
-				     RST "  " CYN "%s" RST, r->family, r->addr);
-			else
-				line("  " DIM "v%d" RST "  " YEL "[  ..  ]" RST
-				     DIM " locating a close node ..." RST,
-				     r->family);
-		} else {
-			line("  " DIM "v%d" RST "  %s " DIM "%s" RST,
-			     r->family, r->ready ? BGR "[ ready ]" RST :
-			     YEL "contacting" RST, r->addr);
-		}
+		if (r->addr[0])			/* known address == located */
+			line("  " DIM "v%d" RST "  " CYN "%s" RST,
+			     r->family, r->addr);
+		else
+			line("  " DIM "v%d" RST DIM
+			     "  locating a close node ..." RST, r->family);
 	}
 	if (u->have_escalate)
 		line("  " RED "! %s" RST, u->escalate);
