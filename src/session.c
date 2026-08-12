@@ -30,13 +30,6 @@
  * catches an agent that neither connects nor fails.
  */
 #define ICE_ATTEMPT_MS 90000
-/*
- * Once the first rendezvous node is located, wait this long for the other
- * reachable family before minting anyway, so a dual-stack host mints a
- * both-family token when it can, without a family that never converges
- * holding the invite back.
- */
-#define RDV_MINT_GRACE_MS 8000
 
 enum state {
 	ST_WAIT_DHT,
@@ -73,7 +66,6 @@ struct sess {
 	int expect4, expect6;		/* host has DHT reach on this family */
 	int minted4, minted6;		/* family's rendezvous node is in the token */
 	int mcast_minted;		/* multicast-only: token published */
-	uint64_t first_rnode_ms;	/* when the first family was located */
 
 	uint64_t start_ms;		/* observer: session start, for escalation */
 	int escalated;			/* observer: client warned of DHT warm */
@@ -604,7 +596,7 @@ static void maybe_announce_rendezvous(struct sess *s)
 	const struct session_obs *o = s->cfg->obs;
 	struct sockaddr_storage a4, a6;
 	socklen_t l4 = sizeof(a4), l6 = sizeof(a6);
-	int have4, have6, all, grace;
+	int have4, have6;
 
 	if (!s->cfg->is_host || !s->cfg->on_rendezvous)
 		return;
@@ -620,29 +612,29 @@ static void maybe_announce_rendezvous(struct sess *s)
 	have4 = sig_located(s->sig, 4, (struct sockaddr *)&a4, &l4);
 	have6 = sig_located(s->sig, 6, (struct sockaddr *)&a6, &l6);
 
-	if (o && o->rendezvous) {			/* fill the view's rows */
+	/* Tell the view each family's state -- located, or expected-but-pending --
+	 * so the invite can say "IPv4 ready, locating IPv6" rather than warn early. */
+	if (o && o->rendezvous) {
 		char b[80];
 
 		if (have4) {
 			addr_str((struct sockaddr *)&a4, b, sizeof(b));
 			o->rendezvous(o->arg, 4, b, 1);
+		} else if (s->expect4) {
+			o->rendezvous(o->arg, 4, "", 0);
 		}
 		if (have6) {
 			addr_str((struct sockaddr *)&a6, b, sizeof(b));
 			o->rendezvous(o->arg, 6, b, 1);
+		} else if (s->expect6) {
+			o->rendezvous(o->arg, 6, "", 0);
 		}
 	}
 
-	if (!have4 && !have6)
-		return;
-	if (!s->first_rnode_ms)
-		s->first_rnode_ms = now_ms();
-
-	all = (!s->expect4 || have4) && (!s->expect6 || have6);
-	grace = now_ms() - s->first_rnode_ms > RDV_MINT_GRACE_MS;
-	if (!all && !grace)
-		return;
-
+	/* Mint as soon as a family is ready, then upgrade the token in place when
+	 * the other arrives: a single-family-reachable host publishes at once, and
+	 * a dual-stack host's invite gains the second family the moment its DHT
+	 * converges. */
 	if (have4 && !s->minted4) {
 		s->cfg->on_rendezvous(s->cfg->arg, (struct sockaddr *)&a4, l4);
 		s->minted4 = 1;

@@ -138,19 +138,14 @@ static void line(const char *fmt, ...)
 	fputs("\033[K\n", stdout);
 }
 
-static const char *tag(int ready)
-{
-	return ready ? BGR "[ ready ]" RST : YEL "[  ..  ]" RST;
-}
-
 /*
- * Colour + text for a path's classification. A srflx global address means NAT
- * only when the family has no direct global path; when it does (fam_open, e.g.
- * a v6 host with a stable address plus a STUN-seen privacy address) the srflx
- * is that reflexive/privacy source, not NAT.
+ * Colour + text for a path's classification. A direct global address is
+ * routable but not proven reachable from a stranger -- a stateful firewall can
+ * still drop inbound -- so it reads "GLOBAL", not "open". A srflx global is
+ * behind NAT. Confirming reachability (open vs firewalled) needs an active
+ * probe from a second vantage (RFC 5780), still to come.
  */
-static void net_label(int scope, int via, int fam_open, const char **color,
-		      const char **text)
+static void net_label(int scope, int via, const char **color, const char **text)
 {
 	if (scope == NET_SCOPE_LAN) {
 		*color = DIM;
@@ -158,15 +153,12 @@ static void net_label(int scope, int via, int fam_open, const char **color,
 	} else if (scope == NET_SCOPE_CGNAT) {
 		*color = YEL;
 		*text = via == NET_VIA_STUN ? "CGNAT (NAT)" : "CGNAT";
-	} else if (via == NET_VIA_DIRECT) {
-		*color = BGR;
-		*text = "GLOBAL (open)";
-	} else if (fam_open) {
-		*color = CYN;
-		*text = "GLOBAL (via STUN)";
-	} else {
+	} else if (via == NET_VIA_STUN) {
 		*color = BYE;
 		*text = "GLOBAL (NAT)";
+	} else {
+		*color = CYN;
+		*text = "GLOBAL";
 	}
 }
 
@@ -201,32 +193,18 @@ static void draw(struct ui *u)
 	line(CYN "NETWORK" RST);
 	if (!u->nnet && !u->nlink)
 		line(DIM "  probing ..." RST);
-	{
-		int open4 = 0, open6 = 0, j;	/* a direct global path per family */
+	for (i = 0; i < u->nnet; i++) {
+		struct netrow *n = &u->net[i];
+		const char *col, *txt;
 
-		for (j = 0; j < u->nnet; j++)
-			if (u->net[j].via == NET_VIA_DIRECT &&
-			    u->net[j].scope == NET_SCOPE_GLOBAL) {
-				if (u->net[j].family == 6)
-					open6 = 1;
-				else
-					open4 = 1;
-			}
-		for (i = 0; i < u->nnet; i++) {
-			struct netrow *n = &u->net[i];
-			const char *col, *txt;
-
-			net_label(n->scope, n->via, n->family == 6 ? open6 : open4,
-				  &col, &txt);
-			line("  " DIM "%s" RST "  " CYN "%-40s" RST "%s%s" RST,
-			     n->family == 6 ? "IPv6" : "IPv4", n->addr, col, txt);
-		}
+		net_label(n->scope, n->via, &col, &txt);
+		line("  " DIM "%s" RST "  " CYN "%-40s" RST "%s%s" RST,
+		     n->family == 6 ? "IPv6" : "IPv4", n->addr, col, txt);
 	}
 	for (i = 0; i < u->nlink; i++) {
 		struct linkrow *l = &u->link[i];
 
-		line("  " DIM "LINK" RST "  " CYN "%-40s" RST DIM "multicast  "
-		     RST "%s%s", l->name,
+		line("  " DIM "LINK" RST "  " CYN "%-44s" RST "%s%s", l->name,
 		     l->has4 ? BGR "v4 " RST : DIM "-- " RST,
 		     l->has6 ? BGR "v6" RST : DIM "--" RST);
 	}
@@ -238,41 +216,57 @@ static void draw(struct ui *u)
 	for (i = 0; i < u->nrdv; i++) {
 		struct rdvrow *r = &u->rdv[i];
 
-		if (u->role == UI_ROLE_HOST)
-			line("  " DIM "v%d" RST "  %s  " CYN "%s" RST,
-			     r->family, tag(r->ready), r->addr);
-		else
+		if (u->role == UI_ROLE_HOST) {
+			if (r->ready)
+				line("  " DIM "v%d" RST "  " BGR "[ ready ]"
+				     RST "  " CYN "%s" RST, r->family, r->addr);
+			else
+				line("  " DIM "v%d" RST "  " YEL "[  ..  ]" RST
+				     DIM " locating a close node ..." RST,
+				     r->family);
+		} else {
 			line("  " DIM "v%d" RST "  %s " DIM "%s" RST,
 			     r->family, r->ready ? BGR "[ ready ]" RST :
 			     YEL "contacting" RST, r->addr);
+		}
 	}
 	if (u->have_escalate)
 		line("  " RED "! %s" RST, u->escalate);
 	line("");
 
 	if (u->role == UI_ROLE_HOST) {
-		int r4 = 0, r6 = 0, j;
+		int r4 = 0, r6 = 0, p4 = 0, p6 = 0, j;
 
-		for (j = 0; j < u->nrdv; j++)
-			if (u->rdv[j].ready) {
-				if (u->rdv[j].family == 4)
-					r4 = 1;
-				else
-					r6 = 1;
-			}
+		for (j = 0; j < u->nrdv; j++) {
+			struct rdvrow *rr = &u->rdv[j];
+
+			if (rr->ready && rr->family == 4)
+				r4 = 1;
+			else if (rr->ready)
+				r6 = 1;
+			else if (rr->family == 4)
+				p4 = 1;
+			else
+				p6 = 1;
+		}
 		line(CYN "INVITE" RST);
 		if (u->have_token) {
 			line("  " WHT "$ comrade %s" RST, u->token);
 			if (r4 && r6)
 				line("  " BGR "reachable over IPv4 and IPv6" RST);
+			else if (r4 && p6)
+				line("  " BGR "IPv4 ready" RST DIM
+				     " -- locating IPv6 ..." RST);
+			else if (r6 && p4)
+				line("  " BGR "IPv6 ready" RST DIM
+				     " -- locating IPv4 ..." RST);
 			else if (r4)
-				line("  " YEL "IPv4 only" RST DIM
-				     " -- IPv6-only peers cannot reach" RST);
+				line("  " YEL "IPv4 only" RST);
 			else if (r6)
 				line("  " RED "! IPv6 only" RST DIM
 				     " -- IPv4-only peers cannot connect" RST);
 		} else {
-			line(DIM "  minting once a rendezvous node is ready ..." RST);
+			line(DIM "  locating a rendezvous node ..." RST);
 		}
 		line("");
 
@@ -382,7 +376,7 @@ static const char *scope_word(int scope, int via)
 		return "lan";
 	if (scope == NET_SCOPE_CGNAT)
 		return via == NET_VIA_STUN ? "cgnat-nat" : "cgnat";
-	return via == NET_VIA_STUN ? "global-nat" : "global-open";
+	return via == NET_VIA_STUN ? "global-nat" : "global";
 }
 
 static void um_net(struct ui *u, int family, int scope, int via, const char *addr)
