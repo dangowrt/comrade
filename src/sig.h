@@ -85,6 +85,11 @@ int sig_locate(struct sig *s);
 int sig_located(struct sig *s, int family, struct sockaddr *out,
 		socklen_t *out_len);
 
+/* Rendezvous progress for `family`: 0 cold, 1 warmup, 2 store, 3 get, 4 ready
+ * (matches the RDV_* enum). The store/get phases are engine-wide; only ready is
+ * truly per-family. Advisory, for the view's spinner. */
+int sig_rdv_stage(struct sig *s, int family);
+
 /* The up, multicast-capable interfaces this signaller services (view only). */
 int sig_link_ifaces(struct sig *s, struct sig_mcast_if *out, int max);
 

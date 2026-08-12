@@ -37,6 +37,13 @@ enum {					/* peer lifecycle for obs.peer */
 	SESSION_PEER_PUNCHING,		/* negotiating a path */
 	SESSION_PEER_LIVE		/* a path carries the session */
 };
+enum {					/* per-family rendezvous progress (spinner) */
+	RDV_COLD,			/* the DHT is not warm yet */
+	RDV_WARMUP,			/* finding nodes close to the key */
+	RDV_STORE,			/* placing the mailbox on them */
+	RDV_GET,			/* reading it back */
+	RDV_READY			/* the rendezvous node is captured */
+};
 
 struct session_obs {
 	void *arg;
@@ -47,6 +54,8 @@ struct session_obs {
 	void (*link)(void *arg, const char *ifname, int have4, int have6);
 	/* A per-family rendezvous node: located (host) or seeded (client). */
 	void (*rendezvous)(void *arg, int family, const char *addr, int ready);
+	/* A family's rendezvous progress advanced (RDV_*); drives the spinner. */
+	void (*rdv_stage)(void *arg, int family, int stage);
 	/* The invite token is minted and ready to share (host). */
 	void (*token)(void *arg, const char *token_str);
 	/* The peer advanced to `state` (SESSION_PEER_*); addr may be "". */

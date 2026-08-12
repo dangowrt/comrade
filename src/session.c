@@ -612,6 +612,13 @@ static void maybe_announce_rendezvous(struct sess *s)
 	have4 = sig_located(s->sig, 4, (struct sockaddr *)&a4, &l4);
 	have6 = sig_located(s->sig, 6, (struct sockaddr *)&a6, &l6);
 
+	if (o && o->rdv_stage) {		/* drive the RENDEZVOUS spinner */
+		if (s->expect4)
+			o->rdv_stage(o->arg, 4, sig_rdv_stage(s->sig, 4));
+		if (s->expect6)
+			o->rdv_stage(o->arg, 6, sig_rdv_stage(s->sig, 6));
+	}
+
 	/* Tell the view each family's state -- located, or expected-but-pending --
 	 * so the invite can say "IPv4 ready, locating IPv6" rather than warn early. */
 	if (o && o->rendezvous) {

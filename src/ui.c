@@ -60,6 +60,7 @@ struct ui {
 	int nlink;
 	struct rdvrow rdv[2];
 	int nrdv;
+	int stage4, stage6;		/* per-family rendezvous stage, -1 unknown */
 	char token[256];
 	int have_token;
 	struct peerrow peer[8];
@@ -162,20 +163,58 @@ static void net_label(int scope, int via, const char **color, const char **text)
 	}
 }
 
+/*
+ * Animated spinners. All keep moving -- the DHT stays alive and pumping even
+ * once ready -- so the STYLE, not the motion, conveys the stage. The rendezvous
+ * spinner has nine styles for the interleaved v4+v6 progress (each family walks
+ * cold -> warmup -> store -> get -> ready, and the pair advances one family at a
+ * time): 0 both cold, 1 one warming, 2 both, 3 one storing, ... 8 both ready.
+ */
+static const char rdv_flavor[9][4] = {
+	{ '.', '\'', '.', ',' },	/* 0 both cold */
+	{ '.', 'o', '.', 'o' },		/* 1 one warming */
+	{ 'o', 'O', 'o', 'O' },		/* 2 both warming */
+	{ '|', '/', '-', '\\' },		/* 3 one storing */
+	{ '-', '\\', '|', '/' },		/* 4 both storing */
+	{ '<', '^', '>', 'v' },		/* 5 one getting */
+	{ '^', '>', 'v', '<' },		/* 6 both getting */
+	{ '+', 'x', '+', 'x' },		/* 7 one ready */
+	{ '*', '+', '*', '+' },		/* 8 both ready */
+};
+static const char net_flavor[3][4] = {
+	{ '|', '/', '-', '\\' },		/* 0 probing */
+	{ 'o', 'O', 'o', 'O' },		/* 1 paths found */
+	{ '*', '+', '*', '+' },		/* 2 NAT resolved */
+};
+
+/* Merge the two families' stages (0..4, or -1 if that family is not expected)
+ * into the 0..8 rendezvous-spinner index. */
+static int rdv_combined(int s4, int s6)
+{
+	int lo, hi, c;
+
+	if (s4 < 0 && s6 < 0)
+		return 0;
+	if (s4 < 0)
+		s4 = s6;			/* single family: even steps only */
+	if (s6 < 0)
+		s6 = s4;
+	lo = s4 < s6 ? s4 : s6;
+	hi = s4 < s6 ? s6 : s4;
+	c = lo * 2 + (hi > lo ? 1 : 0);
+	return c > 8 ? 8 : c;
+}
+
 static void draw(struct ui *u)
 {
-	static const char spc[] = "|/-\\";
-	unsigned el = (unsigned)((now_ms() - u->start) / 1000);
-	char sp = spc[u->spin & 3];
-	int i;
+	int i, f = u->spin & 3, ns = 0, rc;
 
 	hide_cursor(u);
 	fputs("\033[H", stdout);
 
 	if (u->role == UI_ROLE_HOST)
 		line(BGR "comrade" RST DIM
-		     "  shared terminals over a punched p2p link"
-		     RST "        %02u:%02u %c", el / 60, el % 60, sp);
+		     "  shared terminals over a punched p2p link" RST);
 	else {
 		char sh[64];
 
@@ -185,12 +224,16 @@ static void draw(struct ui *u)
 				 u->token, u->token + strlen(u->token) - 3);
 		else
 			snprintf(sh, sizeof(sh), "%.40s", u->token);
-		line(BGR "comrade" RST DIM "  joining  " RST CYN "%s" RST
-		     "        %02u:%02u %c", sh, el / 60, el % 60, sp);
+		line(BGR "comrade" RST DIM "  joining  " RST CYN "%s" RST, sh);
 	}
 	line("");
 
-	line(CYN "NETWORK" RST);
+	if (u->nnet)
+		ns = 1;
+	for (i = 0; i < u->nnet; i++)
+		if (u->net[i].via == NET_VIA_STUN)
+			ns = 2;
+	line(CYN "NETWORK" RST "  " YEL "%c" RST, net_flavor[ns][f]);
 	if (!u->nnet && !u->nlink)
 		line(DIM "  probing ..." RST);
 	for (i = 0; i < u->nnet; i++) {
@@ -210,7 +253,9 @@ static void draw(struct ui *u)
 	}
 	line("");
 
-	line(CYN "RENDEZVOUS" RST);
+	rc = u->role == UI_ROLE_HOST ? rdv_combined(u->stage4, u->stage6) : -1;
+	line(CYN "RENDEZVOUS" RST "  " YEL "%c" RST,
+	     rc < 0 ? net_flavor[0][f] : rdv_flavor[rc][f]);
 	if (!u->nrdv)
 		line(DIM "  locating a close node ..." RST);
 	for (i = 0; i < u->nrdv; i++) {
@@ -442,6 +487,24 @@ static void um_rdv(struct ui *u, int family, int ready, const char *addr)
 	}
 }
 
+static void um_rdv_stage(struct ui *u, int family, int stage)
+{
+	int *cur = family == 6 ? &u->stage6 : &u->stage4;
+
+	if (*cur == stage)
+		return;
+	*cur = stage;
+	if (u->anim) {
+		u->dirty = 1;
+	} else {
+		static const char *nm[] = { "cold", "warmup", "store", "get",
+					    "ready" };
+
+		if (stage >= 0 && stage <= 4)
+			vlog(u, "rdv    v%d %s", family, nm[stage]);
+	}
+}
+
 static void um_token(struct ui *u, const char *tok)
 {
 	snprintf(u->token, sizeof(u->token), "%s", tok);
@@ -505,6 +568,7 @@ static void cb_net(void *a, int f, int sc, int v, const char *ad)
 }
 static void cb_link(void *a, const char *n, int h4, int h6) { um_link(a, n, h4, h6); }
 static void cb_rdv(void *a, int f, const char *ad, int rd) { um_rdv(a, f, rd, ad); }
+static void cb_rdv_stage(void *a, int f, int st) { um_rdv_stage(a, f, st); }
 static void cb_token(void *a, const char *t) { um_token(a, t); }
 static void cb_peer(void *a, int s, const char *ad) { um_peer(a, s, ad); }
 static void cb_esc(void *a, const char *w) { um_escalate(a, w); }
@@ -542,6 +606,7 @@ void ui_bind(struct ui *u, struct session_obs *obs)
 	obs->net = cb_net;
 	obs->link = cb_link;
 	obs->rendezvous = cb_rdv;
+	obs->rdv_stage = cb_rdv_stage;
 	obs->token = cb_token;
 	obs->peer = cb_peer;
 	obs->escalate = cb_esc;
@@ -562,6 +627,10 @@ static void em_link(void *a, const char *n, int h4, int h6)
 static void em_rdv(void *a, int f, const char *ad, int rd)
 {
 	dprintf(((struct ui_emit *)a)->fd, "R %d %d %s\n", f, rd, ad);
+}
+static void em_rdv_stage(void *a, int f, int st)
+{
+	dprintf(((struct ui_emit *)a)->fd, "G %d %d\n", f, st);
 }
 static void em_token(void *a, const char *t)
 {
@@ -593,6 +662,7 @@ void ui_emitter(struct session_obs *obs, int fd)
 	obs->net = em_net;
 	obs->link = em_link;
 	obs->rendezvous = em_rdv;
+	obs->rdv_stage = em_rdv_stage;
 	obs->token = em_token;
 	obs->peer = em_peer;
 	obs->escalate = em_esc;
@@ -625,6 +695,10 @@ static void feed(struct ui *u, char *ln)
 	case 'R':
 		if (sscanf(ln + 1, "%d %d %79[^\n]", &a, &b, s) == 3)
 			um_rdv(u, a, b, s);
+		break;
+	case 'G':
+		if (sscanf(ln + 1, "%d %d", &a, &b) == 2)
+			um_rdv_stage(u, a, b);
 		break;
 	case 'T':
 		if (sscanf(ln + 1, " %255s", u->token) == 1) {
@@ -770,6 +844,7 @@ struct ui *ui_create(int role, int mode)
 	if (!u)
 		return NULL;
 	u->role = role;
+	u->stage4 = u->stage6 = -1;
 	u->anim = (mode != UI_VERBOSE) && isatty(STDOUT_FILENO);
 	u->start = now_ms();
 	u->last_spin = u->start;

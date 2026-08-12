@@ -71,6 +71,7 @@ struct sig {
 	struct sockaddr_storage rnode6;	/* serves the value back */
 	socklen_t rnode6_len;
 	uint64_t first_locate_ms;	/* when the first family was captured */
+	int rdv_stage;			/* engine-wide progress: cold/warmup/store/get */
 
 	uint64_t next_get_ms;
 	uint64_t next_put_ms;
@@ -260,6 +261,15 @@ int sig_link_ifaces(struct sig *s, struct sig_mcast_if *out, int max)
 	if (!s->mc)
 		return 0;
 	return sig_mcast_ifaces(s->mc, out, max);
+}
+
+int sig_rdv_stage(struct sig *s, int family)
+{
+	socklen_t rl = family == 6 ? s->rnode6_len : s->rnode4_len;
+
+	if (rl)
+		return 4;			/* RDV_READY, per family */
+	return s->rdv_stage;			/* 0 cold .. 3 get, engine-wide */
 }
 
 /* Open the peer's sealed slot and deliver it once, de-duplicated. */
@@ -507,14 +517,19 @@ static void on_host_put(void *arg, int stored, const struct sockaddr *node,
 	/* Only a store that found a home earns the wide window for the
 	 * validating gets to pick the rendezvous node; one that stored nowhere
 	 * retries at the normal cadence. */
-	if (stored > 0)
+	if (stored > 0) {
 		s->next_put_ms = now_ms() + SIG_DHT_RESTORE_MS;
+		if (s->rdv_stage < 3)
+			s->rdv_stage = 3;	/* stored: now reading it back */
+	}
 }
 
 static void dht_pump(struct sig *s, uint64_t now)
 {
 	if (!dhtnode_ready(s->node))
 		return;
+	if (s->rdv_stage < 1)
+		s->rdv_stage = 1;		/* DHT warm: nodes found near key */
 	if (now >= s->next_get_ms) {
 		/*
 		 * Read directly from the shared rendezvous node: the host from
@@ -542,6 +557,8 @@ static void dht_pump(struct sig *s, uint64_t now)
 		     now - s->first_locate_ms < SIG_LOCATE_BOTH_MS) &&
 		    !s->put_inflight) {
 			s->put_inflight = 1;
+			if (s->rdv_stage < 2)
+				s->rdv_stage = 2;	/* placing the mailbox */
 			bep44_update(s->engine, s->keys.bep44_sk,
 				     s->keys.bep44_pk, SIG_SALT, mailbox_merge,
 				     s, on_host_put, s);
