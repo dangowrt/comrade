@@ -63,6 +63,7 @@ struct sess {
 
 	char local_sdp[NAT_SDP_MAX];
 	volatile int have_local_sdp;
+	char src6[64];			/* address we source outbound global v6 from */
 	char peer_sdp[NAT_SDP_MAX];
 	volatile int have_peer_sdp;
 	int remote_set;
@@ -237,11 +238,76 @@ static int client_seed_rendezvous(struct sess *s)
 	return n;
 }
 
+/*
+ * "v6 direct": a host reaches its own global v6 at the address the kernel
+ * sources outbound from, which we learn without STUN via source_addr's connect
+ * trick. That is the privacy (temporary) address where RFC 4941 is enabled and
+ * the stable one otherwise -- either way, the address we effectively listen on.
+ * libjuice instead enumerates the interface's stable address, which need not be
+ * the source and is a tracking handle besides. So rewrite the one global v6
+ * candidate to our real source and drop the rest (any other global v6 host
+ * candidate, and the redundant v6 srflx), leaving v4 untouched. With no global
+ * v6 source, leave v6 as gathered.
+ */
+static void canon_v6(const char *in, const char *src6, char *out, size_t cap)
+{
+	const char *line = in;
+	size_t o = 0;
+	int kept6 = 0;
+
+	while (*line) {
+		const char *nl = strchr(line, '\n');
+		size_t len = nl ? (size_t)(nl - line + 1) : strlen(line);
+		char addr[64], typ[16];
+		int drop = 0, rewrite = 0, a0 = 0, a1 = 0;
+
+		if (src6[0] && !strncmp(line, "a=candidate:", 12) &&
+		    sscanf(line, "a=candidate:%*s %*d %*s %*u %63s %*d typ %15s",
+			   addr, typ) == 2 && strchr(addr, ':') &&
+		    addr_scope(addr) == NET_SCOPE_GLOBAL) {
+			if (strcmp(typ, "host"))
+				drop = 1;	/* global v6 srflx: source covers it */
+			else if (kept6)
+				drop = 1;	/* only one global v6 */
+			else
+				rewrite = 1;
+		}
+		if (drop) {
+			if (!nl)
+				break;
+			line = nl + 1;
+			continue;
+		}
+		if (rewrite)
+			sscanf(line, "a=candidate:%*s %*d %*s %*u %n%*s%n", &a0, &a1);
+		if (rewrite && a1 > a0 && a0 > 0) {
+			size_t plen = strlen(src6);
+
+			if (o + (size_t)a0 + plen + (len - (size_t)a1) < cap) {
+				memcpy(out + o, line, (size_t)a0);
+				o += (size_t)a0;
+				memcpy(out + o, src6, plen);
+				o += plen;
+				memcpy(out + o, line + a1, len - (size_t)a1);
+				o += len - (size_t)a1;
+				kept6 = 1;
+			}
+		} else if (o + len < cap) {
+			memcpy(out + o, line, len);
+			o += len;
+		}
+		if (!nl)
+			break;
+		line = nl + 1;
+	}
+	out[o] = '\0';
+}
+
 static void on_local_sdp(void *arg, const char *sdp)
 {
 	struct sess *s = arg;
 
-	strncpy(s->local_sdp, sdp, sizeof(s->local_sdp) - 1);
+	canon_v6(sdp, s->src6, s->local_sdp, sizeof(s->local_sdp));
 	s->have_local_sdp = 1;
 }
 
@@ -364,6 +430,8 @@ static int nat_setup(struct sess *s)
 	struct nat_config cfg;
 
 	memset(&cfg, 0, sizeof(cfg));
+	if (source_addr(AF_INET6, s->src6, sizeof(s->src6)))
+		s->src6[0] = '\0';		/* no global v6 source */
 	cfg.stun_host = s->cfg->stun_host;
 	cfg.stun_port = s->cfg->stun_port;
 	if (!cfg.stun_host && s->cfg->stun_auto) {
