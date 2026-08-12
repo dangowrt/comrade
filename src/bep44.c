@@ -364,6 +364,10 @@ static int get_send(struct b44_op *op, int node)
 	benc_str_add(&b, op->e->myid, 20);
 	benc_key_add(&b, "target");
 	benc_str_add(&b, op->target, 20);
+	benc_key_add(&b, "want");
+	benc_raw_add(&b, "l2:n42:n6e", 10);	/* BEP 32: want both v4 and v6 nodes,
+						 * else a v4-sent query returns only
+						 * v4 and the v6 DHT is never found */
 	benc_raw_add(&b, "e1:q3:get1:t", 12);
 	benc_str_add(&b, tid, 4);
 	benc_raw_add(&b, "1:y1:qe", 7);
@@ -478,16 +482,26 @@ static void retain_add(struct bep44_engine *e, const uint8_t id[20],
  */
 static void op_retain_nodes(struct bep44_engine *e, struct b44_op *op)
 {
-	int k, kept;
+	int k, kept4 = 0, kept6 = 0;
 
-	for (k = 0, kept = 0; k < op->nnodes && kept < 4; k++) {
+	/* Retain the closest answering nodes of EACH family, so the direct get
+	 * that follows a put has v6 nodes to read the value back from -- not just
+	 * the v4 ones that dominate a distance-sorted list. */
+	for (k = 0; k < op->nnodes && (kept4 < 4 || kept6 < 4); k++) {
 		struct b44_node *nd = &op->nodes[k];
+		int v6;
 
 		if (nd->state != B44_NODE_REPLIED && nd->state != B44_NODE_STORED)
 			continue;
+		v6 = nd->ss.ss_family == AF_INET6;
+		if ((v6 ? kept6 : kept4) >= 4)
+			continue;
 		retain_add(e, id_nonzero(nd->id) ? nd->id : NULL,
 			   (struct sockaddr *)&nd->ss, nd->sslen);
-		kept++;
+		if (v6)
+			kept6++;
+		else
+			kept4++;
 	}
 }
 
@@ -496,20 +510,30 @@ static void op_finish(struct b44_op *op)
 	struct bep44_engine *e = op->e;
 
 	if (debug_on()) {
-		int i, replied = 0, tokened = 0;
+		int i, replied = 0, tokened = 0, n6 = 0, r6 = 0, st6 = 0;
 
 		for (i = 0; i < op->nnodes; i++) {
-			if (op->nodes[i].state == B44_NODE_REPLIED ||
-			    op->nodes[i].state == B44_NODE_STORED ||
-			    op->nodes[i].state == B44_NODE_STORE_INFLIGHT)
+			int v6 = op->nodes[i].ss.ss_family == AF_INET6;
+			int up = op->nodes[i].state == B44_NODE_REPLIED ||
+				 op->nodes[i].state == B44_NODE_STORED ||
+				 op->nodes[i].state == B44_NODE_STORE_INFLIGHT;
+
+			if (v6)
+				n6++;
+			if (up) {
 				replied++;
+				if (v6)
+					r6++;
+			}
+			if (op->nodes[i].state == B44_NODE_STORED && v6)
+				st6++;
 			if (op->nodes[i].token_len)
 				tokened++;
 		}
 		fprintf(stderr,
-			"[bep44] %s finish: nodes=%d replied=%d tokened=%d stored=%d best=%d\n",
-			op->is_put ? "put" : "get", op->nnodes, replied,
-			tokened, op->stored, op->have_best);
+			"[bep44] %s finish: nodes=%d(v6=%d) replied=%d(v6=%d) tokened=%d stored=%d(v6=%d) best=%d\n",
+			op->is_put ? "put" : "get", op->nnodes, n6, replied, r6,
+			tokened, op->stored, st6, op->have_best);
 		fprintf(stderr, "[bep44]   target %02x%02x%02x%02x  closest dists:",
 			op->target[0], op->target[1], op->target[2], op->target[3]);
 		for (i = 0; i < op->nnodes && i < 4; i++)
@@ -564,15 +588,26 @@ static void op_finish(struct b44_op *op)
 
 static int store_start(struct b44_op *op)
 {
-	int i, sent = 0;
+	int i, sent = 0, s4 = 0, s6 = 0;
 
+	/* Store on the closest token-bearing nodes of EACH family, so the value
+	 * lands on the v6 k-closest too and a v6-only client can read it. */
 	op->phase = B44_PHASE_STORE;
-	for (i = 0; i < op->nnodes && sent < B44_K; i++) {
+	for (i = 0; i < op->nnodes; i++) {
+		int v6;
+
 		if (op->nodes[i].state != B44_NODE_REPLIED ||
 		    !op->nodes[i].token_len)
 			continue;
+		v6 = op->nodes[i].ss.ss_family == AF_INET6;
+		if ((v6 ? s6 : s4) >= B44_K)
+			continue;
 		if (put_send(op, i))
 			break;
+		if (v6)
+			s6++;
+		else
+			s4++;
 		sent++;
 	}
 	return sent;
@@ -603,7 +638,7 @@ static void update_store(struct b44_op *op)
 static void op_step(struct b44_op *op)
 {
 	uint64_t now = now_ms();
-	int i, inflight = 0;
+	int i, inflight = 0, if4 = 0, if6 = 0;
 
 	if (now - op->start_ms > B44_OP_TIMEOUT_MS) {
 		op_finish(op);
@@ -621,15 +656,36 @@ static void op_step(struct b44_op *op)
 			continue;
 		}
 		inflight++;
+		if (op->nodes[req->node].ss.ss_family == AF_INET6)
+			if6++;
+		else
+			if4++;
 	}
 
 	if (op->phase == B44_PHASE_LOOKUP) {
-		for (i = 0; i < op->nnodes && inflight < B44_ALPHA; i++) {
+		/*
+		 * Budget the query concurrency per family. The nodes are one list
+		 * sorted by distance, but the v4 DHT is far denser, so the closest
+		 * fresh nodes are almost all v4 -- a single ALPHA cap over both
+		 * lets v4 crowd v6 out entirely, and v6 rendezvous then takes
+		 * minutes. Give each family its own ALPHA so the sparse v6 branch
+		 * converges as fast as it would alone (REQS_MAX holds both).
+		 */
+		for (i = 0; i < op->nnodes; i++) {
+			int v6;
+
 			if (op->nodes[i].state != B44_NODE_FRESH)
+				continue;
+			v6 = op->nodes[i].ss.ss_family == AF_INET6;
+			if ((v6 ? if6 : if4) >= B44_ALPHA)
 				continue;
 			if (get_send(op, i))
 				break;
 			inflight++;
+			if (v6)
+				if6++;
+			else
+				if4++;
 		}
 		if (inflight)
 			return;
