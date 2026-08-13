@@ -253,6 +253,7 @@ static void report_candidates(struct sess *s, const char *sdp)
 				via = -1;
 			if (via >= 0) {
 				int scope = addr_scope(addr);
+				int drop6;
 
 				fam = strchr(addr, ':') ? 6 : 4;
 				if (fam == 4 && via == NET_VIA_STUN)
@@ -260,7 +261,20 @@ static void report_candidates(struct sess *s, const char *sdp)
 				else if (fam == 4 && via == NET_VIA_DIRECT &&
 					 scope != NET_SCOPE_GLOBAL)
 					s->have_priv4 = 1;
-				o->net(o->arg, fam, scope, via, addr);
+				/* A global v6 only ever matters at the address we
+				 * source outbound from (source_addr's connect
+				 * trick, as canon_v6 already enforces for the sent
+				 * SDP). libjuice also enumerates the stable/DHCPv6
+				 * address, which we neither source from nor listen
+				 * on for punching -- never surface it. Only when we
+				 * know our source do we judge; otherwise show what
+				 * was gathered, matching canon_v6. */
+				drop6 = fam == 6 && scope == NET_SCOPE_GLOBAL &&
+					s->src6[0] &&
+					(via != NET_VIA_DIRECT ||
+					 strcmp(addr, s->src6));
+				if (!drop6)
+					o->net(o->arg, fam, scope, via, addr);
 			}
 		}
 		p += 10;
