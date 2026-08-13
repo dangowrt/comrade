@@ -22,7 +22,7 @@
 
 #define DHTNODE_SEED_INTERVAL_MS 1000
 #define DHTNODE_BOOTSTRAP_INTERVAL_MS 10000
-#define DHTNODE_SAVE_INTERVAL_MS 120000		/* persist the node cache this often */
+#define DHTNODE_WARMCHECK_MS 2000		/* poll for the one warm-up cache write */
 #define DHTNODE_DHT_PORT 0
 
 /*
@@ -53,9 +53,11 @@ struct dhtnode {
 	uint64_t next_dht_ms;
 	uint64_t next_seed_ms;
 	uint64_t next_bootstrap_ms;
-	uint64_t next_save_ms;
+	uint64_t next_cache_ms;		/* next warm-up cache-write check */
 	int bootstrap_done;
 	int cache_enabled;		/* persist/restore good nodes across runs */
+	int cache_was_empty;		/* no on-disk cache at start */
+	int cache_primed;		/* the one warm-up write has been done */
 	struct netmon netmon;
 	unsigned netgen;
 };
@@ -181,23 +183,29 @@ static void seed_from_dht(struct dhtnode *n)
  * remain the safety net for a client that has been idle for months and whose
  * cached nodes have all gone. Records are compact: 6 bytes for v4 (address then
  * port, both network order), 18 for v6.
+ *
+ * To spare flash on OpenWrt devices the cache is written at most twice per run:
+ * once after warm-up, but only if it was empty at start (so a first-ever run
+ * leaves something behind), and once when the session ends.
  */
 static void cache_path(int af, char *out, size_t n)
 {
 	snprintf(out, n, "%s/dht_nodes_v%d", appdir_data(), af == AF_INET6 ? 6 : 4);
 }
 
-static void cache_load_family(struct dhtnode *n, int af)
+/* Load one family's cache; returns how many nodes it seeded. */
+static int cache_load_family(struct dhtnode *n, int af)
 {
 	char path[600];
 	uint8_t rec[18];
 	size_t rl = af == AF_INET6 ? 18 : 6;
+	int loaded = 0;
 	FILE *f;
 
 	cache_path(af, path, sizeof(path));
 	f = fopen(path, "rb");
 	if (!f)
-		return;
+		return 0;
 	while (fread(rec, 1, rl, f) == rl) {
 		struct sockaddr_storage ss;
 		socklen_t sl;
@@ -220,75 +228,90 @@ static void cache_load_family(struct dhtnode *n, int af)
 		}
 		dht_ping_node((struct sockaddr *)&ss, sl);
 		bep44_bootstrap_add(n->engine, (struct sockaddr *)&ss, sl);
+		loaded++;
 	}
 	fclose(f);
+	return loaded;
 }
 
 static void dhtcache_load(struct dhtnode *n)
 {
+	int loaded = 0;
+
 	if (n->s4 >= 0)
-		cache_load_family(n, AF_INET);
+		loaded += cache_load_family(n, AF_INET);
 	if (n->s6 >= 0)
-		cache_load_family(n, AF_INET6);
+		loaded += cache_load_family(n, AF_INET6);
+	n->cache_was_empty = loaded == 0;
 }
 
-static void cache_write4(const struct sockaddr_in *sin, int num)
+/* Write one family's nodes; returns 1 if a file was written, 0 otherwise. */
+static int cache_write4(const struct sockaddr_in *sin, int num)
 {
 	char path[600], tmp[610];
 	FILE *f;
 	int i;
 
 	if (num < DHTNODE_SAVE_MIN4)
-		return;
+		return 0;
 	cache_path(AF_INET, path, sizeof(path));
 	snprintf(tmp, sizeof(tmp), "%s.tmp", path);
 	f = fopen(tmp, "wb");
 	if (!f)
-		return;
+		return 0;
 	for (i = 0; i < num; i++) {
 		fwrite(&sin[i].sin_addr, 1, 4, f);
 		fwrite(&sin[i].sin_port, 1, 2, f);
 	}
 	fclose(f);
-	if (rename(tmp, path))
+	if (rename(tmp, path)) {
 		unlink(tmp);
+		return 0;
+	}
+	return 1;
 }
 
-static void cache_write6(const struct sockaddr_in6 *sin6, int num)
+static int cache_write6(const struct sockaddr_in6 *sin6, int num)
 {
 	char path[600], tmp[610];
 	FILE *f;
 	int i;
 
 	if (num < DHTNODE_SAVE_MIN6)
-		return;
+		return 0;
 	cache_path(AF_INET6, path, sizeof(path));
 	snprintf(tmp, sizeof(tmp), "%s.tmp", path);
 	f = fopen(tmp, "wb");
 	if (!f)
-		return;
+		return 0;
 	for (i = 0; i < num; i++) {
 		fwrite(&sin6[i].sin6_addr, 1, 16, f);
 		fwrite(&sin6[i].sin6_port, 1, 2, f);
 	}
 	fclose(f);
-	if (rename(tmp, path))
+	if (rename(tmp, path)) {
 		unlink(tmp);
+		return 0;
+	}
+	return 1;
 }
 
-static void dhtcache_save(struct dhtnode *n)
+/* Persist the current good set; returns 1 if anything was written to flash. */
+static int dhtcache_save(struct dhtnode *n)
 {
 	struct sockaddr_in sin[DHTNODE_CACHE_MAX];
 	struct sockaddr_in6 sin6[DHTNODE_CACHE_MAX];
 	int num = DHTNODE_CACHE_MAX, num6 = DHTNODE_CACHE_MAX;
+	int wrote = 0;
 
 	if (!n->cache_enabled)
-		return;
+		return 0;
 	dht_get_nodes(sin, &num, sin6, &num6);
 	if (n->s4 >= 0)
-		cache_write4(sin, num);
+		wrote |= cache_write4(sin, num);
 	if (n->s6 >= 0)
-		cache_write6(sin6, num6);
+		wrote |= cache_write6(sin6, num6);
+	return wrote;
 }
 
 static struct dhtnode *dhtnode_create_impl(int do_bootstrap)
@@ -319,7 +342,7 @@ static struct dhtnode *dhtnode_create_impl(int do_bootstrap)
 		n->cache_enabled = 1;
 		dhtcache_load(n);
 		n->next_bootstrap_ms = now_ms() + DHTNODE_BOOTSTRAP_INTERVAL_MS;
-		n->next_save_ms = now_ms() + DHTNODE_SAVE_INTERVAL_MS;
+		n->next_cache_ms = now_ms() + DHTNODE_WARMCHECK_MS;
 	} else {
 		/* Rendezvous-only: no public routers, the caller injects the
 		 * one node it was handed via dhtnode_seed(). */
@@ -457,10 +480,17 @@ static void housekeep(struct dhtnode *n)
 		bootstrap_resolve(n);
 		n->next_bootstrap_ms = now + DHTNODE_BOOTSTRAP_INTERVAL_MS;
 	}
-	if (n->cache_enabled && now >= n->next_save_ms) {
-		if (dhtnode_ready(n))
-			dhtcache_save(n);
-		n->next_save_ms = now + DHTNODE_SAVE_INTERVAL_MS;
+	/*
+	 * One warm-up write, and only if we started with no cache: keep probing
+	 * until the table is warm enough that a save actually lands (the writers
+	 * hold their per-family minimums), then stop. The other write is on
+	 * teardown. This bounds flash writes to at most two per run.
+	 */
+	if (n->cache_enabled && n->cache_was_empty && !n->cache_primed &&
+	    now >= n->next_cache_ms) {
+		if (dhtnode_ready(n) && dhtcache_save(n))
+			n->cache_primed = 1;
+		n->next_cache_ms = now + DHTNODE_WARMCHECK_MS;
 	}
 	bep44_periodic(n->engine, &b44_timeout);
 }
