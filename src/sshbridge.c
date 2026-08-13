@@ -10,31 +10,20 @@
 
 #define BRIDGE_BUF 65536
 
-/*
- * Once our fd closes we keep the stream running to deliver whatever is still
- * queued, but only for this long. The common path returns as soon as the send
- * queue drains (the peer acked the final close), so this bound only matters
- * when the peer has stopped acking. It is generous enough to let KCP retransmit
- * the trailing channel-close and disconnect a few times over a lossy link --
- * losing those is exactly what leaves the far end hung at session end -- yet
- * still bounded, because a peer that is truly gone will never ack and we must
- * not wait on it forever.
- */
-#define BRIDGE_LINGER_MS 4000
-
 struct sshbridge {
 	int fd;
 	struct stream *s;
 	int fd_eof;		/* read side saw EOF or the fd is dead */
 	int dead;		/* fatal fd error: stop */
 	int linger_set;
+	uint32_t linger_ms;	/* how long to flush after fd_eof (see header) */
 	uint32_t linger_at;	/* monotonic ms when fd_eof was first seen */
 	size_t out_len;		/* bytes pulled from the stream, awaiting write */
 	size_t out_pos;
 	uint8_t out[BRIDGE_BUF];
 };
 
-struct sshbridge *sshbridge_create(int fd, struct stream *s)
+struct sshbridge *sshbridge_create(int fd, struct stream *s, uint32_t linger_ms)
 {
 	struct sshbridge *b;
 	int fl;
@@ -46,6 +35,7 @@ struct sshbridge *sshbridge_create(int fd, struct stream *s)
 		return NULL;
 	b->fd = fd;
 	b->s = s;
+	b->linger_ms = linger_ms;
 	fl = fcntl(fd, F_GETFL, 0);
 	if (fl >= 0)
 		fcntl(fd, F_SETFL, fl | O_NONBLOCK);
@@ -151,7 +141,7 @@ int sshbridge_pump(struct sshbridge *b, short revents, uint32_t now_ms)
 			b->linger_at = now_ms;
 		}
 		if (stream_waitsnd(b->s) == 0 ||
-		    (uint32_t)(now_ms - b->linger_at) >= BRIDGE_LINGER_MS)
+		    (uint32_t)(now_ms - b->linger_at) >= b->linger_ms)
 			return -1;
 	}
 	return 0;

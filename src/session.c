@@ -32,6 +32,16 @@
  */
 #define ICE_ATTEMPT_MS 90000
 
+/*
+ * Post-teardown linger for the bridge. The host keeps flushing long enough to
+ * land the final SSH close on the client over a lossy link; the client exits
+ * promptly, since a session always ends host-first and its own closing bytes
+ * are non-critical -- waiting on acks a departed host will never send only
+ * stalls the client's exit (the "hangs a few seconds at session end" report).
+ */
+#define LINGER_HOST_MS 3000
+#define LINGER_CLIENT_MS 200
+
 enum state {
 	ST_WAIT_DHT,
 	ST_GATHER,
@@ -596,7 +606,8 @@ static int run_ssh(struct sess *s)
 		s->stream = NULL;
 		return -1;
 	}
-	br = sshbridge_create(sp[0], s->stream);
+	br = sshbridge_create(sp[0], s->stream,
+			      s->cfg->is_host ? LINGER_HOST_MS : LINGER_CLIENT_MS);
 
 	while (!done) {
 		struct pollfd fds[8];
