@@ -127,8 +127,8 @@ int main(void)
 	assert(socketpair(AF_UNIX, SOCK_STREAM, 0, spa) == 0);
 	assert(socketpair(AF_UNIX, SOCK_STREAM, 0, spb) == 0);
 
-	ba = sshbridge_create(spa[0], g_a);
-	bb = sshbridge_create(spb[0], g_b);
+	ba = sshbridge_create(spa[0], g_a, 1000);
+	bb = sshbridge_create(spb[0], g_b, 1000);
 	assert(ba && bb);
 
 	memset(&sa, 0, sizeof(sa));
