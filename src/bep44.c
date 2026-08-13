@@ -22,12 +22,22 @@ static int debug_on(void)
 #include "bep44.h"
 #include "sha1.h"
 
-#define B44_ALPHA 16
+/*
+ * Query concurrency is budgeted per family (see op_step): the v4 DHT is dense,
+ * so a shared cap lets v4 crowd out the sparse v6 branch. Give v6 the larger
+ * ALPHA so its lookups fan out wide enough to converge quickly; the request
+ * table holds both families at once. A tighter per-request timeout drops slow
+ * or dead nodes sooner and moves on, and the deeper node list keeps v6 nodes
+ * -- which sort further from the target than the plentiful v4 ones -- from
+ * being evicted before they are queried.
+ */
+#define B44_ALPHA_V4 16
+#define B44_ALPHA_V6 32
 #define B44_K 8
-#define B44_NODES_MAX 128
+#define B44_NODES_MAX 192
 #define B44_BOOTSTRAP_MAX 8
-#define B44_REQS_MAX (B44_ALPHA * 2)
-#define B44_REQ_TIMEOUT_MS 1500
+#define B44_REQS_MAX (B44_ALPHA_V4 + B44_ALPHA_V6)
+#define B44_REQ_TIMEOUT_MS 1000
 #define B44_OP_TIMEOUT_MS 30000
 #define B44_TOKEN_MAX 40
 #define B44_MSG_MAX 1400
@@ -677,7 +687,7 @@ static void op_step(struct b44_op *op)
 			if (op->nodes[i].state != B44_NODE_FRESH)
 				continue;
 			v6 = op->nodes[i].ss.ss_family == AF_INET6;
-			if ((v6 ? if6 : if4) >= B44_ALPHA)
+			if ((v6 ? if6 : if4) >= (v6 ? B44_ALPHA_V6 : B44_ALPHA_V4))
 				continue;
 			if (get_send(op, i))
 				break;

@@ -18,7 +18,9 @@
 #define SIG_SEALED_MAX (SIG_MAX_VALUE + SEAL_OVERHEAD)
 #define SIG_SDP_MAX 4096		/* raw ICE description in/out of candpack */
 #define SIG_DHT_GET_MS 1000
-#define SIG_DHT_PUT_MS 1500
+#define SIG_DHT_PUT_MS 1000		/* re-run the convergent store/gather this
+					 * often while locating, so the slower v6
+					 * DHT gets more attempts inside the window */
 #define SIG_DHT_RESTORE_MS 8000		/* re-store backoff while a store's
 					 * k-close nodes are being validated */
 #define SIG_MCAST_ANN_MS 1000
