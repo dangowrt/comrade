@@ -3,6 +3,7 @@
 
 #include <fcntl.h>
 #include <netdb.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -55,6 +56,20 @@ struct dhtnode {
 	uint64_t next_bootstrap_ms;
 	uint64_t next_cache_ms;		/* next warm-up cache-write check */
 	int bootstrap_done;
+	/*
+	 * The bootstrap routers are resolved on a side thread: getaddrinfo can
+	 * block for many seconds on a slow uplink, and doing it inline would freeze
+	 * the whole client (a black screen) before anything is drawn. The thread
+	 * only resolves; the main loop does the DHT pings, since jech/dht is not
+	 * thread-safe.
+	 */
+	pthread_t resolver;
+	int resolver_on;
+	pthread_mutex_t boot_lock;
+	struct sockaddr_storage boot_addr[16];
+	socklen_t boot_len[16];
+	int boot_n;
+	int boot_ready;
 	int cache_enabled;		/* persist/restore good nodes across runs */
 	int cache_was_empty;		/* no on-disk cache at start */
 	int cache_primed;		/* the one warm-up write has been done */
@@ -107,8 +122,10 @@ fail:
 	return -1;
 }
 
-static void bootstrap_resolve(struct dhtnode *n)
+/* Side thread: resolve the routers (blocking getaddrinfo) into boot_addr. */
+static void *resolver_fn(void *arg)
 {
+	struct dhtnode *n = arg;
 	size_t i;
 
 	for (i = 0; i < sizeof(bootstrap_hosts) / sizeof(bootstrap_hosts[0]); i++) {
@@ -121,31 +138,67 @@ static void bootstrap_resolve(struct dhtnode *n)
 				&hints, &res))
 			continue;
 		for (ai = res; ai; ai = ai->ai_next) {
-			if (ai->ai_family == AF_INET && n->s4 >= 0) {
-				dht_ping_node(ai->ai_addr, ai->ai_addrlen);
-			} else if (ai->ai_family == AF_INET6 && n->s6 >= 0) {
+			if (ai->ai_family == AF_INET6) {
 				const struct sockaddr_in6 *a6 =
 					(const struct sockaddr_in6 *)ai->ai_addr;
 
 				/* A v4-only router's AAAA is a v4-mapped address,
-				 * not a real v6 node; adding it only pollutes the
-				 * (small) v6 bootstrap set and slows convergence. */
+				 * not a real v6 node; it only pollutes the (small)
+				 * v6 bootstrap set and slows convergence. */
 				if (IN6_IS_ADDR_V4MAPPED(&a6->sin6_addr))
 					continue;
-				dht_ping_node(ai->ai_addr, ai->ai_addrlen);
-			} else {
+			} else if (ai->ai_family != AF_INET) {
 				continue;
 			}
-			/*
-			 * Seed the bep44 engine from the same routers, so its
-			 * lookups have responsive entry points at once and warm
-			 * toward the key in parallel, instead of waiting for the
-			 * jech table to confirm good nodes to hand over.
-			 */
-			bep44_bootstrap_add(n->engine, ai->ai_addr,
-					    ai->ai_addrlen);
+			pthread_mutex_lock(&n->boot_lock);
+			if (n->boot_n < (int)(sizeof(n->boot_addr) /
+					      sizeof(n->boot_addr[0]))) {
+				memcpy(&n->boot_addr[n->boot_n], ai->ai_addr,
+				       ai->ai_addrlen);
+				n->boot_len[n->boot_n] = ai->ai_addrlen;
+				n->boot_n++;
+			}
+			pthread_mutex_unlock(&n->boot_lock);
 		}
 		freeaddrinfo(res);
+	}
+	pthread_mutex_lock(&n->boot_lock);
+	n->boot_ready = 1;
+	pthread_mutex_unlock(&n->boot_lock);
+	return NULL;
+}
+
+/*
+ * Main thread: once the resolver has produced addresses, ping the routers and
+ * seed the bep44 engine from them (so its lookups have responsive entry points
+ * at once), then mark bootstrap done. Runs on the DHT thread, as jech/dht
+ * requires. No-op until the resolver is finished.
+ */
+static void bootstrap_ping(struct dhtnode *n)
+{
+	struct sockaddr_storage addr[16];
+	socklen_t len[16];
+	int cnt, i;
+
+	pthread_mutex_lock(&n->boot_lock);
+	if (!n->boot_ready) {
+		pthread_mutex_unlock(&n->boot_lock);
+		return;
+	}
+	cnt = n->boot_n;
+	memcpy(addr, n->boot_addr, sizeof(addr));
+	memcpy(len, n->boot_len, sizeof(len));
+	pthread_mutex_unlock(&n->boot_lock);
+
+	for (i = 0; i < cnt; i++) {
+		int fam = addr[i].ss_family;
+
+		if ((fam == AF_INET && n->s4 < 0) ||
+		    (fam == AF_INET6 && n->s6 < 0))
+			continue;
+		dht_ping_node((struct sockaddr *)&addr[i], len[i]);
+		bep44_bootstrap_add(n->engine, (struct sockaddr *)&addr[i],
+				    len[i]);
 	}
 	n->bootstrap_done = 1;
 }
@@ -337,11 +390,17 @@ static struct dhtnode *dhtnode_create_impl(int do_bootstrap)
 
 	netmon_init(&n->netmon);
 	if (do_bootstrap) {
-		bootstrap_resolve(n);
+		/* Resolve the routers off-thread so getaddrinfo cannot stall the
+		 * client's startup; the main loop pings them once they are ready. */
+		if (!pthread_mutex_init(&n->boot_lock, NULL) &&
+		    !pthread_create(&n->resolver, NULL, resolver_fn, n))
+			n->resolver_on = 1;
+		else
+			pthread_mutex_destroy(&n->boot_lock);
 		/* Cached nodes seed alongside the curated routers, not instead. */
 		n->cache_enabled = 1;
 		dhtcache_load(n);
-		n->next_bootstrap_ms = now_ms() + DHTNODE_BOOTSTRAP_INTERVAL_MS;
+		n->next_bootstrap_ms = now_ms();
 		n->next_cache_ms = now_ms() + DHTNODE_WARMCHECK_MS;
 	} else {
 		/* Rendezvous-only: no public routers, the caller injects the
@@ -379,6 +438,10 @@ void dhtnode_free(struct dhtnode *n)
 {
 	if (!n)
 		return;
+	if (n->resolver_on) {
+		pthread_join(n->resolver, NULL);
+		pthread_mutex_destroy(&n->boot_lock);
+	}
 	if (n->cache_enabled && n->dht_ready)
 		dhtcache_save(n);	/* flush the freshest good set on the way out */
 	if (n->engine)
@@ -476,10 +539,9 @@ static void housekeep(struct dhtnode *n)
 		seed_from_dht(n);
 		n->next_seed_ms = now + DHTNODE_SEED_INTERVAL_MS;
 	}
-	if (!n->bootstrap_done && now >= n->next_bootstrap_ms) {
-		bootstrap_resolve(n);
-		n->next_bootstrap_ms = now + DHTNODE_BOOTSTRAP_INTERVAL_MS;
-	}
+	if (!n->bootstrap_done)
+		bootstrap_ping(n);	/* no-op until the resolver thread is ready,
+					 * then pings the routers once and is done */
 	/*
 	 * One warm-up write, and only if we started with no cache: keep probing
 	 * until the table is warm enough that a save actually lands (the writers

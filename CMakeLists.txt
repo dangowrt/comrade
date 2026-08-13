@@ -26,6 +26,7 @@ comrade_add_flag(-Wdate-time)
 comrade_add_flag(-ffile-prefix-map=${CMAKE_SOURCE_DIR}=.)
 
 find_package(PkgConfig REQUIRED)
+find_package(Threads REQUIRED)
 pkg_check_modules(LIBSSH IMPORTED_TARGET libssh)
 find_package(LibJuice CONFIG QUIET)
 find_package(kcp CONFIG QUIET)
@@ -151,7 +152,7 @@ if(COMRADE_HAVE_CRYPTO AND COMRADE_DHT_DIR AND EXISTS "${COMRADE_DHT_DIR}/dht.c"
 	target_compile_definitions(comrade_dht PRIVATE _GNU_SOURCE)
 	set_source_files_properties(${COMRADE_DHT_DIR}/dht.c PROPERTIES
 		COMPILE_OPTIONS "-w")
-	target_link_libraries(comrade_dht PUBLIC comrade_crypto comrade_appdir)
+	target_link_libraries(comrade_dht PUBLIC comrade_crypto comrade_appdir Threads::Threads)
 endif()
 
 set(COMRADE_HAVE_SIG 0)
