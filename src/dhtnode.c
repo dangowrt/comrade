@@ -13,6 +13,7 @@
 
 #include <monocypher.h>
 
+#include "appdir.h"
 #include "dht.h"
 #include "bep44.h"
 #include "dhtnode.h"
@@ -21,7 +22,17 @@
 
 #define DHTNODE_SEED_INTERVAL_MS 1000
 #define DHTNODE_BOOTSTRAP_INTERVAL_MS 10000
+#define DHTNODE_SAVE_INTERVAL_MS 120000		/* persist the node cache this often */
 #define DHTNODE_DHT_PORT 0
+
+/*
+ * Only overwrite a family's on-disk node cache once we have a worthwhile set,
+ * so a short-lived run cannot clobber a good cache with a handful of nodes.
+ * v6 is sparse, so its bar is lower.
+ */
+#define DHTNODE_SAVE_MIN4 8
+#define DHTNODE_SAVE_MIN6 2
+#define DHTNODE_CACHE_MAX 64
 
 static const struct {
 	const char *host;
@@ -42,7 +53,9 @@ struct dhtnode {
 	uint64_t next_dht_ms;
 	uint64_t next_seed_ms;
 	uint64_t next_bootstrap_ms;
+	uint64_t next_save_ms;
 	int bootstrap_done;
+	int cache_enabled;		/* persist/restore good nodes across runs */
 	struct netmon netmon;
 	unsigned netgen;
 };
@@ -160,6 +173,124 @@ static void seed_from_dht(struct dhtnode *n)
 			       sizeof(sin6[i]));
 }
 
+/*
+ * On-disk DHT node cache: good nodes from a previous run, kept per family in
+ * separate files next to the STUN list. They seed the table AND the bep44
+ * engine on start, IN ADDITION to the curated bootstrap routers -- so warming
+ * (especially the sparse v6 side) has a head start, while the always-on routers
+ * remain the safety net for a client that has been idle for months and whose
+ * cached nodes have all gone. Records are compact: 6 bytes for v4 (address then
+ * port, both network order), 18 for v6.
+ */
+static void cache_path(int af, char *out, size_t n)
+{
+	snprintf(out, n, "%s/dht_nodes_v%d", appdir_data(), af == AF_INET6 ? 6 : 4);
+}
+
+static void cache_load_family(struct dhtnode *n, int af)
+{
+	char path[600];
+	uint8_t rec[18];
+	size_t rl = af == AF_INET6 ? 18 : 6;
+	FILE *f;
+
+	cache_path(af, path, sizeof(path));
+	f = fopen(path, "rb");
+	if (!f)
+		return;
+	while (fread(rec, 1, rl, f) == rl) {
+		struct sockaddr_storage ss;
+		socklen_t sl;
+
+		memset(&ss, 0, sizeof(ss));
+		if (af == AF_INET6) {
+			struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)&ss;
+
+			s6->sin6_family = AF_INET6;
+			memcpy(&s6->sin6_addr, rec, 16);
+			memcpy(&s6->sin6_port, rec + 16, 2);
+			sl = sizeof(*s6);
+		} else {
+			struct sockaddr_in *s4 = (struct sockaddr_in *)&ss;
+
+			s4->sin_family = AF_INET;
+			memcpy(&s4->sin_addr, rec, 4);
+			memcpy(&s4->sin_port, rec + 4, 2);
+			sl = sizeof(*s4);
+		}
+		dht_ping_node((struct sockaddr *)&ss, sl);
+		bep44_bootstrap_add(n->engine, (struct sockaddr *)&ss, sl);
+	}
+	fclose(f);
+}
+
+static void dhtcache_load(struct dhtnode *n)
+{
+	if (n->s4 >= 0)
+		cache_load_family(n, AF_INET);
+	if (n->s6 >= 0)
+		cache_load_family(n, AF_INET6);
+}
+
+static void cache_write4(const struct sockaddr_in *sin, int num)
+{
+	char path[600], tmp[610];
+	FILE *f;
+	int i;
+
+	if (num < DHTNODE_SAVE_MIN4)
+		return;
+	cache_path(AF_INET, path, sizeof(path));
+	snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+	f = fopen(tmp, "wb");
+	if (!f)
+		return;
+	for (i = 0; i < num; i++) {
+		fwrite(&sin[i].sin_addr, 1, 4, f);
+		fwrite(&sin[i].sin_port, 1, 2, f);
+	}
+	fclose(f);
+	if (rename(tmp, path))
+		unlink(tmp);
+}
+
+static void cache_write6(const struct sockaddr_in6 *sin6, int num)
+{
+	char path[600], tmp[610];
+	FILE *f;
+	int i;
+
+	if (num < DHTNODE_SAVE_MIN6)
+		return;
+	cache_path(AF_INET6, path, sizeof(path));
+	snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+	f = fopen(tmp, "wb");
+	if (!f)
+		return;
+	for (i = 0; i < num; i++) {
+		fwrite(&sin6[i].sin6_addr, 1, 16, f);
+		fwrite(&sin6[i].sin6_port, 1, 2, f);
+	}
+	fclose(f);
+	if (rename(tmp, path))
+		unlink(tmp);
+}
+
+static void dhtcache_save(struct dhtnode *n)
+{
+	struct sockaddr_in sin[DHTNODE_CACHE_MAX];
+	struct sockaddr_in6 sin6[DHTNODE_CACHE_MAX];
+	int num = DHTNODE_CACHE_MAX, num6 = DHTNODE_CACHE_MAX;
+
+	if (!n->cache_enabled)
+		return;
+	dht_get_nodes(sin, &num, sin6, &num6);
+	if (n->s4 >= 0)
+		cache_write4(sin, num);
+	if (n->s6 >= 0)
+		cache_write6(sin6, num6);
+}
+
 static struct dhtnode *dhtnode_create_impl(int do_bootstrap)
 {
 	struct dhtnode *n = calloc(1, sizeof(*n));
@@ -184,7 +315,11 @@ static struct dhtnode *dhtnode_create_impl(int do_bootstrap)
 	netmon_init(&n->netmon);
 	if (do_bootstrap) {
 		bootstrap_resolve(n);
+		/* Cached nodes seed alongside the curated routers, not instead. */
+		n->cache_enabled = 1;
+		dhtcache_load(n);
 		n->next_bootstrap_ms = now_ms() + DHTNODE_BOOTSTRAP_INTERVAL_MS;
+		n->next_save_ms = now_ms() + DHTNODE_SAVE_INTERVAL_MS;
 	} else {
 		/* Rendezvous-only: no public routers, the caller injects the
 		 * one node it was handed via dhtnode_seed(). */
@@ -221,6 +356,8 @@ void dhtnode_free(struct dhtnode *n)
 {
 	if (!n)
 		return;
+	if (n->cache_enabled && n->dht_ready)
+		dhtcache_save(n);	/* flush the freshest good set on the way out */
 	if (n->engine)
 		bep44_free(n->engine);
 	if (n->dht_ready)
@@ -319,6 +456,11 @@ static void housekeep(struct dhtnode *n)
 	if (!n->bootstrap_done && now >= n->next_bootstrap_ms) {
 		bootstrap_resolve(n);
 		n->next_bootstrap_ms = now + DHTNODE_BOOTSTRAP_INTERVAL_MS;
+	}
+	if (n->cache_enabled && now >= n->next_save_ms) {
+		if (dhtnode_ready(n))
+			dhtcache_save(n);
+		n->next_save_ms = now + DHTNODE_SAVE_INTERVAL_MS;
 	}
 	bep44_periodic(n->engine, &b44_timeout);
 }

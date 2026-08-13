@@ -9,6 +9,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 
+#include "appdir.h"
 #include "stunlist.h"
 #include "stun_bundle.inc"		/* static const char *const stun_bundle[] */
 
@@ -21,46 +22,11 @@
 	"https://raw.githubusercontent.com/pradt2/always-online-stun/" \
 	"master/valid_nat_testing_hosts.txt"
 
-/* mkdir every component of path (best effort, mode 0700). */
-static void mkdir_p(const char *path)
-{
-	char tmp[512];
-	char *p;
-
-	snprintf(tmp, sizeof(tmp), "%s", path);
-	for (p = tmp + 1; *p; p++) {
-		if (*p == '/') {
-			*p = '\0';
-			mkdir(tmp, 0700);
-			*p = '/';
-		}
-	}
-	mkdir(tmp, 0700);
-}
-
-/* Per-user application data directory, created if absent. */
-static const char *data_dir(void)
-{
-	static char dir[512];
-	const char *base = getenv("XDG_DATA_HOME");
-	const char *home = getenv("HOME");
-
-	if (base && *base)
-		snprintf(dir, sizeof(dir), "%s/comrade", base);
-	else if (home && *home)
-		snprintf(dir, sizeof(dir), "%s/.local/share/comrade", home);
-	else
-		snprintf(dir, sizeof(dir), "/tmp/comrade-%u/data",
-			 (unsigned)getuid());
-	mkdir_p(dir);
-	return dir;
-}
-
 const char *stunlist_path(void)
 {
 	static char path[600];
 
-	snprintf(path, sizeof(path), "%s/stun_servers.txt", data_dir());
+	snprintf(path, sizeof(path), "%s/stun_servers.txt", appdir_data());
 	return path;
 }
 

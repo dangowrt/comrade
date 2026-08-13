@@ -64,6 +64,10 @@ endif()
 add_library(comrade_token STATIC src/base64.c src/base58.c src/token.c src/tokgen.c)
 target_include_directories(comrade_token PUBLIC src)
 
+# Per-user application data directory (STUN list, cached DHT nodes).
+add_library(comrade_appdir STATIC src/appdir.c)
+target_include_directories(comrade_appdir PUBLIC src)
+
 # STUN server pool. The default set is baked in at configure time from the
 # always-online-stun submodule (its RFC 5780-capable list, which also serves
 # for plain reflexive gathering); `comrade stun-update` refreshes it into the
@@ -120,6 +124,7 @@ message(STATUS "STUN bundle: ${STUN_KEPT} servers baked, ${STUN_DROPPED} big-tec
 
 add_library(comrade_stunlist STATIC src/stunlist.c)
 target_include_directories(comrade_stunlist PUBLIC src PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+target_link_libraries(comrade_stunlist PUBLIC comrade_appdir)
 
 set(COMRADE_HAVE_CRYPTO 0)
 if(MONOCYPHER_FOUND)
@@ -146,7 +151,7 @@ if(COMRADE_HAVE_CRYPTO AND COMRADE_DHT_DIR AND EXISTS "${COMRADE_DHT_DIR}/dht.c"
 	target_compile_definitions(comrade_dht PRIVATE _GNU_SOURCE)
 	set_source_files_properties(${COMRADE_DHT_DIR}/dht.c PROPERTIES
 		COMPILE_OPTIONS "-w")
-	target_link_libraries(comrade_dht PUBLIC comrade_crypto)
+	target_link_libraries(comrade_dht PUBLIC comrade_crypto comrade_appdir)
 endif()
 
 set(COMRADE_HAVE_SIG 0)
