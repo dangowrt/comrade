@@ -58,8 +58,7 @@ struct ui {
 	int nnet;
 	struct linkrow link[8];
 	int nlink;
-	struct rdvrow rdv[2];
-	int nrdv;
+	struct rdvrow rdv[2];		/* fixed slots: [0] v4, [1] v6 */
 	int stage4, stage6;		/* per-family rendezvous stage, -1 unknown */
 	char token[256];
 	int have_token;
@@ -256,11 +255,13 @@ static void draw(struct ui *u)
 	rc = u->role == UI_ROLE_HOST ? rdv_combined(u->stage4, u->stage6) : -1;
 	line(CYN "RENDEZVOUS" RST "  " YEL "%c" RST,
 	     rc < 0 ? net_flavor[0][f] : rdv_flavor[rc][f]);
-	if (!u->nrdv)
+	if (!u->rdv[0].family && !u->rdv[1].family)
 		line(DIM "  locating a close node ..." RST);
-	for (i = 0; i < u->nrdv; i++) {
+	for (i = 0; i < 2; i++) {
 		struct rdvrow *r = &u->rdv[i];
 
+		if (!r->family)			/* empty slot */
+			continue;
 		if (r->addr[0])			/* known address == located */
 			line("  " DIM "v%d" RST "  " CYN "%s" RST,
 			     r->family, r->addr);
@@ -275,9 +276,11 @@ static void draw(struct ui *u)
 	if (u->role == UI_ROLE_HOST) {
 		int r4 = 0, r6 = 0, p4 = 0, p6 = 0, j;
 
-		for (j = 0; j < u->nrdv; j++) {
+		for (j = 0; j < 2; j++) {
 			struct rdvrow *rr = &u->rdv[j];
 
+			if (!rr->family)
+				continue;
 			if (rr->ready && rr->family == 4)
 				r4 = 1;
 			else if (rr->ready)
@@ -464,27 +467,20 @@ static void um_link(struct ui *u, const char *name, int has4, int has6)
 
 static void um_rdv(struct ui *u, int family, int ready, const char *addr)
 {
-	int i;
+	int slot;
 
 	if (!u->anim) {
 		vlog(u, "rdv    v%d %s %s", family, addr,
 		     ready ? "validated, pinned" : "contacting");
 		return;
 	}
-	for (i = 0; i < u->nrdv; i++)
-		if (u->rdv[i].family == family) {
-			u->rdv[i].ready = ready;
-			snprintf(u->rdv[i].addr, sizeof(u->rdv[0].addr), "%s", addr);
-			u->dirty = 1;
-			return;
-		}
-	if (u->nrdv < 2) {
-		u->rdv[u->nrdv].family = family;
-		u->rdv[u->nrdv].ready = ready;
-		snprintf(u->rdv[u->nrdv].addr, sizeof(u->rdv[0].addr), "%s", addr);
-		u->nrdv++;
-		u->dirty = 1;
-	}
+	/* Fixed slots -- v4 above v6 -- so host and client render the two
+	 * rendezvous nodes in the same order regardless of which located first. */
+	slot = family == 4 ? 0 : 1;
+	u->rdv[slot].family = family;
+	u->rdv[slot].ready = ready;
+	snprintf(u->rdv[slot].addr, sizeof(u->rdv[slot].addr), "%s", addr);
+	u->dirty = 1;
 }
 
 static void um_rdv_stage(struct ui *u, int family, int stage)
@@ -827,7 +823,7 @@ int ui_host_wait(struct ui *u, int fd)
 	sigaction(SIGINT, &oint, NULL);
 	sigaction(SIGTERM, &oterm, NULL);
 	if (result == 1) {
-		zap(u, 0);
+		zap(u, 1);			/* same TX-noise entry as the client */
 	} else if (u->anim) {
 		fputs(RST "\033[2J\033[H", stdout);	/* clean screen on abort */
 		fflush(stdout);
