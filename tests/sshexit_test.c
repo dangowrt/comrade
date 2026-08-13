@@ -2,15 +2,17 @@
 /* Copyright (C) 2026 Daniel Golle <daniel@makrotopia.org> */
 
 /*
- * Session-end teardown: the server's command exits on its own (a short sleep,
- * as a real tmux session does when its last shell exits). The server must then
- * close the channel toward the client so the client's read returns and it can
- * exit. A pty master reports the command's exit as EIO rather than a clean EOF,
- * which the connectors do not reliably surface, so the server watches the child
- * pid directly; without that the client would hang forever waiting for a close
- * that never comes -- the "[exited] then hang" symptom. The test's ctest
- * timeout turns any such hang into a failure. Both a pipe- and a pty-backed
- * command are exercised.
+ * Session-end teardown. When the served session ends, the server must close
+ * the channel toward the client so the client's read returns and it exits;
+ * without that the client hangs -- the "[exited] then hang" symptom. Three
+ * paths are exercised, each with the ctest timeout turning a hang into a fail:
+ *
+ *  - a command that exits on its own over a pipe (clean EOF), and
+ *  - the same over a pty (the master reports EIO, not EOF, so the server relies
+ *    on watching the child pid), and
+ *  - a command that never exits, ended instead by the end-of-session fd going
+ *    readable -- exactly how the host's liveness monitor releases the client
+ *    the instant the shared tmux session dies.
  */
 
 #include <assert.h>
@@ -24,22 +26,13 @@
 #include "sshc.h"
 #include "sshd.h"
 
-/* A liveness probe that reports the session gone after a few polls, standing in
- * for tmux's has-session going false while `tmux attach` itself lingers. */
-static int g_alive_calls;
-static int probe_dies(void *arg)
-{
-	(void)arg;
-	return (++g_alive_calls < 8);	/* alive briefly, then gone */
-}
-
 struct srv_arg {
 	int fd;
 	void *hostkey;
 	uint8_t auth[TOKEN_AUTH_LEN];
 	int use_pty;
 	const char *command;
-	int (*alive)(void *arg);
+	int end_fd;
 };
 
 static void *srv_thread(void *p)
@@ -52,7 +45,7 @@ static void *srv_thread(void *p)
 	memcpy(o.auth, a->auth, sizeof(o.auth));
 	o.command = a->command;
 	o.use_pty = a->use_pty;
-	o.alive = a->alive;
+	o.end_fd = a->end_fd;
 	sshd_serve_fd(a->fd, &o);
 	return NULL;
 }
@@ -86,16 +79,20 @@ static void *cli_thread(void *p)
 	return NULL;
 }
 
-/* Returns 0 if the client returned in time, -1 if it hung. The command either
- * exits on its own (alive == NULL) or lingers while the probe reports the end. */
+/*
+ * Serve one round. If close_after_ms >= 0, the write end of the end-of-session
+ * fd is closed after that delay (standing in for the liveness monitor exiting);
+ * the command then never exits on its own. Otherwise the command exits itself.
+ * Returns 0 if the client returned in time, -1 if it hung.
+ */
 static int one_round(void *hostkey, const uint8_t fp[32],
 		     const uint8_t auth[TOKEN_AUTH_LEN], int use_pty,
-		     const char *command, int (*alive)(void *))
+		     const char *command, int close_after_ms)
 {
 	struct srv_arg sa;
 	struct cli_arg ca;
 	pthread_t sth, cth;
-	int sp[2], i;
+	int sp[2], ep[2] = { -1, -1 }, i;
 
 	assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0);
 
@@ -105,7 +102,10 @@ static int one_round(void *hostkey, const uint8_t fp[32],
 	memcpy(sa.auth, auth, sizeof(sa.auth));
 	sa.use_pty = use_pty;
 	sa.command = command;
-	sa.alive = alive;
+	if (close_after_ms >= 0) {
+		assert(pipe(ep) == 0);
+		sa.end_fd = ep[0];	/* read end handed to the server */
+	}
 
 	memset(&ca, 0, sizeof(ca));
 	ca.fd = sp[0];
@@ -115,6 +115,11 @@ static int one_round(void *hostkey, const uint8_t fp[32],
 	assert(pthread_create(&sth, NULL, srv_thread, &sa) == 0);
 	assert(pthread_create(&cth, NULL, cli_thread, &ca) == 0);
 
+	if (close_after_ms >= 0) {
+		usleep((useconds_t)close_after_ms * 1000);
+		close(ep[1]);		/* EOF on the server's end_fd => end */
+	}
+
 	for (i = 0; i < 50 && !ca.done; i++)
 		usleep(100000);
 	if (!ca.done)
@@ -122,6 +127,8 @@ static int one_round(void *hostkey, const uint8_t fp[32],
 
 	pthread_join(cth, NULL);
 	pthread_join(sth, NULL);
+	if (ep[0] >= 0)
+		close(ep[0]);
 	return 0;
 }
 
@@ -137,26 +144,25 @@ int main(void)
 	assert(hostkey);
 
 	/* Command exits on its own (a shell whose last command returns). */
-	if (one_round(hostkey, fp, auth, 0, "sleep 0.3", NULL)) {
+	if (one_round(hostkey, fp, auth, 0, "sleep 0.3", -1)) {
 		fprintf(stderr, "SSHEXIT FAIL: client hung, command exit (pipe)\n");
 		sshd_hostkey_free(hostkey);
 		return 1;
 	}
-	if (one_round(hostkey, fp, auth, 1, "sleep 0.3", NULL)) {
+	if (one_round(hostkey, fp, auth, 1, "sleep 0.3", -1)) {
 		fprintf(stderr, "SSHEXIT FAIL: client hung, command exit (pty)\n");
 		sshd_hostkey_free(hostkey);
 		return 1;
 	}
 
-	/* Command lingers (as `tmux attach` does); the liveness probe ends it. */
-	g_alive_calls = 0;
-	if (one_round(hostkey, fp, auth, 1, "sleep 30", probe_dies)) {
-		fprintf(stderr, "SSHEXIT FAIL: client hung, liveness probe (pty)\n");
+	/* Command lingers (as `tmux attach` does); the end fd ends the session. */
+	if (one_round(hostkey, fp, auth, 1, "sleep 30", 500)) {
+		fprintf(stderr, "SSHEXIT FAIL: client hung, end fd (pty)\n");
 		sshd_hostkey_free(hostkey);
 		return 1;
 	}
 
 	sshd_hostkey_free(hostkey);
-	printf("SSHEXIT PASS: client exits on command end and on probe\n");
+	printf("SSHEXIT PASS: client exits on command end and on end fd\n");
 	return 0;
 }
