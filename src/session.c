@@ -22,6 +22,7 @@
 #include "sshc.h"
 #include "sshd.h"
 #include "stream.h"
+#include "stunlist.h"
 
 #define SESSION_CONV 0x70326531
 /*
@@ -75,6 +76,10 @@ struct sess {
 
 	int ssh_fd;			/* the ssh thread's socketpair end */
 	int ssh_cli_rc;
+
+	char **stun_servers;		/* rotated across ICE retries (host:port) */
+	int stun_count;
+	char stun_host[128];		/* the current attempt's host, split out */
 };
 
 static uint64_t now_ms(void)
@@ -468,18 +473,6 @@ out:
 	return rc;
 }
 
-/*
- * Independent community STUN servers for stun_auto, rotated across re-gathers
- * so one being down does not sink NAT discovery. No big-tech defaults.
- * TODO: source the hourly-validated set from the always-online-stun project at
- * build time rather than hardcoding.
- */
-static const char *stun_auto_servers[] = {
-	"stun.nextcloud.com",
-	"stun.ipfire.org",
-	"stun.sipgate.net",
-};
-
 static int nat_setup(struct sess *s)
 {
 	static char bind_addr[64];
@@ -490,11 +483,20 @@ static int nat_setup(struct sess *s)
 		s->src6[0] = '\0';		/* no global v6 source */
 	cfg.stun_host = s->cfg->stun_host;
 	cfg.stun_port = s->cfg->stun_port;
-	if (!cfg.stun_host && s->cfg->stun_auto) {
-		int n = (int)(sizeof(stun_auto_servers) /
-			      sizeof(stun_auto_servers[0]));
+	if (!cfg.stun_host && s->cfg->stun_auto && s->stun_count > 0) {
+		/* Rotate the managed pool across retries, splitting host:port. */
+		const char *e = s->stun_servers[s->ice_attempt % s->stun_count];
+		const char *colon = strrchr(e, ':');
+		size_t hl = colon ? (size_t)(colon - e) : strlen(e);
 
-		cfg.stun_host = stun_auto_servers[s->ice_attempt % n];
+		if (hl >= sizeof(s->stun_host))
+			hl = sizeof(s->stun_host) - 1;
+		memcpy(s->stun_host, e, hl);
+		s->stun_host[hl] = '\0';
+		cfg.stun_host = s->stun_host;
+		cfg.stun_port = colon ? (uint16_t)atoi(colon + 1) : 3478;
+		if (!cfg.stun_port)
+			cfg.stun_port = 3478;
 	}
 	if (!cfg.stun_host && !(s->cfg->sig_flags & SIG_MCAST)) {
 		int af = s->cfg->family == 4 ? AF_INET : AF_INET6;
@@ -729,6 +731,8 @@ int session_run(const struct session_cfg *cfg)
 	memset(&s, 0, sizeof(s));
 	s.cfg = cfg;
 	memcpy(s.auth, cfg->tok.auth, TOKEN_AUTH_LEN);
+	if (cfg->stun_auto)
+		s.stun_servers = stunlist_load(&s.stun_count);
 	if (cfg->log_level >= 0)
 		nat_log_level(cfg->log_level);
 
@@ -905,5 +909,6 @@ int session_run(const struct session_cfg *cfg)
 	if (s.lan)
 		lanlink_destroy(s.lan);
 	sig_destroy(s.sig);
+	stunlist_free(s.stun_servers, s.stun_count);
 	return rc;
 }

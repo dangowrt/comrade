@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "host.h"
+#include "stunlist.h"
 #include "token.h"
 #include "ui.h"			/* UI_* enums used by main() in every build */
 
@@ -27,6 +28,7 @@ static int usage(int ret)
 		"usage: comrade            start a shared session\n"
 		"       comrade <token>    connect to a shared session\n"
 		"       comrade show       print the tokens of the running session\n"
+		"       comrade stun-update  refresh the STUN server list\n"
 		"opts:  -v, --verbose      log lines instead of the dashboard\n"
 		"       --no-multicast     skip link-local discovery, DHT/STUN only\n");
 	return ret;
@@ -103,5 +105,14 @@ int main(int argc, char **argv)
 		return host_run(ui_mode, no_mcast);
 	if (!strcmp(pos, "show"))
 		return host_show();
+	if (!strcmp(pos, "stun-update")) {
+		int count = 0;
+
+		if (stunlist_update(&count))
+			return 1;
+		fprintf(stderr, "comrade: saved %d STUN servers to\n  %s\n",
+			count, stunlist_path());
+		return 0;
+	}
 	return session_connect(pos, ui_mode, no_mcast);
 }

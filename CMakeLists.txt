@@ -64,6 +64,31 @@ endif()
 add_library(comrade_token STATIC src/base64.c src/base58.c src/token.c src/tokgen.c)
 target_include_directories(comrade_token PUBLIC src)
 
+# STUN server pool. The default set is baked in at configure time from the
+# always-online-stun submodule (its RFC 5780-capable list, which also serves
+# for plain reflexive gathering); `comrade stun-update` refreshes it into the
+# user's data folder at runtime. The list is never copied into our own tree.
+set(STUN_LIST_SRC "${CMAKE_CURRENT_SOURCE_DIR}/deps/always-online-stun/valid_nat_testing_hosts.txt")
+set(STUN_BUNDLE_INC "${CMAKE_CURRENT_BINARY_DIR}/stun_bundle.inc")
+if(EXISTS "${STUN_LIST_SRC}")
+	file(STRINGS "${STUN_LIST_SRC}" STUN_LIST_LINES)
+else()
+	message(WARNING "always-online-stun submodule not present; baking a minimal STUN fallback. Run: git submodule update --init --depth 1 deps/always-online-stun")
+	set(STUN_LIST_LINES "stun.nextcloud.com:443" "stun.sipgate.net:3478" "stun.ipfire.org:3478")
+endif()
+set(STUN_BUNDLE_BODY "/* Generated from always-online-stun; do not edit. */\nstatic const char *const stun_bundle[] = {\n")
+foreach(_line ${STUN_LIST_LINES})
+	string(STRIP "${_line}" _line)
+	if(_line MATCHES "^[A-Za-z0-9]")
+		string(APPEND STUN_BUNDLE_BODY "\t\"${_line}\",\n")
+	endif()
+endforeach()
+string(APPEND STUN_BUNDLE_BODY "};\n")
+file(WRITE "${STUN_BUNDLE_INC}" "${STUN_BUNDLE_BODY}")
+
+add_library(comrade_stunlist STATIC src/stunlist.c)
+target_include_directories(comrade_stunlist PUBLIC src PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+
 set(COMRADE_HAVE_CRYPTO 0)
 if(MONOCYPHER_FOUND)
 	set(COMRADE_HAVE_CRYPTO 1)
@@ -150,7 +175,7 @@ if(COMRADE_HAVE_SIG AND COMRADE_HAVE_NAT AND COMRADE_HAVE_STREAM AND COMRADE_HAV
 	target_include_directories(comrade_session PUBLIC src)
 	target_link_libraries(comrade_session PUBLIC
 		comrade_sig comrade_nat comrade_lanlink comrade_stream comrade_ssh
-		comrade_bridge comrade_token comrade_crypto)
+		comrade_bridge comrade_token comrade_crypto comrade_stunlist)
 
 	# The view: the only module that draws to the terminal (MVC).
 	add_library(comrade_ui STATIC src/ui.c)
@@ -170,6 +195,7 @@ add_executable(comrade src/main.c)
 target_link_libraries(comrade
 	comrade_host
 	comrade_token
+	comrade_stunlist
 )
 if(COMRADE_HAVE_SESSION)
 	target_link_libraries(comrade comrade_session comrade_ui)

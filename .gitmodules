@@ -1,0 +1,3 @@
+[submodule "deps/always-online-stun"]
+	path = deps/always-online-stun
+	url = https://github.com/pradt2/always-online-stun
