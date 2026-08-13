@@ -219,6 +219,11 @@ if(BUILD_TESTING)
 	add_test(NAME sshloop_test COMMAND sshloop_test)
 	set_tests_properties(sshloop_test PROPERTIES TIMEOUT 30)
 
+	add_executable(sshexit_test tests/sshexit_test.c)
+	target_link_libraries(sshexit_test comrade_ssh comrade_token Threads::Threads)
+	add_test(NAME sshexit_test COMMAND sshexit_test)
+	set_tests_properties(sshexit_test PROPERTIES TIMEOUT 30)
+
 	add_executable(sshkcp_test tests/sshkcp_test.c)
 	target_link_libraries(sshkcp_test
 		comrade_ssh comrade_bridge comrade_stream comrade_token Threads::Threads)
@@ -255,7 +260,7 @@ if(BUILD_TESTING)
 	foreach(t IN ITEMS
 		token_test tokgen_test netmon_test candpolicy_test candpack_test
 		bep44_test bep44_pin_test natstream_test sshloop_test
-		sshkcp_test)
+		sshexit_test sshkcp_test)
 		if(TARGET ${t})
 			target_compile_options(${t} PRIVATE -UNDEBUG)
 		endif()
