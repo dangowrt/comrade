@@ -143,6 +143,12 @@ static int tmux_alive(const char *sock)
 	return rc == 0;
 }
 
+/* sshd liveness probe: the served session is over once its tmux is gone. */
+static int session_alive(void *arg)
+{
+	return tmux_alive((const char *)arg);
+}
+
 /* Newest live session id into id[ID_LEN+1]; returns 1 if one was found. */
 static int find_live(char *id)
 {
@@ -252,6 +258,8 @@ static void run_service(struct svc *v, void *hostkey, int wfd, int no_mcast)
 	cfg.hostkey = hostkey;
 	cfg.ssh_command = cmd;
 	cfg.use_pty = 1;
+	cfg.ssh_alive = session_alive;
+	cfg.ssh_alive_arg = v->sock;
 	cfg.on_rendezvous = on_rendezvous;
 	cfg.arg = v;
 	cfg.obs = &v->obs;

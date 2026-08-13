@@ -12,12 +12,15 @@
 
 /*
  * Once our fd closes we keep the stream running to deliver whatever is still
- * queued, but only for this long. Waiting for a full acknowledgement is not
- * safe: the peer may already be tearing down and no longer acking, which
- * would hang us forever on the trailing disconnect bytes. A live peer drains
- * the send queue well within this window, so real terminal output is not lost.
+ * queued, but only for this long. The common path returns as soon as the send
+ * queue drains (the peer acked the final close), so this bound only matters
+ * when the peer has stopped acking. It is generous enough to let KCP retransmit
+ * the trailing channel-close and disconnect a few times over a lossy link --
+ * losing those is exactly what leaves the far end hung at session end -- yet
+ * still bounded, because a peer that is truly gone will never ack and we must
+ * not wait on it forever.
  */
-#define BRIDGE_LINGER_MS 1000
+#define BRIDGE_LINGER_MS 4000
 
 struct sshbridge {
 	int fd;

@@ -22,6 +22,17 @@ struct sshd_opts {
 	uint8_t auth[TOKEN_AUTH_LEN];	/* session password material */
 	const char *command;		/* /bin/sh -c argument; NULL => default */
 	int use_pty;			/* allocate a pty (interactive shell/tmux) */
+	/*
+	 * Optional liveness probe for the served session. The command we run is
+	 * `tmux attach`, which -- surprisingly -- does not exit when the shared
+	 * session it is attached to is destroyed (it prints "[exited]" and
+	 * lingers), so watching the child pid is not enough to notice the end of
+	 * the session. When set, this is polled while serving; returning zero
+	 * means the session is over, and we close the channel toward the client
+	 * so it does not hang. NULL disables the probe (child-exit only).
+	 */
+	int (*alive)(void *arg);
+	void *alive_arg;
 };
 
 /*

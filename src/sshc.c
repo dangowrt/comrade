@@ -111,7 +111,18 @@ static int run_interactive(ssh_session s, ssh_channel chan)
 	ssh_event_add_connector(event, c_err);
 
 	while (ssh_channel_is_open(chan) && !ssh_channel_is_eof(chan)) {
-		ssh_event_dopoll(event, 200);	/* short, so SIGWINCH is timely */
+		/*
+		 * Exit not only on a clean channel EOF but also when the poll
+		 * errors or the session itself ends. The host closes the channel
+		 * and disconnects when the shared session is over, and that may
+		 * arrive without flipping the channel's is_open; watching only the
+		 * channel would leave the client spinning after the remote tmux has
+		 * gone -- the "[exited] then hang" symptom.
+		 */
+		if (ssh_event_dopoll(event, 200) == SSH_ERROR)
+			break;
+		if (!ssh_is_connected(s))
+			break;
 		if (g_winch) {
 			struct winsize ws;
 

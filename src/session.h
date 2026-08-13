@@ -86,6 +86,14 @@ struct session_cfg {
 	const char *ssh_command;	/* command to serve; NULL => tmux default */
 	int use_pty;			/* allocate a pty (interactive/tmux) */
 	/*
+	 * Optional liveness probe for the served session, polled while a client
+	 * is attached. Returning zero means the shared session has ended, so the
+	 * connection to the client is closed rather than left hanging (the
+	 * `tmux attach` command does not exit on its own when the session dies).
+	 */
+	int (*ssh_alive)(void *arg);
+	void *ssh_alive_arg;
+	/*
 	 * Called once the rendezvous is ready to advertise: with the located
 	 * DHT node (embed it in the token), or NULL/0 when there is none to
 	 * embed (multicast-only) so the token can be published immediately.

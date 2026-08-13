@@ -200,12 +200,24 @@ static int do_shell_request(ssh_session s, int *want_pty)
 	}
 }
 
-/* Bridge the channel to the child's fds until either side ends. */
-static void pump(ssh_session s, ssh_channel chan, int to_child, int from_child)
+/*
+ * Bridge the channel to the child's fds until either side ends. The child
+ * exiting is one authoritative end of a session, but a pty master returns EIO
+ * rather than a clean EOF when its slave goes away, so the connectors do not
+ * reliably surface it. Worse, our command is `tmux attach`, which lingers even
+ * after the shared session it serves is gone. So we end the loop on any of:
+ * the connectors erroring, the child exiting (watched directly; WNOWAIT leaves
+ * it for the caller to reap), or the optional liveness probe reporting the
+ * session over. A few extra polls flush the command's final output first; then
+ * we return and the caller closes the channel toward the client.
+ */
+static void pump(ssh_session s, ssh_channel chan, int to_child, int from_child,
+		 pid_t child, const struct sshd_opts *o)
 {
 	ssh_event event = ssh_event_new();
 	ssh_connector c_in = ssh_connector_new(s);   /* channel -> child stdin */
 	ssh_connector c_out = ssh_connector_new(s);  /* child stdout -> channel */
+	int ending = 0, drain = 0, alive_wait = 0;
 
 	if (!event || !c_in || !c_out)
 		goto out;
@@ -219,7 +231,18 @@ static void pump(ssh_session s, ssh_channel chan, int to_child, int from_child)
 	ssh_event_add_connector(event, c_out);
 
 	while (ssh_channel_is_open(chan) && !ssh_channel_is_eof(chan)) {
-		if (ssh_event_dopoll(event, 1000) == SSH_ERROR)
+		if (ssh_event_dopoll(event, 200) == SSH_ERROR)
+			break;
+		if (!ending &&
+		    waitpid(child, NULL, WNOHANG | WNOWAIT) == child)
+			ending = 1;
+		/* Poll the liveness probe about once a second (dopoll ~ 200ms). */
+		if (!ending && o && o->alive && ++alive_wait >= 5) {
+			alive_wait = 0;
+			if (!o->alive(o->alive_arg))
+				ending = 1;
+		}
+		if (ending && ++drain >= 3)
 			break;
 	}
 
@@ -278,7 +301,7 @@ int sshd_serve_fd(int fd, const struct sshd_opts *o)
 		  &to_child, &from_child))
 		goto out;
 
-	pump(s, chan, to_child, from_child);
+	pump(s, chan, to_child, from_child, child, o);
 	rc = 0;
 out:
 	if (to_child >= 0)
@@ -292,8 +315,10 @@ out:
 		waitpid(child, &status, 0);
 	}
 	if (chan) {
-		if (ssh_channel_is_open(chan))
+		if (ssh_channel_is_open(chan)) {
+			ssh_channel_send_eof(chan);
 			ssh_channel_close(chan);
+		}
 		ssh_channel_free(chan);
 	}
 	if (s) {
