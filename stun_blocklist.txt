@@ -1,0 +1,51 @@
+# STUN servers to drop from the baked default pool: those operated by, or
+# hosted on the infrastructure of, hyperscalers and large CDNs. The project
+# does not send users' addresses to big-tech by default.
+#
+# One case-insensitive hostname substring per line; '#' starts a comment. This
+# is applied at build time to the bundled list only. It catches big-tech
+# operators and cloud/CDN hostnames; a server with an independent hostname on a
+# big-tech IP address is not caught here -- that would need IP-to-ASN data,
+# which we deliberately do not ship. `comrade stun-update` fetches the raw
+# upstream list unfiltered and warns about exactly this.
+
+# Amazon / AWS
+amazonaws.com
+compute.amazonaws.com
+awsglobalaccelerator.com
+
+# Google / Alphabet
+google.com
+1e100.net
+googleusercontent.com
+gstatic.com
+googledomains.com
+
+# Microsoft / Azure
+microsoft.com
+azure.com
+azurewebsites.net
+cloudapp.net
+cloudapp.azure.com
+windows.net
+trafficmanager.net
+
+# Apple
+apple.com
+icloud.com
+
+# Meta / Facebook
+facebook.com
+fbcdn.net
+meta.com
+
+# Cloudflare
+cloudflare.com
+cloudflare.net
+
+# Other large CDNs / hyperscalers
+akamai.net
+akamaitechnologies.com
+akamaiedge.net
+fastly.net
+oraclecloud.com
