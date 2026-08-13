@@ -179,5 +179,11 @@ int nat_selected(struct nat_agent *a, char *local, size_t local_len,
 
 void nat_log_level(int level)
 {
-	juice_set_log_level((juice_log_level_t)level);
+	/*
+	 * A negative level means silence. libjuice otherwise defaults to warnings
+	 * on stderr, which on the client is the terminal running tmux -- its once-
+	 * a-second ICE lines would corrupt the shared session.
+	 */
+	juice_set_log_level(level < 0 ? JUICE_LOG_LEVEL_NONE :
+			    (juice_log_level_t)level);
 }

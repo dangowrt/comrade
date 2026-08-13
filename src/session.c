@@ -411,8 +411,10 @@ static void on_peer_offer(void *arg, const uint8_t *data, size_t len)
 	s->peer_sdp[len] = '\0';
 	s->have_peer_sdp = 1;
 	/* Later arrivals are fresh candidates (multicast trickles one source at
-	 * a time); feed them straight into the already-primed agent. */
-	if (s->nat && s->remote_set) {
+	 * a time); feed them straight into the already-primed agent -- but not
+	 * once connected, when the mailbox GET keeps redelivering the same set and
+	 * re-adding it only churns the agent (and logs "max candidates"). */
+	if (s->nat && s->remote_set && !nat_connected(s->nat)) {
 		sdp_filter(s->peer_sdp, s->cfg->family, filtered, sizeof(filtered));
 		nat_set_remote_description(s->nat, filtered);
 	}
@@ -746,8 +748,7 @@ int session_run(const struct session_cfg *cfg)
 	memcpy(s.auth, cfg->tok.auth, TOKEN_AUTH_LEN);
 	if (cfg->stun_auto)
 		s.stun_servers = stunlist_load(&s.stun_count);
-	if (cfg->log_level >= 0)
-		nat_log_level(cfg->log_level);
+	nat_log_level(cfg->log_level);	/* < 0 silences libjuice (see nat_log_level) */
 
 	/* Stable ICE identity, reused across re-gathers (see nat_config). */
 	random_bytes(rb, 4);
