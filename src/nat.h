@@ -14,6 +14,8 @@ struct nat_agent;
 typedef void nat_cb_local_sdp(void *arg, const char *sdp);
 typedef void nat_cb_state(void *arg, int connected, int failed);
 typedef void nat_cb_recv(void *arg, const uint8_t *data, size_t len);
+/* One local candidate, delivered as it is gathered (before the full sdp). */
+typedef void nat_cb_candidate(void *arg, const char *cand);
 
 struct nat_config {
 	const char *stun_host;
@@ -32,6 +34,7 @@ struct nat_config {
 	nat_cb_local_sdp *on_local_sdp;
 	nat_cb_state *on_state;
 	nat_cb_recv *on_recv;
+	nat_cb_candidate *on_candidate;
 	void *arg;
 };
 

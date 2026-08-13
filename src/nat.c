@@ -13,6 +13,7 @@ struct nat_agent {
 	nat_cb_local_sdp *on_local_sdp;
 	nat_cb_state *on_state;
 	nat_cb_recv *on_recv;
+	nat_cb_candidate *on_candidate;
 	void *arg;
 	int connected;
 	int failed;
@@ -33,9 +34,11 @@ static void on_state_changed(juice_agent_t *agent, juice_state_t state, void *us
 
 static void on_candidate(juice_agent_t *agent, const char *sdp, void *user)
 {
+	struct nat_agent *a = user;
+
 	(void)agent;
-	(void)sdp;
-	(void)user;
+	if (a->on_candidate && sdp)
+		a->on_candidate(a->arg, sdp);
 }
 
 static void on_gathering_done(juice_agent_t *agent, void *user)
@@ -69,6 +72,7 @@ struct nat_agent *nat_create(const struct nat_config *cfg)
 	a->on_local_sdp = cfg->on_local_sdp;
 	a->on_state = cfg->on_state;
 	a->on_recv = cfg->on_recv;
+	a->on_candidate = cfg->on_candidate;
 	a->arg = cfg->arg;
 
 	memset(&jc, 0, sizeof(jc));

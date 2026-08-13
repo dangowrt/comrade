@@ -76,6 +76,15 @@ struct sess {
 
 	char local_sdp[NAT_SDP_MAX];
 	volatile int have_local_sdp;
+	/*
+	 * Candidates as they trickle in (libjuice's gather thread appends here
+	 * under trickle_lock; the main loop drains and reports them), so the local
+	 * addresses show at once instead of waiting for gathering -- which can
+	 * stall behind a slow STUN server -- to finish.
+	 */
+	char trickle_sdp[NAT_SDP_MAX];
+	pthread_mutex_t trickle_lock;
+	volatile int trickle_dirty;
 	char src6[64];			/* address we source outbound global v6 from */
 	char peer_sdp[NAT_SDP_MAX];
 	volatile int have_peer_sdp;
@@ -212,18 +221,20 @@ static int addr_scope(const char *addr)
  * host ones -- and let the view de-duplicate, so STUN paths and the NAT verdict
  * they imply appear the moment they are known.
  */
-static void obs_report_net(struct sess *s)
+static void report_candidates(struct sess *s, const char *sdp)
 {
 	const struct session_obs *o = s->cfg->obs;
-	const char *p = s->local_sdp;
+	const char *p = sdp;
 
 	if (!o || !o->net)
 		return;
-	while ((p = strstr(p, "a=candidate:")) != NULL) {
+	/* Match "candidate:" so both a full sdp ("a=candidate:...") and a lone
+	 * trickled line ("[a=]candidate:...") are handled. */
+	while ((p = strstr(p, "candidate:")) != NULL) {
 		char addr[64], typ[16];
 		int via, fam;
 
-		if (sscanf(p, "a=candidate:%*s %*d %*s %*u %63s %*d typ %15s",
+		if (sscanf(p, "candidate:%*s %*d %*s %*u %63s %*d typ %15s",
 			   addr, typ) == 2) {
 			if (!strcmp(typ, "host"))
 				via = NET_VIA_DIRECT;
@@ -243,8 +254,13 @@ static void obs_report_net(struct sess *s)
 				o->net(o->arg, fam, scope, via, addr);
 			}
 		}
-		p += 12;
+		p += 10;
 	}
+}
+
+static void obs_report_net(struct sess *s)
+{
+	report_candidates(s, s->local_sdp);
 }
 
 /* Keep only candidate lines of the requested family (0 = all). */
@@ -400,6 +416,24 @@ static void on_local_sdp(void *arg, const char *sdp)
 	s->have_local_sdp = 1;
 }
 
+/* libjuice gather thread: a candidate is ready. Append it for the main loop. */
+static void on_ice_candidate(void *arg, const char *cand)
+{
+	struct sess *s = arg;
+	size_t used, room, n = strlen(cand);
+
+	pthread_mutex_lock(&s->trickle_lock);
+	used = strlen(s->trickle_sdp);
+	room = sizeof(s->trickle_sdp) - used - 1;
+	if (n + 1 <= room) {
+		memcpy(s->trickle_sdp + used, cand, n);
+		s->trickle_sdp[used + n] = '\n';
+		s->trickle_sdp[used + n + 1] = '\0';
+		s->trickle_dirty = 1;
+	}
+	pthread_mutex_unlock(&s->trickle_lock);
+}
+
 static void on_transport_recv(void *arg, const uint8_t *data, size_t len)
 {
 	struct sess *s = arg;
@@ -540,6 +574,7 @@ static int nat_setup(struct sess *s)
 	cfg.ice_pwd = s->ice_pwd;
 	cfg.on_local_sdp = on_local_sdp;
 	cfg.on_recv = on_transport_recv;
+	cfg.on_candidate = on_ice_candidate;
 	cfg.arg = s;
 
 	s->remote_set = 0;
@@ -763,6 +798,7 @@ int session_run(const struct session_cfg *cfg)
 	memset(&s, 0, sizeof(s));
 	s.cfg = cfg;
 	memcpy(s.auth, cfg->tok.auth, TOKEN_AUTH_LEN);
+	pthread_mutex_init(&s.trickle_lock, NULL);
 	if (cfg->stun_auto)
 		s.stun_servers = stunlist_load(&s.stun_count);
 	nat_log_level(cfg->log_level);	/* < 0 silences libjuice (see nat_log_level) */
@@ -817,6 +853,16 @@ int session_run(const struct session_cfg *cfg)
 		pump_once(&s, 100);
 		maybe_announce_rendezvous(&s);
 		if (o) {
+			if (o->net && s.trickle_dirty) {
+				char buf[NAT_SDP_MAX];
+
+				pthread_mutex_lock(&s.trickle_lock);
+				memcpy(buf, s.trickle_sdp, sizeof(buf));
+				s.trickle_sdp[0] = '\0';
+				s.trickle_dirty = 0;
+				pthread_mutex_unlock(&s.trickle_lock);
+				report_candidates(&s, buf);
+			}
 			if (o->net && s.have_local_sdp)
 				obs_report_net(&s);	/* view de-dups */
 			if (o->tick)
@@ -950,5 +996,6 @@ int session_run(const struct session_cfg *cfg)
 		lanlink_destroy(s.lan);
 	sig_destroy(s.sig);
 	stunlist_free(s.stun_servers, s.stun_count);
+	pthread_mutex_destroy(&s.trickle_lock);
 	return rc;
 }
