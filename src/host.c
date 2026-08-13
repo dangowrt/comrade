@@ -123,6 +123,52 @@ static int run_wait(char *const argv[])
 	return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
+/*
+ * Like run_wait, but capture the child's stderr into err (NUL-terminated, one
+ * line, trailing newline stripped) so a failure can be reported with its real
+ * cause instead of a guess.
+ */
+static int run_capture(char *const argv[], char *err, size_t cap)
+{
+	int p[2];
+	pid_t pid;
+	int status;
+
+	if (err && cap)
+		err[0] = '\0';
+	if (pipe(p))
+		return -1;
+	pid = fork();
+	if (pid < 0) {
+		close(p[0]);
+		close(p[1]);
+		return -1;
+	}
+	if (pid == 0) {
+		dup2(p[1], STDERR_FILENO);
+		close(p[0]);
+		close(p[1]);
+		execvp(argv[0], argv);
+		_exit(127);
+	}
+	close(p[1]);
+	if (err && cap > 1) {
+		ssize_t n = read(p[0], err, cap - 1);
+		char drain[256];
+
+		err[n > 0 ? n : 0] = '\0';
+		while (read(p[0], drain, sizeof(drain)) > 0)
+			;
+		while (*err && (err[strlen(err) - 1] == '\n' ||
+			        err[strlen(err) - 1] == '\r'))
+			err[strlen(err) - 1] = '\0';
+	}
+	close(p[0]);
+	if (waitpid(pid, &status, 0) < 0)
+		return -1;
+	return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
 static int tmux_alive(const char *sock)
 {
 	char *argv[] = { "tmux", "-S", (char *)sock, "has-session",
@@ -189,6 +235,33 @@ static int spawn_end_monitor(const char *sock, pid_t *pid)
 }
 
 /* Newest live session id into id[ID_LEN+1]; returns 1 if one was found. */
+/* Remove socket/token files whose tmux server is gone, so stale state from an
+ * earlier run cannot linger or confuse a fresh start. */
+static void sweep_stale(void)
+{
+	DIR *d = opendir(state_dir());
+	struct dirent *e;
+
+	if (!d)
+		return;
+	while ((e = readdir(d))) {
+		char cand[ID_LEN + 1], sock[512], tok[512];
+
+		if (strlen(e->d_name) != ID_LEN + 5 ||
+		    strcmp(e->d_name + ID_LEN, ".sock"))
+			continue;
+		memcpy(cand, e->d_name, ID_LEN);
+		cand[ID_LEN] = '\0';
+		sock_path(sock, sizeof(sock), cand);
+		if (tmux_alive(sock))
+			continue;		/* a live session: leave it */
+		unlink(sock);
+		tok_path(tok, sizeof(tok), cand);
+		unlink(tok);
+	}
+	closedir(d);
+}
+
 static int find_live(char *id)
 {
 	DIR *d = opendir(state_dir());
@@ -359,10 +432,15 @@ static int start_new(int ui_mode, int no_mcast)
 	{
 		char *mk[] = { "tmux", "-S", v.sock, "new-session", "-d",
 			       "-s", "comrade", NULL };
+		char err[256];
 
-		if (run_wait(mk)) {
-			fprintf(stderr,
-				"comrade: could not start tmux (is it installed?)\n");
+		if (run_capture(mk, err, sizeof(err))) {
+			if (err[0])
+				fprintf(stderr, "comrade: could not start tmux: %s\n",
+					err);
+			else
+				fprintf(stderr, "comrade: could not start tmux "
+					"(is it installed?)\n");
 			return 1;
 		}
 	}
@@ -411,6 +489,7 @@ int host_run(int ui_mode, int no_mcast)
 {
 	char id[ID_LEN + 1];
 
+	sweep_stale();
 	if (find_live(id)) {
 		fprintf(stderr, "comrade: re-attaching to your running session"
 			" (its token: `comrade show`)\n");
