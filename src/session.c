@@ -505,8 +505,7 @@ static void *ssh_srv_thread(void *p)
 	memcpy(o.auth, s->auth, sizeof(o.auth));
 	o.command = s->cfg->ssh_command;	/* NULL => tmux default */
 	o.use_pty = s->cfg->use_pty;
-	o.alive = s->cfg->ssh_alive;
-	o.alive_arg = s->cfg->ssh_alive_arg;
+	o.end_fd = s->cfg->ssh_end_fd;
 	sshd_serve_fd(s->ssh_fd, &o);
 	return NULL;
 }

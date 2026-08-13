@@ -143,10 +143,49 @@ static int tmux_alive(const char *sock)
 	return rc == 0;
 }
 
-/* sshd liveness probe: the served session is over once its tmux is gone. */
-static int session_alive(void *arg)
+/*
+ * Spawn a light end-of-session monitor. `tmux wait-for <channel>` connects to
+ * the server and blocks until that channel is signalled -- which we never do --
+ * so it simply blocks until the server dies, i.e. until the shared session
+ * ends. It attaches no client and emits no output, so the only event on its
+ * stdout pipe is EOF when it exits with the session. The readable end of that
+ * pipe is the event-driven end-of-session signal handed to sshd; it releases a
+ * connected client at once instead of after a poll interval. Returns the
+ * readable fd (and the pid to reap), or -1 on failure.
+ */
+static int spawn_end_monitor(const char *sock, pid_t *pid)
 {
-	return tmux_alive((const char *)arg);
+	int p[2];
+	pid_t c;
+
+	if (pipe(p))
+		return -1;
+	c = fork();
+	if (c < 0) {
+		close(p[0]);
+		close(p[1]);
+		return -1;
+	}
+	if (c == 0) {
+		char *argv[] = { "tmux", "-S", (char *)sock, "wait-for",
+				 "comrade-session", NULL };
+		int nul = open("/dev/null", O_RDWR);
+
+		if (nul >= 0) {
+			dup2(nul, STDIN_FILENO);
+			dup2(nul, STDERR_FILENO);
+			if (nul > STDERR_FILENO)
+				close(nul);
+		}
+		dup2(p[1], STDOUT_FILENO);
+		close(p[0]);
+		close(p[1]);
+		execvp("tmux", argv);
+		_exit(127);
+	}
+	close(p[1]);
+	*pid = c;
+	return p[0];
 }
 
 /* Newest live session id into id[ID_LEN+1]; returns 1 if one was found. */
@@ -232,6 +271,8 @@ static void run_service(struct svc *v, void *hostkey, int wfd, int no_mcast)
 	char cmd[600];
 	struct session_cfg cfg;
 	int devnull;
+	int end_fd;
+	pid_t end_pid = -1;
 
 	setsid();
 	signal(SIGPIPE, SIG_IGN);	/* foreground may exec away mid-session */
@@ -244,6 +285,7 @@ static void run_service(struct svc *v, void *hostkey, int wfd, int no_mcast)
 			close(devnull);
 	}
 	snprintf(cmd, sizeof(cmd), "tmux -S %s attach -t comrade", v->sock);
+	end_fd = spawn_end_monitor(v->sock, &end_pid);
 
 	ui_emitter(&v->obs, wfd);	/* progress -> the foreground view */
 
@@ -258,8 +300,7 @@ static void run_service(struct svc *v, void *hostkey, int wfd, int no_mcast)
 	cfg.hostkey = hostkey;
 	cfg.ssh_command = cmd;
 	cfg.use_pty = 1;
-	cfg.ssh_alive = session_alive;
-	cfg.ssh_alive_arg = v->sock;
+	cfg.ssh_end_fd = end_fd > 0 ? end_fd : 0;
 	cfg.on_rendezvous = on_rendezvous;
 	cfg.arg = v;
 	cfg.obs = &v->obs;
@@ -269,6 +310,12 @@ static void run_service(struct svc *v, void *hostkey, int wfd, int no_mcast)
 					 * next idle attempt reinforces it rather
 					 * than locating (and churning) a new one */
 		session_run(&cfg);
+	}
+	if (end_fd > 0)
+		close(end_fd);
+	if (end_pid > 0) {
+		kill(end_pid, SIGTERM);
+		waitpid(end_pid, NULL, 0);
 	}
 	unlink(v->tokfile);
 	_exit(0);

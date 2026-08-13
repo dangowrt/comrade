@@ -2,6 +2,7 @@
 /* Copyright (C) 2026 Daniel Golle <daniel@makrotopia.org> */
 
 #include <fcntl.h>
+#include <poll.h>
 #include <pty.h>
 #include <stdlib.h>
 #include <string.h>
@@ -200,24 +201,35 @@ static int do_shell_request(ssh_session s, int *want_pty)
 	}
 }
 
+/* End-of-session fd became readable (a liveness monitor exited with the shared
+ * session). Flag it; the pump breaks on the flag and closes toward the client. */
+static int on_end_fd(socket_t fd, int revents, void *userdata)
+{
+	(void)fd;
+	if (revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL))
+		*(int *)userdata = 1;
+	return 0;
+}
+
 /*
  * Bridge the channel to the child's fds until either side ends. The child
  * exiting is one authoritative end of a session, but a pty master returns EIO
  * rather than a clean EOF when its slave goes away, so the connectors do not
- * reliably surface it. Worse, our command is `tmux attach`, which lingers even
- * after the shared session it serves is gone. So we end the loop on any of:
- * the connectors erroring, the child exiting (watched directly; WNOWAIT leaves
- * it for the caller to reap), or the optional liveness probe reporting the
- * session over. A few extra polls flush the command's final output first; then
- * we return and the caller closes the channel toward the client.
+ * reliably surface it. Worse, our command is `tmux attach`, which does not
+ * reliably exit when the shared session it serves is gone. So we end the loop
+ * on any of: the connectors erroring, the child exiting (watched directly;
+ * WNOWAIT leaves it for the caller to reap), or the optional end-of-session fd
+ * signalling (event-driven, so the client is released the moment the session
+ * ends, not after a poll interval). A few extra polls flush the command's final
+ * output first; then we return and the caller closes the channel to the client.
  */
 static void pump(ssh_session s, ssh_channel chan, int to_child, int from_child,
-		 pid_t child, const struct sshd_opts *o)
+		 pid_t child, int end_fd)
 {
 	ssh_event event = ssh_event_new();
 	ssh_connector c_in = ssh_connector_new(s);   /* channel -> child stdin */
 	ssh_connector c_out = ssh_connector_new(s);  /* child stdout -> channel */
-	int ending = 0, drain = 0, alive_wait = 0;
+	int ending = 0, drain = 0, end_hit = 0;
 
 	if (!event || !c_in || !c_out)
 		goto out;
@@ -229,23 +241,25 @@ static void pump(ssh_session s, ssh_channel chan, int to_child, int from_child,
 
 	ssh_event_add_connector(event, c_in);
 	ssh_event_add_connector(event, c_out);
+	if (end_fd > 0)
+		ssh_event_add_fd(event, end_fd,
+				 POLLIN | POLLHUP | POLLERR | POLLNVAL,
+				 on_end_fd, &end_hit);
 
 	while (ssh_channel_is_open(chan) && !ssh_channel_is_eof(chan)) {
 		if (ssh_event_dopoll(event, 200) == SSH_ERROR)
 			break;
+		if (!ending && end_hit)
+			ending = 1;
 		if (!ending &&
 		    waitpid(child, NULL, WNOHANG | WNOWAIT) == child)
 			ending = 1;
-		/* Poll the liveness probe about once a second (dopoll ~ 200ms). */
-		if (!ending && o && o->alive && ++alive_wait >= 5) {
-			alive_wait = 0;
-			if (!o->alive(o->alive_arg))
-				ending = 1;
-		}
 		if (ending && ++drain >= 3)
 			break;
 	}
 
+	if (end_fd > 0)
+		ssh_event_remove_fd(event, end_fd);
 	ssh_event_remove_connector(event, c_in);
 	ssh_event_remove_connector(event, c_out);
 out:
@@ -301,7 +315,7 @@ int sshd_serve_fd(int fd, const struct sshd_opts *o)
 		  &to_child, &from_child))
 		goto out;
 
-	pump(s, chan, to_child, from_child, child, o);
+	pump(s, chan, to_child, from_child, child, o->end_fd);
 	rc = 0;
 out:
 	if (to_child >= 0)
