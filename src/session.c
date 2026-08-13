@@ -111,6 +111,7 @@ struct sess {
 	pthread_mutex_t status_lock;
 	struct conn_status status;
 	char status_peer[80];		/* address of the chosen pair, once live */
+	char status_rdv[80];		/* located rendezvous endpoint (host side) */
 	uint64_t next_status_ms;
 
 	int ssh_fd;			/* the ssh thread's socketpair end */
@@ -297,7 +298,13 @@ static void publish_status(struct sess *s, int state)
 	memset(&cs, 0, sizeof(cs));
 	cs.state = state;
 	snprintf(cs.peer, sizeof(cs.peer), "%s", s->status_peer);
-	fmt_token_rdv(&s->cfg->tok, cs.rdv, sizeof(cs.rdv));
+	/* The host learns its rendezvous endpoint mid-session (after the token
+	 * snapshot this run was started with), so prefer the located address; the
+	 * client, whose token already carries it, falls back to the token. */
+	if (s->status_rdv[0])
+		snprintf(cs.rdv, sizeof(cs.rdv), "%s", s->status_rdv);
+	else
+		fmt_token_rdv(&s->cfg->tok, cs.rdv, sizeof(cs.rdv));
 	cs.rtt_ms = s->stream ? stream_rtt(s->stream) : 0;
 
 	pthread_mutex_lock(&s->status_lock);
@@ -806,6 +813,15 @@ static void maybe_announce_rendezvous(struct sess *s)
 	update_expect(s);
 	have4 = sig_located(s->sig, 4, (struct sockaddr *)&a4, &l4);
 	have6 = sig_located(s->sig, 6, (struct sockaddr *)&a6, &l6);
+
+	/* Remember the located rendezvous endpoint for the local status line,
+	 * preferring v6 to match how the token renders it. */
+	if (have6)
+		fmt_sockaddr((struct sockaddr *)&a6, l6,
+			     s->status_rdv, sizeof(s->status_rdv));
+	else if (have4)
+		fmt_sockaddr((struct sockaddr *)&a4, l4,
+			     s->status_rdv, sizeof(s->status_rdv));
 
 	if (o && o->rdv_stage) {		/* drive the RENDEZVOUS spinner */
 		if (s->expect4)

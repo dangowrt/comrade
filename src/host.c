@@ -573,7 +573,9 @@ static int start_new(int ui_mode, int no_mcast)
 
 	{
 		char *mk[] = { "tmux", "-S", v.sock, "new-session", "-d",
-			       "-s", "comrade", NULL };
+			       "-s", "comrade",
+			       ";", "set", "-g", "status-position", "top",
+			       NULL };
 		char err[256];
 
 		if (run_capture(mk, err, sizeof(err))) {
