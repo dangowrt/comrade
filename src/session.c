@@ -2,6 +2,7 @@
 /* Copyright (C) 2026 Daniel Golle <daniel@makrotopia.org> */
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <poll.h>
 #include <pthread.h>
@@ -13,6 +14,7 @@
 #include <unistd.h>
 
 #include "candpolicy.h"
+#include "conn.h"
 #include "keys.h"
 #include "lanlink.h"
 #include "nat.h"
@@ -104,6 +106,12 @@ struct sess {
 	int have_priv4;			/* a private/CGNAT v4 host candidate (needs STUN) */
 	int have_srflx4;		/* STUN gave us a public v4 (reflexive) */
 	int stun_warned;		/* warned once that STUN produced nothing */
+
+	/* Local connection status (data only; the view renders it). */
+	pthread_mutex_t status_lock;
+	struct conn_status status;
+	char status_peer[80];		/* address of the chosen pair, once live */
+	uint64_t next_status_ms;
 
 	int ssh_fd;			/* the ssh thread's socketpair end */
 	int ssh_cli_rc;
@@ -261,6 +269,53 @@ static void report_candidates(struct sess *s, const char *sdp)
 static void obs_report_net(struct sess *s)
 {
 	report_candidates(s, s->local_sdp);
+}
+
+/* The mutual rendezvous node from the token, printable ("addr:port"). */
+static void fmt_token_rdv(const struct token *t, char *out, size_t n)
+{
+	char ip[64];
+
+	out[0] = '\0';
+	if ((t->flags & TOKEN_FLAG_EP6_RDV) &&
+	    inet_ntop(AF_INET6, t->ep6_addr, ip, sizeof(ip)))
+		snprintf(out, n, "[%s]:%u", ip, t->ep6_port);
+	else if ((t->flags & TOKEN_FLAG_EP4_RDV) &&
+		 inet_ntop(AF_INET, t->ep4_addr, ip, sizeof(ip)))
+		snprintf(out, n, "%s:%u", ip, t->ep4_port);
+}
+
+/*
+ * Fill the structured connection status (no display text -- the view renders
+ * it) and stash it: in memory for the client's in-process renderer, and, for
+ * the host, in a tmpfs file the operator's separate process reads.
+ */
+static void publish_status(struct sess *s, int state)
+{
+	struct conn_status cs;
+
+	memset(&cs, 0, sizeof(cs));
+	cs.state = state;
+	snprintf(cs.peer, sizeof(cs.peer), "%s", s->status_peer);
+	fmt_token_rdv(&s->cfg->tok, cs.rdv, sizeof(cs.rdv));
+	cs.rtt_ms = s->stream ? stream_rtt(s->stream) : 0;
+
+	pthread_mutex_lock(&s->status_lock);
+	s->status = cs;
+	pthread_mutex_unlock(&s->status_lock);
+
+	if (s->cfg->status_path)
+		conn_write(s->cfg->status_path, &cs);
+}
+
+/* sshc status callback: hand the client's renderer the current status data. */
+static void session_status(void *arg, struct conn_status *out)
+{
+	struct sess *s = arg;
+
+	pthread_mutex_lock(&s->status_lock);
+	*out = s->status;
+	pthread_mutex_unlock(&s->status_lock);
 }
 
 /* Keep only candidate lines of the requested family (0 = all). */
@@ -624,6 +679,8 @@ static void *ssh_cli_thread(void *p)
 	memcpy(o.host_fp, s->cfg->tok.hostpub, 32);
 	memcpy(o.auth, s->auth, sizeof(o.auth));
 	o.interactive = s->cfg->interactive;
+	o.status = session_status;
+	o.status_arg = s;
 	o.send = s->cfg->test_send;
 	o.send_len = s->cfg->test_send_len;
 	o.recv = s->cfg->test_recv;
@@ -685,6 +742,10 @@ static int run_ssh(struct sess *s)
 			lanlink_dispatch(s->lan, fds + nfds, lnf);
 		if (sshbridge_pump(br, fds[bidx].revents, (uint32_t)now_ms()) < 0)
 			done = 1;
+		if (now_ms() >= s->next_status_ms) {
+			publish_status(s, CONN_LIVE);
+			s->next_status_ms = now_ms() + 1000;
+		}
 	}
 
 	pthread_join(th, NULL);
@@ -799,6 +860,7 @@ int session_run(const struct session_cfg *cfg)
 	s.cfg = cfg;
 	memcpy(s.auth, cfg->tok.auth, TOKEN_AUTH_LEN);
 	pthread_mutex_init(&s.trickle_lock, NULL);
+	pthread_mutex_init(&s.status_lock, NULL);	/* s.status zeroed = connecting */
 	if (cfg->stun_auto)
 		s.stun_servers = stunlist_load(&s.stun_count);
 	nat_log_level(cfg->log_level);	/* < 0 silences libjuice (see nat_log_level) */
@@ -852,6 +914,13 @@ int session_run(const struct session_cfg *cfg)
 
 		pump_once(&s, 100);
 		maybe_announce_rendezvous(&s);
+		if (now_ms() >= s.next_status_ms) {
+			publish_status(&s,
+				       st == ST_WAIT_ICE ? CONN_PUNCHING :
+				       (st == ST_GATHER || st == ST_SIGNAL) ?
+				       CONN_GATHERING : CONN_CONNECTING);
+			s.next_status_ms = now_ms() + 500;
+		}
 		if (o) {
 			if (o->net && s.trickle_dirty) {
 				char buf[NAT_SDP_MAX];
@@ -936,20 +1005,23 @@ int session_run(const struct session_cfg *cfg)
 		case ST_WAIT_ICE:
 			if (nat_connected(s.nat) ||
 			    (s.lan && lanlink_have_peer(s.lan))) {
-				if (o && o->peer &&
-				    s.peer_state < SESSION_PEER_LIVE) {
-					char pa[80];
+				if (s.peer_state < SESSION_PEER_LIVE) {
 					char loc[192], rem[192];
 
-					pa[0] = '\0';
+					s.status_peer[0] = '\0';
 					if (nat_connected(s.nat) &&
 					    !nat_selected(s.nat, loc, sizeof(loc),
 							  rem, sizeof(rem)))
-						cand_addr(rem, pa, sizeof(pa));
+						cand_addr(rem, s.status_peer,
+							  sizeof(s.status_peer));
 					else if (s.direct_addr[0])
-						snprintf(pa, sizeof(pa), "%s",
-							 s.direct_addr);
-					o->peer(o->arg, SESSION_PEER_LIVE, pa);
+						snprintf(s.status_peer,
+							 sizeof(s.status_peer),
+							 "%s", s.direct_addr);
+					if (o && o->peer)
+						o->peer(o->arg,
+							SESSION_PEER_LIVE,
+							s.status_peer);
 					s.peer_state = SESSION_PEER_LIVE;
 				}
 				st = ST_RUN;
@@ -997,5 +1069,6 @@ int session_run(const struct session_cfg *cfg)
 	sig_destroy(s.sig);
 	stunlist_free(s.stun_servers, s.stun_count);
 	pthread_mutex_destroy(&s.trickle_lock);
+	pthread_mutex_destroy(&s.status_lock);
 	return rc;
 }

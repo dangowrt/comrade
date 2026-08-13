@@ -69,6 +69,15 @@ target_include_directories(comrade_token PUBLIC src)
 add_library(comrade_appdir STATIC src/appdir.c)
 target_include_directories(comrade_appdir PUBLIC src)
 
+# Structured connection status (controller fills it, view renders it) and the
+# view that paints it on the reserved bottom terminal row.
+add_library(comrade_conn STATIC src/conn.c)
+target_include_directories(comrade_conn PUBLIC src)
+
+add_library(comrade_statusbar STATIC src/statusbar.c)
+target_include_directories(comrade_statusbar PUBLIC src)
+target_link_libraries(comrade_statusbar PUBLIC comrade_conn)
+
 # STUN server pool. The default set is baked in at configure time from the
 # always-online-stun submodule (its RFC 5780-capable list, which also serves
 # for plain reflexive gathering); `comrade stun-update` refreshes it into the
@@ -199,7 +208,7 @@ if(LIBSSH_FOUND)
 	# The message-based libssh server API is deprecated in favour of the
 	# callback API but is clearer and fully functional; migrate later.
 	target_compile_options(comrade_ssh PRIVATE -Wno-deprecated-declarations)
-	target_link_libraries(comrade_ssh PUBLIC comrade_token PkgConfig::LIBSSH Threads::Threads)
+	target_link_libraries(comrade_ssh PUBLIC comrade_token comrade_statusbar PkgConfig::LIBSSH Threads::Threads)
 	find_library(COMRADE_UTIL util)
 	if(COMRADE_UTIL)
 		target_link_libraries(comrade_ssh PUBLIC ${COMRADE_UTIL})
@@ -213,7 +222,7 @@ if(COMRADE_HAVE_SIG AND COMRADE_HAVE_NAT AND COMRADE_HAVE_STREAM AND COMRADE_HAV
 	target_include_directories(comrade_session PUBLIC src)
 	target_link_libraries(comrade_session PUBLIC
 		comrade_sig comrade_nat comrade_lanlink comrade_stream comrade_ssh
-		comrade_bridge comrade_token comrade_crypto comrade_stunlist)
+		comrade_bridge comrade_token comrade_crypto comrade_stunlist comrade_conn)
 
 	# The view: the only module that draws to the terminal (MVC).
 	add_library(comrade_ui STATIC src/ui.c)
@@ -234,6 +243,7 @@ target_link_libraries(comrade
 	comrade_host
 	comrade_token
 	comrade_stunlist
+	comrade_statusbar
 )
 if(COMRADE_HAVE_SESSION)
 	target_link_libraries(comrade comrade_session comrade_ui)

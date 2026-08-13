@@ -94,6 +94,13 @@ struct session_cfg {
 	 */
 	int ssh_end_fd;
 	/*
+	 * Where to write the one-line connection status (host only): the operator
+	 * runs in a separate process from this service, so it reads the line from
+	 * this file. Put it on tmpfs (the runtime dir) -- it is rewritten often.
+	 * NULL for the client, which reads its status in-process.
+	 */
+	const char *status_path;
+	/*
 	 * Called once the rendezvous is ready to advertise: with the located
 	 * DHT node (embed it in the token), or NULL/0 when there is none to
 	 * embed (multicast-only) so the token can be published immediately.

@@ -25,21 +25,28 @@ int host_show(void)
 
 #include <arpa/inet.h>
 #include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <poll.h>
+#include <pty.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
+#include <termios.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
+#include "conn.h"
 #include "keys.h"
 #include "session.h"
 #include "sig.h"
 #include "sshd.h"
+#include "statusbar.h"
 #include "token.h"
 #include "ui.h"
 
@@ -61,6 +68,7 @@ struct svc {
 	struct token tok;
 	char sock[512];
 	char tokfile[512];
+	char statusfile[512];
 	struct session_obs obs;		/* view-event emitter to the foreground */
 };
 
@@ -90,6 +98,13 @@ static void sock_path(char *out, size_t n, const char *id)
 static void tok_path(char *out, size_t n, const char *id)
 {
 	snprintf(out, n, "%s/%s.tok", state_dir(), id);
+}
+
+/* The connection-status line file (tmpfs), written by the service, read by the
+ * operator's foreground to paint the local status row. */
+static void status_path(char *out, size_t n, const char *id)
+{
+	snprintf(out, n, "%s/%s.status", state_dir(), id);
 }
 
 static void gen_id(char *out)
@@ -258,6 +273,8 @@ static void sweep_stale(void)
 		unlink(sock);
 		tok_path(tok, sizeof(tok), cand);
 		unlink(tok);
+		status_path(tok, sizeof(tok), cand);
+		unlink(tok);
 	}
 	closedir(d);
 }
@@ -294,15 +311,137 @@ static int find_live(char *id)
 	return found;
 }
 
-static int attach(const char *id)
-{
-	char sock[512];
-	char *argv[] = { "tmux", "-S", sock, "attach", "-t", "comrade", NULL };
+static volatile sig_atomic_t g_winch;
 
-	sock_path(sock, sizeof(sock), id);
+static void on_winch(int sig)
+{
+	(void)sig;
+	g_winch = 1;
+}
+
+static uint64_t mono_ms(void)
+{
+	struct timespec t;
+
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return (uint64_t)t.tv_sec * 1000 + (uint64_t)(t.tv_nsec / 1000000);
+}
+
+/* Exec tmux directly, taking over this process (no local status row). */
+static int exec_tmux(char *const argv[])
+{
 	execvp(argv[0], argv);
 	fprintf(stderr, "comrade: could not run tmux\n");
 	return 1;
+}
+
+/*
+ * Attach the operator to the shared tmux, reserving the bottom terminal row for
+ * comrade's own status line -- run tmux in a pty one row shorter and paint the
+ * status (read from the service's tmpfs file) on the freed row ourselves, so it
+ * stays live even while the link is down. The view (statusbar) does the drawing;
+ * we only bridge bytes and reserve the row. Falls back to a plain exec when
+ * there is no usable tty.
+ */
+static int attach(const char *id)
+{
+	char sock[512], statuspath[512];
+	char *argv[] = { "tmux", "-S", sock, "attach", "-t", "comrade", NULL };
+	struct termios orig, raw;
+	struct sigaction sa, oldwinch;
+	struct winsize ws, cws;
+	int rows, cols, master, alive = 1;
+	pid_t child;
+	uint64_t last_paint = 0;
+	struct conn_status cur, prev;
+
+	sock_path(sock, sizeof(sock), id);
+	status_path(statuspath, sizeof(statuspath), id);
+
+	if (!isatty(STDIN_FILENO) || ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) ||
+	    ws.ws_row < 2 || tcgetattr(STDIN_FILENO, &orig))
+		return exec_tmux(argv);
+	rows = ws.ws_row;
+	cols = ws.ws_col;
+
+	cws = ws;
+	cws.ws_row = (unsigned short)(rows - 1);	/* tmux gets one row less */
+	child = forkpty(&master, NULL, &orig, &cws);
+	if (child < 0)
+		return exec_tmux(argv);
+	if (child == 0) {
+		execvp(argv[0], argv);
+		_exit(127);
+	}
+
+	raw = orig;
+	cfmakeraw(&raw);
+	tcsetattr(STDIN_FILENO, TCSANOW, &raw);
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = on_winch;
+	sigaction(SIGWINCH, &sa, &oldwinch);
+	memset(&prev, 0, sizeof(prev));
+
+	while (alive) {
+		struct pollfd fds[2];
+		char buf[4096];
+		ssize_t n;
+		uint64_t now;
+
+		fds[0].fd = STDIN_FILENO;
+		fds[0].events = POLLIN;
+		fds[0].revents = 0;
+		fds[1].fd = master;
+		fds[1].events = POLLIN;
+		fds[1].revents = 0;
+		poll(fds, 2, 200);
+
+		if (g_winch) {
+			g_winch = 0;
+			if (!ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) &&
+			    ws.ws_row >= 2) {
+				rows = ws.ws_row;
+				cols = ws.ws_col;
+				cws = ws;
+				cws.ws_row = (unsigned short)(rows - 1);
+				ioctl(master, TIOCSWINSZ, &cws);
+				memset(&prev, 0, sizeof(prev));
+			}
+		}
+		if (fds[0].revents & POLLIN) {
+			n = read(STDIN_FILENO, buf, sizeof(buf));
+			if (n > 0) {
+				ssize_t w = write(master, buf, (size_t)n);
+
+				(void)w;
+			}
+		}
+		if (fds[1].revents & (POLLIN | POLLHUP | POLLERR)) {
+			n = read(master, buf, sizeof(buf));
+			if (n > 0) {
+				ssize_t w = write(STDOUT_FILENO, buf, (size_t)n);
+
+				(void)w;
+			} else if (n == 0 ||
+				   (n < 0 && errno != EAGAIN && errno != EINTR)) {
+				alive = 0;	/* tmux exited */
+			}
+		}
+		now = mono_ms();
+		memset(&cur, 0, sizeof(cur));
+		conn_read(statuspath, &cur);	/* zeroed = "connecting" if absent */
+		if (memcmp(&cur, &prev, sizeof(cur)) || now - last_paint > 2000) {
+			statusbar_render(STDOUT_FILENO, rows, cols, &cur);
+			prev = cur;
+			last_paint = now;
+		}
+	}
+
+	tcsetattr(STDIN_FILENO, TCSANOW, &orig);
+	sigaction(SIGWINCH, &oldwinch, NULL);
+	close(master);
+	waitpid(child, NULL, 0);
+	return 0;
 }
 
 /* Called (in the service) once the rendezvous is ready; write the full token
@@ -374,6 +513,7 @@ static void run_service(struct svc *v, void *hostkey, int wfd, int no_mcast)
 	cfg.ssh_command = cmd;
 	cfg.use_pty = 1;
 	cfg.ssh_end_fd = end_fd > 0 ? end_fd : 0;
+	cfg.status_path = v->statusfile;
 	cfg.on_rendezvous = on_rendezvous;
 	cfg.arg = v;
 	cfg.obs = &v->obs;
@@ -391,6 +531,7 @@ static void run_service(struct svc *v, void *hostkey, int wfd, int no_mcast)
 		waitpid(end_pid, NULL, 0);
 	}
 	unlink(v->tokfile);
+	unlink(v->statusfile);
 	_exit(0);
 }
 
@@ -419,6 +560,7 @@ static int start_new(int ui_mode, int no_mcast)
 	gen_id(id);
 	sock_path(v.sock, sizeof(v.sock), id);
 	tok_path(v.tokfile, sizeof(v.tokfile), id);
+	status_path(v.statusfile, sizeof(v.statusfile), id);
 
 	v.tok.version = TOKEN_VERSION;
 	hostkey = sshd_hostkey_new(v.tok.hostpub);

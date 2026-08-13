@@ -14,6 +14,15 @@
 
 #include "base64.h"
 #include "sshc.h"
+#include "statusbar.h"
+
+static uint64_t mono_ms(void)
+{
+	struct timespec t;
+
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return (uint64_t)t.tv_sec * 1000 + (uint64_t)(t.tv_nsec / 1000000);
+}
 
 /* Verify the server host key against the token-pinned fingerprint. A
  * mismatch is a hard failure: it means a MITM, so there is nothing to
@@ -77,10 +86,14 @@ static void on_winch(int sig)
  * relaying window-size changes to the remote pty. Runs until the channel ends
  * (the remote tmux detaches or exits).
  */
-static int run_interactive(ssh_session s, ssh_channel chan)
+static int run_interactive(ssh_session s, ssh_channel chan,
+			   const struct sshc_opts *o)
 {
 	struct termios orig, raw;
 	struct sigaction sa, old_winch;
+	int rows = 0, cols = 0, reserve = 0;
+	uint64_t last_status = 0;
+	struct conn_status cur, prev;
 	ssh_event event = ssh_event_new();
 	ssh_connector c_in = ssh_connector_new(s);	/* stdin -> channel */
 	ssh_connector c_out = ssh_connector_new(s);	/* channel -> stdout */
@@ -100,6 +113,20 @@ static int run_interactive(ssh_session s, ssh_channel chan)
 	memset(&sa, 0, sizeof(sa));
 	sa.sa_handler = on_winch;
 	sigaction(SIGWINCH, &sa, &old_winch);
+
+	/* Reserve the bottom row for our local status line, if requested and there
+	 * is room: the remote tmux was asked for a pty one row shorter, so it never
+	 * touches this row. */
+	memset(&prev, 0, sizeof(prev));
+	if (have_tty && o && o->status) {
+		struct winsize ws;
+
+		if (!ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) && ws.ws_row > 1) {
+			rows = ws.ws_row;
+			cols = ws.ws_col;
+			reserve = 1;
+		}
+	}
 
 	ssh_connector_set_in_fd(c_in, STDIN_FILENO);
 	ssh_connector_set_out_channel(c_in, chan, SSH_CONNECTOR_STDOUT);
@@ -134,9 +161,25 @@ static int run_interactive(ssh_session s, ssh_channel chan)
 			struct winsize ws;
 
 			g_winch = 0;
-			if (have_tty && !ioctl(STDIN_FILENO, TIOCGWINSZ, &ws))
+			if (have_tty && !ioctl(STDIN_FILENO, TIOCGWINSZ, &ws)) {
+				rows = ws.ws_row;
+				cols = ws.ws_col;
 				ssh_channel_change_pty_size(chan, ws.ws_col,
-							    ws.ws_row);
+							    ws.ws_row - reserve);
+				memset(&prev, 0, sizeof(prev));	/* repaint */
+			}
+		}
+		if (reserve) {
+			uint64_t now = mono_ms();
+
+			memset(&cur, 0, sizeof(cur));
+			o->status(o->status_arg, &cur);
+			if (memcmp(&cur, &prev, sizeof(cur)) ||
+			    now - last_status > 2000) {
+				statusbar_render(STDOUT_FILENO, rows, cols, &cur);
+				prev = cur;
+				last_status = now;
+			}
 		}
 	}
 
@@ -199,16 +242,22 @@ int sshc_connect_fd(int fd, const struct sshc_opts *o)
 
 		if (!term)
 			term = "xterm-256color";
+		int reserve, prows;
+
 		if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws)) {
 			ws.ws_col = 80;
 			ws.ws_row = 24;
 		}
+		/* Match run_interactive: a status line steals the bottom row. */
+		reserve = (o->status && isatty(STDIN_FILENO) &&
+			   ws.ws_row > 1) ? 1 : 0;
+		prows = ws.ws_row - reserve;
 		if (ssh_channel_request_pty_size(chan, term, ws.ws_col,
-						 ws.ws_row) != SSH_OK)
+						 prows) != SSH_OK)
 			goto out;
 		if (ssh_channel_request_shell(chan) != SSH_OK)
 			goto out;
-		rc = run_interactive(s, chan);
+		rc = run_interactive(s, chan, o);
 	} else {
 		if (ssh_channel_request_shell(chan) != SSH_OK)
 			goto out;

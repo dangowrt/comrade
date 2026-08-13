@@ -7,6 +7,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "conn.h"
 #include "token.h"
 
 /*
@@ -24,6 +25,15 @@ struct sshc_opts {
 	uint8_t auth[TOKEN_AUTH_LEN];	/* session password material */
 
 	int interactive;		/* bridge local stdin/stdout raw */
+
+	/*
+	 * Optional local status. When set, interactive mode reserves the bottom
+	 * terminal row (runs the remote tmux one row shorter) and has the view
+	 * paint this connection status there each tick -- staying live even when
+	 * the link is down. The controller supplies data only; fill *out.
+	 */
+	void (*status)(void *arg, struct conn_status *out);
+	void *status_arg;
 
 	/* test mode (used when interactive == 0): */
 	const uint8_t *send;

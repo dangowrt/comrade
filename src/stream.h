@@ -22,4 +22,7 @@ uint32_t stream_update(struct stream *s, uint32_t now_ms);
 int stream_waitsnd(struct stream *s);
 void stream_set_output(struct stream *s, stream_output_fn *out, void *arg);
 
+/* Smoothed round-trip time in ms (KCP's rx_srtt); 0 before the first sample. */
+int stream_rtt(struct stream *s);
+
 #endif

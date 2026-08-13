@@ -117,6 +117,16 @@ int stream_waitsnd(struct stream *s)
 	return rc;
 }
 
+int stream_rtt(struct stream *s)
+{
+	int rtt;
+
+	pthread_mutex_lock(&s->lock);
+	rtt = s->kcp ? (int)s->kcp->rx_srtt : 0;
+	pthread_mutex_unlock(&s->lock);
+	return rtt;
+}
+
 void stream_set_output(struct stream *s, stream_output_fn *out, void *arg)
 {
 	pthread_mutex_lock(&s->lock);
