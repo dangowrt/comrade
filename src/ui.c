@@ -329,8 +329,17 @@ static void draw(struct ui *u)
 		line(DIM "[ " BYE "ENTER" DIM " / " BYE "SPACE" DIM
 		     " to enter the shared session ]" RST);
 	} else {
-		if (u->established)
+		const char *pa = u->npeer && u->peer[0].addr[0] &&
+				 u->peer[0].addr[0] != '-' ? u->peer[0].addr : NULL;
+
+		if (u->established && pa)
+			line(BGR "  link up via " RST CYN "%s" RST BGR
+			     " -- entering ..." RST, pa);
+		else if (u->established)
 			line(BGR "  link up -- entering ..." RST);
+		else if (pa)
+			line(DIM "  connecting to " RST CYN "%s" RST DIM
+			     " ..." RST, pa);
 		else
 			line(DIM "  connecting ..." RST);
 	}

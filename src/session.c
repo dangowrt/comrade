@@ -71,6 +71,7 @@ struct sess {
 	int escalated;			/* observer: client warned of DHT warm */
 	int peer_state;			/* observer: highest SESSION_PEER_* sent */
 	int established_fired;		/* observer: established sent once */
+	char direct_addr[80];		/* observer: link-local peer, printable */
 
 	int ssh_fd;			/* the ssh thread's socketpair end */
 	int ssh_cli_rc;
@@ -115,6 +116,41 @@ static int sdp_first_addr(const char *sdp, char *out, size_t n)
 		return 0;
 	snprintf(out, n, "%s", addr);
 	return 1;
+}
+
+/* "addr:port" from an ICE candidate line (as juice reports the selected pair);
+ * handles both the "candidate:" and "a=candidate:" spellings. 1 if found. */
+static int cand_addr(const char *cand, char *out, size_t n)
+{
+	const char *p = strstr(cand, "candidate:");
+	char addr[64];
+	unsigned port = 0;
+
+	if (!p)
+		return 0;
+	if (sscanf(p, "candidate:%*s %*d %*s %*u %63s %u", addr, &port) < 1)
+		return 0;
+	if (port)
+		snprintf(out, n, "%s:%u", addr, port);
+	else
+		snprintf(out, n, "%s", addr);
+	return 1;
+}
+
+/* Printable "addr:port" ("[v6]:port") for a sockaddr; empty on failure. */
+static void fmt_sockaddr(const struct sockaddr *sa, socklen_t len,
+			 char *out, size_t n)
+{
+	char host[64], serv[16];
+
+	out[0] = '\0';
+	if (getnameinfo(sa, len, host, sizeof(host), serv, sizeof(serv),
+			NI_NUMERICHOST | NI_NUMERICSERV))
+		return;
+	if (strchr(host, ':'))
+		snprintf(out, n, "[%s]:%s", host, serv);
+	else
+		snprintf(out, n, "%s:%s", host, serv);
 }
 
 /* Classify a bare address string by reachability scope. */
@@ -344,6 +380,7 @@ static void on_direct_peer(void *arg, const struct sockaddr *peer, socklen_t len
 
 	if (s->lan)
 		lanlink_set_peer(s->lan, peer, len);
+	fmt_sockaddr(peer, len, s->direct_addr, sizeof(s->direct_addr));
 }
 
 static void on_peer_offer(void *arg, const uint8_t *data, size_t len)
@@ -811,7 +848,18 @@ int session_run(const struct session_cfg *cfg)
 			    (s.lan && lanlink_have_peer(s.lan))) {
 				if (o && o->peer &&
 				    s.peer_state < SESSION_PEER_LIVE) {
-					o->peer(o->arg, SESSION_PEER_LIVE, "");
+					char pa[80];
+					char loc[192], rem[192];
+
+					pa[0] = '\0';
+					if (nat_connected(s.nat) &&
+					    !nat_selected(s.nat, loc, sizeof(loc),
+							  rem, sizeof(rem)))
+						cand_addr(rem, pa, sizeof(pa));
+					else if (s.direct_addr[0])
+						snprintf(pa, sizeof(pa), "%s",
+							 s.direct_addr);
+					o->peer(o->arg, SESSION_PEER_LIVE, pa);
 					s.peer_state = SESSION_PEER_LIVE;
 				}
 				st = ST_RUN;
