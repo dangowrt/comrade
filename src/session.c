@@ -33,6 +33,13 @@
 #define ICE_ATTEMPT_MS 90000
 
 /*
+ * If, this long after start, we still hold only a private/CGNAT IPv4 and STUN
+ * has not returned a public one, the STUN pool is probably stale or unreachable
+ * -- warn once and point at `comrade stun-update`.
+ */
+#define STUN_WARN_MS 8000
+
+/*
  * Post-teardown linger for the bridge. The host keeps flushing generously, to
  * land the dedicated end-of-session signal (the channel exit-status and close)
  * on the client even over a lossy link -- it returns as soon as the client
@@ -85,6 +92,9 @@ struct sess {
 	int peer_state;			/* observer: highest SESSION_PEER_* sent */
 	int established_fired;		/* observer: established sent once */
 	char direct_addr[80];		/* observer: link-local peer, printable */
+	int have_priv4;			/* a private/CGNAT v4 host candidate (needs STUN) */
+	int have_srflx4;		/* STUN gave us a public v4 (reflexive) */
+	int stun_warned;		/* warned once that STUN produced nothing */
 
 	int ssh_fd;			/* the ssh thread's socketpair end */
 	int ssh_cli_rc;
@@ -222,8 +232,15 @@ static void obs_report_net(struct sess *s)
 			else
 				via = -1;
 			if (via >= 0) {
+				int scope = addr_scope(addr);
+
 				fam = strchr(addr, ':') ? 6 : 4;
-				o->net(o->arg, fam, addr_scope(addr), via, addr);
+				if (fam == 4 && via == NET_VIA_STUN)
+					s->have_srflx4 = 1;
+				else if (fam == 4 && via == NET_VIA_DIRECT &&
+					 scope != NET_SCOPE_GLOBAL)
+					s->have_priv4 = 1;
+				o->net(o->arg, fam, scope, via, addr);
 			}
 		}
 		p += 12;
@@ -809,6 +826,15 @@ int session_run(const struct session_cfg *cfg)
 				o->escalate(o->arg, "rendezvous node quiet -- "
 					    "warming the full DHT");
 				s.escalated = 1;
+			}
+			if (o->escalate && !s.stun_warned &&
+			    (cfg->sig_flags & SIG_DHT) && s.have_priv4 &&
+			    !s.have_srflx4 && s.stun_count > 0 &&
+			    now_ms() - s.start_ms > STUN_WARN_MS) {
+				o->escalate(o->arg, "no public IPv4 from STUN -- "
+					    "the server list may be stale; run "
+					    "`comrade stun-update`");
+				s.stun_warned = 1;
 			}
 			if (o->peer && s.have_peer_sdp &&
 			    s.peer_state < SESSION_PEER_SEEN) {
