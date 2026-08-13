@@ -26,11 +26,13 @@ static int usage(int ret)
 	fprintf(stderr,
 		"usage: comrade            start a shared session\n"
 		"       comrade <token>    connect to a shared session\n"
-		"       comrade show       print the tokens of the running session\n");
+		"       comrade show       print the tokens of the running session\n"
+		"opts:  -v, --verbose      log lines instead of the dashboard\n"
+		"       --no-multicast     skip link-local discovery, DHT/STUN only\n");
 	return ret;
 }
 
-static int session_connect(const char *arg, int ui_mode)
+static int session_connect(const char *arg, int ui_mode, int no_mcast)
 {
 #ifdef COMRADE_HAVE_SESSION
 	struct session_cfg cfg;
@@ -43,8 +45,10 @@ static int session_connect(const char *arg, int ui_mode)
 		fprintf(stderr, "comrade: invalid token\n");
 		return 1;
 	}
-	/* Race the LAN (multicast) and the DHT: whichever reaches the host wins. */
-	cfg.sig_flags = SIG_DHT | SIG_MCAST;
+	/* Race the LAN (multicast) and the DHT: whichever reaches the host wins.
+	 * --no-multicast drops the LAN path, so two hosts on one segment can be
+	 * forced onto the DHT/STUN path for testing. */
+	cfg.sig_flags = SIG_DHT | (no_mcast ? 0 : SIG_MCAST);
 	cfg.stun_port = 3478;
 	cfg.stun_auto = 1;
 	cfg.log_level = -1;
@@ -66,6 +70,7 @@ static int session_connect(const char *arg, int ui_mode)
 	struct token tok;
 
 	(void)ui_mode;
+	(void)no_mcast;
 	if (token_decode(&tok, arg))
 		fprintf(stderr, "comrade: invalid token\n");
 	fprintf(stderr, "comrade: built without the session stack\n");
@@ -75,7 +80,7 @@ static int session_connect(const char *arg, int ui_mode)
 
 int main(int argc, char **argv)
 {
-	int ui_mode = UI_AUTO;
+	int ui_mode = UI_AUTO, no_mcast = 0;
 	const char *pos = NULL;
 	int i;
 
@@ -84,6 +89,8 @@ int main(int argc, char **argv)
 			return usage(0);
 		if (!strcmp(argv[i], "-v") || !strcmp(argv[i], "--verbose"))
 			ui_mode = UI_VERBOSE;
+		else if (!strcmp(argv[i], "--no-multicast"))
+			no_mcast = 1;
 		else if (argv[i][0] == '-')
 			return usage(1);
 		else if (!pos)
@@ -93,8 +100,8 @@ int main(int argc, char **argv)
 	}
 
 	if (!pos)
-		return host_run(ui_mode);
+		return host_run(ui_mode, no_mcast);
 	if (!strcmp(pos, "show"))
 		return host_show();
-	return session_connect(pos, ui_mode);
+	return session_connect(pos, ui_mode, no_mcast);
 }

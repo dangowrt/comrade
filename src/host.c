@@ -7,9 +7,10 @@
 
 #ifndef COMRADE_HAVE_SESSION
 
-int host_run(int ui_mode)
+int host_run(int ui_mode, int no_mcast)
 {
 	(void)ui_mode;
+	(void)no_mcast;
 	fprintf(stderr, "comrade: built without the session stack\n");
 	return 1;
 }
@@ -220,7 +221,7 @@ static void on_rendezvous(void *arg, const struct sockaddr *sa, socklen_t len)
 
 /* The backgrounded connection service: serve the shared tmux over the punched
  * link, again after each client, until the tmux server is gone. */
-static void run_service(struct svc *v, void *hostkey, int wfd)
+static void run_service(struct svc *v, void *hostkey, int wfd, int no_mcast)
 {
 	char cmd[600];
 	struct session_cfg cfg;
@@ -243,7 +244,7 @@ static void run_service(struct svc *v, void *hostkey, int wfd)
 	memset(&cfg, 0, sizeof(cfg));
 	cfg.is_host = 1;
 	cfg.tok = v->tok;
-	cfg.sig_flags = SIG_DHT | SIG_MCAST;
+	cfg.sig_flags = SIG_DHT | (no_mcast ? 0 : SIG_MCAST);
 	cfg.stun_port = 3478;
 	cfg.stun_auto = 1;
 	cfg.log_level = -1;
@@ -277,7 +278,7 @@ static void teardown(pid_t svc, const char *sock, const char *tokfile)
 	unlink(sock);
 }
 
-static int start_new(int ui_mode)
+static int start_new(int ui_mode, int no_mcast)
 {
 	struct svc v;
 	char id[ID_LEN + 1];
@@ -327,7 +328,7 @@ static int start_new(int ui_mode)
 	}
 	if (pid == 0) {
 		close(pfd[0]);
-		run_service(&v, hostkey, pfd[1]);	/* never returns */
+		run_service(&v, hostkey, pfd[1], no_mcast);	/* never returns */
 	}
 	close(pfd[1]);
 	sshd_hostkey_free(hostkey);		/* the service has its own copy */
@@ -351,7 +352,7 @@ static int start_new(int ui_mode)
 	return 1;
 }
 
-int host_run(int ui_mode)
+int host_run(int ui_mode, int no_mcast)
 {
 	char id[ID_LEN + 1];
 
@@ -360,7 +361,7 @@ int host_run(int ui_mode)
 			" (its token: `comrade show`)\n");
 		return attach(id);
 	}
-	return start_new(ui_mode);
+	return start_new(ui_mode, no_mcast);
 }
 
 int host_show(void)
