@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
 
@@ -112,17 +113,23 @@ static int run_interactive(ssh_session s, ssh_channel chan)
 
 	while (ssh_channel_is_open(chan) && !ssh_channel_is_eof(chan)) {
 		/*
-		 * Exit not only on a clean channel EOF but also when the poll
-		 * errors or the session itself ends. The host closes the channel
-		 * and disconnects when the shared session is over, and that may
-		 * arrive without flipping the channel's is_open; watching only the
-		 * channel would leave the client spinning after the remote tmux has
-		 * gone -- the "[exited] then hang" symptom.
+		 * End only on the dedicated end-of-session signal: the host sends
+		 * a channel exit-status and closes the channel when the shared
+		 * session is over, which surfaces here as the channel reaching EOF
+		 * / no longer open (the loop condition). A transport hiccup -- a
+		 * slow or flaky link, or a roam that needs a fresh handshake -- must
+		 * NOT be taken for the end of the session, so we deliberately do not
+		 * exit on a poll error or a dropped connection. The SSH transport is
+		 * a local socketpair bridged to KCP, so a broken path shows up here
+		 * only as no data (dopoll idles), never as an error; a genuine end
+		 * always arrives as the channel close. On the rare real poll error,
+		 * pause briefly rather than spin, and keep waiting for the channel.
 		 */
-		if (ssh_event_dopoll(event, 200) == SSH_ERROR)
-			break;
-		if (!ssh_is_connected(s))
-			break;
+		if (ssh_event_dopoll(event, 200) == SSH_ERROR) {
+			struct timespec ts = { 0, 100 * 1000 * 1000 };
+
+			nanosleep(&ts, NULL);
+		}
 		if (g_winch) {
 			struct winsize ws;
 

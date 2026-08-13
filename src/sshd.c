@@ -282,6 +282,7 @@ int sshd_serve_fd(int fd, const struct sshd_opts *o)
 	int want_pty = 0;
 	int gave_fd = 0;
 	int rc = -1;
+	int exit_code = 0;
 
 	if (!o || !o->hostkey)
 		return -1;
@@ -323,13 +324,19 @@ out:
 	if (from_child >= 0 && from_child != to_child)
 		close(from_child);
 	if (child > 0) {
-		int status;
-
 		kill(child, SIGHUP);
-		waitpid(child, &status, 0);
+		waitpid(child, &exit_code, 0);
+		exit_code = WIFEXITED(exit_code) ? WEXITSTATUS(exit_code) : 0;
 	}
 	if (chan) {
 		if (ssh_channel_is_open(chan)) {
+			/*
+			 * The dedicated end-of-session signal: an SSH exit-status
+			 * followed by EOF and close. This is how the peer learns the
+			 * shared session is over -- distinct from a transport drop, so
+			 * a flaky link or a roam is never mistaken for the end.
+			 */
+			ssh_channel_request_send_exit_status(chan, exit_code);
 			ssh_channel_send_eof(chan);
 			ssh_channel_close(chan);
 		}
