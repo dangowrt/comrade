@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 /* Copyright (C) 2026 Daniel Golle <daniel@makrotopia.org> */
 
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,6 +17,40 @@
 #include "dbg.h"
 #include "sshc.h"
 #include "statusbar.h"
+#include "termfilter.h"
+
+/*
+ * stdin -> channel, replacing libssh's plain connector so we can filter the
+ * byte stream: tmux asks the terminal for its size and the terminal's answer
+ * comes back this way, so termfilter rewrites it one row shorter to keep the
+ * reserved status row (see termfilter.h). Keystrokes and everything else pass
+ * through untouched.
+ */
+struct stdin_ctx {
+	ssh_channel chan;
+	struct termfilter *tf;
+	int eof;
+};
+
+static int on_stdin(socket_t fd, int revents, void *userdata)
+{
+	struct stdin_ctx *c = userdata;
+	char buf[4096], fb[4096 + 32];
+	ssize_t n;
+	size_t fn;
+
+	if (!(revents & (POLLIN | POLLHUP | POLLERR)))
+		return 0;
+	n = read(fd, buf, sizeof(buf));
+	if (n <= 0) {
+		c->eof = 1;
+		return 0;
+	}
+	fn = termfilter_run(c->tf, buf, (size_t)n, fb);
+	if (fn)
+		ssh_channel_write(c->chan, fb, (uint32_t)fn);
+	return 0;
+}
 
 /* Confine the terminal's scroll region to the rows above our reserved status
  * row, so nothing scrolling in the tmux area can ever push into it; on == 0
@@ -114,13 +149,14 @@ static int run_interactive(ssh_session s, ssh_channel chan,
 	int rows = 0, cols = 0, reserve = 0;
 	uint64_t last_status = 0;
 	struct conn_status cur, prev;
+	struct termfilter tf;
+	struct stdin_ctx sctx;
 	ssh_event event = ssh_event_new();
-	ssh_connector c_in = ssh_connector_new(s);	/* stdin -> channel */
 	ssh_connector c_out = ssh_connector_new(s);	/* channel -> stdout */
 	ssh_connector c_err = ssh_connector_new(s);	/* channel stderr -> stderr */
 	int have_tty = isatty(STDIN_FILENO);
 
-	if (!event || !c_in || !c_out || !c_err)
+	if (!event || !c_out || !c_err)
 		goto out;
 
 	if (have_tty && !tcgetattr(STDIN_FILENO, &orig)) {
@@ -152,13 +188,17 @@ static int run_interactive(ssh_session s, ssh_channel chan,
 		 rows, cols, reserve, reserve ? rows - 1 : rows);
 	scroll_guard(rows, reserve, 1);
 
-	ssh_connector_set_in_fd(c_in, STDIN_FILENO);
-	ssh_connector_set_out_channel(c_in, chan, SSH_CONNECTOR_STDOUT);
+	/* stdin is pumped by us (with the terminal-answer filter); the channel's
+	 * two output directions stay on libssh connectors. */
+	termfilter_init(&tf, reserve);
+	sctx.chan = chan;
+	sctx.tf = &tf;
+	sctx.eof = 0;
 	ssh_connector_set_in_channel(c_out, chan, SSH_CONNECTOR_STDOUT);
 	ssh_connector_set_out_fd(c_out, STDOUT_FILENO);
 	ssh_connector_set_in_channel(c_err, chan, SSH_CONNECTOR_STDERR);
 	ssh_connector_set_out_fd(c_err, STDERR_FILENO);
-	ssh_event_add_connector(event, c_in);
+	ssh_event_add_fd(event, STDIN_FILENO, POLLIN, on_stdin, &sctx);
 	ssh_event_add_connector(event, c_out);
 	ssh_event_add_connector(event, c_err);
 
@@ -211,7 +251,7 @@ static int run_interactive(ssh_session s, ssh_channel chan,
 		}
 	}
 
-	ssh_event_remove_connector(event, c_in);
+	ssh_event_remove_fd(event, STDIN_FILENO);
 	ssh_event_remove_connector(event, c_out);
 	ssh_event_remove_connector(event, c_err);
 	scroll_guard(rows, reserve, 0);
@@ -219,8 +259,6 @@ static int run_interactive(ssh_session s, ssh_channel chan,
 	if (have_tty)
 		tcsetattr(STDIN_FILENO, TCSANOW, &orig);
 out:
-	if (c_in)
-		ssh_connector_free(c_in);
 	if (c_out)
 		ssh_connector_free(c_out);
 	if (c_err)

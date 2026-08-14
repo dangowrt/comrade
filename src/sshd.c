@@ -12,7 +12,6 @@
 #include <sys/wait.h>
 
 #include <libssh/libssh.h>
-#include <libssh/callbacks.h>
 #include <libssh/server.h>
 
 #include "base64.h"
@@ -258,26 +257,35 @@ static int do_shell_request(ssh_session s, int *want_pty, struct winsize *ws,
 	}
 }
 
-/* The client resized its terminal: apply the new size to the child's pty so
- * tmux reflows and keeps to the rows it was given (the client still reserves
- * its bottom status row by asking for one fewer). userdata is the master fd. */
-static int on_pty_winch(ssh_session s, ssh_channel c, int width, int height,
-			int pxwidth, int pxheight, void *userdata)
+/* Apply a client window-change to the child pty so tmux reflows. The client
+ * has already subtracted its reserved status row, and its terminal-size answer
+ * to tmux is corrected on the client side too, so tmux stays one row short. */
+static void apply_winch(int master, ssh_message m)
 {
-	int master = *(int *)userdata;
 	struct winsize ws;
 
-	(void)s;
-	(void)c;
-	(void)pxwidth;
-	(void)pxheight;
-	if (master < 0)
-		return 0;
 	memset(&ws, 0, sizeof(ws));
-	ws.ws_col = (unsigned short)width;
-	ws.ws_row = (unsigned short)height;
-	ioctl(master, TIOCSWINSZ, &ws);
-	return 0;
+	ws.ws_col = (unsigned short)ssh_message_channel_request_pty_width(m);
+	ws.ws_row = (unsigned short)ssh_message_channel_request_pty_height(m);
+	dbg_logf("sshd window-change -> pty %dx%d", ws.ws_row, ws.ws_col);
+	if (master >= 0 && ws.ws_row)
+		ioctl(master, TIOCSWINSZ, &ws);
+}
+
+/* Drain any pending session messages; apply window-change requests to the pty
+ * and reply to the rest so nothing stalls. Non-blocking (the session is put in
+ * non-blocking mode by the pump), so it returns once the queue is empty. */
+static void drain_messages(ssh_session s, int master)
+{
+	ssh_message m;
+
+	while ((m = ssh_message_get(s)) != NULL) {
+		if (ssh_message_type(m) == SSH_REQUEST_CHANNEL &&
+		    ssh_message_subtype(m) == SSH_CHANNEL_REQUEST_WINDOW_CHANGE)
+			apply_winch(master, m);
+		ssh_message_reply_default(m);
+		ssh_message_free(m);
+	}
 }
 
 /* End-of-session fd became readable (a liveness monitor exited with the shared
@@ -325,9 +333,13 @@ static void pump(ssh_session s, ssh_channel chan, int to_child, int from_child,
 				 POLLIN | POLLHUP | POLLERR | POLLNVAL,
 				 on_end_fd, &end_hit);
 
+	/* So drain_messages() can poll the request queue without blocking. */
+	ssh_set_blocking(s, 0);
+
 	while (ssh_channel_is_open(chan) && !ssh_channel_is_eof(chan)) {
 		if (ssh_event_dopoll(event, 200) == SSH_ERROR)
 			break;
+		drain_messages(s, to_child);
 		if (!ending && end_hit)
 			ending = 1;
 		if (!ending &&
@@ -364,7 +376,6 @@ int sshd_serve_fd(int fd, const struct sshd_opts *o)
 	int exit_code = 0;
 	struct winsize ws;
 	char term[64];
-	struct ssh_channel_callbacks_struct cb;
 
 	if (!o || !o->hostkey)
 		return -1;
@@ -400,14 +411,8 @@ int sshd_serve_fd(int fd, const struct sshd_opts *o)
 		  &to_child, &from_child))
 		goto out;
 
-	if (want_pty) {			/* track live resizes onto the pty */
-		memset(&cb, 0, sizeof(cb));
-		cb.userdata = &to_child;	/* the pty master in pty mode */
-		cb.channel_pty_window_change_function = on_pty_winch;
-		ssh_callbacks_init(&cb);
-		ssh_set_channel_callbacks(chan, &cb);
-	}
-
+	/* Live resizes arrive as window-change requests; the pump applies them
+	 * to the pty (see drain_messages). */
 	pump(s, chan, to_child, from_child, child, o->end_fd);
 	rc = 0;
 out:

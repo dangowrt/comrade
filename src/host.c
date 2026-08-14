@@ -48,6 +48,7 @@ int host_show(void)
 #include "sig.h"
 #include "sshd.h"
 #include "statusbar.h"
+#include "termfilter.h"
 #include "token.h"
 #include "ui.h"
 
@@ -355,49 +356,6 @@ static void scroll_guard(int rows, int reserve, int on)
 	}
 }
 
-/* Ask the running tmux what size it settled on and log it, so a size mismatch
- * between the reserved terminal and the shared window is visible. Captures the
- * command's stdout (run_capture only takes stderr). */
-static void log_tmux_size(const char *sock)
-{
-	char *q[] = { "tmux", "-S", (char *)sock, "display", "-p",
-		      "client=#{client_height}x#{client_width} "
-		      "window=#{window_height}x#{window_width}", NULL };
-	char out[256];
-	int p[2];
-	pid_t pid;
-	ssize_t n = 0;
-
-	if (!getenv("COMRADE_DEBUG"))
-		return;
-	if (pipe(p))
-		return;
-	pid = fork();
-	if (pid < 0) {
-		close(p[0]);
-		close(p[1]);
-		return;
-	}
-	if (pid == 0) {
-		dup2(p[1], STDOUT_FILENO);
-		close(p[0]);
-		close(p[1]);
-		execvp(q[0], q);
-		_exit(127);
-	}
-	close(p[1]);
-	n = read(p[0], out, sizeof(out) - 1);
-	close(p[0]);
-	waitpid(pid, NULL, 0);
-	if (n > 0) {
-		out[n] = '\0';
-		while (n > 0 && (out[n - 1] == '\n' || out[n - 1] == '\r'))
-			out[--n] = '\0';
-		dbg_logf("host tmux settled: %s (terminal reserved 1 row for "
-			 "comrade)", out);
-	}
-}
-
 /*
  * Attach the operator to the shared tmux, reserving the bottom terminal row for
  * comrade's own status line -- run tmux in a pty one row shorter and paint the
@@ -414,10 +372,10 @@ static int attach(const char *id)
 	struct sigaction sa, oldwinch;
 	struct winsize ws, cws;
 	int rows, cols, master, alive = 1;
-	int size_probe = 6;		/* log tmux's size once, ~1.2s in */
 	pid_t child;
 	uint64_t last_paint = 0;
 	struct conn_status cur, prev;
+	struct termfilter tf;
 
 	sock_path(sock, sizeof(sock), id);
 	status_path(statuspath, sizeof(statuspath), id);
@@ -444,6 +402,7 @@ static int attach(const char *id)
 	cfmakeraw(&raw);
 	tcsetattr(STDIN_FILENO, TCSANOW, &raw);
 	scroll_guard(rows, 1, 1);
+	termfilter_init(&tf, 1);	/* keep tmux one row shorter than the tty */
 	memset(&sa, 0, sizeof(sa));
 	sa.sa_handler = on_winch;
 	sigaction(SIGWINCH, &sa, &oldwinch);
@@ -478,12 +437,13 @@ static int attach(const char *id)
 				memset(&prev, 0, sizeof(prev));
 			}
 		}
-		if (size_probe > 0 && --size_probe == 0)
-			log_tmux_size(sock);	/* one-shot, after tmux settles */
 		if (fds[0].revents & POLLIN) {
 			n = read(STDIN_FILENO, buf, sizeof(buf));
 			if (n > 0) {
-				ssize_t w = write(master, buf, (size_t)n);
+				char fb[sizeof(buf) + sizeof(tf.pend)];
+				size_t fn = termfilter_run(&tf, buf, (size_t)n,
+							   fb);
+				ssize_t w = write(master, fb, fn);
 
 				(void)w;
 			}
