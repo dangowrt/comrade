@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <pty.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -65,13 +66,46 @@ void sshd_hostkey_free(void *hostkey)
 		ssh_key_free((ssh_key)hostkey);
 }
 
-/* Spawn /bin/sh -c command; return its pid, plus write- and read-side fds
- * toward the child's stdin and stdout. With a pty both are the master fd. */
-static int spawn(const char *command, int use_pty, const struct winsize *ws,
-		 pid_t *pid, int *to_child, int *from_child)
+/* A terminal type is a short name; accept only a safe charset so it can be
+ * pasted into the shell command that sets TERM (see spawn) without escaping. */
+static int safe_term(const char *t)
 {
-	const char *cmd = command ? command : "tmux new-session -A -s comrade";
+	size_t i;
+
+	if (!t || !*t)
+		return 0;
+	for (i = 0; t[i]; i++) {
+		char c = t[i];
+
+		if (i >= 63)
+			return 0;
+		if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+		      (c >= '0' && c <= '9') || c == '.' || c == '-' ||
+		      c == '_'))
+			return 0;
+	}
+	return 1;
+}
+
+/* Spawn /bin/sh -c command; return its pid, plus write- and read-side fds
+ * toward the child's stdin and stdout. With a pty both are the master fd.
+ *
+ * When the client negotiated a terminal type, prepend it as a TERM assignment
+ * to the command so the remote command (tmux) renders for the client's actual
+ * terminal -- crucially, one whose terminfo has the alternate screen, so tmux
+ * does not fall back to scrolling the main screen. Done through the shell
+ * rather than setenv() after fork(), which is not safe in a threaded process. */
+static int spawn(const char *command, int use_pty, const struct winsize *ws,
+		 const char *term, pid_t *pid, int *to_child, int *from_child)
+{
+	const char *base = command ? command : "tmux new-session -A -s comrade";
+	char cmd[768];
 	pid_t p;
+
+	if (term && term[0])
+		snprintf(cmd, sizeof(cmd), "TERM=%s %s", term, base);
+	else
+		snprintf(cmd, sizeof(cmd), "%s", base);
 
 	if (use_pty) {
 		int master;
@@ -179,7 +213,8 @@ static ssh_channel do_channel(ssh_session s)
 /* Wait for a shell/exec request; accept pty requests along the way. Reports
  * whether the client asked for a pty and, if so, the terminal size it asked
  * for so the child's pty can match it (see spawn). */
-static int do_shell_request(ssh_session s, int *want_pty, struct winsize *ws)
+static int do_shell_request(ssh_session s, int *want_pty, struct winsize *ws,
+			    char *term, size_t termlen)
 {
 	*want_pty = 0;
 	for (;;) {
@@ -192,11 +227,16 @@ static int do_shell_request(ssh_session s, int *want_pty, struct winsize *ws)
 		subtype = ssh_message_subtype(m);
 		if (type == SSH_REQUEST_CHANNEL) {
 			if (subtype == SSH_CHANNEL_REQUEST_PTY) {
+				const char *t =
+					ssh_message_channel_request_pty_term(m);
+
 				*want_pty = 1;
 				ws->ws_col = (unsigned short)
 					ssh_message_channel_request_pty_width(m);
 				ws->ws_row = (unsigned short)
 					ssh_message_channel_request_pty_height(m);
+				if (safe_term(t))
+					snprintf(term, termlen, "%s", t);
 				ssh_message_channel_request_reply_success(m);
 				ssh_message_free(m);
 				continue;
@@ -318,6 +358,7 @@ int sshd_serve_fd(int fd, const struct sshd_opts *o)
 	int rc = -1;
 	int exit_code = 0;
 	struct winsize ws;
+	char term[64];
 	struct ssh_channel_callbacks_struct cb;
 
 	if (!o || !o->hostkey)
@@ -346,10 +387,11 @@ int sshd_serve_fd(int fd, const struct sshd_opts *o)
 	if (!chan)
 		goto out;
 	memset(&ws, 0, sizeof(ws));
-	if (do_shell_request(s, &want_pty, &ws))
+	term[0] = '\0';
+	if (do_shell_request(s, &want_pty, &ws, term, sizeof(term)))
 		goto out;
 
-	if (spawn(o->command, o->use_pty || want_pty, &ws, &child,
+	if (spawn(o->command, o->use_pty || want_pty, &ws, term, &child,
 		  &to_child, &from_child))
 		goto out;
 
