@@ -7,9 +7,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/ioctl.h>
 #include <sys/wait.h>
 
 #include <libssh/libssh.h>
+#include <libssh/callbacks.h>
 #include <libssh/server.h>
 
 #include "base64.h"
@@ -65,8 +67,8 @@ void sshd_hostkey_free(void *hostkey)
 
 /* Spawn /bin/sh -c command; return its pid, plus write- and read-side fds
  * toward the child's stdin and stdout. With a pty both are the master fd. */
-static int spawn(const char *command, int use_pty, pid_t *pid,
-		 int *to_child, int *from_child)
+static int spawn(const char *command, int use_pty, const struct winsize *ws,
+		 pid_t *pid, int *to_child, int *from_child)
 {
 	const char *cmd = command ? command : "tmux new-session -A -s comrade";
 	pid_t p;
@@ -74,7 +76,12 @@ static int spawn(const char *command, int use_pty, pid_t *pid,
 	if (use_pty) {
 		int master;
 
-		p = forkpty(&master, NULL, NULL, NULL);
+		/* Size the pty from the client's request so the remote command
+		 * (tmux) uses exactly the rows it asked for. The client reserves
+		 * its own bottom status row by requesting one row fewer; honouring
+		 * that here is what keeps tmux off that row. */
+		p = forkpty(&master, NULL, NULL,
+			    (ws && ws->ws_row) ? (struct winsize *)ws : NULL);
 		if (p < 0)
 			return -1;
 		if (p == 0) {
@@ -170,8 +177,9 @@ static ssh_channel do_channel(ssh_session s)
 }
 
 /* Wait for a shell/exec request; accept pty requests along the way. Reports
- * whether the client asked for a pty so we can match it on the child. */
-static int do_shell_request(ssh_session s, int *want_pty)
+ * whether the client asked for a pty and, if so, the terminal size it asked
+ * for so the child's pty can match it (see spawn). */
+static int do_shell_request(ssh_session s, int *want_pty, struct winsize *ws)
 {
 	*want_pty = 0;
 	for (;;) {
@@ -185,6 +193,10 @@ static int do_shell_request(ssh_session s, int *want_pty)
 		if (type == SSH_REQUEST_CHANNEL) {
 			if (subtype == SSH_CHANNEL_REQUEST_PTY) {
 				*want_pty = 1;
+				ws->ws_col = (unsigned short)
+					ssh_message_channel_request_pty_width(m);
+				ws->ws_row = (unsigned short)
+					ssh_message_channel_request_pty_height(m);
 				ssh_message_channel_request_reply_success(m);
 				ssh_message_free(m);
 				continue;
@@ -199,6 +211,28 @@ static int do_shell_request(ssh_session s, int *want_pty)
 		ssh_message_reply_default(m);
 		ssh_message_free(m);
 	}
+}
+
+/* The client resized its terminal: apply the new size to the child's pty so
+ * tmux reflows and keeps to the rows it was given (the client still reserves
+ * its bottom status row by asking for one fewer). userdata is the master fd. */
+static int on_pty_winch(ssh_session s, ssh_channel c, int width, int height,
+			int pxwidth, int pxheight, void *userdata)
+{
+	int master = *(int *)userdata;
+	struct winsize ws;
+
+	(void)s;
+	(void)c;
+	(void)pxwidth;
+	(void)pxheight;
+	if (master < 0)
+		return 0;
+	memset(&ws, 0, sizeof(ws));
+	ws.ws_col = (unsigned short)width;
+	ws.ws_row = (unsigned short)height;
+	ioctl(master, TIOCSWINSZ, &ws);
+	return 0;
 }
 
 /* End-of-session fd became readable (a liveness monitor exited with the shared
@@ -283,6 +317,8 @@ int sshd_serve_fd(int fd, const struct sshd_opts *o)
 	int gave_fd = 0;
 	int rc = -1;
 	int exit_code = 0;
+	struct winsize ws;
+	struct ssh_channel_callbacks_struct cb;
 
 	if (!o || !o->hostkey)
 		return -1;
@@ -309,12 +345,21 @@ int sshd_serve_fd(int fd, const struct sshd_opts *o)
 	chan = do_channel(s);
 	if (!chan)
 		goto out;
-	if (do_shell_request(s, &want_pty))
+	memset(&ws, 0, sizeof(ws));
+	if (do_shell_request(s, &want_pty, &ws))
 		goto out;
 
-	if (spawn(o->command, o->use_pty || want_pty, &child,
+	if (spawn(o->command, o->use_pty || want_pty, &ws, &child,
 		  &to_child, &from_child))
 		goto out;
+
+	if (want_pty) {			/* track live resizes onto the pty */
+		memset(&cb, 0, sizeof(cb));
+		cb.userdata = &to_child;	/* the pty master in pty mode */
+		cb.channel_pty_window_change_function = on_pty_winch;
+		ssh_callbacks_init(&cb);
+		ssh_set_channel_callbacks(chan, &cb);
+	}
 
 	pump(s, chan, to_child, from_child, child, o->end_fd);
 	rc = 0;
