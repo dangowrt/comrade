@@ -575,6 +575,7 @@ static int start_new(int ui_mode, int no_mcast)
 		char *mk[] = { "tmux", "-S", v.sock, "new-session", "-d",
 			       "-s", "comrade",
 			       ";", "set", "-g", "status-position", "top",
+			       ";", "set", "-g", "window-size", "smallest",
 			       NULL };
 		char err[256];
 
