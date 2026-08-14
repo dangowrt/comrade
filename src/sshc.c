@@ -30,6 +30,8 @@ struct stdin_ctx {
 	ssh_channel chan;
 	struct termfilter *tf;
 	int eof;
+	const volatile int *interrupted;	/* link is down: keys go nowhere */
+	volatile int *quit;			/* set to bail out of the session */
 };
 
 static int on_stdin(socket_t fd, int revents, void *userdata)
@@ -45,6 +47,24 @@ static int on_stdin(socket_t fd, int revents, void *userdata)
 	if (n <= 0) {
 		c->eof = 1;
 		return 0;
+	}
+	/*
+	 * While the link is down these keystrokes cannot reach the peer, so give
+	 * the user a way out that does not need a second terminal: a lone Escape
+	 * or a Ctrl-C quits instead of being swallowed. When the link is up they
+	 * are ordinary input and pass straight through.
+	 */
+	if (c->interrupted && *c->interrupted) {
+		int bail = (n == 1 && buf[0] == 0x1b);	/* lone ESC */
+		ssize_t i;
+
+		for (i = 0; i < n; i++)
+			if (buf[i] == 0x03)		/* Ctrl-C */
+				bail = 1;
+		if (bail) {
+			*c->quit = 1;
+			return 0;
+		}
 	}
 	fn = termfilter_run(c->tf, buf, (size_t)n, fb);
 	if (fn)
@@ -147,6 +167,7 @@ static int run_interactive(ssh_session s, ssh_channel chan,
 	struct termios orig, raw;
 	struct sigaction sa, old_winch;
 	int rows = 0, cols = 0, reserve = 0;
+	volatile int interrupted = 0, quit = 0;
 	uint64_t last_status = 0;
 	struct conn_status cur, prev;
 	struct termfilter tf;
@@ -194,6 +215,8 @@ static int run_interactive(ssh_session s, ssh_channel chan,
 	sctx.chan = chan;
 	sctx.tf = &tf;
 	sctx.eof = 0;
+	sctx.interrupted = &interrupted;
+	sctx.quit = &quit;
 	ssh_connector_set_in_channel(c_out, chan, SSH_CONNECTOR_STDOUT);
 	ssh_connector_set_out_fd(c_out, STDOUT_FILENO);
 	ssh_connector_set_in_channel(c_err, chan, SSH_CONNECTOR_STDERR);
@@ -202,7 +225,7 @@ static int run_interactive(ssh_session s, ssh_channel chan,
 	ssh_event_add_connector(event, c_out);
 	ssh_event_add_connector(event, c_err);
 
-	while (ssh_channel_is_open(chan) && !ssh_channel_is_eof(chan)) {
+	while (ssh_channel_is_open(chan) && !ssh_channel_is_eof(chan) && !quit) {
 		/*
 		 * End only on the dedicated end-of-session signal: the host sends
 		 * a channel exit-status and closes the channel when the shared
@@ -237,13 +260,14 @@ static int run_interactive(ssh_session s, ssh_channel chan,
 				memset(&prev, 0, sizeof(prev));	/* repaint */
 			}
 		}
-		if (reserve) {
+		if (o && o->status) {
 			uint64_t now = mono_ms();
 
 			memset(&cur, 0, sizeof(cur));
 			o->status(o->status_arg, &cur);
-			if (memcmp(&cur, &prev, sizeof(cur)) ||
-			    now - last_status > 2000) {
+			interrupted = (cur.state == CONN_LOST);
+			if (reserve && (memcmp(&cur, &prev, sizeof(cur)) ||
+			    now - last_status > 2000)) {
 				statusbar_render(STDOUT_FILENO, rows, cols, &cur);
 				prev = cur;
 				last_status = now;
@@ -255,9 +279,20 @@ static int run_interactive(ssh_session s, ssh_channel chan,
 	ssh_event_remove_connector(event, c_out);
 	ssh_event_remove_connector(event, c_err);
 	scroll_guard(rows, reserve, 0);
+	if (quit) {
+		/* We force-quit while the remote tmux still owned the screen:
+		 * leave its alternate screen and reset attributes so the shell
+		 * comes back clean rather than on tmux's buffer. */
+		const char *cl = "\033[?1049l\033[0m";
+		ssize_t r = write(STDOUT_FILENO, cl, strlen(cl));
+
+		(void)r;
+	}
 	sigaction(SIGWINCH, &old_winch, NULL);
 	if (have_tty)
 		tcsetattr(STDIN_FILENO, TCSANOW, &orig);
+	if (quit)
+		fprintf(stderr, "comrade: link lost -- disconnected.\n");
 out:
 	if (c_out)
 		ssh_connector_free(c_out);

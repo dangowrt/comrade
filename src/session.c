@@ -27,6 +27,16 @@
 #include "stunlist.h"
 
 #define SESSION_CONV 0x70326531
+
+/* Liveness heartbeat carried over the same transport as the KCP stream but
+ * distinguished by a magic that is not the stream's conv, so on_transport_recv
+ * tells the two apart. Packet: magic(4) type(1) timestamp(8), big-endian. */
+#define HB_MAGIC 0x484d4221u		/* != SESSION_CONV */
+#define HB_PING 0
+#define HB_PONG 1
+#define HB_LEN 13
+#define HB_INTERVAL_MS 700
+#define HB_LOST_MS 2500
 /*
  * Backstop only, well above real-internet connect time: libjuice reaches its
  * own FAILED verdict after a full ICE negotiation, which drives retry; this
@@ -113,6 +123,13 @@ struct sess {
 	char status_peer[80];		/* address of the chosen pair, once live */
 	char status_rdv[80];		/* located rendezvous endpoint (host side) */
 	uint64_t next_status_ms;
+
+	/* Liveness heartbeat: a tiny ping/pong over the active transport (not the
+	 * KCP stream), so a dead link is noticed even when nobody is typing. */
+	pthread_mutex_t hb_lock;
+	uint64_t hb_last_pong;		/* when a pong last came back */
+	int hb_rtt;			/* round trip from the last pong, ms */
+	uint64_t lost_since_ms;		/* when the link was first seen lost, 0 if live */
 
 	int ssh_fd;			/* the ssh thread's socketpair end */
 	int ssh_cli_rc;
@@ -319,7 +336,14 @@ static void publish_status(struct sess *s, int state)
 		snprintf(cs.rdv, sizeof(cs.rdv), "%s", s->status_rdv);
 	else
 		fmt_token_rdv(&s->cfg->tok, cs.rdv, sizeof(cs.rdv));
-	cs.rtt_ms = s->stream ? stream_rtt(s->stream) : 0;
+	/* Prefer the heartbeat's round trip (measured even when idle); the stream
+	 * RTT only moves when SSH data flows. Report how long a loss has lasted. */
+	pthread_mutex_lock(&s->hb_lock);
+	cs.rtt_ms = s->hb_rtt > 0 ? s->hb_rtt :
+		(s->stream ? stream_rtt(s->stream) : 0);
+	if (state == CONN_LOST && s->lost_since_ms)
+		cs.since_s = (int)((now_ms() - s->lost_since_ms) / 1000);
+	pthread_mutex_unlock(&s->hb_lock);
 
 	pthread_mutex_lock(&s->status_lock);
 	s->status = cs;
@@ -510,10 +534,63 @@ static void on_ice_candidate(void *arg, const char *cand)
 	pthread_mutex_unlock(&s->trickle_lock);
 }
 
+/* Send over whichever transport carries the stream right now (see the priority
+ * in on_stream_output). Used for the KCP stream and the liveness heartbeat. */
+static int transport_send(struct sess *s, const uint8_t *data, size_t len)
+{
+	if (s->lan && lanlink_have_peer(s->lan))
+		return lanlink_send(s->lan, data, len);
+	if (s->nat && nat_connected(s->nat))
+		return nat_send(s->nat, data, len);
+	return -1;
+}
+
+static void hb_build(uint8_t *pkt, int type, uint64_t ts)
+{
+	int i;
+
+	pkt[0] = (uint8_t)(HB_MAGIC >> 24);
+	pkt[1] = (uint8_t)(HB_MAGIC >> 16);
+	pkt[2] = (uint8_t)(HB_MAGIC >> 8);
+	pkt[3] = (uint8_t)HB_MAGIC;
+	pkt[4] = (uint8_t)type;
+	for (i = 0; i < 8; i++)
+		pkt[5 + i] = (uint8_t)(ts >> (56 - 8 * i));
+}
+
+/*
+ * Transport receive. A heartbeat is answered (ping -> pong echoing the sender's
+ * timestamp) or recorded (pong -> note the round trip and that the peer is
+ * alive); everything else is stream data. May run on libjuice's thread, so the
+ * heartbeat bookkeeping is under hb_lock.
+ */
 static void on_transport_recv(void *arg, const uint8_t *data, size_t len)
 {
 	struct sess *s = arg;
 
+	if (len >= HB_LEN &&
+	    (uint32_t)((data[0] << 24) | (data[1] << 16) |
+		       (data[2] << 8) | data[3]) == HB_MAGIC) {
+		uint64_t ts = 0;
+		int i;
+
+		for (i = 0; i < 8; i++)
+			ts = (ts << 8) | data[5 + i];
+		if (data[4] == HB_PING) {
+			uint8_t pong[HB_LEN];
+
+			hb_build(pong, HB_PONG, ts);
+			transport_send(s, pong, sizeof(pong));
+		} else if (data[4] == HB_PONG) {
+			uint64_t now = now_ms();
+
+			pthread_mutex_lock(&s->hb_lock);
+			s->hb_last_pong = now;
+			s->hb_rtt = (int)(now - ts);
+			pthread_mutex_unlock(&s->hb_lock);
+		}
+		return;
+	}
 	if (s->stream)
 		stream_input(s->stream, data, len);
 }
@@ -555,13 +632,7 @@ static void on_peer_offer(void *arg, const uint8_t *data, size_t len)
  */
 static int on_stream_output(void *arg, const uint8_t *data, size_t len)
 {
-	struct sess *s = arg;
-
-	if (s->lan && lanlink_have_peer(s->lan))
-		return lanlink_send(s->lan, data, len);
-	if (s->nat && nat_connected(s->nat))
-		return nat_send(s->nat, data, len);
-	return -1;
+	return transport_send((struct sess *)arg, data, len);
 }
 
 /*
@@ -722,6 +793,7 @@ static int run_ssh(struct sess *s)
 	pthread_t th;
 	int sp[2];
 	int done = 0;
+	uint64_t next_hb;
 
 	if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp))
 		return -1;
@@ -743,6 +815,13 @@ static int run_ssh(struct sess *s)
 	br = sshbridge_create(sp[0], s->stream,
 			      s->cfg->is_host ? LINGER_HOST_MS : LINGER_CLIENT_MS);
 
+	/* The path is up on entry, so start the liveness clock as alive. */
+	pthread_mutex_lock(&s->hb_lock);
+	s->hb_last_pong = now_ms();
+	s->lost_since_ms = 0;
+	pthread_mutex_unlock(&s->hb_lock);
+	next_hb = now_ms();
+
 	while (!done) {
 		struct pollfd fds[8];
 		int timeout, nfds, lnf = 0, bidx;
@@ -763,9 +842,30 @@ static int run_ssh(struct sess *s)
 			lanlink_dispatch(s->lan, fds + nfds, lnf);
 		if (sshbridge_pump(br, fds[bidx].revents, (uint32_t)now_ms()) < 0)
 			done = 1;
+
+		if (now_ms() >= next_hb) {
+			uint8_t ping[HB_LEN];
+
+			hb_build(ping, HB_PING, now_ms());
+			transport_send(s, ping, sizeof(ping));
+			next_hb = now_ms() + HB_INTERVAL_MS;
+		}
 		if (now_ms() >= s->next_status_ms) {
-			publish_status(s, CONN_LIVE);
-			s->next_status_ms = now_ms() + 1000;
+			uint64_t now = now_ms(), lp;
+			int state;
+
+			pthread_mutex_lock(&s->hb_lock);
+			lp = s->hb_last_pong;
+			if (now - lp > HB_LOST_MS) {
+				if (!s->lost_since_ms)
+					s->lost_since_ms = now;
+			} else {
+				s->lost_since_ms = 0;
+			}
+			state = s->lost_since_ms ? CONN_LOST : CONN_LIVE;
+			pthread_mutex_unlock(&s->hb_lock);
+			publish_status(s, state);
+			s->next_status_ms = now + 500;
 		}
 	}
 
@@ -891,6 +991,7 @@ int session_run(const struct session_cfg *cfg)
 	memcpy(s.auth, cfg->tok.auth, TOKEN_AUTH_LEN);
 	pthread_mutex_init(&s.trickle_lock, NULL);
 	pthread_mutex_init(&s.status_lock, NULL);	/* s.status zeroed = connecting */
+	pthread_mutex_init(&s.hb_lock, NULL);
 	if (cfg->stun_auto)
 		s.stun_servers = stunlist_load(&s.stun_count);
 	nat_log_level(cfg->log_level);	/* < 0 silences libjuice (see nat_log_level) */
@@ -1100,5 +1201,6 @@ int session_run(const struct session_cfg *cfg)
 	stunlist_free(s.stun_servers, s.stun_count);
 	pthread_mutex_destroy(&s.trickle_lock);
 	pthread_mutex_destroy(&s.status_lock);
+	pthread_mutex_destroy(&s.hb_lock);
 	return rc;
 }

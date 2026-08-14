@@ -25,6 +25,7 @@ struct conn_status {
 	char peer[80];			/* chosen pair's remote addr, "" if none */
 	char rdv[80];			/* mutual rendezvous node, "" if none */
 	int rtt_ms;			/* smoothed RTT, 0 if unknown */
+	int since_s;			/* seconds in the current state (loss age) */
 };
 
 /* Serialise/parse to a tmpfs file. Return 0 on success, -1 on failure. */
