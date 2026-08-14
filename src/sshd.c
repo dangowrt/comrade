@@ -16,6 +16,7 @@
 #include <libssh/server.h>
 
 #include "base64.h"
+#include "dbg.h"
 #include "sshd.h"
 
 /* Constant-time equality over a fixed-length buffer. */
@@ -106,6 +107,10 @@ static int spawn(const char *command, int use_pty, const struct winsize *ws,
 		snprintf(cmd, sizeof(cmd), "TERM=%s %s", term, base);
 	else
 		snprintf(cmd, sizeof(cmd), "%s", base);
+
+	dbg_logf("sshd spawn: use_pty=%d client-requested pty=%dx%d TERM=[%s]",
+		 use_pty, ws ? ws->ws_row : -1, ws ? ws->ws_col : -1,
+		 term ? term : "");
 
 	if (use_pty) {
 		int master;

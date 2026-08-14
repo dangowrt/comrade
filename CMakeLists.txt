@@ -71,6 +71,9 @@ target_include_directories(comrade_appdir PUBLIC src)
 
 # Structured connection status (controller fills it, view renders it) and the
 # view that paints it on the reserved bottom terminal row.
+add_library(comrade_dbg STATIC src/dbg.c)
+target_include_directories(comrade_dbg PUBLIC src)
+
 add_library(comrade_conn STATIC src/conn.c)
 target_include_directories(comrade_conn PUBLIC src)
 
@@ -208,7 +211,7 @@ if(LIBSSH_FOUND)
 	# The message-based libssh server API is deprecated in favour of the
 	# callback API but is clearer and fully functional; migrate later.
 	target_compile_options(comrade_ssh PRIVATE -Wno-deprecated-declarations)
-	target_link_libraries(comrade_ssh PUBLIC comrade_token comrade_statusbar PkgConfig::LIBSSH Threads::Threads)
+	target_link_libraries(comrade_ssh PUBLIC comrade_token comrade_statusbar comrade_dbg PkgConfig::LIBSSH Threads::Threads)
 	find_library(COMRADE_UTIL util)
 	if(COMRADE_UTIL)
 		target_link_libraries(comrade_ssh PUBLIC ${COMRADE_UTIL})
@@ -232,7 +235,7 @@ endif()
 
 add_library(comrade_host STATIC src/host.c)
 target_include_directories(comrade_host PUBLIC src)
-target_link_libraries(comrade_host PUBLIC comrade_token)
+target_link_libraries(comrade_host PUBLIC comrade_token comrade_dbg)
 if(COMRADE_HAVE_SESSION)
 	target_link_libraries(comrade_host PUBLIC comrade_session comrade_ui)
 	target_compile_definitions(comrade_host PRIVATE COMRADE_HAVE_SESSION=1)

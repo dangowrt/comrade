@@ -42,6 +42,7 @@ int host_show(void)
 #include <unistd.h>
 
 #include "conn.h"
+#include "dbg.h"
 #include "keys.h"
 #include "session.h"
 #include "sig.h"
@@ -335,6 +336,68 @@ static int exec_tmux(char *const argv[])
 	return 1;
 }
 
+/* Confine the terminal scroll region to the rows above the reserved status row
+ * so nothing scrolling in the tmux area can push into it; on == 0 restores the
+ * full-screen region. */
+static void scroll_guard(int rows, int reserve, int on)
+{
+	char b[32];
+	int n;
+
+	if (!reserve)
+		return;
+	if (on)
+		n = snprintf(b, sizeof(b), "\033[1;%dr", rows - 1);
+	else
+		n = snprintf(b, sizeof(b), "\033[r");
+	if (n > 0 && write(STDOUT_FILENO, b, (size_t)n)) {
+		/* best effort */
+	}
+}
+
+/* Ask the running tmux what size it settled on and log it, so a size mismatch
+ * between the reserved terminal and the shared window is visible. Captures the
+ * command's stdout (run_capture only takes stderr). */
+static void log_tmux_size(const char *sock)
+{
+	char *q[] = { "tmux", "-S", (char *)sock, "display", "-p",
+		      "client=#{client_height}x#{client_width} "
+		      "window=#{window_height}x#{window_width}", NULL };
+	char out[256];
+	int p[2];
+	pid_t pid;
+	ssize_t n = 0;
+
+	if (!getenv("COMRADE_DEBUG"))
+		return;
+	if (pipe(p))
+		return;
+	pid = fork();
+	if (pid < 0) {
+		close(p[0]);
+		close(p[1]);
+		return;
+	}
+	if (pid == 0) {
+		dup2(p[1], STDOUT_FILENO);
+		close(p[0]);
+		close(p[1]);
+		execvp(q[0], q);
+		_exit(127);
+	}
+	close(p[1]);
+	n = read(p[0], out, sizeof(out) - 1);
+	close(p[0]);
+	waitpid(pid, NULL, 0);
+	if (n > 0) {
+		out[n] = '\0';
+		while (n > 0 && (out[n - 1] == '\n' || out[n - 1] == '\r'))
+			out[--n] = '\0';
+		dbg_logf("host tmux settled: %s (terminal reserved 1 row for "
+			 "comrade)", out);
+	}
+}
+
 /*
  * Attach the operator to the shared tmux, reserving the bottom terminal row for
  * comrade's own status line -- run tmux in a pty one row shorter and paint the
@@ -351,6 +414,7 @@ static int attach(const char *id)
 	struct sigaction sa, oldwinch;
 	struct winsize ws, cws;
 	int rows, cols, master, alive = 1;
+	int size_probe = 6;		/* log tmux's size once, ~1.2s in */
 	pid_t child;
 	uint64_t last_paint = 0;
 	struct conn_status cur, prev;
@@ -366,6 +430,8 @@ static int attach(const char *id)
 
 	cws = ws;
 	cws.ws_row = (unsigned short)(rows - 1);	/* tmux gets one row less */
+	dbg_logf("host attach: terminal rows=%d cols=%d -> tmux gets %d rows",
+		 rows, cols, rows - 1);
 	child = forkpty(&master, NULL, &orig, &cws);
 	if (child < 0)
 		return exec_tmux(argv);
@@ -377,6 +443,7 @@ static int attach(const char *id)
 	raw = orig;
 	cfmakeraw(&raw);
 	tcsetattr(STDIN_FILENO, TCSANOW, &raw);
+	scroll_guard(rows, 1, 1);
 	memset(&sa, 0, sizeof(sa));
 	sa.sa_handler = on_winch;
 	sigaction(SIGWINCH, &sa, &oldwinch);
@@ -405,9 +472,14 @@ static int attach(const char *id)
 				cws = ws;
 				cws.ws_row = (unsigned short)(rows - 1);
 				ioctl(master, TIOCSWINSZ, &cws);
+				scroll_guard(rows, 1, 1);
+				dbg_logf("host resize: rows=%d cols=%d -> tmux "
+					 "%d rows", rows, cols, rows - 1);
 				memset(&prev, 0, sizeof(prev));
 			}
 		}
+		if (size_probe > 0 && --size_probe == 0)
+			log_tmux_size(sock);	/* one-shot, after tmux settles */
 		if (fds[0].revents & POLLIN) {
 			n = read(STDIN_FILENO, buf, sizeof(buf));
 			if (n > 0) {
@@ -437,6 +509,7 @@ static int attach(const char *id)
 		}
 	}
 
+	scroll_guard(rows, 1, 0);
 	tcsetattr(STDIN_FILENO, TCSANOW, &orig);
 	sigaction(SIGWINCH, &oldwinch, NULL);
 	close(master);

@@ -13,8 +13,28 @@
 #include <libssh/libssh.h>
 
 #include "base64.h"
+#include "dbg.h"
 #include "sshc.h"
 #include "statusbar.h"
+
+/* Confine the terminal's scroll region to the rows above our reserved status
+ * row, so nothing scrolling in the tmux area can ever push into it; on == 0
+ * restores the full-screen region. A no-op when we are not reserving. */
+static void scroll_guard(int rows, int reserve, int on)
+{
+	char buf[32];
+	int n;
+
+	if (!reserve)
+		return;
+	if (on)
+		n = snprintf(buf, sizeof(buf), "\033[1;%dr", rows - 1);
+	else
+		n = snprintf(buf, sizeof(buf), "\033[r");
+	if (n > 0 && write(STDOUT_FILENO, buf, (size_t)n)) {
+		/* best effort */
+	}
+}
 
 static uint64_t mono_ms(void)
 {
@@ -127,6 +147,10 @@ static int run_interactive(ssh_session s, ssh_channel chan,
 			reserve = 1;
 		}
 	}
+	dbg_logf("sshc run_interactive: have_tty=%d status=%d rows=%d cols=%d "
+		 "reserve=%d (tmux gets %d rows)", have_tty, o && o->status,
+		 rows, cols, reserve, reserve ? rows - 1 : rows);
+	scroll_guard(rows, reserve, 1);
 
 	ssh_connector_set_in_fd(c_in, STDIN_FILENO);
 	ssh_connector_set_out_channel(c_in, chan, SSH_CONNECTOR_STDOUT);
@@ -166,6 +190,10 @@ static int run_interactive(ssh_session s, ssh_channel chan,
 				cols = ws.ws_col;
 				ssh_channel_change_pty_size(chan, ws.ws_col,
 							    ws.ws_row - reserve);
+				dbg_logf("sshc resize: rows=%d cols=%d "
+					 "(tmux gets %d rows)", rows, cols,
+					 rows - reserve);
+				scroll_guard(rows, reserve, 1);
 				memset(&prev, 0, sizeof(prev));	/* repaint */
 			}
 		}
@@ -186,6 +214,7 @@ static int run_interactive(ssh_session s, ssh_channel chan,
 	ssh_event_remove_connector(event, c_in);
 	ssh_event_remove_connector(event, c_out);
 	ssh_event_remove_connector(event, c_err);
+	scroll_guard(rows, reserve, 0);
 	sigaction(SIGWINCH, &old_winch, NULL);
 	if (have_tty)
 		tcsetattr(STDIN_FILENO, TCSANOW, &orig);
@@ -252,6 +281,9 @@ int sshc_connect_fd(int fd, const struct sshc_opts *o)
 		reserve = (o->status && isatty(STDIN_FILENO) &&
 			   ws.ws_row > 1) ? 1 : 0;
 		prows = ws.ws_row - reserve;
+		dbg_logf("sshc connect: term=%s rows=%d cols=%d reserve=%d "
+			 "-> request pty %dx%d", term, ws.ws_row, ws.ws_col,
+			 reserve, prows, ws.ws_col);
 		if (ssh_channel_request_pty_size(chan, term, ws.ws_col,
 						 prows) != SSH_OK)
 			goto out;
