@@ -32,6 +32,16 @@ struct sshd_opts {
 	 * at once rather than leave it hanging. 0 disables it (child-exit only).
 	 */
 	int end_fd;
+	/*
+	 * Optional control-plane fd. When > 0, the server accepts one extra SSH
+	 * channel whose subsystem is "comrade-ctl" and bridges it to this fd, so
+	 * the session layer can run an authenticated control protocol (liveness,
+	 * rendezvous exchange) inside the SSH session rather than over the raw
+	 * transport. The shell channel is unaffected. Dispatch is by subsystem
+	 * name, leaving room for future services (comrade-transfer, ...). 0/-1
+	 * disables it, in which case behaviour is exactly the single-channel one.
+	 */
+	int ctl_fd;
 };
 
 /*

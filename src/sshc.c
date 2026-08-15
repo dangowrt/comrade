@@ -175,6 +175,8 @@ static int run_interactive(ssh_session s, ssh_channel chan,
 	ssh_event event = ssh_event_new();
 	ssh_connector c_out = ssh_connector_new(s);	/* channel -> stdout */
 	ssh_connector c_err = ssh_connector_new(s);	/* channel stderr -> stderr */
+	ssh_channel ctl = NULL;				/* comrade-ctl subsystem */
+	ssh_connector c_ctl_in = NULL, c_ctl_out = NULL;
 	int have_tty = isatty(STDIN_FILENO);
 
 	if (!event || !c_out || !c_err)
@@ -225,6 +227,28 @@ static int run_interactive(ssh_session s, ssh_channel chan,
 	ssh_event_add_connector(event, c_out);
 	ssh_event_add_connector(event, c_err);
 
+	/* Open the authenticated control plane alongside the shell: a second SSH
+	 * channel requesting the comrade-ctl subsystem, bridged to o->ctl_fd. The
+	 * session layer runs its liveness/rendezvous protocol over that fd. */
+	if (o && o->ctl_fd > 0) {
+		ctl = ssh_channel_new(s);
+		if (ctl && ssh_channel_open_session(ctl) == SSH_OK &&
+		    ssh_channel_request_subsystem(ctl, "comrade-ctl") == SSH_OK) {
+			c_ctl_in = ssh_connector_new(s);
+			c_ctl_out = ssh_connector_new(s);
+			if (c_ctl_in && c_ctl_out) {
+				ssh_connector_set_in_fd(c_ctl_in, o->ctl_fd);
+				ssh_connector_set_out_channel(c_ctl_in, ctl,
+							SSH_CONNECTOR_STDOUT);
+				ssh_connector_set_in_channel(c_ctl_out, ctl,
+							SSH_CONNECTOR_STDOUT);
+				ssh_connector_set_out_fd(c_ctl_out, o->ctl_fd);
+				ssh_event_add_connector(event, c_ctl_in);
+				ssh_event_add_connector(event, c_ctl_out);
+			}
+		}
+	}
+
 	while (ssh_channel_is_open(chan) && !ssh_channel_is_eof(chan) && !quit) {
 		/*
 		 * End only on the dedicated end-of-session signal: the host sends
@@ -274,10 +298,17 @@ static int run_interactive(ssh_session s, ssh_channel chan,
 			}
 		}
 	}
-
 	ssh_event_remove_fd(event, STDIN_FILENO);
 	ssh_event_remove_connector(event, c_out);
 	ssh_event_remove_connector(event, c_err);
+	if (c_ctl_in) {
+		ssh_event_remove_connector(event, c_ctl_in);
+		ssh_event_remove_connector(event, c_ctl_out);
+	}
+	if (ctl && ssh_channel_is_open(ctl)) {
+		ssh_channel_send_eof(ctl);
+		ssh_channel_close(ctl);
+	}
 	scroll_guard(rows, reserve, 0);
 	if (quit) {
 		/* We force-quit while the remote tmux still owned the screen:
@@ -294,6 +325,12 @@ static int run_interactive(ssh_session s, ssh_channel chan,
 	if (quit)
 		fprintf(stderr, "comrade: link lost -- disconnected.\n");
 out:
+	if (c_ctl_in)
+		ssh_connector_free(c_ctl_in);
+	if (c_ctl_out)
+		ssh_connector_free(c_ctl_out);
+	if (ctl)
+		ssh_channel_free(ctl);
 	if (c_out)
 		ssh_connector_free(c_out);
 	if (c_err)

@@ -272,17 +272,85 @@ static void apply_winch(int master, ssh_message m)
 		ioctl(master, TIOCSWINSZ, &ws);
 }
 
-/* Drain any pending session messages; apply window-change requests to the pty
- * and reply to the rest so nothing stalls. Non-blocking (the session is put in
- * non-blocking mode by the pump), so it returns once the queue is empty. */
-static void drain_messages(ssh_session s, int master)
+/*
+ * State the pump loop carries so drain_messages() can accept and wire up extra
+ * channels that arrive after the shell channel. Channels are dispatched by
+ * subsystem name; today only "comrade-ctl" (an authenticated control plane
+ * bridged to ctl_fd), leaving room for comrade-transfer / comrade-tunnel.
+ */
+struct pump_ctx {
+	ssh_session s;
+	ssh_event event;
+	int master;			/* the shell pty, for window-change */
+	int ctl_fd;			/* control-plane fd, <= 0 if none */
+	ssh_channel ctl_chan;		/* the accepted control channel */
+	ssh_connector ctl_in;		/* ctl_fd -> channel */
+	ssh_connector ctl_out;		/* channel -> ctl_fd */
+	int end_hit;
+};
+
+/* Bridge the accepted control channel to ctl_fd, both ways, once its subsystem
+ * request has named it comrade-ctl. Returns 0 on success. */
+static int ctl_bridge_up(struct pump_ctx *c)
+{
+	c->ctl_in = ssh_connector_new(c->s);
+	c->ctl_out = ssh_connector_new(c->s);
+	if (!c->ctl_in || !c->ctl_out)
+		return -1;
+	ssh_connector_set_in_fd(c->ctl_in, c->ctl_fd);
+	ssh_connector_set_out_channel(c->ctl_in, c->ctl_chan,
+				      SSH_CONNECTOR_STDOUT);
+	ssh_connector_set_in_channel(c->ctl_out, c->ctl_chan,
+				     SSH_CONNECTOR_STDOUT);
+	ssh_connector_set_out_fd(c->ctl_out, c->ctl_fd);
+	ssh_event_add_connector(c->event, c->ctl_in);
+	ssh_event_add_connector(c->event, c->ctl_out);
+	dbg_logf("sshd: comrade-ctl channel bridged");
+	return 0;
+}
+
+/*
+ * Drain pending session messages: apply window-change to the pty, accept a
+ * second session channel and, if it requests the comrade-ctl subsystem, bridge
+ * it to ctl_fd; reply to everything else so nothing stalls. Non-blocking (the
+ * session is in non-blocking mode), so it returns once the queue is empty.
+ */
+static void drain_messages(struct pump_ctx *c)
 {
 	ssh_message m;
 
-	while ((m = ssh_message_get(s)) != NULL) {
-		if (ssh_message_type(m) == SSH_REQUEST_CHANNEL &&
-		    ssh_message_subtype(m) == SSH_CHANNEL_REQUEST_WINDOW_CHANGE)
-			apply_winch(master, m);
+	while ((m = ssh_message_get(c->s)) != NULL) {
+		int type = ssh_message_type(m);
+		int sub = ssh_message_subtype(m);
+
+		if (type == SSH_REQUEST_CHANNEL_OPEN &&
+		    sub == SSH_CHANNEL_SESSION && c->ctl_fd > 0 &&
+		    !c->ctl_chan) {
+			c->ctl_chan =
+				ssh_message_channel_request_open_reply_accept(m);
+			ssh_message_free(m);
+			continue;
+		}
+		if (type == SSH_REQUEST_CHANNEL &&
+		    sub == SSH_CHANNEL_REQUEST_WINDOW_CHANGE) {
+			apply_winch(c->master, m);
+			ssh_message_reply_default(m);
+			ssh_message_free(m);
+			continue;
+		}
+		if (type == SSH_REQUEST_CHANNEL &&
+		    sub == SSH_CHANNEL_REQUEST_SUBSYSTEM && c->ctl_chan &&
+		    !c->ctl_in) {
+			const char *name =
+				ssh_message_channel_request_subsystem(m);
+
+			if (name && !strcmp(name, "comrade-ctl") &&
+			    !ctl_bridge_up(c)) {
+				ssh_message_channel_request_reply_success(m);
+				ssh_message_free(m);
+				continue;
+			}
+		}
 		ssh_message_reply_default(m);
 		ssh_message_free(m);
 	}
@@ -311,14 +379,20 @@ static int on_end_fd(socket_t fd, int revents, void *userdata)
  * output first; then we return and the caller closes the channel to the client.
  */
 static void pump(ssh_session s, ssh_channel chan, int to_child, int from_child,
-		 pid_t child, int end_fd)
+		 pid_t child, int end_fd, int ctl_fd)
 {
-	ssh_event event = ssh_event_new();
-	ssh_connector c_in = ssh_connector_new(s);   /* channel -> child stdin */
-	ssh_connector c_out = ssh_connector_new(s);  /* child stdout -> channel */
-	int ending = 0, drain = 0, end_hit = 0;
+	struct pump_ctx c;
+	ssh_connector c_in, c_out;	/* shell channel <-> child */
+	int ending = 0, drain = 0;
 
-	if (!event || !c_in || !c_out)
+	memset(&c, 0, sizeof(c));
+	c.s = s;
+	c.master = to_child;
+	c.ctl_fd = ctl_fd;
+	c.event = ssh_event_new();
+	c_in = ssh_connector_new(s);
+	c_out = ssh_connector_new(s);
+	if (!c.event || !c_in || !c_out)
 		goto out;
 
 	ssh_connector_set_out_fd(c_in, to_child);
@@ -326,40 +400,51 @@ static void pump(ssh_session s, ssh_channel chan, int to_child, int from_child,
 	ssh_connector_set_in_fd(c_out, from_child);
 	ssh_connector_set_out_channel(c_out, chan, SSH_CONNECTOR_STDOUT);
 
-	ssh_event_add_connector(event, c_in);
-	ssh_event_add_connector(event, c_out);
+	ssh_event_add_connector(c.event, c_in);
+	ssh_event_add_connector(c.event, c_out);
 	if (end_fd > 0)
-		ssh_event_add_fd(event, end_fd,
+		ssh_event_add_fd(c.event, end_fd,
 				 POLLIN | POLLHUP | POLLERR | POLLNVAL,
-				 on_end_fd, &end_hit);
+				 on_end_fd, &c.end_hit);
 
 	/* So drain_messages() can poll the request queue without blocking. */
 	ssh_set_blocking(s, 0);
 
 	while (ssh_channel_is_open(chan) && !ssh_channel_is_eof(chan)) {
-		if (ssh_event_dopoll(event, 200) == SSH_ERROR)
+		if (ssh_event_dopoll(c.event, 200) == SSH_ERROR)
 			break;
-		drain_messages(s, to_child);
-		if (!ending && end_hit)
+		drain_messages(&c);
+		if (!ending && c.end_hit)
 			ending = 1;
-		if (!ending &&
-		    waitpid(child, NULL, WNOHANG | WNOWAIT) == child)
+		if (!ending && waitpid(child, NULL, WNOHANG | WNOWAIT) == child)
 			ending = 1;
 		if (ending && ++drain >= 3)
 			break;
 	}
 
 	if (end_fd > 0)
-		ssh_event_remove_fd(event, end_fd);
-	ssh_event_remove_connector(event, c_in);
-	ssh_event_remove_connector(event, c_out);
+		ssh_event_remove_fd(c.event, end_fd);
+	ssh_event_remove_connector(c.event, c_in);
+	ssh_event_remove_connector(c.event, c_out);
+	if (c.ctl_in) {
+		ssh_event_remove_connector(c.event, c.ctl_in);
+		ssh_event_remove_connector(c.event, c.ctl_out);
+	}
+	if (c.ctl_chan && ssh_channel_is_open(c.ctl_chan))
+		ssh_channel_close(c.ctl_chan);
 out:
 	if (c_in)
 		ssh_connector_free(c_in);
 	if (c_out)
 		ssh_connector_free(c_out);
-	if (event)
-		ssh_event_free(event);
+	if (c.ctl_in)
+		ssh_connector_free(c.ctl_in);
+	if (c.ctl_out)
+		ssh_connector_free(c.ctl_out);
+	if (c.ctl_chan)
+		ssh_channel_free(c.ctl_chan);
+	if (c.event)
+		ssh_event_free(c.event);
 }
 
 int sshd_serve_fd(int fd, const struct sshd_opts *o)
@@ -412,8 +497,9 @@ int sshd_serve_fd(int fd, const struct sshd_opts *o)
 		goto out;
 
 	/* Live resizes arrive as window-change requests; the pump applies them
-	 * to the pty (see drain_messages). */
-	pump(s, chan, to_child, from_child, child, o->end_fd);
+	 * to the pty. A second channel requesting the comrade-ctl subsystem is
+	 * bridged to o->ctl_fd (both in drain_messages). */
+	pump(s, chan, to_child, from_child, child, o->end_fd, o->ctl_fd);
 	rc = 0;
 out:
 	if (to_child >= 0)

@@ -27,6 +27,14 @@ struct sshc_opts {
 	int interactive;		/* bridge local stdin/stdout raw */
 
 	/*
+	 * Optional control-plane fd. When > 0, the client opens one extra SSH
+	 * channel (subsystem "comrade-ctl") alongside the shell channel and
+	 * bridges it to this fd, carrying the session's control protocol inside
+	 * the authenticated SSH session. 0/-1 leaves the single-channel path.
+	 */
+	int ctl_fd;
+
+	/*
 	 * Optional local status. When set, interactive mode reserves the bottom
 	 * terminal row (runs the remote tmux one row shorter) and has the view
 	 * paint this connection status there each tick -- staying live even when
