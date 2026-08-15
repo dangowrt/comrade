@@ -32,11 +32,29 @@
  * distinguished by a magic that is not the stream's conv, so on_transport_recv
  * tells the two apart. Packet: magic(4) type(1) timestamp(8), big-endian. */
 #define HB_MAGIC 0x484d4221u		/* != SESSION_CONV */
-#define HB_PING 0
-#define HB_PONG 1
+#define CTL_PING 0			/* magic(4) type(1) timestamp(8) */
+#define CTL_PONG 1			/* magic(4) type(1) echoed-ts(8) */
+#define CTL_RDV 2			/* magic(4) type(1) family(1) port(2) addr(16) */
 #define HB_LEN 13
+#define CTL_RDV_LEN 24
 #define HB_INTERVAL_MS 700
 #define HB_LOST_MS 2500
+#define RDV_WARM_MS 3000		/* keep both families' rendezvous warm */
+#define RDV_TELL_MS 5000		/* re-announce our nodes to the peer */
+
+/* Rendezvous node kept for reconnection (ours when we can reach the family, or
+ * the peer's for a family we cannot yet reach but might roam to). */
+struct rdv_node {
+	struct sockaddr_storage sa;
+	socklen_t len;
+	int have;
+};
+
+/* [0] is IPv4, [1] is IPv6. */
+static int fam_idx(int family)
+{
+	return family == 6 ? 1 : 0;
+}
 /*
  * Backstop only, well above real-internet connect time: libjuice reaches its
  * own FAILED verdict after a full ICE negotiation, which drives retry; this
@@ -130,6 +148,18 @@ struct sess {
 	uint64_t hb_last_pong;		/* when a pong last came back */
 	int hb_rtt;			/* round trip from the last pong, ms */
 	uint64_t lost_since_ms;		/* when the link was first seen lost, 0 if live */
+
+	/*
+	 * Rendezvous nodes kept warm and exchanged in-band for a fast reconnect:
+	 * [0]=v4 [1]=v6. rdv is our current best per family (our own located node
+	 * where we reach the family, or the peer's for one we might roam to);
+	 * rdv_in is a pending peer announcement the recv thread hands to the loop.
+	 */
+	struct rdv_node rdv[2];
+	pthread_mutex_t rdv_lock;
+	struct rdv_node rdv_in[2];
+	int rdv_in_dirty;
+	uint64_t next_rdv_warm_ms, next_rdv_tell_ms;
 
 	int ssh_fd;			/* the ssh thread's socketpair end */
 	int ssh_cli_rc;
@@ -558,6 +588,66 @@ static void hb_build(uint8_t *pkt, int type, uint64_t ts)
 		pkt[5 + i] = (uint8_t)(ts >> (56 - 8 * i));
 }
 
+/* Build a CTL_RDV announcement: our rendezvous node for `family`. */
+static void rdv_build(uint8_t *pkt, int family, const struct sockaddr *sa)
+{
+	uint16_t port = 0;
+	const void *addr = NULL;
+	int alen = 0;
+
+	pkt[0] = (uint8_t)(HB_MAGIC >> 24);
+	pkt[1] = (uint8_t)(HB_MAGIC >> 16);
+	pkt[2] = (uint8_t)(HB_MAGIC >> 8);
+	pkt[3] = (uint8_t)HB_MAGIC;
+	pkt[4] = CTL_RDV;
+	pkt[5] = (uint8_t)(family == 6 ? 6 : 4);
+	if (family == 6) {
+		const struct sockaddr_in6 *a = (const struct sockaddr_in6 *)sa;
+
+		port = ntohs(a->sin6_port);
+		addr = &a->sin6_addr;
+		alen = 16;
+	} else {
+		const struct sockaddr_in *a = (const struct sockaddr_in *)sa;
+
+		port = ntohs(a->sin_port);
+		addr = &a->sin_addr;
+		alen = 4;
+	}
+	pkt[6] = (uint8_t)(port >> 8);
+	pkt[7] = (uint8_t)port;
+	memset(pkt + 8, 0, 16);
+	memcpy(pkt + 8, addr, (size_t)alen);
+}
+
+/* Parse a CTL_RDV payload into out; returns the family (4 or 6) or 0. */
+static int rdv_parse(const uint8_t *pkt, struct sockaddr_storage *out,
+		     socklen_t *len)
+{
+	uint16_t port = (uint16_t)((pkt[6] << 8) | pkt[7]);
+
+	memset(out, 0, sizeof(*out));
+	if (pkt[5] == 6) {
+		struct sockaddr_in6 *a = (struct sockaddr_in6 *)out;
+
+		a->sin6_family = AF_INET6;
+		a->sin6_port = htons(port);
+		memcpy(&a->sin6_addr, pkt + 8, 16);
+		*len = sizeof(*a);
+		return 6;
+	}
+	if (pkt[5] == 4) {
+		struct sockaddr_in *a = (struct sockaddr_in *)out;
+
+		a->sin_family = AF_INET;
+		a->sin_port = htons(port);
+		memcpy(&a->sin_addr, pkt + 8, 4);
+		*len = sizeof(*a);
+		return 4;
+	}
+	return 0;
+}
+
 /*
  * Transport receive. A heartbeat is answered (ping -> pong echoing the sender's
  * timestamp) or recorded (pong -> note the round trip and that the peer is
@@ -568,26 +658,44 @@ static void on_transport_recv(void *arg, const uint8_t *data, size_t len)
 {
 	struct sess *s = arg;
 
-	if (len >= HB_LEN &&
+	if (len >= 5 &&
 	    (uint32_t)((data[0] << 24) | (data[1] << 16) |
 		       (data[2] << 8) | data[3]) == HB_MAGIC) {
-		uint64_t ts = 0;
-		int i;
+		if ((data[4] == CTL_PING || data[4] == CTL_PONG) &&
+		    len >= HB_LEN) {
+			uint64_t ts = 0;
+			int i;
 
-		for (i = 0; i < 8; i++)
-			ts = (ts << 8) | data[5 + i];
-		if (data[4] == HB_PING) {
-			uint8_t pong[HB_LEN];
+			for (i = 0; i < 8; i++)
+				ts = (ts << 8) | data[5 + i];
+			if (data[4] == CTL_PING) {
+				uint8_t pong[HB_LEN];
 
-			hb_build(pong, HB_PONG, ts);
-			transport_send(s, pong, sizeof(pong));
-		} else if (data[4] == HB_PONG) {
-			uint64_t now = now_ms();
+				hb_build(pong, CTL_PONG, ts);
+				transport_send(s, pong, sizeof(pong));
+			} else {
+				uint64_t now = now_ms();
 
-			pthread_mutex_lock(&s->hb_lock);
-			s->hb_last_pong = now;
-			s->hb_rtt = (int)(now - ts);
-			pthread_mutex_unlock(&s->hb_lock);
+				pthread_mutex_lock(&s->hb_lock);
+				s->hb_last_pong = now;
+				s->hb_rtt = (int)(now - ts);
+				pthread_mutex_unlock(&s->hb_lock);
+			}
+		} else if (data[4] == CTL_RDV && len >= CTL_RDV_LEN) {
+			struct sockaddr_storage sa;
+			socklen_t sl = 0;
+			int fam = rdv_parse(data, &sa, &sl);
+
+			if (fam) {
+				int i = fam_idx(fam);
+
+				pthread_mutex_lock(&s->rdv_lock);
+				s->rdv_in[i].sa = sa;
+				s->rdv_in[i].len = sl;
+				s->rdv_in[i].have = 1;
+				s->rdv_in_dirty = 1;
+				pthread_mutex_unlock(&s->rdv_lock);
+			}
 		}
 		return;
 	}
@@ -783,6 +891,78 @@ static void *ssh_cli_thread(void *p)
 }
 
 /*
+ * Keep a rendezvous node warm on each reachable family, re-announce them to the
+ * peer in-band, and adopt the peer's node for any family we cannot reach yet.
+ * The result is that both ends hold both families' rendezvous nodes, kept fresh
+ * and validated for the whole session, so a forced family downgrade can
+ * re-signal over the survivor. Self-throttled; runs from the
+ * live loop's thread, where sig is single-threaded.
+ */
+static void rdv_maintain(struct sess *s)
+{
+	static const int famv[2] = { 4, 6 };
+	uint64_t now = now_ms();
+	int i;
+
+	if (!(s->cfg->sig_flags & SIG_DHT))
+		return;
+
+	/* Re-validate and keep warm each family we can reach ourselves. */
+	if (now >= s->next_rdv_warm_ms) {
+		for (i = 0; i < 2; i++) {
+			struct sockaddr_storage sa;
+			socklen_t sl = sizeof(sa);
+
+			if (sig_located(s->sig, famv[i],
+					(struct sockaddr *)&sa, &sl) &&
+			    (!s->rdv[i].have || s->rdv[i].len != sl ||
+			     memcmp(&s->rdv[i].sa, &sa, sl))) {
+				s->rdv[i].sa = sa;
+				s->rdv[i].len = sl;
+				s->rdv[i].have = 1;
+				sig_reinforce(s->sig, famv[i],
+					      (struct sockaddr *)&sa, sl);
+			}
+		}
+		s->next_rdv_warm_ms = now + RDV_WARM_MS;
+	}
+
+	/* Tell the peer our nodes, so it has fresh ones to reconnect through even
+	 * if the token only carried one family. */
+	if (now >= s->next_rdv_tell_ms) {
+		for (i = 0; i < 2; i++)
+			if (s->rdv[i].have) {
+				uint8_t pkt[CTL_RDV_LEN];
+
+				rdv_build(pkt, famv[i],
+					  (struct sockaddr *)&s->rdv[i].sa);
+				transport_send(s, pkt, sizeof(pkt));
+			}
+		s->next_rdv_tell_ms = now + RDV_TELL_MS;
+	}
+
+	/* Adopt the peer's announcement for any family we cannot reach ourselves,
+	 * readying us to roam onto it (e.g. a v4-only host gaining v6, told a v6
+	 * node by a dual-stack client). */
+	if (s->rdv_in_dirty) {
+		struct rdv_node in[2];
+
+		pthread_mutex_lock(&s->rdv_lock);
+		memcpy(in, s->rdv_in, sizeof(in));
+		s->rdv_in_dirty = 0;
+		pthread_mutex_unlock(&s->rdv_lock);
+		for (i = 0; i < 2; i++) {
+			struct sockaddr_storage sa;
+			socklen_t sl = sizeof(sa);
+
+			if (in[i].have && !sig_located(s->sig, famv[i],
+						(struct sockaddr *)&sa, &sl))
+				s->rdv[i] = in[i];
+		}
+	}
+}
+
+/*
  * Run the SSH session over the connected stream until it ends. A failed
  * bring-up (the peer is not serving yet) ends the ssh thread quickly, so this
  * returns to be retried; a live session ends only when a side closes it.
@@ -822,6 +1002,13 @@ static int run_ssh(struct sess *s)
 	pthread_mutex_unlock(&s->hb_lock);
 	next_hb = now_ms();
 
+	/* Capture a rendezvous node per family for reconnection (the host was
+	 * already locating; ask on the client side too). */
+	if (s->cfg->sig_flags & SIG_DHT)
+		sig_locate(s->sig);
+	s->next_rdv_warm_ms = now_ms();
+	s->next_rdv_tell_ms = now_ms() + 1500;
+
 	while (!done) {
 		struct pollfd fds[8];
 		int timeout, nfds, lnf = 0, bidx;
@@ -846,10 +1033,11 @@ static int run_ssh(struct sess *s)
 		if (now_ms() >= next_hb) {
 			uint8_t ping[HB_LEN];
 
-			hb_build(ping, HB_PING, now_ms());
+			hb_build(ping, CTL_PING, now_ms());
 			transport_send(s, ping, sizeof(ping));
 			next_hb = now_ms() + HB_INTERVAL_MS;
 		}
+		rdv_maintain(s);
 		if (now_ms() >= s->next_status_ms) {
 			uint64_t now = now_ms(), lp;
 			int state;
@@ -992,6 +1180,7 @@ int session_run(const struct session_cfg *cfg)
 	pthread_mutex_init(&s.trickle_lock, NULL);
 	pthread_mutex_init(&s.status_lock, NULL);	/* s.status zeroed = connecting */
 	pthread_mutex_init(&s.hb_lock, NULL);
+	pthread_mutex_init(&s.rdv_lock, NULL);
 	if (cfg->stun_auto)
 		s.stun_servers = stunlist_load(&s.stun_count);
 	nat_log_level(cfg->log_level);	/* < 0 silences libjuice (see nat_log_level) */
@@ -1202,5 +1391,6 @@ int session_run(const struct session_cfg *cfg)
 	pthread_mutex_destroy(&s.trickle_lock);
 	pthread_mutex_destroy(&s.status_lock);
 	pthread_mutex_destroy(&s.hb_lock);
+	pthread_mutex_destroy(&s.rdv_lock);
 	return rc;
 }
