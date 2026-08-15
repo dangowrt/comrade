@@ -275,6 +275,10 @@ if(BUILD_TESTING)
 	target_link_libraries(termfilter_test comrade_termfilter)
 	add_test(NAME termfilter_test COMMAND termfilter_test)
 
+	add_executable(ctlproto_test tests/ctlproto_test.c)
+	target_link_libraries(ctlproto_test comrade_ctlproto)
+	add_test(NAME ctlproto_test COMMAND ctlproto_test)
+
 	add_executable(netmon_test tests/netmon_test.c)
 	target_link_libraries(netmon_test comrade_crypto)
 	add_test(NAME netmon_test COMMAND netmon_test)
@@ -346,7 +350,7 @@ endif()
 #
 if(BUILD_TESTING)
 	foreach(t IN ITEMS
-		token_test tokgen_test termfilter_test netmon_test
+		token_test tokgen_test termfilter_test ctlproto_test netmon_test
 		candpolicy_test candpack_test bep44_test bep44_pin_test
 		natstream_test sshloop_test sshexit_test sshkcp_test sshctl_test)
 		if(TARGET ${t})
