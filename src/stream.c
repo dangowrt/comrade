@@ -19,6 +19,9 @@ struct stream {
 	pthread_mutex_t lock;
 };
 
+/* Called from ikcp_input/ikcp_update with s->lock held (non-recursive), so the
+ * output callback must not re-enter stream_* on the same stream; the only
+ * callback writes to a socket, which does not. */
 static int kcp_output(const char *buf, int len, ikcpcb *kcp, void *user)
 {
 	struct stream *s = user;

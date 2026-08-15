@@ -77,6 +77,9 @@ target_include_directories(comrade_dbg PUBLIC src)
 add_library(comrade_termfilter STATIC src/termfilter.c)
 target_include_directories(comrade_termfilter PUBLIC src)
 
+add_library(comrade_ctlproto STATIC src/ctlproto.c)
+target_include_directories(comrade_ctlproto PUBLIC src)
+
 add_library(comrade_conn STATIC src/conn.c)
 target_include_directories(comrade_conn PUBLIC src)
 
@@ -228,7 +231,8 @@ if(COMRADE_HAVE_SIG AND COMRADE_HAVE_NAT AND COMRADE_HAVE_STREAM AND COMRADE_HAV
 	target_include_directories(comrade_session PUBLIC src)
 	target_link_libraries(comrade_session PUBLIC
 		comrade_sig comrade_nat comrade_lanlink comrade_stream comrade_ssh
-		comrade_bridge comrade_token comrade_crypto comrade_stunlist comrade_conn)
+		comrade_bridge comrade_token comrade_crypto comrade_stunlist comrade_conn
+		comrade_ctlproto)
 
 	# The view: the only module that draws to the terminal (MVC).
 	add_library(comrade_ui STATIC src/ui.c)

@@ -15,6 +15,7 @@
 
 #include "candpolicy.h"
 #include "conn.h"
+#include "ctlproto.h"
 #include "keys.h"
 #include "lanlink.h"
 #include "nat.h"
@@ -28,15 +29,11 @@
 
 #define SESSION_CONV 0x70326531
 
-/* Liveness heartbeat carried over the same transport as the KCP stream but
- * distinguished by a magic that is not the stream's conv, so on_transport_recv
- * tells the two apart. Packet: magic(4) type(1) timestamp(8), big-endian. */
-#define HB_MAGIC 0x484d4221u		/* != SESSION_CONV */
-#define CTL_PING 0			/* magic(4) type(1) timestamp(8) */
-#define CTL_PONG 1			/* magic(4) type(1) echoed-ts(8) */
-#define CTL_RDV 2			/* magic(4) type(1) family(1) port(2) addr(16) */
-#define HB_LEN 13
-#define CTL_RDV_LEN 24
+/*
+ * Liveness heartbeat cadence over the comrade-ctl control channel (framing in
+ * ctlproto.h): a ping every HB_INTERVAL_MS, and the link is declared lost when
+ * no pong has come back for HB_LOST_MS.
+ */
 #define HB_INTERVAL_MS 700
 #define HB_LOST_MS 2500
 /*
@@ -150,8 +147,10 @@ struct sess {
 	char status_rdv[80];		/* located rendezvous endpoint (host side) */
 	uint64_t next_status_ms;
 
-	/* Liveness heartbeat: a tiny ping/pong over the active transport (not the
-	 * KCP stream), so a dead link is noticed even when nobody is typing. */
+	/* Liveness heartbeat: a tiny ping/pong over the comrade-ctl channel, so a
+	 * dead link is noticed even when nobody is typing. Riding the reliable
+	 * SSH/KCP stream, it measures end-to-end liveness -- a pong stops arriving
+	 * once the link has truly stalled, which is exactly the signal we want. */
 	pthread_mutex_t hb_lock;
 	uint64_t hb_last_pong;		/* when a pong last came back */
 	int hb_rtt;			/* round trip from the last pong, ms */
@@ -170,6 +169,9 @@ struct sess {
 	uint64_t next_rdv_warm_ms, next_rdv_tell_ms;
 
 	int ssh_fd;			/* the ssh thread's socketpair end */
+	int ssh_ctl_fd;			/* the ssh thread's comrade-ctl end */
+	int ctl_fd;			/* our end of the comrade-ctl socketpair */
+	struct ctl_reframer ctl_rf;	/* reassembles ctl messages across reads */
 	int ssh_cli_rc;
 
 	char **stun_servers;		/* rotated across ICE retries (host:port) */
@@ -583,130 +585,78 @@ static int transport_send(struct sess *s, const uint8_t *data, size_t len)
 	return -1;
 }
 
-static void hb_build(uint8_t *pkt, int type, uint64_t ts)
+/* Send one control message to the peer over the comrade-ctl channel. Best
+ * effort: MSG_NOSIGNAL so a closed channel during teardown cannot raise
+ * SIGPIPE, and a full/short write only ever drops a heartbeat, which the next
+ * tick repeats. */
+static void ctl_send(struct sess *s, int type, const uint8_t *payload,
+		     size_t plen)
 {
-	int i;
+	uint8_t buf[CTL_FRAME_MAX];
+	size_t n;
+	ssize_t w;
 
-	pkt[0] = (uint8_t)(HB_MAGIC >> 24);
-	pkt[1] = (uint8_t)(HB_MAGIC >> 16);
-	pkt[2] = (uint8_t)(HB_MAGIC >> 8);
-	pkt[3] = (uint8_t)HB_MAGIC;
-	pkt[4] = (uint8_t)type;
-	for (i = 0; i < 8; i++)
-		pkt[5 + i] = (uint8_t)(ts >> (56 - 8 * i));
+	n = ctl_frame(buf, type, payload, plen);
+	if (s->ctl_fd < 0 || !n)
+		return;
+	w = send(s->ctl_fd, buf, n, MSG_NOSIGNAL);
+	(void)w;
 }
 
-/* Build a CTL_RDV announcement: our rendezvous node for `family`. */
-static void rdv_build(uint8_t *pkt, int family, const struct sockaddr *sa)
+/* Act on one decoded control message (a ctl_reframer callback): answer a ping,
+ * record a pong's round trip, or stash the peer's announced rendezvous node for
+ * rdv_maintain to adopt. */
+static void ctl_dispatch(void *arg, int type, const uint8_t *pl, size_t plen)
 {
-	uint16_t port = 0;
-	const void *addr = NULL;
-	int alen = 0;
+	struct sess *s = arg;
 
-	pkt[0] = (uint8_t)(HB_MAGIC >> 24);
-	pkt[1] = (uint8_t)(HB_MAGIC >> 16);
-	pkt[2] = (uint8_t)(HB_MAGIC >> 8);
-	pkt[3] = (uint8_t)HB_MAGIC;
-	pkt[4] = CTL_RDV;
-	pkt[5] = (uint8_t)(family == 6 ? 6 : 4);
-	if (family == 6) {
-		const struct sockaddr_in6 *a = (const struct sockaddr_in6 *)sa;
+	if (type == CTLM_PING && plen >= CTL_TS_LEN) {
+		ctl_send(s, CTLM_PONG, pl, CTL_TS_LEN);
+	} else if (type == CTLM_PONG && plen >= CTL_TS_LEN) {
+		uint64_t now = now_ms();
 
-		port = ntohs(a->sin6_port);
-		addr = &a->sin6_addr;
-		alen = 16;
-	} else {
-		const struct sockaddr_in *a = (const struct sockaddr_in *)sa;
+		pthread_mutex_lock(&s->hb_lock);
+		s->hb_last_pong = now;
+		s->hb_rtt = (int)(now - ctl_get_u64(pl));
+		pthread_mutex_unlock(&s->hb_lock);
+	} else if (type == CTLM_RDV && plen >= CTL_RDV_PLEN) {
+		struct sockaddr_storage sa;
+		socklen_t sl = 0;
+		int fam = ctl_rdv_decode(pl, &sa, &sl);
 
-		port = ntohs(a->sin_port);
-		addr = &a->sin_addr;
-		alen = 4;
+		if (fam) {
+			int i = fam_idx(fam);
+
+			pthread_mutex_lock(&s->rdv_lock);
+			s->rdv_in[i].sa = sa;
+			s->rdv_in[i].len = sl;
+			s->rdv_in[i].have = 1;
+			s->rdv_in_dirty = 1;
+			pthread_mutex_unlock(&s->rdv_lock);
+		}
 	}
-	pkt[6] = (uint8_t)(port >> 8);
-	pkt[7] = (uint8_t)port;
-	memset(pkt + 8, 0, 16);
-	memcpy(pkt + 8, addr, (size_t)alen);
 }
 
-/* Parse a CTL_RDV payload into out; returns the family (4 or 6) or 0. */
-static int rdv_parse(const uint8_t *pkt, struct sockaddr_storage *out,
-		     socklen_t *len)
+/* Drain the comrade-ctl fd and dispatch each complete message the read yields
+ * (reframing across read boundaries lives in the reframer). */
+static void ctl_readable(struct sess *s)
 {
-	uint16_t port = (uint16_t)((pkt[6] << 8) | pkt[7]);
+	uint8_t tmp[64];
+	ssize_t n = read(s->ctl_fd, tmp, sizeof(tmp));
 
-	memset(out, 0, sizeof(*out));
-	if (pkt[5] == 6) {
-		struct sockaddr_in6 *a = (struct sockaddr_in6 *)out;
-
-		a->sin6_family = AF_INET6;
-		a->sin6_port = htons(port);
-		memcpy(&a->sin6_addr, pkt + 8, 16);
-		*len = sizeof(*a);
-		return 6;
-	}
-	if (pkt[5] == 4) {
-		struct sockaddr_in *a = (struct sockaddr_in *)out;
-
-		a->sin_family = AF_INET;
-		a->sin_port = htons(port);
-		memcpy(&a->sin_addr, pkt + 8, 4);
-		*len = sizeof(*a);
-		return 4;
-	}
-	return 0;
+	if (n > 0)
+		ctl_reframer_feed(&s->ctl_rf, tmp, (size_t)n, ctl_dispatch, s);
 }
 
 /*
- * Transport receive. A heartbeat is answered (ping -> pong echoing the sender's
- * timestamp) or recorded (pong -> note the round trip and that the peer is
- * alive); everything else is stream data. May run on libjuice's thread, so the
- * heartbeat bookkeeping is under hb_lock.
+ * Transport receive: with the control protocol now inside the SSH session,
+ * everything arriving on the raw path is KCP stream data. May run on
+ * libjuice's thread.
  */
 static void on_transport_recv(void *arg, const uint8_t *data, size_t len)
 {
 	struct sess *s = arg;
 
-	if (len >= 5 &&
-	    (uint32_t)((data[0] << 24) | (data[1] << 16) |
-		       (data[2] << 8) | data[3]) == HB_MAGIC) {
-		if ((data[4] == CTL_PING || data[4] == CTL_PONG) &&
-		    len >= HB_LEN) {
-			uint64_t ts = 0;
-			int i;
-
-			for (i = 0; i < 8; i++)
-				ts = (ts << 8) | data[5 + i];
-			if (data[4] == CTL_PING) {
-				uint8_t pong[HB_LEN];
-
-				hb_build(pong, CTL_PONG, ts);
-				transport_send(s, pong, sizeof(pong));
-			} else {
-				uint64_t now = now_ms();
-
-				pthread_mutex_lock(&s->hb_lock);
-				s->hb_last_pong = now;
-				s->hb_rtt = (int)(now - ts);
-				pthread_mutex_unlock(&s->hb_lock);
-			}
-		} else if (data[4] == CTL_RDV && len >= CTL_RDV_LEN) {
-			struct sockaddr_storage sa;
-			socklen_t sl = 0;
-			int fam = rdv_parse(data, &sa, &sl);
-
-			if (fam) {
-				int i = fam_idx(fam);
-
-				pthread_mutex_lock(&s->rdv_lock);
-				s->rdv_in[i].sa = sa;
-				s->rdv_in[i].len = sl;
-				s->rdv_in[i].have = 1;
-				s->rdv_in_dirty = 1;
-				pthread_mutex_unlock(&s->rdv_lock);
-			}
-		}
-		return;
-	}
 	if (s->stream)
 		stream_input(s->stream, data, len);
 }
@@ -874,6 +824,7 @@ static void *ssh_srv_thread(void *p)
 	o.command = s->cfg->ssh_command;	/* NULL => tmux default */
 	o.use_pty = s->cfg->use_pty;
 	o.end_fd = s->cfg->ssh_end_fd;
+	o.ctl_fd = s->ssh_ctl_fd;
 	sshd_serve_fd(s->ssh_fd, &o);
 	return NULL;
 }
@@ -887,6 +838,7 @@ static void *ssh_cli_thread(void *p)
 	memcpy(o.host_fp, s->cfg->tok.hostpub, 32);
 	memcpy(o.auth, s->auth, sizeof(o.auth));
 	o.interactive = s->cfg->interactive;
+	o.ctl_fd = s->ssh_ctl_fd;
 	o.status = session_status;
 	o.status_arg = s;
 	o.send = s->cfg->test_send;
@@ -946,11 +898,11 @@ static void rdv_maintain(struct sess *s)
 	if (now >= s->next_rdv_tell_ms) {
 		for (i = 0; i < 2; i++)
 			if (s->rdv[i].have) {
-				uint8_t pkt[CTL_RDV_LEN];
+				uint8_t pl[CTL_RDV_PLEN];
 
-				rdv_build(pkt, famv[i],
-					  (struct sockaddr *)&s->rdv[i].sa);
-				transport_send(s, pkt, sizeof(pkt));
+				ctl_rdv_encode(pl, famv[i],
+					       (struct sockaddr *)&s->rdv[i].sa);
+				ctl_send(s, CTLM_RDV, pl, sizeof(pl));
 			}
 		s->next_rdv_tell_ms = now + RDV_TELL_MS;
 	}
@@ -985,23 +937,36 @@ static int run_ssh(struct sess *s)
 {
 	struct sshbridge *br;
 	pthread_t th;
-	int sp[2];
+	int sp[2], cp[2];
 	int done = 0;
 	uint64_t next_hb;
 
 	if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp))
 		return -1;
-	s->stream = stream_create(SESSION_CONV, on_stream_output, s);
-	if (!s->stream) {
+	if (socketpair(AF_UNIX, SOCK_STREAM, 0, cp)) {
 		close(sp[0]);
 		close(sp[1]);
 		return -1;
 	}
+	s->stream = stream_create(SESSION_CONV, on_stream_output, s);
+	if (!s->stream) {
+		close(sp[0]);
+		close(sp[1]);
+		close(cp[0]);
+		close(cp[1]);
+		return -1;
+	}
 	s->ssh_fd = sp[1];
+	s->ssh_ctl_fd = cp[1];
+	s->ctl_fd = cp[0];
+	s->ctl_rf.len = 0;
 	if (pthread_create(&th, NULL,
 			   s->cfg->is_host ? ssh_srv_thread : ssh_cli_thread, s)) {
 		close(sp[0]);
 		close(sp[1]);
+		close(cp[0]);
+		close(cp[1]);
+		s->ctl_fd = -1;
 		stream_destroy(s->stream);
 		s->stream = NULL;
 		return -1;
@@ -1024,12 +989,12 @@ static int run_ssh(struct sess *s)
 	s->next_rdv_tell_ms = now_ms() + 1500;
 
 	while (!done) {
-		struct pollfd fds[8];
-		int timeout, nfds, lnf = 0, bidx;
+		struct pollfd fds[9];
+		int timeout, nfds, lnf = 0, bidx, cidx;
 
 		nfds = sig_prepare(s->sig, fds, 5, &timeout);
 		if (s->lan)
-			lnf = lanlink_prepare(s->lan, fds + nfds, 8 - nfds - 1,
+			lnf = lanlink_prepare(s->lan, fds + nfds, 9 - nfds - 2,
 					      &timeout);
 		if (timeout < 0 || timeout > 10)
 			timeout = 10;
@@ -1037,18 +1002,24 @@ static int run_ssh(struct sess *s)
 		fds[bidx].fd = sshbridge_fd(br);
 		fds[bidx].events = sshbridge_events(br);
 		fds[bidx].revents = 0;
-		poll(fds, (nfds_t)(bidx + 1), timeout);
+		cidx = bidx + 1;
+		fds[cidx].fd = s->ctl_fd;
+		fds[cidx].events = POLLIN;
+		fds[cidx].revents = 0;
+		poll(fds, (nfds_t)(cidx + 1), timeout);
 		sig_dispatch(s->sig, fds, nfds);
 		if (s->lan)
 			lanlink_dispatch(s->lan, fds + nfds, lnf);
 		if (sshbridge_pump(br, fds[bidx].revents, (uint32_t)now_ms()) < 0)
 			done = 1;
+		if (fds[cidx].revents & (POLLIN | POLLHUP | POLLERR))
+			ctl_readable(s);
 
 		if (now_ms() >= next_hb) {
-			uint8_t ping[HB_LEN];
+			uint8_t ts[CTL_TS_LEN];
 
-			hb_build(ping, CTL_PING, now_ms());
-			transport_send(s, ping, sizeof(ping));
+			ctl_put_u64(ts, now_ms());
+			ctl_send(s, CTLM_PING, ts, sizeof(ts));
 			next_hb = now_ms() + HB_INTERVAL_MS;
 		}
 		rdv_maintain(s);
@@ -1074,6 +1045,12 @@ static int run_ssh(struct sess *s)
 	pthread_join(th, NULL);
 	sshbridge_destroy(br);
 	close(sp[0]);			/* sp[1] is closed by the ssh module */
+	/* Both control-socket ends are ours to close: the ssh module bridges
+	 * cp[1] but never closes it. Mark the fd gone first so a stray ctl_send
+	 * is a no-op. */
+	s->ctl_fd = -1;
+	close(cp[0]);
+	close(cp[1]);
 	stream_destroy(s->stream);
 	s->stream = NULL;
 
@@ -1190,6 +1167,7 @@ int session_run(const struct session_cfg *cfg)
 
 	memset(&s, 0, sizeof(s));
 	s.cfg = cfg;
+	s.ctl_fd = -1;			/* no control channel until run_ssh */
 	memcpy(s.auth, cfg->tok.auth, TOKEN_AUTH_LEN);
 	pthread_mutex_init(&s.trickle_lock, NULL);
 	pthread_mutex_init(&s.status_lock, NULL);	/* s.status zeroed = connecting */
