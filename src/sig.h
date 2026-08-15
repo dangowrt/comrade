@@ -56,6 +56,31 @@ int sig_post(struct sig *s, const uint8_t *data, size_t len);
 int sig_subscribe(struct sig *s, sig_recv_cb *cb, void *arg);
 
 /*
+ * Multi-client turnstile. The mailbox is used as a
+ * mutex: the host advertises one offer and clears the answer slot to release
+ * it; a client claims by writing its answer only into an empty answer slot,
+ * with CAS, so exactly one client ever holds a given offer.
+ */
+
+/* The client's view of the answer slot in the last mailbox read. */
+enum sig_claim {
+	SIG_CLAIM_UNKNOWN = 0,	/* the mailbox has not been read yet */
+	SIG_CLAIM_FREE,		/* answer slot empty -- claimable */
+	SIG_CLAIM_HELD,		/* our own answer occupies the slot */
+	SIG_CLAIM_BUSY		/* another client's answer occupies the slot */
+};
+enum sig_claim sig_claim_status(struct sig *s);
+
+/* Client: stop advertising our answer, so a slot the host frees is not
+ * re-claimed automatically (e.g. once we start punching or give up). A later
+ * sig_post re-arms it. */
+void sig_withdraw(struct sig *s);
+
+/* Host: publish a fresh offer and release (clear) the answer slot in one
+ * atomic rotate, readying the turnstile for the next client. */
+int sig_rotate(struct sig *s, const uint8_t *offer, size_t len);
+
+/*
  * Link-local direct bypass (multicast only). Our own direct-transport port is
  * carried in the announcement; when the peer's announcement arrives from a
  * link-local source -- proving a clear layer-2 path that needs no ICE -- cb

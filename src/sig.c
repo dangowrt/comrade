@@ -56,6 +56,8 @@ struct sig {
 	int64_t cur_seq;
 	int have_cur;
 	int need_write;
+	int clear_peer;			/* host one-shot: omit the answer slot on
+					 * the next write (turnstile release) */
 
 	sig_recv_cb *cb;
 	void *arg;
@@ -218,6 +220,35 @@ int sig_subscribe(struct sig *s, sig_recv_cb *cb, void *arg)
 	return 0;
 }
 
+enum sig_claim sig_claim_status(struct sig *s)
+{
+	if (s->is_host || !s->have_cur)
+		return SIG_CLAIM_UNKNOWN;
+	if (!s->slot_a_len)
+		return SIG_CLAIM_FREE;
+	if (s->have_mine && s->slot_a_len == s->mine_len &&
+	    !memcmp(s->slot_a, s->mine, s->mine_len))
+		return SIG_CLAIM_HELD;
+	return SIG_CLAIM_BUSY;
+}
+
+void sig_withdraw(struct sig *s)
+{
+	s->have_mine = 0;
+	s->need_write = 0;
+}
+
+int sig_rotate(struct sig *s, const uint8_t *offer, size_t len)
+{
+	int rc = sig_post(s, offer, len);
+
+	if (rc)
+		return rc;
+	s->clear_peer = 1;	/* omit the answer slot on the next write */
+	s->have_last = 0;	/* re-deliver the next answer even if identical */
+	return 0;
+}
+
 void sig_set_direct_port(struct sig *s, uint16_t port)
 {
 	s->direct_port = port;
@@ -375,6 +406,10 @@ static size_t container_build(struct sig *s, uint8_t *out, size_t outlen)
 		lo = s->mine_len;
 		pa = s->slot_a;
 		la = s->slot_a_len;
+		if (s->clear_peer) {
+			la = 0;			/* release the answer slot */
+			s->clear_peer = 0;	/* one-shot per rotate */
+		}
 	} else {
 		pa = s->mine;
 		la = s->mine_len;
@@ -604,11 +639,15 @@ static void dht_pump(struct sig *s, uint64_t now)
 					    mailbox_merge, s, NULL, NULL);
 			s->next_put_ms = now + SIG_DHT_PUT_MS;
 		}
-	} else if (s->have_mine && s->need_write && s->have_cur) {
+	} else if (s->have_mine && s->need_write && s->have_cur &&
+		   s->slot_a_len == 0) {
 		/*
-		 * The client writes its answer straight to the pinned rendezvous
-		 * node once it has read the offer -- a round-trip, not a lookup,
-		 * so it never clobbers the offer and never converges.
+		 * The client claims by writing its answer straight to the pinned
+		 * rendezvous node once it has read the offer -- a round-trip, not
+		 * a lookup, so it never clobbers the offer and never converges.
+		 * Only an EMPTY answer slot is claimed (the turnstile mutex): a
+		 * slot already holding an answer belongs to another client, so we
+		 * leave it and back off until the host frees it.
 		 */
 		bep44_update_direct(s->engine, s->keys.bep44_sk,
 				    s->keys.bep44_pk, SIG_SALT, mailbox_merge,
