@@ -39,8 +39,16 @@
 #define CTL_RDV_LEN 24
 #define HB_INTERVAL_MS 700
 #define HB_LOST_MS 2500
-#define RDV_WARM_MS 3000		/* keep both families' rendezvous warm */
-#define RDV_TELL_MS 5000		/* re-announce our nodes to the peer */
+/*
+ * Rendezvous keep-warm cadence. Re-validating a rendezvous node touches the
+ * DHT, so do it rarely: a node dying AND a roam needing it inside the same
+ * window is unlikely, and a full DHT lookup is always the fallback. Poll faster
+ * only until the first node is captured after locate starts. The peer
+ * announcement rides the transport (not the DHT), so it can refresh more often.
+ */
+#define RDV_WARM_MS 180000		/* 3 min: re-validate/keep warm */
+#define RDV_POLL_MS 5000		/* until the first node is captured */
+#define RDV_TELL_MS 30000		/* announce our nodes to the peer */
 
 /* Rendezvous node kept for reconnection (ours when we can reach the family, or
  * the peer's for a family we cannot yet reach but might roam to). */
@@ -907,24 +915,30 @@ static void rdv_maintain(struct sess *s)
 	if (!(s->cfg->sig_flags & SIG_DHT))
 		return;
 
-	/* Re-validate and keep warm each family we can reach ourselves. */
+	/* Re-validate and keep warm each family we can reach ourselves. Rare (a
+	 * held node dying inside the window is unlikely and the DHT lookup is the
+	 * fallback), but poll faster until the first node has been captured. */
 	if (now >= s->next_rdv_warm_ms) {
+		int captured = 0;
+
 		for (i = 0; i < 2; i++) {
 			struct sockaddr_storage sa;
 			socklen_t sl = sizeof(sa);
 
-			if (sig_located(s->sig, famv[i],
-					(struct sockaddr *)&sa, &sl) &&
-			    (!s->rdv[i].have || s->rdv[i].len != sl ||
-			     memcmp(&s->rdv[i].sa, &sa, sl))) {
+			if (!sig_located(s->sig, famv[i],
+					 (struct sockaddr *)&sa, &sl))
+				continue;
+			captured = 1;
+			if (!s->rdv[i].have || s->rdv[i].len != sl ||
+			    memcmp(&s->rdv[i].sa, &sa, sl)) {
 				s->rdv[i].sa = sa;
 				s->rdv[i].len = sl;
 				s->rdv[i].have = 1;
-				sig_reinforce(s->sig, famv[i],
-					      (struct sockaddr *)&sa, sl);
 			}
+			sig_reinforce(s->sig, famv[i],
+				      (struct sockaddr *)&sa, sl);
 		}
-		s->next_rdv_warm_ms = now + RDV_WARM_MS;
+		s->next_rdv_warm_ms = now + (captured ? RDV_WARM_MS : RDV_POLL_MS);
 	}
 
 	/* Tell the peer our nodes, so it has fresh ones to reconnect through even
