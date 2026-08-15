@@ -344,7 +344,7 @@ if(BUILD_TESTING)
 	foreach(t IN ITEMS
 		token_test tokgen_test termfilter_test netmon_test
 		candpolicy_test candpack_test bep44_test bep44_pin_test
-		natstream_test sshloop_test sshexit_test sshkcp_test)
+		natstream_test sshloop_test sshexit_test sshkcp_test sshctl_test)
 		if(TARGET ${t})
 			target_compile_options(${t} PRIVATE -UNDEBUG)
 		endif()
