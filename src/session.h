@@ -83,6 +83,8 @@ struct session_cfg {
 
 	/* Host only. */
 	void *hostkey;			/* ssh_key (private) */
+	int host_serve_max;		/* stop after serving this many clients
+					 * (0 = until the deadline / operator) */
 	const char *ssh_command;	/* command to serve; NULL => tmux default */
 	int use_pty;			/* allocate a pty (interactive/tmux) */
 	/*

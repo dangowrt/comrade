@@ -108,6 +108,13 @@ struct sess;			/* forward: a conn carries a back-pointer to it */
 struct conn {
 	struct sess *sess;		/* the session this connection belongs to */
 
+	/* This connection's ICE identity. A fresh one per host offer (single-use
+	 * per join, so two clients never share credentials); the client keeps its
+	 * one identity for the session. */
+	uint16_t bind_port;
+	char ice_ufrag[16];
+	char ice_pwd[40];
+
 	struct nat_agent *nat;
 	struct stream *stream;
 
@@ -143,9 +150,6 @@ struct conn {
 struct sess {
 	const struct session_cfg *cfg;
 
-	uint16_t bind_port;
-	char ice_ufrag[16];
-	char ice_pwd[40];
 	uint8_t auth[TOKEN_AUTH_LEN];
 
 	struct sig *sig;
@@ -775,6 +779,31 @@ out:
 	return rc;
 }
 
+/* Fill a connection's ICE identity: a fresh ufrag/pwd and a random bind port.
+ * The host uses a new one per offer (single-use per join, so two clients never
+ * share credentials); the client keeps its one for the whole session. */
+static void conn_gen_ice(struct conn *c)
+{
+	static const char hx[] = "0123456789abcdef";
+	uint8_t rb[16];
+	int j;
+
+	random_bytes(rb, 4);
+	for (j = 0; j < 4; j++) {
+		c->ice_ufrag[j * 2] = hx[rb[j] >> 4];
+		c->ice_ufrag[j * 2 + 1] = hx[rb[j] & 0xf];
+	}
+	c->ice_ufrag[8] = '\0';
+	random_bytes(rb, 16);
+	for (j = 0; j < 16; j++) {
+		c->ice_pwd[j * 2] = hx[rb[j] >> 4];
+		c->ice_pwd[j * 2 + 1] = hx[rb[j] & 0xf];
+	}
+	c->ice_pwd[32] = '\0';
+	random_bytes(rb, 2);
+	c->bind_port = (uint16_t)(40000 + (((rb[0] << 8) | rb[1]) % 20000));
+}
+
 static int nat_setup(struct conn *c)
 {
 	struct sess *s = c->sess;
@@ -807,9 +836,9 @@ static int nat_setup(struct conn *c)
 		if (!source_addr(af, bind_addr, sizeof(bind_addr)))
 			cfg.bind_address = bind_addr;
 	}
-	cfg.bind_port = s->bind_port;
-	cfg.ice_ufrag = s->ice_ufrag;
-	cfg.ice_pwd = s->ice_pwd;
+	cfg.bind_port = c->bind_port;
+	cfg.ice_ufrag = c->ice_ufrag;
+	cfg.ice_pwd = c->ice_pwd;
 	cfg.on_local_sdp = on_local_sdp;
 	cfg.on_recv = on_transport_recv;
 	cfg.on_candidate = on_ice_candidate;
@@ -1208,12 +1237,10 @@ static void maybe_announce_rendezvous(struct sess *s)
 
 int session_run(const struct session_cfg *cfg)
 {
-	static const char hx[] = "0123456789abcdef";
 	struct sess s;
 	enum state st = ST_WAIT_DHT;
 	uint64_t deadline;
-	uint8_t rb[16];
-	int j, rc;
+	int rc;
 
 	memset(&s, 0, sizeof(s));
 	s.cfg = cfg;
@@ -1228,21 +1255,7 @@ int session_run(const struct session_cfg *cfg)
 		s.stun_servers = stunlist_load(&s.stun_count);
 	nat_log_level(cfg->log_level);	/* < 0 silences libjuice (see nat_log_level) */
 
-	/* Stable ICE identity, reused across re-gathers (see nat_config). */
-	random_bytes(rb, 4);
-	for (j = 0; j < 4; j++) {
-		s.ice_ufrag[j * 2] = hx[rb[j] >> 4];
-		s.ice_ufrag[j * 2 + 1] = hx[rb[j] & 0xf];
-	}
-	s.ice_ufrag[8] = '\0';
-	random_bytes(rb, 16);
-	for (j = 0; j < 16; j++) {
-		s.ice_pwd[j * 2] = hx[rb[j] >> 4];
-		s.ice_pwd[j * 2 + 1] = hx[rb[j] & 0xf];
-	}
-	s.ice_pwd[32] = '\0';
-	random_bytes(rb, 2);
-	s.bind_port = (uint16_t)(40000 + (((rb[0] << 8) | rb[1]) % 20000));
+	conn_gen_ice(&s.c);
 
 	s.sig = sig_create(cfg->tok.rdv, cfg->sig_flags, cfg->is_host);
 	if (!s.sig)
