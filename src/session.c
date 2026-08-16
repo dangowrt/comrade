@@ -96,6 +96,50 @@ enum state {
 	ST_FAIL,
 };
 
+struct sess;			/* forward: a conn carries a back-pointer to it */
+
+/*
+ * One client connection's running state: the transport (nat/stream), the SSH
+ * session and its comrade-ctl channel, the liveness heartbeat, the peer's
+ * rendezvous announcement, and this connection's status. A host serves several
+ * of these at once over the shared tmux; today there is
+ * one, embedded in the session. Callbacks reach the session through `sess`.
+ */
+struct conn {
+	struct sess *sess;		/* the session this connection belongs to */
+
+	struct nat_agent *nat;
+	struct stream *stream;
+
+	int ssh_fd;			/* the ssh thread's socketpair end */
+	int ssh_ctl_fd;			/* the ssh thread's comrade-ctl end */
+	int ctl_fd;			/* our end of the comrade-ctl socketpair */
+	struct ctl_reframer ctl_rf;	/* reassembles ctl messages across reads */
+	int ssh_cli_rc;
+
+	/* Liveness heartbeat: a tiny ping/pong over the comrade-ctl channel, so a
+	 * dead link is noticed even when nobody is typing. Riding the reliable
+	 * SSH/KCP stream, it measures end-to-end liveness -- a pong stops arriving
+	 * once the link has truly stalled, which is exactly the signal we want. */
+	pthread_mutex_t hb_lock;
+	uint64_t hb_last_pong;		/* when a pong last came back */
+	int hb_rtt;			/* round trip from the last pong, ms */
+	uint64_t lost_since_ms;		/* when the link was first seen lost, 0 if live */
+
+	/* The peer's rendezvous announcement, handed from the ctl reader to the
+	 * loop; [0]=v4 [1]=v6. */
+	struct rdv_node rdv_in[2];
+	pthread_mutex_t rdv_lock;
+	int rdv_in_dirty;
+	uint64_t next_rdv_tell_ms;
+
+	/* This connection's status (data only; the view renders it). */
+	pthread_mutex_t status_lock;
+	struct conn_status status;
+	char status_peer[80];		/* address of the chosen pair, once live */
+	uint64_t next_status_ms;
+};
+
 struct sess {
 	const struct session_cfg *cfg;
 
@@ -105,9 +149,7 @@ struct sess {
 	uint8_t auth[TOKEN_AUTH_LEN];
 
 	struct sig *sig;
-	struct nat_agent *nat;
 	struct lanlink *lan;
-	struct stream *stream;
 
 	char local_sdp[NAT_SDP_MAX];
 	volatile int have_local_sdp;
@@ -140,43 +182,21 @@ struct sess {
 	int have_srflx4;		/* STUN gave us a public v4 (reflexive) */
 	int stun_warned;		/* warned once that STUN produced nothing */
 
-	/* Local connection status (data only; the view renders it). */
-	pthread_mutex_t status_lock;
-	struct conn_status status;
-	char status_peer[80];		/* address of the chosen pair, once live */
 	char status_rdv[80];		/* located rendezvous endpoint (host side) */
-	uint64_t next_status_ms;
-
-	/* Liveness heartbeat: a tiny ping/pong over the comrade-ctl channel, so a
-	 * dead link is noticed even when nobody is typing. Riding the reliable
-	 * SSH/KCP stream, it measures end-to-end liveness -- a pong stops arriving
-	 * once the link has truly stalled, which is exactly the signal we want. */
-	pthread_mutex_t hb_lock;
-	uint64_t hb_last_pong;		/* when a pong last came back */
-	int hb_rtt;			/* round trip from the last pong, ms */
-	uint64_t lost_since_ms;		/* when the link was first seen lost, 0 if live */
 
 	/*
-	 * Rendezvous nodes kept warm and exchanged in-band for a fast reconnect:
-	 * [0]=v4 [1]=v6. rdv is our current best per family (our own located node
-	 * where we reach the family, or the peer's for one we might roam to);
-	 * rdv_in is a pending peer announcement the recv thread hands to the loop.
+	 * Rendezvous nodes we have located and keep warm for a fast reconnect:
+	 * [0]=v4 [1]=v6, our own located node per family (or the peer's, adopted
+	 * for one we cannot yet reach but might roam to).
 	 */
 	struct rdv_node rdv[2];
-	pthread_mutex_t rdv_lock;
-	struct rdv_node rdv_in[2];
-	int rdv_in_dirty;
-	uint64_t next_rdv_warm_ms, next_rdv_tell_ms;
-
-	int ssh_fd;			/* the ssh thread's socketpair end */
-	int ssh_ctl_fd;			/* the ssh thread's comrade-ctl end */
-	int ctl_fd;			/* our end of the comrade-ctl socketpair */
-	struct ctl_reframer ctl_rf;	/* reassembles ctl messages across reads */
-	int ssh_cli_rc;
+	uint64_t next_rdv_warm_ms;
 
 	char **stun_servers;		/* rotated across ICE retries (host:port) */
 	int stun_count;
 	char stun_host[128];		/* the current attempt's host, split out */
+
+	struct conn c;			/* the (single, for now) connection */
 };
 
 static uint64_t now_ms(void)
@@ -368,7 +388,7 @@ static void publish_status(struct sess *s, int state)
 
 	memset(&cs, 0, sizeof(cs));
 	cs.state = state;
-	snprintf(cs.peer, sizeof(cs.peer), "%s", s->status_peer);
+	snprintf(cs.peer, sizeof(cs.peer), "%s", s->c.status_peer);
 	/* The host learns its rendezvous endpoint mid-session (after the token
 	 * snapshot this run was started with), so prefer the located address; the
 	 * client, whose token already carries it, falls back to the token. */
@@ -378,16 +398,16 @@ static void publish_status(struct sess *s, int state)
 		fmt_token_rdv(&s->cfg->tok, cs.rdv, sizeof(cs.rdv));
 	/* Prefer the heartbeat's round trip (measured even when idle); the stream
 	 * RTT only moves when SSH data flows. Report how long a loss has lasted. */
-	pthread_mutex_lock(&s->hb_lock);
-	cs.rtt_ms = s->hb_rtt > 0 ? s->hb_rtt :
-		(s->stream ? stream_rtt(s->stream) : 0);
-	if (state == CONN_LOST && s->lost_since_ms)
-		cs.since_s = (int)((now_ms() - s->lost_since_ms) / 1000);
-	pthread_mutex_unlock(&s->hb_lock);
+	pthread_mutex_lock(&s->c.hb_lock);
+	cs.rtt_ms = s->c.hb_rtt > 0 ? s->c.hb_rtt :
+		(s->c.stream ? stream_rtt(s->c.stream) : 0);
+	if (state == CONN_LOST && s->c.lost_since_ms)
+		cs.since_s = (int)((now_ms() - s->c.lost_since_ms) / 1000);
+	pthread_mutex_unlock(&s->c.hb_lock);
 
-	pthread_mutex_lock(&s->status_lock);
-	s->status = cs;
-	pthread_mutex_unlock(&s->status_lock);
+	pthread_mutex_lock(&s->c.status_lock);
+	s->c.status = cs;
+	pthread_mutex_unlock(&s->c.status_lock);
 
 	if (s->cfg->status_path)
 		conn_write(s->cfg->status_path, &cs);
@@ -398,9 +418,9 @@ static void session_status(void *arg, struct conn_status *out)
 {
 	struct sess *s = arg;
 
-	pthread_mutex_lock(&s->status_lock);
-	*out = s->status;
-	pthread_mutex_unlock(&s->status_lock);
+	pthread_mutex_lock(&s->c.status_lock);
+	*out = s->c.status;
+	pthread_mutex_unlock(&s->c.status_lock);
 }
 
 /* Keep only candidate lines of the requested family (0 = all). */
@@ -580,8 +600,8 @@ static int transport_send(struct sess *s, const uint8_t *data, size_t len)
 {
 	if (s->lan && lanlink_have_peer(s->lan))
 		return lanlink_send(s->lan, data, len);
-	if (s->nat && nat_connected(s->nat))
-		return nat_send(s->nat, data, len);
+	if (s->c.nat && nat_connected(s->c.nat))
+		return nat_send(s->c.nat, data, len);
 	return -1;
 }
 
@@ -597,9 +617,9 @@ static void ctl_send(struct sess *s, int type, const uint8_t *payload,
 	ssize_t w;
 
 	n = ctl_frame(buf, type, payload, plen);
-	if (s->ctl_fd < 0 || !n)
+	if (s->c.ctl_fd < 0 || !n)
 		return;
-	w = send(s->ctl_fd, buf, n, MSG_NOSIGNAL);
+	w = send(s->c.ctl_fd, buf, n, MSG_NOSIGNAL);
 	(void)w;
 }
 
@@ -615,10 +635,10 @@ static void ctl_dispatch(void *arg, int type, const uint8_t *pl, size_t plen)
 	} else if (type == CTLM_PONG && plen >= CTL_TS_LEN) {
 		uint64_t now = now_ms();
 
-		pthread_mutex_lock(&s->hb_lock);
-		s->hb_last_pong = now;
-		s->hb_rtt = (int)(now - ctl_get_u64(pl));
-		pthread_mutex_unlock(&s->hb_lock);
+		pthread_mutex_lock(&s->c.hb_lock);
+		s->c.hb_last_pong = now;
+		s->c.hb_rtt = (int)(now - ctl_get_u64(pl));
+		pthread_mutex_unlock(&s->c.hb_lock);
 	} else if (type == CTLM_RDV && plen >= CTL_RDV_PLEN) {
 		struct sockaddr_storage sa;
 		socklen_t sl = 0;
@@ -627,12 +647,12 @@ static void ctl_dispatch(void *arg, int type, const uint8_t *pl, size_t plen)
 		if (fam) {
 			int i = fam_idx(fam);
 
-			pthread_mutex_lock(&s->rdv_lock);
-			s->rdv_in[i].sa = sa;
-			s->rdv_in[i].len = sl;
-			s->rdv_in[i].have = 1;
-			s->rdv_in_dirty = 1;
-			pthread_mutex_unlock(&s->rdv_lock);
+			pthread_mutex_lock(&s->c.rdv_lock);
+			s->c.rdv_in[i].sa = sa;
+			s->c.rdv_in[i].len = sl;
+			s->c.rdv_in[i].have = 1;
+			s->c.rdv_in_dirty = 1;
+			pthread_mutex_unlock(&s->c.rdv_lock);
 		}
 	}
 }
@@ -642,10 +662,10 @@ static void ctl_dispatch(void *arg, int type, const uint8_t *pl, size_t plen)
 static void ctl_readable(struct sess *s)
 {
 	uint8_t tmp[64];
-	ssize_t n = read(s->ctl_fd, tmp, sizeof(tmp));
+	ssize_t n = read(s->c.ctl_fd, tmp, sizeof(tmp));
 
 	if (n > 0)
-		ctl_reframer_feed(&s->ctl_rf, tmp, (size_t)n, ctl_dispatch, s);
+		ctl_reframer_feed(&s->c.ctl_rf, tmp, (size_t)n, ctl_dispatch, s);
 }
 
 /*
@@ -657,8 +677,8 @@ static void on_transport_recv(void *arg, const uint8_t *data, size_t len)
 {
 	struct sess *s = arg;
 
-	if (s->stream)
-		stream_input(s->stream, data, len);
+	if (s->c.stream)
+		stream_input(s->c.stream, data, len);
 }
 
 static void on_direct_peer(void *arg, const struct sockaddr *peer, socklen_t len)
@@ -684,9 +704,9 @@ static void on_peer_offer(void *arg, const uint8_t *data, size_t len)
 	 * a time); feed them straight into the already-primed agent -- but not
 	 * once connected, when the mailbox GET keeps redelivering the same set and
 	 * re-adding it only churns the agent (and logs "max candidates"). */
-	if (s->nat && s->remote_set && !nat_connected(s->nat)) {
+	if (s->c.nat && s->remote_set && !nat_connected(s->c.nat)) {
 		sdp_filter(s->peer_sdp, s->cfg->family, filtered, sizeof(filtered));
-		nat_set_remote_description(s->nat, filtered);
+		nat_set_remote_description(s->c.nat, filtered);
 	}
 }
 
@@ -791,8 +811,8 @@ static int nat_setup(struct sess *s)
 	cfg.arg = s;
 
 	s->remote_set = 0;
-	s->nat = nat_create(&cfg);
-	if (!s->nat || nat_gather(s->nat))
+	s->c.nat = nat_create(&cfg);
+	if (!s->c.nat || nat_gather(s->c.nat))
 		return -1;
 	return 0;
 }
@@ -824,8 +844,8 @@ static void *ssh_srv_thread(void *p)
 	o.command = s->cfg->ssh_command;	/* NULL => tmux default */
 	o.use_pty = s->cfg->use_pty;
 	o.end_fd = s->cfg->ssh_end_fd;
-	o.ctl_fd = s->ssh_ctl_fd;
-	sshd_serve_fd(s->ssh_fd, &o);
+	o.ctl_fd = s->c.ssh_ctl_fd;
+	sshd_serve_fd(s->c.ssh_fd, &o);
 	return NULL;
 }
 
@@ -838,7 +858,7 @@ static void *ssh_cli_thread(void *p)
 	memcpy(o.host_fp, s->cfg->tok.hostpub, 32);
 	memcpy(o.auth, s->auth, sizeof(o.auth));
 	o.interactive = s->cfg->interactive;
-	o.ctl_fd = s->ssh_ctl_fd;
+	o.ctl_fd = s->c.ssh_ctl_fd;
 	o.status = session_status;
 	o.status_arg = s;
 	o.send = s->cfg->test_send;
@@ -846,7 +866,7 @@ static void *ssh_cli_thread(void *p)
 	o.recv = s->cfg->test_recv;
 	o.recv_cap = s->cfg->test_recv_cap;
 	o.recv_len = s->cfg->test_recv_len;
-	s->ssh_cli_rc = sshc_connect_fd(s->ssh_fd, &o);
+	s->c.ssh_cli_rc = sshc_connect_fd(s->c.ssh_fd, &o);
 	return NULL;
 }
 
@@ -895,7 +915,7 @@ static void rdv_maintain(struct sess *s)
 
 	/* Tell the peer our nodes, so it has fresh ones to reconnect through even
 	 * if the token only carried one family. */
-	if (now >= s->next_rdv_tell_ms) {
+	if (now >= s->c.next_rdv_tell_ms) {
 		for (i = 0; i < 2; i++)
 			if (s->rdv[i].have) {
 				uint8_t pl[CTL_RDV_PLEN];
@@ -904,19 +924,19 @@ static void rdv_maintain(struct sess *s)
 					       (struct sockaddr *)&s->rdv[i].sa);
 				ctl_send(s, CTLM_RDV, pl, sizeof(pl));
 			}
-		s->next_rdv_tell_ms = now + RDV_TELL_MS;
+		s->c.next_rdv_tell_ms = now + RDV_TELL_MS;
 	}
 
 	/* Adopt the peer's announcement for any family we cannot reach ourselves,
 	 * readying us to roam onto it (e.g. a v4-only host gaining v6, told a v6
 	 * node by a dual-stack client). */
-	if (s->rdv_in_dirty) {
+	if (s->c.rdv_in_dirty) {
 		struct rdv_node in[2];
 
-		pthread_mutex_lock(&s->rdv_lock);
-		memcpy(in, s->rdv_in, sizeof(in));
-		s->rdv_in_dirty = 0;
-		pthread_mutex_unlock(&s->rdv_lock);
+		pthread_mutex_lock(&s->c.rdv_lock);
+		memcpy(in, s->c.rdv_in, sizeof(in));
+		s->c.rdv_in_dirty = 0;
+		pthread_mutex_unlock(&s->c.rdv_lock);
 		for (i = 0; i < 2; i++) {
 			struct sockaddr_storage sa;
 			socklen_t sl = sizeof(sa);
@@ -948,37 +968,37 @@ static int run_ssh(struct sess *s)
 		close(sp[1]);
 		return -1;
 	}
-	s->stream = stream_create(SESSION_CONV, on_stream_output, s);
-	if (!s->stream) {
+	s->c.stream = stream_create(SESSION_CONV, on_stream_output, s);
+	if (!s->c.stream) {
 		close(sp[0]);
 		close(sp[1]);
 		close(cp[0]);
 		close(cp[1]);
 		return -1;
 	}
-	s->ssh_fd = sp[1];
-	s->ssh_ctl_fd = cp[1];
-	s->ctl_fd = cp[0];
-	s->ctl_rf.len = 0;
+	s->c.ssh_fd = sp[1];
+	s->c.ssh_ctl_fd = cp[1];
+	s->c.ctl_fd = cp[0];
+	s->c.ctl_rf.len = 0;
 	if (pthread_create(&th, NULL,
 			   s->cfg->is_host ? ssh_srv_thread : ssh_cli_thread, s)) {
 		close(sp[0]);
 		close(sp[1]);
 		close(cp[0]);
 		close(cp[1]);
-		s->ctl_fd = -1;
-		stream_destroy(s->stream);
-		s->stream = NULL;
+		s->c.ctl_fd = -1;
+		stream_destroy(s->c.stream);
+		s->c.stream = NULL;
 		return -1;
 	}
-	br = sshbridge_create(sp[0], s->stream,
+	br = sshbridge_create(sp[0], s->c.stream,
 			      s->cfg->is_host ? LINGER_HOST_MS : LINGER_CLIENT_MS);
 
 	/* The path is up on entry, so start the liveness clock as alive. */
-	pthread_mutex_lock(&s->hb_lock);
-	s->hb_last_pong = now_ms();
-	s->lost_since_ms = 0;
-	pthread_mutex_unlock(&s->hb_lock);
+	pthread_mutex_lock(&s->c.hb_lock);
+	s->c.hb_last_pong = now_ms();
+	s->c.lost_since_ms = 0;
+	pthread_mutex_unlock(&s->c.hb_lock);
 	next_hb = now_ms();
 
 	/* Capture a rendezvous node per family for reconnection (the host was
@@ -986,7 +1006,7 @@ static int run_ssh(struct sess *s)
 	if (s->cfg->sig_flags & SIG_DHT)
 		sig_locate(s->sig);
 	s->next_rdv_warm_ms = now_ms();
-	s->next_rdv_tell_ms = now_ms() + 1500;
+	s->c.next_rdv_tell_ms = now_ms() + 1500;
 
 	while (!done) {
 		struct pollfd fds[9];
@@ -1003,7 +1023,7 @@ static int run_ssh(struct sess *s)
 		fds[bidx].events = sshbridge_events(br);
 		fds[bidx].revents = 0;
 		cidx = bidx + 1;
-		fds[cidx].fd = s->ctl_fd;
+		fds[cidx].fd = s->c.ctl_fd;
 		fds[cidx].events = POLLIN;
 		fds[cidx].revents = 0;
 		poll(fds, (nfds_t)(cidx + 1), timeout);
@@ -1023,22 +1043,22 @@ static int run_ssh(struct sess *s)
 			next_hb = now_ms() + HB_INTERVAL_MS;
 		}
 		rdv_maintain(s);
-		if (now_ms() >= s->next_status_ms) {
+		if (now_ms() >= s->c.next_status_ms) {
 			uint64_t now = now_ms(), lp;
 			int state;
 
-			pthread_mutex_lock(&s->hb_lock);
-			lp = s->hb_last_pong;
+			pthread_mutex_lock(&s->c.hb_lock);
+			lp = s->c.hb_last_pong;
 			if (now - lp > HB_LOST_MS) {
-				if (!s->lost_since_ms)
-					s->lost_since_ms = now;
+				if (!s->c.lost_since_ms)
+					s->c.lost_since_ms = now;
 			} else {
-				s->lost_since_ms = 0;
+				s->c.lost_since_ms = 0;
 			}
-			state = s->lost_since_ms ? CONN_LOST : CONN_LIVE;
-			pthread_mutex_unlock(&s->hb_lock);
+			state = s->c.lost_since_ms ? CONN_LOST : CONN_LIVE;
+			pthread_mutex_unlock(&s->c.hb_lock);
 			publish_status(s, state);
-			s->next_status_ms = now + 500;
+			s->c.next_status_ms = now + 500;
 		}
 	}
 
@@ -1048,15 +1068,15 @@ static int run_ssh(struct sess *s)
 	/* Both control-socket ends are ours to close: the ssh module bridges
 	 * cp[1] but never closes it. Mark the fd gone first so a stray ctl_send
 	 * is a no-op. */
-	s->ctl_fd = -1;
+	s->c.ctl_fd = -1;
 	close(cp[0]);
 	close(cp[1]);
-	stream_destroy(s->stream);
-	s->stream = NULL;
+	stream_destroy(s->c.stream);
+	s->c.stream = NULL;
 
 	if (s->cfg->is_host)
 		return 0;
-	return s->ssh_cli_rc;
+	return s->c.ssh_cli_rc;
 }
 
 /* Note which DHT families this host can reach, from its own candidates: any v4
@@ -1167,12 +1187,13 @@ int session_run(const struct session_cfg *cfg)
 
 	memset(&s, 0, sizeof(s));
 	s.cfg = cfg;
-	s.ctl_fd = -1;			/* no control channel until run_ssh */
+	s.c.sess = &s;
+	s.c.ctl_fd = -1;			/* no control channel until run_ssh */
 	memcpy(s.auth, cfg->tok.auth, TOKEN_AUTH_LEN);
 	pthread_mutex_init(&s.trickle_lock, NULL);
-	pthread_mutex_init(&s.status_lock, NULL);	/* s.status zeroed = connecting */
-	pthread_mutex_init(&s.hb_lock, NULL);
-	pthread_mutex_init(&s.rdv_lock, NULL);
+	pthread_mutex_init(&s.c.status_lock, NULL);	/* s.c.status zeroed = connecting */
+	pthread_mutex_init(&s.c.hb_lock, NULL);
+	pthread_mutex_init(&s.c.rdv_lock, NULL);
 	if (cfg->stun_auto)
 		s.stun_servers = stunlist_load(&s.stun_count);
 	nat_log_level(cfg->log_level);	/* < 0 silences libjuice (see nat_log_level) */
@@ -1226,12 +1247,12 @@ int session_run(const struct session_cfg *cfg)
 
 		pump_once(&s, 100);
 		maybe_announce_rendezvous(&s);
-		if (now_ms() >= s.next_status_ms) {
+		if (now_ms() >= s.c.next_status_ms) {
 			publish_status(&s,
 				       st == ST_WAIT_ICE ? CONN_PUNCHING :
 				       (st == ST_GATHER || st == ST_SIGNAL) ?
 				       CONN_GATHERING : CONN_CONNECTING);
-			s.next_status_ms = now_ms() + 500;
+			s.c.next_status_ms = now_ms() + 500;
 		}
 		if (o) {
 			if (o->net && s.trickle_dirty) {
@@ -1300,7 +1321,7 @@ int session_run(const struct session_cfg *cfg)
 			if (s.have_peer_sdp && !s.remote_set) {
 				sdp_filter(s.peer_sdp, cfg->family, filtered,
 					   sizeof(filtered));
-				if (nat_set_remote_description(s.nat, filtered)) {
+				if (nat_set_remote_description(s.c.nat, filtered)) {
 					st = ST_FAIL;
 					break;
 				}
@@ -1315,35 +1336,35 @@ int session_run(const struct session_cfg *cfg)
 			}
 			break;
 		case ST_WAIT_ICE:
-			if (nat_connected(s.nat) ||
+			if (nat_connected(s.c.nat) ||
 			    (s.lan && lanlink_have_peer(s.lan))) {
 				if (s.peer_state < SESSION_PEER_LIVE) {
 					char loc[192], rem[192];
 
-					s.status_peer[0] = '\0';
-					if (nat_connected(s.nat) &&
-					    !nat_selected(s.nat, loc, sizeof(loc),
+					s.c.status_peer[0] = '\0';
+					if (nat_connected(s.c.nat) &&
+					    !nat_selected(s.c.nat, loc, sizeof(loc),
 							  rem, sizeof(rem)))
-						cand_addr(rem, s.status_peer,
-							  sizeof(s.status_peer));
+						cand_addr(rem, s.c.status_peer,
+							  sizeof(s.c.status_peer));
 					else if (s.direct_addr[0])
-						snprintf(s.status_peer,
-							 sizeof(s.status_peer),
+						snprintf(s.c.status_peer,
+							 sizeof(s.c.status_peer),
 							 "%s", s.direct_addr);
 					if (o && o->peer)
 						o->peer(o->arg,
 							SESSION_PEER_LIVE,
-							s.status_peer);
+							s.c.status_peer);
 					s.peer_state = SESSION_PEER_LIVE;
 				}
 				st = ST_RUN;
 				break;
 			}
-			if (nat_failed(s.nat) ||
+			if (nat_failed(s.c.nat) ||
 			    now_ms() - s.ice_attempt_start > ICE_ATTEMPT_MS) {
 				s.ice_attempt++;
-				nat_destroy(s.nat);
-				s.nat = NULL;
+				nat_destroy(s.c.nat);
+				s.c.nat = NULL;
 				if (nat_setup(&s))
 					st = ST_FAIL;
 				else
@@ -1372,17 +1393,17 @@ int session_run(const struct session_cfg *cfg)
 	}
 
 	rc = (st == ST_DONE) ? 0 : 1;
-	if (s.stream)
-		stream_destroy(s.stream);
-	if (s.nat)
-		nat_destroy(s.nat);
+	if (s.c.stream)
+		stream_destroy(s.c.stream);
+	if (s.c.nat)
+		nat_destroy(s.c.nat);
 	if (s.lan)
 		lanlink_destroy(s.lan);
 	sig_destroy(s.sig);
 	stunlist_free(s.stun_servers, s.stun_count);
 	pthread_mutex_destroy(&s.trickle_lock);
-	pthread_mutex_destroy(&s.status_lock);
-	pthread_mutex_destroy(&s.hb_lock);
-	pthread_mutex_destroy(&s.rdv_lock);
+	pthread_mutex_destroy(&s.c.status_lock);
+	pthread_mutex_destroy(&s.c.hb_lock);
+	pthread_mutex_destroy(&s.c.rdv_lock);
 	return rc;
 }
