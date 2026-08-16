@@ -168,6 +168,7 @@ static int run_interactive(ssh_session s, ssh_channel chan,
 	struct sigaction sa, old_winch;
 	int rows = 0, cols = 0, reserve = 0;
 	volatile int interrupted = 0, quit = 0;
+	int reconnect = 0;
 	uint64_t last_status = 0;
 	struct conn_status cur, prev;
 	struct termfilter tf;
@@ -249,7 +250,8 @@ static int run_interactive(ssh_session s, ssh_channel chan,
 		}
 	}
 
-	while (ssh_channel_is_open(chan) && !ssh_channel_is_eof(chan) && !quit) {
+	while (ssh_channel_is_open(chan) && !ssh_channel_is_eof(chan) &&
+	       !quit && !reconnect) {
 		/*
 		 * End only on the dedicated end-of-session signal: the host sends
 		 * a channel exit-status and closes the channel when the shared
@@ -290,6 +292,12 @@ static int run_interactive(ssh_session s, ssh_channel chan,
 			memset(&cur, 0, sizeof(cur));
 			o->status(o->status_arg, &cur);
 			interrupted = (cur.state == CONN_LOST);
+			/* Lost past the grace window: stop waiting and rejoin as
+			 * a fresh client (the session lives on the host). A brief
+			 * blip stays under the grace and rides out over KCP. */
+			if (cur.state == CONN_LOST &&
+			    cur.since_s >= SSHC_REJOIN_GRACE_S)
+				reconnect = 1;
 			if (reserve && (memcmp(&cur, &prev, sizeof(cur)) ||
 			    now - last_status > 2000)) {
 				statusbar_render(STDOUT_FILENO, rows, cols, &cur);
@@ -337,7 +345,7 @@ out:
 		ssh_connector_free(c_err);
 	if (event)
 		ssh_event_free(event);
-	return 0;
+	return reconnect ? SSHC_RECONNECT : 0;
 }
 
 int sshc_connect_fd(int fd, const struct sshc_opts *o)

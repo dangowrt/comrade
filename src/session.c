@@ -1687,13 +1687,39 @@ int session_run(const struct session_cfg *cfg)
 					st = ST_GATHER;
 			}
 			break;
-		case ST_RUN:
+		case ST_RUN: {
+			int r;
+
 			if (o && o->established && !s.established_fired) {
 				o->established(o->arg);
 				s.established_fired = 1;
 			}
-			if (run_ssh(&s) == 0) {
+			r = run_ssh(&s);
+			if (r == 0) {
 				st = ST_DONE;
+			} else if (r == SSHC_RECONNECT) {
+				/*
+				 * The link stayed down past the grace window.
+				 * Rejoin as a fresh client -- a new ICE identity,
+				 * a new punch and a new claim -- re-attaching to
+				 * the session that lives on the host. Reset the
+				 * deadline so the reconnect is not bounded by the
+				 * original connect budget.
+				 */
+				nat_destroy(s.c.nat);
+				s.c.nat = NULL;
+				conn_gen_ice(&s.c);
+				s.have_local_sdp = 0;
+				s.have_peer_sdp = 0;
+				s.remote_set = 0;
+				s.local_sdp[0] = '\0';
+				s.peer_sdp[0] = '\0';
+				deadline = now_ms() +
+					(uint64_t)cfg->connect_timeout_s * 1000;
+				if (nat_setup(&s.c))
+					st = ST_FAIL;
+				else
+					st = ST_GATHER;
 			} else if (now_ms() + 10000 < deadline) {
 				/* ICE reported a path but the peer is not serving
 				 * yet; keep signalling and re-check rather than
@@ -1703,6 +1729,7 @@ int session_run(const struct session_cfg *cfg)
 				st = ST_FAIL;
 			}
 			break;
+		}
 		default:
 			break;
 		}

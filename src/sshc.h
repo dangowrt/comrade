@@ -52,9 +52,23 @@ struct sshc_opts {
 };
 
 /*
- * Run one SSH session on fd; blocks until it ends. Returns 0 on success,
- * -1 on any failure including a host-key fingerprint mismatch (which is
- * treated as a hard error: a mismatch means a MITM, never a prompt).
+ * The interactive session gave up on a path lost past the grace window and
+ * wants the caller to rejoin (re-punch and re-attach) as a fresh client, rather
+ * than end -- the shared session lives on the host, so a reconnect is just a new
+ * attach. Distinct from 0 (clean end) and -1 (failure).
+ */
+#define SSHC_RECONNECT 2
+
+/* How long the link may stay down before the interactive client stops waiting
+ * and asks to rejoin. Short enough to recover quickly from a roam, long enough
+ * that a brief blip (which KCP rides out) does not trigger a needless re-punch. */
+#define SSHC_REJOIN_GRACE_S 6
+
+/*
+ * Run one SSH session on fd; blocks until it ends. Returns 0 on a clean end,
+ * SSHC_RECONNECT if the caller should rejoin after a lost path, or -1 on any
+ * failure including a host-key fingerprint mismatch (which is treated as a hard
+ * error: a mismatch means a MITM, never a prompt).
  */
 int sshc_connect_fd(int fd, const struct sshc_opts *o);
 
