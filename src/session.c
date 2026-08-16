@@ -1365,12 +1365,12 @@ static int host_turnstile(struct sess *s)
 	uint64_t ice_start = 0, last_active = now_ms();
 	char filtered[NAT_SDP_MAX];
 	char pending[NAT_SDP_MAX], last_served[NAT_SDP_MAX];
+	int end_fd = cfg->ssh_end_fd;
 	int served = 0, have_served = 0, i;
 
 	memset(ws, 0, sizeof(ws));
 
-	while (now_ms() < deadline &&
-	       (cfg->host_serve_max == 0 || served < cfg->host_serve_max)) {
+	while (cfg->host_serve_max == 0 || served < cfg->host_serve_max) {
 		int active = 0;
 
 		pump_once(s, 100);		/* the main thread owns sig + lan */
@@ -1480,10 +1480,28 @@ static int host_turnstile(struct sess *s)
 			break;
 		}
 
-		if (active || ts != TS_GATHER)
+		/*
+		 * The real host runs until its shared tmux ends (the end monitor
+		 * signals end_fd, as it does for each worker's sshd). The test
+		 * harness passes no end monitor, so there it is bounded by the
+		 * deadline, or exits once idle having served at least one client.
+		 */
+		if (end_fd > 0) {
+			struct pollfd ef;
+
+			ef.fd = end_fd;
+			ef.events = POLLIN;
+			ef.revents = 0;
+			if (poll(&ef, 1, 0) > 0 &&
+			    (ef.revents & (POLLIN | POLLHUP | POLLERR)))
+				break;
+		} else if (now_ms() >= deadline) {
+			break;
+		} else if (active || ts != TS_GATHER) {
 			last_active = now_ms();
-		else if (served > 0 && now_ms() - last_active > HOST_IDLE_MS)
+		} else if (served > 0 && now_ms() - last_active > HOST_IDLE_MS) {
 			break;			/* served all, now idle */
+		}
 	}
 
 	conn_free(listen);
