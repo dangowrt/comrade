@@ -6,16 +6,18 @@
 #include <string.h>
 #include <time.h>
 
-#include "bencode.h"
 #include "bep44.h"
 #include "candpack.h"
 #include "dhtnode.h"
 #include "keys.h"
+#include "mailbox.h"
 #include "sig.h"
 #include "sig_mcast.h"
 
 #define SIG_SALT "m"			/* the one shared mailbox */
 #define SIG_SEALED_MAX (SIG_MAX_VALUE + SEAL_OVERHEAD)
+/* the mcast value prepends a 2-byte direct-transport port to the candpack */
+#define SIG_MCAST_SEALED_MAX (2 + SIG_MAX_VALUE + SEAL_OVERHEAD)
 #define SIG_SDP_MAX 4096		/* raw ICE description in/out of candpack */
 #define SIG_DHT_GET_MS 1000
 #define SIG_DHT_PUT_MS 1000		/* re-run the convergent store/gather this
@@ -42,22 +44,10 @@ struct sig {
 	struct sig_mcast *mc;
 	int mcast_delivered;
 
-	uint8_t mine[SIG_SEALED_MAX];	/* our slot value, sealed (DHT) */
-	size_t mine_len;
-	uint8_t mcast_mine[SIG_SEALED_MAX];	/* our announcement, sealed (mcast) */
+	struct mailbox mb;		/* the two-slot rendezvous container */
+	uint8_t mcast_mine[SIG_MCAST_SEALED_MAX];	/* our announcement, sealed (mcast) */
 	size_t mcast_mine_len;
-	int have_mine;
-
-	/* Last-seen container: each slot's sealed bytes (len 0 = absent). */
-	uint8_t slot_o[SIG_SEALED_MAX];
-	size_t slot_o_len;
-	uint8_t slot_a[SIG_SEALED_MAX];
-	size_t slot_a_len;
 	int64_t cur_seq;
-	int have_cur;
-	int need_write;
-	int clear_peer;			/* host one-shot: omit the answer slot on
-					 * the next write (turnstile release) */
 
 	sig_recv_cb *cb;
 	void *arg;
@@ -120,6 +110,7 @@ struct sig *sig_create(const uint8_t rdv[TOKEN_RDV_LEN], unsigned flags,
 	keys_derive(&s->keys, rdv);
 	s->flags = flags;
 	s->is_host = is_host;
+	mailbox_init(&s->mb, is_host);
 	s->start_ms = now_ms();
 
 	if (flags & SIG_MCAST) {
@@ -174,6 +165,7 @@ int sig_post(struct sig *s, const uint8_t *data, size_t len)
 {
 	char sdp[SIG_SDP_MAX];
 	uint8_t packed[SIG_MAX_VALUE];
+	uint8_t sealed[SIG_SEALED_MAX];
 	uint8_t mc[2 + SIG_MAX_VALUE];
 	int plen, slen;
 
@@ -186,11 +178,11 @@ int sig_post(struct sig *s, const uint8_t *data, size_t len)
 	plen = candpack_encode(sdp, 1, packed, sizeof(packed));
 	if (plen <= 0)
 		return -1;
-	slen = msg_seal(s->mine, sizeof(s->mine), s->keys.sig_key, packed,
+	slen = msg_seal(sealed, sizeof(sealed), s->keys.sig_key, packed,
 			(size_t)plen);
 	if (slen < 0)
 		return -1;
-	s->mine_len = (size_t)slen;
+	mailbox_set_mine(&s->mb, sealed, (size_t)slen);
 
 	/*
 	 * The multicast announcement is the same routable candpack for ICE, with
@@ -206,8 +198,6 @@ int sig_post(struct sig *s, const uint8_t *data, size_t len)
 	if (slen > 0)
 		s->mcast_mine_len = (size_t)slen;
 
-	s->have_mine = 1;
-	s->need_write = 1;
 	s->next_put_ms = 0;
 	s->next_mcast_ms = 0;
 	return 0;
@@ -222,20 +212,21 @@ int sig_subscribe(struct sig *s, sig_recv_cb *cb, void *arg)
 
 enum sig_claim sig_claim_status(struct sig *s)
 {
-	if (s->is_host || !s->have_cur)
-		return SIG_CLAIM_UNKNOWN;
-	if (!s->slot_a_len)
+	switch (mailbox_claim_status(&s->mb)) {
+	case MAILBOX_CLAIM_FREE:
 		return SIG_CLAIM_FREE;
-	if (s->have_mine && s->slot_a_len == s->mine_len &&
-	    !memcmp(s->slot_a, s->mine, s->mine_len))
+	case MAILBOX_CLAIM_HELD:
 		return SIG_CLAIM_HELD;
-	return SIG_CLAIM_BUSY;
+	case MAILBOX_CLAIM_BUSY:
+		return SIG_CLAIM_BUSY;
+	default:
+		return SIG_CLAIM_UNKNOWN;
+	}
 }
 
 void sig_withdraw(struct sig *s)
 {
-	s->have_mine = 0;
-	s->need_write = 0;
+	mailbox_withdraw(&s->mb);
 }
 
 int sig_rotate(struct sig *s, const uint8_t *offer, size_t len)
@@ -244,7 +235,7 @@ int sig_rotate(struct sig *s, const uint8_t *offer, size_t len)
 
 	if (rc)
 		return rc;
-	s->clear_peer = 1;	/* omit the answer slot on the next write */
+	mailbox_arm_release(&s->mb);	/* omit the answer slot on the next write */
 	s->have_last = 0;	/* re-deliver the next answer even if identical */
 	return 0;
 }
@@ -351,86 +342,6 @@ static void deliver_peer(struct sig *s, const uint8_t *sealed, size_t len)
 		s->cb(s->arg, (const uint8_t *)sdp, (size_t)slen);
 }
 
-static size_t peer_sealed(struct sig *s, const uint8_t **out)
-{
-	if (s->is_host) {
-		*out = s->slot_a;
-		return s->slot_a_len;
-	}
-	*out = s->slot_o;
-	return s->slot_o_len;
-}
-
-/* Pull one slot's sealed string out of the container into dst. */
-static size_t slot_extract(const uint8_t *v, size_t v_len, const char *key,
-			   uint8_t *dst, size_t dst_max)
-{
-	const uint8_t *val, *str;
-	size_t val_len, str_len;
-
-	if (benc_dict_find(v, v_len, key, &val, &val_len) ||
-	    benc_str_get(val, val_len, &str, &str_len) || str_len > dst_max)
-		return 0;
-	memcpy(dst, str, str_len);
-	return str_len;
-}
-
-static void container_parse(struct sig *s, const uint8_t *v, size_t v_len)
-{
-	s->slot_o_len = slot_extract(v, v_len, "o", s->slot_o, sizeof(s->slot_o));
-	s->slot_a_len = slot_extract(v, v_len, "a", s->slot_a, sizeof(s->slot_a));
-}
-
-/* We must (re)write when our slot in the container does not match ours. */
-static void recompute_need_write(struct sig *s)
-{
-	const uint8_t *cur = s->is_host ? s->slot_o : s->slot_a;
-	size_t cur_len = s->is_host ? s->slot_o_len : s->slot_a_len;
-
-	if (!s->have_mine)
-		s->need_write = 0;
-	else
-		s->need_write = (cur_len != s->mine_len ||
-				 memcmp(cur, s->mine, s->mine_len)) ? 1 : 0;
-}
-
-/* Build the merged container: our slot plus the peer's, if known. */
-static size_t container_build(struct sig *s, uint8_t *out, size_t outlen)
-{
-	struct benc_buf b;
-	const uint8_t *pa = NULL, *po = NULL;
-	size_t la = 0, lo = 0;
-
-	if (s->is_host) {
-		po = s->mine;
-		lo = s->mine_len;
-		pa = s->slot_a;
-		la = s->slot_a_len;
-		if (s->clear_peer) {
-			la = 0;			/* release the answer slot */
-			s->clear_peer = 0;	/* one-shot per rotate */
-		}
-	} else {
-		pa = s->mine;
-		la = s->mine_len;
-		po = s->slot_o;
-		lo = s->slot_o_len;
-	}
-
-	benc_buf_init(&b, out, outlen);
-	benc_raw_add(&b, "d", 1);
-	if (la) {
-		benc_key_add(&b, "a");
-		benc_str_add(&b, pa, la);
-	}
-	if (lo) {
-		benc_key_add(&b, "o");
-		benc_str_add(&b, po, lo);
-	}
-	benc_raw_add(&b, "e", 1);
-	return b.err ? 0 : b.len;
-}
-
 static void on_dht_get(void *arg, const uint8_t *v, size_t v_len, int64_t seq,
 		       const struct sockaddr *node, socklen_t node_len)
 {
@@ -440,12 +351,10 @@ static void on_dht_get(void *arg, const uint8_t *v, size_t v_len, int64_t seq,
 
 	if (!v)
 		return;
-	container_parse(s, v, v_len);
+	mailbox_parse(&s->mb, v, v_len);
 	s->cur_seq = seq;
-	s->have_cur = 1;
-	recompute_need_write(s);
 
-	peer_len = peer_sealed(s, &peer);
+	peer_len = mailbox_peer_slot(&s->mb, &peer);
 	if (peer_len)
 		deliver_peer(s, peer, peer_len);
 
@@ -544,19 +453,12 @@ static void on_mcast_recv(void *arg, const char *salt, const uint8_t *data,
 }
 
 /* Merge our slot into the value just read, preserving the peer's slot. */
-static int mailbox_merge(void *arg, const uint8_t *cur, size_t cur_len,
-			 uint8_t *out, size_t *out_len, size_t max)
+static int sig_merge(void *arg, const uint8_t *cur, size_t cur_len,
+		     uint8_t *out, size_t *out_len, size_t max)
 {
 	struct sig *s = arg;
-	size_t n;
 
-	if (cur)
-		container_parse(s, cur, cur_len);
-	n = container_build(s, out, max);
-	if (!n)
-		return -1;
-	*out_len = n;
-	return 0;
+	return mailbox_merge(&s->mb, cur, cur_len, out, out_len, max);
 }
 
 /*
@@ -617,16 +519,16 @@ static void dht_pump(struct sig *s, uint64_t now)
 			       (!s->first_locate_ms ||
 				now - s->first_locate_ms < SIG_LOCATE_BOTH_MS);
 
-		if (s->have_mine && locating && !s->put_inflight) {
+		if (s->mb.have_mine && locating && !s->put_inflight) {
 			s->put_inflight = 1;
 			if (s->rdv_stage < 2)
 				s->rdv_stage = 2;	/* placing the mailbox */
 			bep44_update(s->engine, s->keys.bep44_sk,
-				     s->keys.bep44_pk, SIG_SALT, mailbox_merge,
+				     s->keys.bep44_pk, SIG_SALT, sig_merge,
 				     s, on_host_put, s);
 			s->next_put_ms = now + SIG_DHT_PUT_MS;
-		} else if (s->have_mine && (s->rnode4_len || s->rnode6_len) &&
-			   s->need_write) {
+		} else if (s->mb.have_mine && (s->rnode4_len || s->rnode6_len) &&
+			   s->mb.need_write) {
 			/*
 			 * Locating done: keep the anchor warm with a direct
 			 * store -- a round-trip to the pinned node, no
@@ -636,11 +538,10 @@ static void dht_pump(struct sig *s, uint64_t now)
 			 */
 			bep44_update_direct(s->engine, s->keys.bep44_sk,
 					    s->keys.bep44_pk, SIG_SALT,
-					    mailbox_merge, s, NULL, NULL);
+					    sig_merge, s, NULL, NULL);
 			s->next_put_ms = now + SIG_DHT_PUT_MS;
 		}
-	} else if (s->have_mine && s->need_write && s->have_cur &&
-		   s->slot_a_len == 0) {
+	} else if (mailbox_client_should_claim(&s->mb)) {
 		/*
 		 * The client claims by writing its answer straight to the pinned
 		 * rendezvous node once it has read the offer -- a round-trip, not
@@ -650,7 +551,7 @@ static void dht_pump(struct sig *s, uint64_t now)
 		 * leave it and back off until the host frees it.
 		 */
 		bep44_update_direct(s->engine, s->keys.bep44_sk,
-				    s->keys.bep44_pk, SIG_SALT, mailbox_merge,
+				    s->keys.bep44_pk, SIG_SALT, sig_merge,
 				    s, NULL, NULL);
 		s->next_put_ms = now + SIG_DHT_PUT_MS;
 	}
@@ -660,7 +561,7 @@ static void mcast_pump(struct sig *s, uint64_t now)
 {
 	char ms[2];
 
-	if (!s->have_mine || !s->mcast_mine_len || now < s->next_mcast_ms)
+	if (!s->mb.have_mine || !s->mcast_mine_len || now < s->next_mcast_ms)
 		return;
 	ms[0] = my_slot(s);
 	ms[1] = '\0';

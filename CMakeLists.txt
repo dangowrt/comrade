@@ -158,6 +158,14 @@ if(MONOCYPHER_FOUND)
 	endif()
 endif()
 
+# The rendezvous mailbox: the two-slot container plus turnstile claim logic
+# (bencode only, no crypto or DHT), extracted from sig.c so it is unit-testable.
+if(COMRADE_HAVE_CRYPTO)
+	add_library(comrade_mailbox STATIC src/mailbox.c)
+	target_include_directories(comrade_mailbox PUBLIC src)
+	target_link_libraries(comrade_mailbox PUBLIC comrade_crypto)
+endif()
+
 set(COMRADE_HAVE_DHT 0)
 if(COMRADE_HAVE_CRYPTO AND COMRADE_DHT_DIR AND EXISTS "${COMRADE_DHT_DIR}/dht.c")
 	set(COMRADE_HAVE_DHT 1)
@@ -178,7 +186,7 @@ if(COMRADE_HAVE_DHT)
 	set(COMRADE_HAVE_SIG 1)
 	add_library(comrade_sig STATIC src/sig.c src/sig_mcast.c)
 	target_include_directories(comrade_sig PUBLIC src)
-	target_link_libraries(comrade_sig PUBLIC comrade_dht)
+	target_link_libraries(comrade_sig PUBLIC comrade_dht comrade_mailbox)
 endif()
 
 find_package(Threads REQUIRED)
