@@ -1235,6 +1235,250 @@ static void maybe_announce_rendezvous(struct sess *s)
 	}
 }
 
+/* Keep the located rendezvous nodes warm (host, main thread only -- sig is
+ * single-threaded). The per-connection announce/adopt lives in rdv_maintain. */
+static void rdv_keep_warm(struct sess *s)
+{
+	static const int famv[2] = { 4, 6 };
+	uint64_t now = now_ms();
+	int i, captured = 0;
+
+	if (!(s->cfg->sig_flags & SIG_DHT) || now < s->next_rdv_warm_ms)
+		return;
+	for (i = 0; i < 2; i++) {
+		struct sockaddr_storage sa;
+		socklen_t sl = sizeof(sa);
+
+		if (!sig_located(s->sig, famv[i], (struct sockaddr *)&sa, &sl))
+			continue;
+		captured = 1;
+		if (!s->rdv[i].have || s->rdv[i].len != sl ||
+		    memcmp(&s->rdv[i].sa, &sa, sl)) {
+			s->rdv[i].sa = sa;
+			s->rdv[i].len = sl;
+			s->rdv[i].have = 1;
+		}
+		sig_reinforce(s->sig, famv[i], (struct sockaddr *)&sa, sl);
+	}
+	s->next_rdv_warm_ms = now + (captured ? RDV_WARM_MS : RDV_POLL_MS);
+}
+
+static struct conn *conn_alloc(struct sess *s)
+{
+	struct conn *c = calloc(1, sizeof(*c));
+
+	if (!c)
+		return NULL;
+	c->sess = s;
+	c->ctl_fd = -1;
+	pthread_mutex_init(&c->hb_lock, NULL);
+	pthread_mutex_init(&c->rdv_lock, NULL);
+	pthread_mutex_init(&c->status_lock, NULL);
+	conn_gen_ice(c);
+	return c;
+}
+
+static void conn_free(struct conn *c)
+{
+	if (!c)
+		return;
+	if (c->nat)
+		nat_destroy(c->nat);
+	pthread_mutex_destroy(&c->hb_lock);
+	pthread_mutex_destroy(&c->rdv_lock);
+	pthread_mutex_destroy(&c->status_lock);
+	free(c);
+}
+
+#define HOST_MAX_WORKERS 16
+#define HOST_IDLE_MS 3000		/* exit after this idle once we have served */
+
+struct worker {
+	pthread_t th;
+	struct conn *c;
+	volatile int done;
+	int used;
+};
+
+/* A worker runs one connected client's session on the shared command (tmux
+ * attach), without driving sig -- that stays with the host's main thread. */
+static void *worker_thread(void *p)
+{
+	struct worker *w = p;
+
+	conn_run(w->c, 0);
+	w->done = 1;
+	return NULL;
+}
+
+static int worker_spawn(struct worker *ws, struct conn *c)
+{
+	int i;
+
+	for (i = 0; i < HOST_MAX_WORKERS; i++)
+		if (!ws[i].used) {
+			ws[i].c = c;
+			ws[i].done = 0;
+			ws[i].used = 1;
+			if (pthread_create(&ws[i].th, NULL, worker_thread,
+					   &ws[i])) {
+				ws[i].used = 0;
+				return -1;
+			}
+			return 0;
+		}
+	return -1;			/* worker table full */
+}
+
+/*
+ * Host turnstile: advertise one offer at a time (a fresh ICE identity per
+ * offer), accept a client's claimed answer, punch, and on connect hand the
+ * connection to a worker on the shared command, then rotate the offer for the
+ * next client. Joins are serialised through the single mailbox slot; the worker
+ * sessions run concurrently. Signalling and the rendezvous keep-warm stay on
+ * this thread (sig is single-threaded); workers only pump their own transport.
+ */
+static int host_turnstile(struct sess *s)
+{
+	const struct session_cfg *cfg = s->cfg;
+	const struct session_obs *o = cfg->obs;
+	struct worker ws[HOST_MAX_WORKERS];
+	struct conn *listen = NULL;
+	enum { TS_GATHER, TS_WAIT_CLAIM, TS_WAIT_ICE } ts = TS_GATHER;
+	uint64_t deadline = now_ms() + (uint64_t)cfg->connect_timeout_s * 1000;
+	uint64_t ice_start = 0, last_active = now_ms();
+	char filtered[NAT_SDP_MAX];
+	char pending[NAT_SDP_MAX], last_served[NAT_SDP_MAX];
+	int served = 0, have_served = 0, i;
+
+	memset(ws, 0, sizeof(ws));
+
+	while (now_ms() < deadline &&
+	       (cfg->host_serve_max == 0 || served < cfg->host_serve_max)) {
+		int active = 0;
+
+		pump_once(s, 100);		/* the main thread owns sig + lan */
+		maybe_announce_rendezvous(s);	/* mint and advertise the token */
+		rdv_keep_warm(s);
+
+		if (o) {			/* dashboard: local candidates */
+			if (o->net && s->trickle_dirty) {
+				char buf[NAT_SDP_MAX];
+
+				pthread_mutex_lock(&s->trickle_lock);
+				memcpy(buf, s->trickle_sdp, sizeof(buf));
+				s->trickle_sdp[0] = '\0';
+				s->trickle_dirty = 0;
+				pthread_mutex_unlock(&s->trickle_lock);
+				report_candidates(s, buf);
+			}
+			if (o->net && s->have_local_sdp)
+				obs_report_net(s);
+			if (o->tick)
+				o->tick(o->arg);
+		}
+
+		for (i = 0; i < HOST_MAX_WORKERS; i++) {
+			if (ws[i].used && ws[i].done) {
+				pthread_join(ws[i].th, NULL);
+				conn_free(ws[i].c);
+				ws[i].used = 0;
+				served++;
+			}
+			if (ws[i].used)
+				active = 1;
+		}
+
+		switch (ts) {
+		case TS_GATHER:
+			if (!listen) {
+				listen = conn_alloc(s);
+				if (!listen)
+					break;
+				s->have_local_sdp = 0;
+				s->have_peer_sdp = 0;
+				s->remote_set = 0;
+				s->local_sdp[0] = '\0';
+				s->peer_sdp[0] = '\0';
+				sig_subscribe(s->sig, on_peer_offer, listen);
+				if (nat_setup(listen)) {
+					conn_free(listen);
+					listen = NULL;
+					break;
+				}
+			}
+			if (s->have_local_sdp) {
+				sdp_filter(s->local_sdp, cfg->family, filtered,
+					   sizeof(filtered));
+				strncpy(s->local_sdp, filtered,
+					sizeof(s->local_sdp) - 1);
+				sig_rotate(s->sig, (const uint8_t *)s->local_sdp,
+					   strlen(s->local_sdp));
+				sig_locate(s->sig);
+				ts = TS_WAIT_CLAIM;
+			}
+			break;
+		case TS_WAIT_CLAIM:
+			if (s->have_peer_sdp && !s->remote_set) {
+				/* Ignore the answer we just served: it lingers in
+				 * the slot until the rotate's clear lands, and the
+				 * rotate re-arms delivery, so it would otherwise be
+				 * punched again (an already-served client) and burn
+				 * a whole ICE attempt. Wait for a fresh claimant. */
+				if (have_served &&
+				    !strcmp(s->peer_sdp, last_served)) {
+					s->have_peer_sdp = 0;
+					break;
+				}
+				sdp_filter(s->peer_sdp, cfg->family, filtered,
+					   sizeof(filtered));
+				if (nat_set_remote_description(listen->nat,
+							       filtered)) {
+					conn_free(listen);
+					listen = NULL;
+					ts = TS_GATHER;
+					break;
+				}
+				snprintf(pending, sizeof(pending), "%s",
+					 s->peer_sdp);
+				s->remote_set = 1;
+				ice_start = now_ms();
+				ts = TS_WAIT_ICE;
+			}
+			break;
+		case TS_WAIT_ICE:
+			if (nat_connected(listen->nat)) {
+				snprintf(last_served, sizeof(last_served), "%s",
+					 pending);
+				have_served = 1;
+				if (worker_spawn(ws, listen))
+					conn_free(listen);	/* table full */
+				listen = NULL;
+				ts = TS_GATHER;		/* rotate for the next */
+			} else if (nat_failed(listen->nat) ||
+				   now_ms() - ice_start > ICE_ATTEMPT_MS) {
+				conn_free(listen);
+				listen = NULL;
+				ts = TS_GATHER;
+			}
+			break;
+		}
+
+		if (active || ts != TS_GATHER)
+			last_active = now_ms();
+		else if (served > 0 && now_ms() - last_active > HOST_IDLE_MS)
+			break;			/* served all, now idle */
+	}
+
+	conn_free(listen);
+	for (i = 0; i < HOST_MAX_WORKERS; i++)
+		if (ws[i].used) {
+			pthread_join(ws[i].th, NULL);
+			conn_free(ws[i].c);
+		}
+	return 0;
+}
+
 int session_run(const struct session_cfg *cfg)
 {
 	struct sess s;
@@ -1283,6 +1527,19 @@ int session_run(const struct session_cfg *cfg)
 
 	s.start_ms = now_ms();
 	deadline = s.start_ms + (uint64_t)cfg->connect_timeout_s * 1000;
+
+	/*
+	 * A DHT host serves many clients through the turnstile (multi-user). The
+	 * link-local / isolated-LAN path (SIG_MCAST) keeps the single-connection
+	 * state machine below: multi-user over the shared LAN transport is not yet
+	 * supported, and forcing the DHT would break an
+	 * isolated LAN that has no internet.
+	 */
+	if (cfg->is_host && (cfg->sig_flags & SIG_DHT) &&
+	    !(cfg->sig_flags & SIG_MCAST)) {
+		rc = host_turnstile(&s);
+		goto done;
+	}
 
 	while (st != ST_DONE && st != ST_FAIL && now_ms() < deadline) {
 		char filtered[NAT_SDP_MAX];
@@ -1436,6 +1693,7 @@ int session_run(const struct session_cfg *cfg)
 	}
 
 	rc = (st == ST_DONE) ? 0 : 1;
+done:
 	if (s.c.stream)
 		stream_destroy(s.c.stream);
 	if (s.c.nat)
