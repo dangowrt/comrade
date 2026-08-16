@@ -1,0 +1,362 @@
+/* SPDX-License-Identifier: AGPL-3.0-or-later */
+/* Copyright (C) 2026 Daniel Golle <daniel@makrotopia.org> */
+
+/*
+ * Unit tests for the rendezvous mailbox: the
+ * two-slot container build/parse/merge, the turnstile claim decision (the
+ * answer slot as a mutex), the host rotate that clears the answer slot exactly
+ * once, and the CAS/seq contract modelled with an in-test store so that two
+ * claimants against one empty slot resolve to exactly one winner. The slot
+ * payloads are arbitrary byte blobs -- the container layer never inspects the
+ * sealed contents -- so no crypto or DHT is involved.
+ */
+#include <assert.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "bep44.h"		/* BEP44_MAX_VALUE, the modelled store's value size */
+#include "mailbox.h"
+
+/*
+ * A minimal model of the BEP44 mutable-item store: a stored value with a seq.
+ * A put carries the value's new seq and the cas (the seq the writer read); the
+ * node accepts it only if cas matches the currently stored seq, mirroring
+ * bep44.c update_store (seq = prev+1, cas = prev). This is the sole modelled
+ * piece; the bytes it stores are always produced by the REAL mailbox_merge.
+ */
+struct store {
+	uint8_t v[BEP44_MAX_VALUE];
+	size_t len;
+	int64_t seq;
+	int have;
+};
+
+static void store_seed(struct store *st, const uint8_t *v, size_t len,
+		       int64_t seq)
+{
+	memcpy(st->v, v, len);
+	st->len = len;
+	st->seq = seq;
+	st->have = 1;
+}
+
+/* Attempt a CAS put; returns 0 on success, -1 if the CAS is lost. */
+static int store_put(struct store *st, const uint8_t *v, size_t len,
+		     int64_t seq, int64_t cas)
+{
+	if (st->have && cas != st->seq)
+		return -1;		/* stale writer: CAS lost */
+	memcpy(st->v, v, len);
+	st->len = len;
+	st->seq = seq;
+	st->have = 1;
+	return 0;
+}
+
+/* Build an offer-only container (the free turnstile state a host publishes). */
+static size_t offer_only(uint8_t *out, size_t max, const uint8_t *offer,
+			 size_t olen)
+{
+	struct mailbox h;
+
+	mailbox_init(&h, 1);
+	mailbox_set_mine(&h, offer, olen);
+	return mailbox_build(&h, out, max);
+}
+
+/* One client's claim attempt against the value it read at read_seq: write only
+ * when the mutex is free, with CAS against read_seq. Returns 0 lands, -1 CAS
+ * lost, 1 declined (slot busy). The merged bytes come from mailbox_merge. */
+static int client_claim(struct store *st, struct mailbox *m,
+			const uint8_t *read_v, size_t read_len, int64_t read_seq)
+{
+	uint8_t out[BEP44_MAX_VALUE];
+	size_t olen;
+
+	if (!mailbox_client_should_claim(m))
+		return 1;
+	if (mailbox_merge(m, read_v, read_len, out, &olen, sizeof(out)))
+		return -2;
+	return store_put(st, out, olen, read_seq + 1, read_seq);
+}
+
+int main(void)
+{
+	static const uint8_t OFFER_E[] = { 0xEE, 0x01, 0x02 };
+	static const uint8_t OFFER_E1[] = { 0xEE, 0x11, 0x22, 0x33 };
+	static const uint8_t ANS1[] = { 0xA1, 0xA1, 0xA1 };
+	static const uint8_t ANS2[] = { 0xB2, 0xB2 };
+	static const uint8_t ANS3[] = { 0xC3, 0xC3, 0xC3, 0xC3 };
+	uint8_t out[BEP44_MAX_VALUE];
+	uint8_t offv[64];
+	size_t offlen;
+	size_t n;
+
+	/* An offer-only container reused across the claim-status cases. */
+	offlen = offer_only(offv, sizeof(offv), OFFER_E, sizeof(OFFER_E));
+
+	/* ---- 1. Container build/parse, all slot combinations ---- */
+
+	/* Host, offer only, no peer answer: exact bencode framing. */
+	{
+		struct mailbox h;
+		uint8_t off[2];
+
+		off[0] = 'X';
+		off[1] = 'Y';
+		mailbox_init(&h, 1);
+		mailbox_set_mine(&h, off, 2);
+		n = mailbox_build(&h, out, sizeof(out));
+		assert(n == 9 && !memcmp(out, "d1:o2:XYe", 9));
+	}
+
+	/* Client, answer and known offer: 'a' then 'o', deterministic order. */
+	{
+		struct mailbox c;
+		uint8_t a1[1];
+
+		a1[0] = 'A';
+		mailbox_init(&c, 0);
+		mailbox_set_mine(&c, a1, 1);
+		mailbox_parse(&c, (const uint8_t *)"d1:o1:Be", 8);	/* learn offer */
+		n = mailbox_build(&c, out, sizeof(out));
+		assert(n == 14 && !memcmp(out, "d1:a1:A1:o1:Be", 14));
+	}
+
+	/* Empty container: no mine, no peer -> "de"; parse yields both absent. */
+	{
+		struct mailbox h;
+
+		mailbox_init(&h, 1);
+		n = mailbox_build(&h, out, sizeof(out));
+		assert(n == 2 && !memcmp(out, "de", 2));
+		mailbox_parse(&h, out, n);
+		assert(h.slot_o_len == 0 && h.slot_a_len == 0);
+	}
+
+	/* Round-trip: build a two-slot container, parse it back, slots intact. */
+	{
+		struct mailbox c, probe;
+		const uint8_t *po, *pa;
+
+		mailbox_init(&c, 0);
+		mailbox_set_mine(&c, ANS1, sizeof(ANS1));
+		mailbox_parse(&c, offv, offlen);		/* learn the offer */
+		n = mailbox_build(&c, out, sizeof(out));
+
+		mailbox_init(&probe, 1);
+		mailbox_parse(&probe, out, n);
+		assert(probe.slot_a_len == sizeof(ANS1));
+		assert(!memcmp(probe.slot_a, ANS1, sizeof(ANS1)));
+		assert(probe.slot_o_len == sizeof(OFFER_E));
+		assert(!memcmp(probe.slot_o, OFFER_E, sizeof(OFFER_E)));
+		/* peer_slot for a host is the answer, for a client the offer */
+		assert(mailbox_peer_slot(&probe, &pa) == sizeof(ANS1));
+		assert(!memcmp(pa, ANS1, sizeof(ANS1)));
+		assert(mailbox_peer_slot(&c, &po) == sizeof(OFFER_E));
+		assert(!memcmp(po, OFFER_E, sizeof(OFFER_E)));
+	}
+
+	/* Merge preserves the peer's slot: a host writing its offer keeps the
+	 * client's answer that is already in the container. */
+	{
+		struct mailbox h, probe;
+		uint8_t cur[64];
+		size_t clen, olen;
+
+		/* current container holds a client answer in 'a' only */
+		mailbox_init(&h, 0);
+		mailbox_set_mine(&h, ANS1, sizeof(ANS1));
+		clen = mailbox_build(&h, cur, sizeof(cur));
+
+		mailbox_init(&h, 1);
+		mailbox_set_mine(&h, OFFER_E, sizeof(OFFER_E));
+		assert(mailbox_merge(&h, cur, clen, out, &olen, sizeof(out)) == 0);
+		mailbox_init(&probe, 1);
+		mailbox_parse(&probe, out, olen);
+		assert(probe.slot_a_len == sizeof(ANS1));	/* peer answer kept */
+		assert(!memcmp(probe.slot_a, ANS1, sizeof(ANS1)));
+		assert(probe.slot_o_len == sizeof(OFFER_E));	/* our offer written */
+	}
+
+	/* Host rotate omits the answer slot EXACTLY once (the one-shot release):
+	 * the first build after arming drops 'a', the next build keeps it. */
+	{
+		struct mailbox h, probe;
+		uint8_t cur[64];
+		size_t clen, b1, b2;
+
+		mailbox_init(&h, 0);
+		mailbox_set_mine(&h, ANS1, sizeof(ANS1));
+		clen = mailbox_build(&h, cur, sizeof(cur));
+
+		mailbox_init(&h, 1);
+		mailbox_set_mine(&h, OFFER_E, sizeof(OFFER_E));
+		mailbox_parse(&h, cur, clen);		/* host reads answer into slot_a */
+		assert(h.slot_a_len == sizeof(ANS1));
+
+		mailbox_arm_release(&h);
+		b1 = mailbox_build(&h, out, sizeof(out));	/* clears 'a' this once */
+		mailbox_init(&probe, 1);
+		mailbox_parse(&probe, out, b1);
+		assert(probe.slot_a_len == 0);
+		assert(probe.slot_o_len == sizeof(OFFER_E));
+
+		b2 = mailbox_build(&h, out, sizeof(out));	/* not armed: 'a' returns */
+		mailbox_parse(&probe, out, b2);
+		assert(probe.slot_a_len == sizeof(ANS1));
+	}
+
+	/* ---- 2. Turnstile claim / mutex logic ---- */
+
+	/* A host mailbox is never a claimant: status is always UNKNOWN. */
+	{
+		struct mailbox h;
+
+		mailbox_init(&h, 1);
+		assert(mailbox_claim_status(&h) == MAILBOX_CLAIM_UNKNOWN);
+		mailbox_set_mine(&h, OFFER_E, sizeof(OFFER_E));
+		mailbox_parse(&h, offv, offlen);
+		assert(mailbox_claim_status(&h) == MAILBOX_CLAIM_UNKNOWN);
+	}
+
+	/* A fresh client that has not read the mailbox: UNKNOWN, no claim. */
+	{
+		struct mailbox c;
+
+		mailbox_init(&c, 0);
+		mailbox_set_mine(&c, ANS1, sizeof(ANS1));
+		assert(mailbox_claim_status(&c) == MAILBOX_CLAIM_UNKNOWN);
+		assert(!mailbox_client_should_claim(&c));
+	}
+
+	/* Empty answer slot -> FREE and claimable. */
+	{
+		struct mailbox c;
+
+		mailbox_init(&c, 0);
+		mailbox_set_mine(&c, ANS1, sizeof(ANS1));
+		mailbox_parse(&c, offv, offlen);
+		assert(mailbox_claim_status(&c) == MAILBOX_CLAIM_FREE);
+		assert(mailbox_client_should_claim(&c));
+	}
+
+	/* Our own answer in the slot -> HELD, and nothing left to write. */
+	{
+		struct mailbox c;
+		uint8_t cur[64];
+		size_t clen;
+
+		mailbox_init(&c, 0);
+		mailbox_set_mine(&c, ANS1, sizeof(ANS1));
+		mailbox_parse(&c, offv, offlen);
+		clen = mailbox_build(&c, cur, sizeof(cur));	/* our a + the offer */
+		mailbox_parse(&c, cur, clen);			/* read it back */
+		assert(mailbox_claim_status(&c) == MAILBOX_CLAIM_HELD);
+		assert(!c.need_write);
+		assert(!mailbox_client_should_claim(&c));
+	}
+
+	/* A foreign answer in the slot -> BUSY; we leave it alone and do NOT
+	 * claim, even though our own slot is stale (need_write set). */
+	{
+		struct mailbox c, other;
+		uint8_t cur[64];
+		size_t clen;
+
+		mailbox_init(&other, 0);
+		mailbox_set_mine(&other, ANS2, sizeof(ANS2));
+		mailbox_parse(&other, offv, offlen);
+		clen = mailbox_build(&other, cur, sizeof(cur));	/* foreign a + offer */
+
+		mailbox_init(&c, 0);
+		mailbox_set_mine(&c, ANS1, sizeof(ANS1));
+		mailbox_parse(&c, cur, clen);
+		assert(mailbox_claim_status(&c) == MAILBOX_CLAIM_BUSY);
+		assert(c.need_write);				/* our answer is not there */
+		assert(!mailbox_client_should_claim(&c));	/* but we back off */
+	}
+
+	/* ---- 3. CAS/seq contract: two claimants, one empty slot ---- */
+	{
+		struct store st;
+		struct mailbox host, c1, c2, probe;
+		uint8_t free_v[64];
+		size_t free_len;
+		const uint8_t *picked;
+		size_t plen;
+		int r1, r2, rh;
+		int64_t read_seq;
+
+		/* Host publishes offer E, answer slot empty: the free state at seq 5. */
+		mailbox_init(&host, 1);
+		mailbox_set_mine(&host, OFFER_E, sizeof(OFFER_E));
+		free_len = offer_only(free_v, sizeof(free_v), OFFER_E,
+				      sizeof(OFFER_E));
+		store_seed(&st, free_v, free_len, 5);
+
+		/* Two clients GET the same free state (both observe FREE at seq 5). */
+		mailbox_init(&c1, 0);
+		mailbox_set_mine(&c1, ANS1, sizeof(ANS1));
+		mailbox_parse(&c1, st.v, st.len);
+		mailbox_init(&c2, 0);
+		mailbox_set_mine(&c2, ANS2, sizeof(ANS2));
+		mailbox_parse(&c2, st.v, st.len);
+		read_seq = st.seq;
+		assert(mailbox_claim_status(&c1) == MAILBOX_CLAIM_FREE);
+		assert(mailbox_claim_status(&c2) == MAILBOX_CLAIM_FREE);
+
+		/* Both write with cas = 5. Exactly one lands; the other loses CAS. */
+		r1 = client_claim(&st, &c1, free_v, free_len, read_seq);
+		r2 = client_claim(&st, &c2, free_v, free_len, read_seq);
+		assert(r1 == 0);		/* first write lands */
+		assert(r2 == -1);		/* second write bounced by CAS */
+		assert(st.seq == 6);
+
+		/* The slot holds client 1's answer, never a mix or the loser's. */
+		mailbox_init(&probe, 1);
+		mailbox_parse(&probe, st.v, st.len);
+		assert(probe.slot_a_len == sizeof(ANS1));
+		assert(!memcmp(probe.slot_a, ANS1, sizeof(ANS1)));
+
+		/* ---- Host pickup + release-on-rotate ---- */
+
+		/* Host reads the answer it just picked up. */
+		mailbox_parse(&host, st.v, st.len);
+		plen = mailbox_peer_slot(&host, &picked);
+		assert(plen == sizeof(ANS1) && !memcmp(picked, ANS1, sizeof(ANS1)));
+
+		/* Rotate: fresh offer E+1 into 'o', clear 'a', CAS against seq 6. */
+		read_seq = st.seq;
+		mailbox_set_mine(&host, OFFER_E1, sizeof(OFFER_E1));
+		mailbox_arm_release(&host);
+		{
+			uint8_t hw[BEP44_MAX_VALUE];
+			size_t hlen;
+
+			assert(mailbox_merge(&host, st.v, st.len, hw, &hlen,
+					     sizeof(hw)) == 0);
+			rh = store_put(&st, hw, hlen, read_seq + 1, read_seq);
+		}
+		assert(rh == 0 && st.seq == 7);
+
+		/* The turnstile is free again: answer cleared, fresh offer present. */
+		mailbox_parse(&probe, st.v, st.len);
+		assert(probe.slot_a_len == 0);
+		assert(probe.slot_o_len == sizeof(OFFER_E1));
+		assert(!memcmp(probe.slot_o, OFFER_E1, sizeof(OFFER_E1)));
+
+		/* A stale writer holding the old seq 6 is still bounced. */
+		assert(store_put(&st, free_v, free_len, 7, 6) == -1);
+
+		/* The next client sees the fresh free state and claims it. */
+		mailbox_init(&probe, 0);
+		mailbox_set_mine(&probe, ANS3, sizeof(ANS3));
+		mailbox_parse(&probe, st.v, st.len);
+		assert(mailbox_claim_status(&probe) == MAILBOX_CLAIM_FREE);
+		assert(mailbox_client_should_claim(&probe));
+	}
+
+	printf("mailbox: all container, turnstile and CAS cases pass\n");
+	return 0;
+}
