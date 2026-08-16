@@ -107,6 +107,8 @@ int main(int argc, char **argv)
 			cfg.stun_port = (uint16_t)atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--timeout") && i + 1 < argc)
 			cfg.connect_timeout_s = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--serve") && i + 1 < argc)
+			cfg.host_serve_max = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--log") && i + 1 < argc)
 			cfg.log_level = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--mcast"))
