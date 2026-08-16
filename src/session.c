@@ -37,6 +37,14 @@
 #define HB_INTERVAL_MS 700
 #define HB_LOST_MS 2500
 /*
+ * A host worker whose client has been silent this long is presumed gone and the
+ * worker reaps itself: with no clean disconnect the SSH bridge never ends on its
+ * own (KCP buffers a dead path indefinitely), so the heartbeat is what frees the
+ * worker (and its tmux client). Well above HB_LOST_MS so a brief outage, during
+ * which the client may still be reconnecting, does not tear a live worker down.
+ */
+#define HOST_REAP_MS 12000
+/*
  * Rendezvous keep-warm cadence. Re-validating a rendezvous node touches the
  * DHT, so do it rarely: a node dying AND a roam needing it inside the same
  * window is unlikely, and a full DHT lookup is always the fallback. Poll faster
@@ -1111,6 +1119,14 @@ static int conn_run(struct conn *c, int drive_sig)
 			pthread_mutex_unlock(&c->hb_lock);
 			publish_status(c, state);
 			c->next_status_ms = now + 500;
+			/* A host worker (no sig to drive) reaps itself once its
+			 * client has been silent too long -- the bridge would
+			 * otherwise never end for a client that vanished without
+			 * a clean disconnect. The client's own loop stays up on
+			 * loss (it shows the outage and lets the user quit). */
+			if (!drive_sig && c->lost_since_ms &&
+			    now - c->lost_since_ms > HOST_REAP_MS)
+				done = 1;
 		}
 	}
 
