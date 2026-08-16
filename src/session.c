@@ -840,7 +840,8 @@ static void pump_once(struct sess *s, int timeout_cap_ms)
 
 static void *ssh_srv_thread(void *p)
 {
-	struct sess *s = p;
+	struct conn *c = p;
+	struct sess *s = c->sess;
 	struct sshd_opts o;
 
 	memset(&o, 0, sizeof(o));
@@ -849,29 +850,30 @@ static void *ssh_srv_thread(void *p)
 	o.command = s->cfg->ssh_command;	/* NULL => tmux default */
 	o.use_pty = s->cfg->use_pty;
 	o.end_fd = s->cfg->ssh_end_fd;
-	o.ctl_fd = s->c.ssh_ctl_fd;
-	sshd_serve_fd(s->c.ssh_fd, &o);
+	o.ctl_fd = c->ssh_ctl_fd;
+	sshd_serve_fd(c->ssh_fd, &o);
 	return NULL;
 }
 
 static void *ssh_cli_thread(void *p)
 {
-	struct sess *s = p;
+	struct conn *c = p;
+	struct sess *s = c->sess;
 	struct sshc_opts o;
 
 	memset(&o, 0, sizeof(o));
 	memcpy(o.host_fp, s->cfg->tok.hostpub, 32);
 	memcpy(o.auth, s->auth, sizeof(o.auth));
 	o.interactive = s->cfg->interactive;
-	o.ctl_fd = s->c.ssh_ctl_fd;
+	o.ctl_fd = c->ssh_ctl_fd;
 	o.status = session_status;
-	o.status_arg = &s->c;
+	o.status_arg = c;
 	o.send = s->cfg->test_send;
 	o.send_len = s->cfg->test_send_len;
 	o.recv = s->cfg->test_recv;
 	o.recv_cap = s->cfg->test_recv_cap;
 	o.recv_len = s->cfg->test_recv_len;
-	s->c.ssh_cli_rc = sshc_connect_fd(s->c.ssh_fd, &o);
+	c->ssh_cli_rc = sshc_connect_fd(c->ssh_fd, &o);
 	return NULL;
 }
 
@@ -955,12 +957,20 @@ static void rdv_maintain(struct conn *c)
 }
 
 /*
- * Run the SSH session over the connected stream until it ends. A failed
- * bring-up (the peer is not serving yet) ends the ssh thread quickly, so this
- * returns to be retried; a live session ends only when a side closes it.
+ * Run one connection's SSH session over its connected stream until it ends.
+ * Sets up the KCP stream, the ssh thread (sshd on a host, sshc on a client) and
+ * its comrade-ctl channel, then pumps the bridge, the heartbeat and the status.
+ * A failed bring-up (the peer is not serving yet) ends the ssh thread quickly,
+ * so this returns to be retried; a live session ends only when a side closes it.
+ *
+ * drive_sig: also pump the signalling (sig/lanlink) and rendezvous keep-warm
+ * from this loop. The single-connection path (client, or a host with one
+ * connection) sets it; a host worker does not -- sig is single-threaded and
+ * stays owned by the host's main loop, so a worker only pumps its own transport.
  */
-static int run_ssh(struct sess *s)
+static int conn_run(struct conn *c, int drive_sig)
 {
+	struct sess *s = c->sess;
 	struct sshbridge *br;
 	pthread_t th;
 	int sp[2], cp[2];
@@ -974,97 +984,104 @@ static int run_ssh(struct sess *s)
 		close(sp[1]);
 		return -1;
 	}
-	s->c.stream = stream_create(SESSION_CONV, on_stream_output, &s->c);
-	if (!s->c.stream) {
+	c->stream = stream_create(SESSION_CONV, on_stream_output, c);
+	if (!c->stream) {
 		close(sp[0]);
 		close(sp[1]);
 		close(cp[0]);
 		close(cp[1]);
 		return -1;
 	}
-	s->c.ssh_fd = sp[1];
-	s->c.ssh_ctl_fd = cp[1];
-	s->c.ctl_fd = cp[0];
-	s->c.ctl_rf.len = 0;
+	c->ssh_fd = sp[1];
+	c->ssh_ctl_fd = cp[1];
+	c->ctl_fd = cp[0];
+	c->ctl_rf.len = 0;
 	if (pthread_create(&th, NULL,
-			   s->cfg->is_host ? ssh_srv_thread : ssh_cli_thread, s)) {
+			   s->cfg->is_host ? ssh_srv_thread : ssh_cli_thread, c)) {
 		close(sp[0]);
 		close(sp[1]);
 		close(cp[0]);
 		close(cp[1]);
-		s->c.ctl_fd = -1;
-		stream_destroy(s->c.stream);
-		s->c.stream = NULL;
+		c->ctl_fd = -1;
+		stream_destroy(c->stream);
+		c->stream = NULL;
 		return -1;
 	}
-	br = sshbridge_create(sp[0], s->c.stream,
+	br = sshbridge_create(sp[0], c->stream,
 			      s->cfg->is_host ? LINGER_HOST_MS : LINGER_CLIENT_MS);
 
 	/* The path is up on entry, so start the liveness clock as alive. */
-	pthread_mutex_lock(&s->c.hb_lock);
-	s->c.hb_last_pong = now_ms();
-	s->c.lost_since_ms = 0;
-	pthread_mutex_unlock(&s->c.hb_lock);
+	pthread_mutex_lock(&c->hb_lock);
+	c->hb_last_pong = now_ms();
+	c->lost_since_ms = 0;
+	pthread_mutex_unlock(&c->hb_lock);
 	next_hb = now_ms();
 
-	/* Capture a rendezvous node per family for reconnection (the host was
-	 * already locating; ask on the client side too). */
-	if (s->cfg->sig_flags & SIG_DHT)
-		sig_locate(s->sig);
-	s->next_rdv_warm_ms = now_ms();
-	s->c.next_rdv_tell_ms = now_ms() + 1500;
+	if (drive_sig) {
+		/* Capture a rendezvous node per family for reconnection (the host
+		 * was already locating; ask on the client side too). */
+		if (s->cfg->sig_flags & SIG_DHT)
+			sig_locate(s->sig);
+		s->next_rdv_warm_ms = now_ms();
+		c->next_rdv_tell_ms = now_ms() + 1500;
+	}
 
 	while (!done) {
 		struct pollfd fds[9];
-		int timeout, nfds, lnf = 0, bidx, cidx;
+		int timeout = 10, nfds = 0, lnf = 0, bidx, cidx;
 
-		nfds = sig_prepare(s->sig, fds, 5, &timeout);
-		if (s->lan)
-			lnf = lanlink_prepare(s->lan, fds + nfds, 9 - nfds - 2,
-					      &timeout);
-		if (timeout < 0 || timeout > 10)
-			timeout = 10;
+		if (drive_sig) {
+			nfds = sig_prepare(s->sig, fds, 5, &timeout);
+			if (s->lan)
+				lnf = lanlink_prepare(s->lan, fds + nfds,
+						      9 - nfds - 2, &timeout);
+			if (timeout < 0 || timeout > 10)
+				timeout = 10;
+		}
 		bidx = nfds + lnf;
 		fds[bidx].fd = sshbridge_fd(br);
 		fds[bidx].events = sshbridge_events(br);
 		fds[bidx].revents = 0;
 		cidx = bidx + 1;
-		fds[cidx].fd = s->c.ctl_fd;
+		fds[cidx].fd = c->ctl_fd;
 		fds[cidx].events = POLLIN;
 		fds[cidx].revents = 0;
 		poll(fds, (nfds_t)(cidx + 1), timeout);
-		sig_dispatch(s->sig, fds, nfds);
-		if (s->lan)
-			lanlink_dispatch(s->lan, fds + nfds, lnf);
+		if (drive_sig) {
+			sig_dispatch(s->sig, fds, nfds);
+			if (s->lan)
+				lanlink_dispatch(s->lan, fds + nfds, lnf);
+		}
 		if (sshbridge_pump(br, fds[bidx].revents, (uint32_t)now_ms()) < 0)
 			done = 1;
 		if (fds[cidx].revents & (POLLIN | POLLHUP | POLLERR))
-			ctl_readable(&s->c);
+			ctl_readable(c);
 
 		if (now_ms() >= next_hb) {
 			uint8_t ts[CTL_TS_LEN];
 
 			ctl_put_u64(ts, now_ms());
-			ctl_send(&s->c, CTLM_PING, ts, sizeof(ts));
+			ctl_send(c, CTLM_PING, ts, sizeof(ts));
 			next_hb = now_ms() + HB_INTERVAL_MS;
 		}
-		rdv_maintain(&s->c);
-		if (now_ms() >= s->c.next_status_ms) {
+		if (drive_sig)
+			rdv_maintain(c);
+		if (now_ms() >= c->next_status_ms) {
 			uint64_t now = now_ms(), lp;
 			int state;
 
-			pthread_mutex_lock(&s->c.hb_lock);
-			lp = s->c.hb_last_pong;
+			pthread_mutex_lock(&c->hb_lock);
+			lp = c->hb_last_pong;
 			if (now - lp > HB_LOST_MS) {
-				if (!s->c.lost_since_ms)
-					s->c.lost_since_ms = now;
+				if (!c->lost_since_ms)
+					c->lost_since_ms = now;
 			} else {
-				s->c.lost_since_ms = 0;
+				c->lost_since_ms = 0;
 			}
-			state = s->c.lost_since_ms ? CONN_LOST : CONN_LIVE;
-			pthread_mutex_unlock(&s->c.hb_lock);
-			publish_status(&s->c, state);
-			s->c.next_status_ms = now + 500;
+			state = c->lost_since_ms ? CONN_LOST : CONN_LIVE;
+			pthread_mutex_unlock(&c->hb_lock);
+			publish_status(c, state);
+			c->next_status_ms = now + 500;
 		}
 	}
 
@@ -1074,15 +1091,22 @@ static int run_ssh(struct sess *s)
 	/* Both control-socket ends are ours to close: the ssh module bridges
 	 * cp[1] but never closes it. Mark the fd gone first so a stray ctl_send
 	 * is a no-op. */
-	s->c.ctl_fd = -1;
+	c->ctl_fd = -1;
 	close(cp[0]);
 	close(cp[1]);
-	stream_destroy(s->c.stream);
-	s->c.stream = NULL;
+	stream_destroy(c->stream);
+	c->stream = NULL;
 
 	if (s->cfg->is_host)
 		return 0;
-	return s->c.ssh_cli_rc;
+	return c->ssh_cli_rc;
+}
+
+/* The single-connection path (client, or a host serving one connection): run
+ * the session's one connection, driving signalling from the same loop. */
+static int run_ssh(struct sess *s)
+{
+	return conn_run(&s->c, 1);
 }
 
 /* Note which DHT families this host can reach, from its own candidates: any v4
