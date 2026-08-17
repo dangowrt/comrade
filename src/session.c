@@ -1834,6 +1834,12 @@ int session_run(const struct session_cfg *cfg)
 				 * original connect budget.
 				 */
 				dbg_logf("session: rejoin (roam)");
+				/* Flush the dashboard's stale view (old candidates,
+				 * the dead peer, the "link up") before re-gathering
+				 * on the new network. */
+				if (o && o->reset)
+					o->reset(o->arg);
+				s.established_fired = 0;
 				nat_destroy(s.c.nat);
 				s.c.nat = NULL;
 				conn_gen_ice(&s.c);
@@ -1842,6 +1848,10 @@ int session_run(const struct session_cfg *cfg)
 				s.remote_set = 0;
 				s.local_sdp[0] = '\0';
 				s.peer_sdp[0] = '\0';
+				pthread_mutex_lock(&s.trickle_lock);
+				s.trickle_sdp[0] = '\0';	/* drop the old agent's trickle */
+				s.trickle_dirty = 0;
+				pthread_mutex_unlock(&s.trickle_lock);
 				s.peer_state = SESSION_PEER_SEEN;
 				deadline = now_ms() +
 					(uint64_t)cfg->connect_timeout_s * 1000;

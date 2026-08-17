@@ -61,6 +61,11 @@ struct session_obs {
 	void (*token)(void *arg, const char *token_str);
 	/* The peer advanced to `state` (SESSION_PEER_*); addr may be "". */
 	void (*peer)(void *arg, int state, const char *addr);
+	/* The connection context was torn down and is being rebuilt (a roam or
+	 * reconnect): drop stale local candidates, the peer, and the "link up"
+	 * state, so the dashboard reflects the fresh attempt rather than the
+	 * addresses of the network that just went away. */
+	void (*reset)(void *arg);
 	/* The client had to fall back from a seeded node to a full DHT warm. */
 	void (*escalate)(void *arg, const char *why);
 	/* A path is up and the session is about to seize the terminal. */
