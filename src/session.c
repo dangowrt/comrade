@@ -1585,6 +1585,19 @@ static int host_turnstile(struct sess *s)
 }
 
 /*
+ * A DHT host runs the turnstile (multi-user): many clients over per-connection
+ * ICE, on the shared tmux. The link-local direct transport (lanlink) is
+ * inherently one peer -- transport_send prefers it session-wide -- so it cannot
+ * back concurrent workers; a multi-user host therefore serves everyone,
+ * same-LAN included, over ICE and does not bring lanlink up. The single-
+ * connection path keeps lanlink for an isolated LAN with no DHT (no internet).
+ */
+static int host_is_multiuser(const struct session_cfg *cfg)
+{
+	return cfg->is_host && (cfg->sig_flags & SIG_DHT) && !cfg->test_single_conn;
+}
+
+/*
  * Create the signalling (and, for multicast, the link-local transport),
  * subscribe the callbacks and seed the rendezvous. Used at start and, for a
  * client, again on a roam: a fresh sig binds a new DHT socket on the new
@@ -1600,7 +1613,7 @@ static int sig_setup(struct sess *s)
 	if (!s->sig)
 		return -1;
 	sig_subscribe(s->sig, on_peer_offer, &s->c);
-	if (cfg->sig_flags & SIG_MCAST) {
+	if ((cfg->sig_flags & SIG_MCAST) && !host_is_multiuser(cfg)) {
 		s->lan = lanlink_create(on_transport_recv, &s->c);
 		if (s->lan) {
 			sig_set_direct_port(s->sig, lanlink_port(s->lan));
@@ -1651,14 +1664,12 @@ int session_run(const struct session_cfg *cfg)
 	deadline = s.start_ms + (uint64_t)cfg->connect_timeout_s * 1000;
 
 	/*
-	 * A DHT host serves many clients through the turnstile (multi-user). The
-	 * link-local / isolated-LAN path (SIG_MCAST) keeps the single-connection
-	 * state machine below: multi-user over the shared LAN transport is not yet
-	 * supported, and forcing the DHT would break an
-	 * isolated LAN that has no internet.
+	 * A DHT host serves many clients through the turnstile (multi-user),
+	 * whether or not multicast is also on -- it serves same-LAN clients over
+	 * ICE too (see host_is_multiuser). Only a host with no DHT at all (an
+	 * isolated LAN) falls through to the single-connection state machine.
 	 */
-	if (cfg->is_host && (cfg->sig_flags & SIG_DHT) &&
-	    !(cfg->sig_flags & SIG_MCAST) && !cfg->test_single_conn) {
+	if (host_is_multiuser(cfg)) {
 		rc = host_turnstile(&s);
 		goto done;
 	}
