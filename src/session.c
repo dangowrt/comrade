@@ -1761,69 +1761,38 @@ int session_run(const struct session_cfg *cfg)
 				s.established_fired = 1;
 			}
 			r = run_ssh(&s);
-			dbg_logf("session: run_ssh rc=%d established=%d",
-				 r, s.established_fired);
+			dbg_logf("session: run_ssh rc=%d", r);
 			if (r == 0) {
 				st = ST_DONE;
-			} else if (r == SSHC_RECONNECT ||
-				   (r < 0 && s.established_fired &&
-				    now_ms() + 10000 < deadline)) {
+			} else if (r == SSHC_RECONNECT) {
 				/*
-				 * Re-punch as a fresh client -- a new ICE identity, a
-				 * new punch and a new claim -- re-attaching to the
-				 * session that lives on the host. Triggered when the
-				 * link stayed down past the grace window
-				 * (SSHC_RECONNECT), or when an already-established
-				 * session could not bring SSH up over the connected
-				 * path: a stale ICE pair, or a host worker not serving
-				 * this connection, is not recovered by hammering the
-				 * same path, so drop it and gather afresh. Only a grace
-				 * reconnect resets the deadline; an ssh-fail re-punch
-				 * stays bounded by it so it cannot loop forever.
+				 * The link stayed down past the grace window: rejoin
+				 * as a fresh client -- a new ICE identity, a new
+				 * punch and a new claim -- re-attaching to the session
+				 * that lives on the host. Reuse the signalling; reset
+				 * the deadline so the reconnect is not bounded by the
+				 * original connect budget.
 				 */
-				dbg_logf("session: re-punch (%s)",
-					r == SSHC_RECONNECT ? "grace" :
-					"ssh-bringup-failed");
+				dbg_logf("session: rejoin (roam)");
 				nat_destroy(s.c.nat);
 				s.c.nat = NULL;
 				conn_gen_ice(&s.c);
-				s.ice_attempt = 0;
 				s.have_local_sdp = 0;
 				s.have_peer_sdp = 0;
 				s.remote_set = 0;
 				s.local_sdp[0] = '\0';
 				s.peer_sdp[0] = '\0';
 				s.peer_state = SESSION_PEER_SEEN;
-				if (r == SSHC_RECONNECT) {
-					/*
-					 * A roam: rebuild signalling so its DHT
-					 * socket rebinds to the new network, then
-					 * restart from ST_WAIT_DHT exactly like a
-					 * fresh connect (which reconnects instantly).
-					 * The reused socket stays stuck on the
-					 * interface that just vanished.
-					 */
-					sig_destroy(s.sig);
-					if (s.lan) {
-						lanlink_destroy(s.lan);
-						s.lan = NULL;
-					}
-					deadline = now_ms() +
-						(uint64_t)cfg->connect_timeout_s * 1000;
-					if (sig_setup(&s))
-						st = ST_FAIL;
-					else
-						st = ST_WAIT_DHT;
-				} else if (nat_setup(&s.c)) {
+				deadline = now_ms() +
+					(uint64_t)cfg->connect_timeout_s * 1000;
+				if (nat_setup(&s.c))
 					st = ST_FAIL;
-				} else {
+				else
 					st = ST_GATHER;
-				}
-			} else if (r < 0 && !s.established_fired &&
-				   now_ms() + 10000 < deadline) {
-				/* Initial connect: ICE reported a path but the peer is
-				 * not serving yet; keep signalling so the reverse
-				 * channel can complete. */
+			} else if (now_ms() + 10000 < deadline) {
+				/* ICE reported a path but the peer is not serving
+				 * yet; keep signalling and re-check rather than give
+				 * up, so the reverse channel can complete. */
 				st = ST_WAIT_ICE;
 			} else {
 				st = ST_FAIL;
