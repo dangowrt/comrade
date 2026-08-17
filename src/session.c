@@ -1060,6 +1060,15 @@ static int conn_run(struct conn *c, int drive_sig)
 		 * was already locating; ask on the client side too). */
 		if (s->cfg->sig_flags & SIG_DHT)
 			sig_locate(s->sig);
+		/*
+		 * Now connected, a client stops advertising its answer: otherwise
+		 * it would keep re-claiming the single mailbox slot the host clears
+		 * after serving it, hogging it for the whole session so no other
+		 * client could ever join. A rejoin re-posts (ST_GATHER). The host
+		 * (mcast single-connection path) keeps advertising its offer.
+		 */
+		if (!s->cfg->is_host)
+			sig_withdraw(s->sig);
 		s->next_rdv_warm_ms = now_ms();
 		c->next_rdv_tell_ms = now_ms() + 1500;
 	}
@@ -1432,6 +1441,8 @@ static int host_turnstile(struct sess *s)
 				sig_rotate(s->sig, (const uint8_t *)s->local_sdp,
 					   strlen(s->local_sdp));
 				sig_locate(s->sig);
+				dbg_logf("host: offer published (served=%d "
+					 "active=%d)", served, active);
 				ts = TS_WAIT_CLAIM;
 			}
 			break;
@@ -1444,9 +1455,12 @@ static int host_turnstile(struct sess *s)
 				 * a whole ICE attempt. Wait for a fresh claimant. */
 				if (have_served &&
 				    !strcmp(s->peer_sdp, last_served)) {
+					dbg_logf("host: ignore stale claim "
+						 "(== last served)");
 					s->have_peer_sdp = 0;
 					break;
 				}
+				dbg_logf("host: claim received -> punch");
 				sdp_filter(s->peer_sdp, cfg->family, filtered,
 					   sizeof(filtered));
 				if (nat_set_remote_description(listen->nat,
@@ -1468,6 +1482,7 @@ static int host_turnstile(struct sess *s)
 				snprintf(last_served, sizeof(last_served), "%s",
 					 pending);
 				have_served = 1;
+				dbg_logf("host: connected -> spawn worker");
 				if (worker_spawn(ws, listen))
 					conn_free(listen);	/* table full */
 				listen = NULL;
