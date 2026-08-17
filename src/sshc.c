@@ -144,6 +144,19 @@ static int run_test(ssh_channel chan, const struct sshc_opts *o)
 	}
 	if (o->recv_len)
 		*o->recv_len = got;
+	/* Hold the session open (the session layer keeps the heartbeat alive on
+	 * its own thread), so a test can keep one client connected while another
+	 * joins -- the case that reveals slot hogging. */
+	if (o->hold_ms > 0) {
+		uint64_t end = mono_ms() + (uint64_t)o->hold_ms;
+
+		while (mono_ms() < end && ssh_channel_is_open(chan) &&
+		       !ssh_channel_is_eof(chan)) {
+			struct timespec ts = { 0, 50 * 1000 * 1000 };
+
+			nanosleep(&ts, NULL);
+		}
+	}
 	return 0;
 }
 

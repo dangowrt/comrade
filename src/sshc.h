@@ -49,6 +49,9 @@ struct sshc_opts {
 	uint8_t *recv;
 	size_t recv_cap;
 	size_t *recv_len;
+	int hold_ms;			/* after the echo, keep the session open this
+					 * long (test: stay connected while another
+					 * client joins) */
 };
 
 /*

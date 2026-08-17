@@ -121,6 +121,7 @@ struct session_cfg {
 	uint8_t *test_recv;
 	size_t test_recv_cap;
 	size_t *test_recv_len;
+	int test_hold_ms;		/* keep the session open this long after echo */
 };
 
 /* Run the session to completion; returns 0 on success, non-zero on failure. */
