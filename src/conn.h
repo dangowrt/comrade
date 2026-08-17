@@ -22,8 +22,9 @@ enum conn_state {
 
 struct conn_status {
 	int state;			/* enum conn_state */
-	char peer[80];			/* chosen pair's remote addr, "" if none */
-	char rdv[80];			/* mutual rendezvous node, "" if none */
+	char peer[80];			/* the in-use transport's remote addr, "" if none */
+	char rdv[80];			/* IPv4 rendezvous node, "" if none */
+	char rdv6[80];			/* IPv6 rendezvous node, "" if none */
 	int rtt_ms;			/* smoothed RTT, 0 if unknown */
 	int since_s;			/* seconds in the current state (loss age) */
 };

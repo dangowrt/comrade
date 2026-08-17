@@ -376,16 +376,26 @@ static void obs_report_net(struct sess *s)
 	report_candidates(s, s->local_sdp);
 }
 
-/* The mutual rendezvous node from the token, printable ("addr:port"). */
-static void fmt_token_rdv(const struct token *t, char *out, size_t n)
+/*
+ * The rendezvous node for `family` (4 or 6), printable ("addr:port"). Prefer a
+ * node located this session -- our own kept-warm one, or the peer's adopted over
+ * the control channel -- so both families show once the in-band exchange has
+ * caught up; fall back to whatever the token carried for that family.
+ */
+static void fmt_rdv_fam(struct sess *s, int family, char *out, size_t n)
 {
+	const struct token *t = &s->cfg->tok;
+	int i = fam_idx(family);
 	char ip[64];
 
 	out[0] = '\0';
-	if ((t->flags & TOKEN_FLAG_EP6_RDV) &&
-	    inet_ntop(AF_INET6, t->ep6_addr, ip, sizeof(ip)))
+	if (s->rdv[i].have)
+		fmt_sockaddr((struct sockaddr *)&s->rdv[i].sa, s->rdv[i].len,
+			     out, n);
+	else if (family == 6 && (t->flags & TOKEN_FLAG_EP6_RDV) &&
+		 inet_ntop(AF_INET6, t->ep6_addr, ip, sizeof(ip)))
 		snprintf(out, n, "[%s]:%u", ip, t->ep6_port);
-	else if ((t->flags & TOKEN_FLAG_EP4_RDV) &&
+	else if (family == 4 && (t->flags & TOKEN_FLAG_EP4_RDV) &&
 		 inet_ntop(AF_INET, t->ep4_addr, ip, sizeof(ip)))
 		snprintf(out, n, "%s:%u", ip, t->ep4_port);
 }
@@ -402,14 +412,22 @@ static void publish_status(struct conn *c, int state)
 
 	memset(&cs, 0, sizeof(cs));
 	cs.state = state;
-	snprintf(cs.peer, sizeof(cs.peer), "%s", c->status_peer);
-	/* The host learns its rendezvous endpoint mid-session (after the token
-	 * snapshot this run was started with), so prefer the located address; the
-	 * client, whose token already carries it, falls back to the token. */
-	if (s->status_rdv[0])
-		snprintf(cs.rdv, sizeof(cs.rdv), "%s", s->status_rdv);
-	else
-		fmt_token_rdv(&s->cfg->tok, cs.rdv, sizeof(cs.rdv));
+	/* Show the endpoint that is actually carrying KCP right now: the
+	 * link-local direct peer when that path is up (it is preferred in
+	 * transport_send), otherwise the selected -- proven -- ICE pair. Never a
+	 * mere gathered candidate. */
+	if (s->lan && lanlink_have_peer(s->lan) && s->direct_addr[0]) {
+		snprintf(cs.peer, sizeof(cs.peer), "%s", s->direct_addr);
+	} else if (c->nat && nat_connected(c->nat)) {
+		char loc[192], rem[192];
+
+		if (!nat_selected(c->nat, loc, sizeof(loc), rem, sizeof(rem)))
+			cand_addr(rem, cs.peer, sizeof(cs.peer));
+	}
+	/* Both families, so a session that started on one can be seen to gain the
+	 * other once the in-band rendezvous exchange propagates it. */
+	fmt_rdv_fam(s, 4, cs.rdv, sizeof(cs.rdv));
+	fmt_rdv_fam(s, 6, cs.rdv6, sizeof(cs.rdv6));
 	/* Prefer the heartbeat's round trip (measured even when idle); the stream
 	 * RTT only moves when SSH data flows. Report how long a loss has lasted. */
 	pthread_mutex_lock(&c->hb_lock);

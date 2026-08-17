@@ -57,7 +57,9 @@ void statusbar_render(int fd, int rows, int cols, const struct conn_status *st)
 	if (p > 0 && p < (int)sizeof(text) && st->peer[0])
 		p += snprintf(text + p, sizeof(text) - p, "  peer %s", st->peer);
 	if (p > 0 && p < (int)sizeof(text) && st->rdv[0])
-		p += snprintf(text + p, sizeof(text) - p, "  rdv %s", st->rdv);
+		p += snprintf(text + p, sizeof(text) - p, "  rdv4 %s", st->rdv);
+	if (p > 0 && p < (int)sizeof(text) && st->rdv6[0])
+		p += snprintf(text + p, sizeof(text) - p, "  rdv6 %s", st->rdv6);
 	if (p > 0 && p < (int)sizeof(text) && st->state == CONN_LIVE &&
 	    st->rtt_ms > 0)
 		p += snprintf(text + p, sizeof(text) - p, "  rtt %dms",
