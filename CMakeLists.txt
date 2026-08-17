@@ -240,7 +240,7 @@ if(COMRADE_HAVE_SIG AND COMRADE_HAVE_NAT AND COMRADE_HAVE_STREAM AND COMRADE_HAV
 	target_link_libraries(comrade_session PUBLIC
 		comrade_sig comrade_nat comrade_lanlink comrade_stream comrade_ssh
 		comrade_bridge comrade_token comrade_crypto comrade_stunlist comrade_conn
-		comrade_ctlproto)
+		comrade_ctlproto comrade_dbg)
 
 	# The view: the only module that draws to the terminal (MVC).
 	add_library(comrade_ui STATIC src/ui.c)

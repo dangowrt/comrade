@@ -16,6 +16,7 @@
 #include "candpolicy.h"
 #include "conn.h"
 #include "ctlproto.h"
+#include "dbg.h"
 #include "keys.h"
 #include "lanlink.h"
 #include "nat.h"
@@ -1708,40 +1709,57 @@ int session_run(const struct session_cfg *cfg)
 		case ST_RUN: {
 			int r;
 
-			if (o && o->established && !s.established_fired) {
-				o->established(o->arg);
+			if (!s.established_fired) {
+				if (o && o->established)
+					o->established(o->arg);
 				s.established_fired = 1;
 			}
 			r = run_ssh(&s);
+			dbg_logf("session: run_ssh rc=%d established=%d",
+				 r, s.established_fired);
 			if (r == 0) {
 				st = ST_DONE;
-			} else if (r == SSHC_RECONNECT) {
+			} else if (r == SSHC_RECONNECT ||
+				   (r < 0 && s.established_fired &&
+				    now_ms() + 10000 < deadline)) {
 				/*
-				 * The link stayed down past the grace window.
-				 * Rejoin as a fresh client -- a new ICE identity,
-				 * a new punch and a new claim -- re-attaching to
-				 * the session that lives on the host. Reset the
-				 * deadline so the reconnect is not bounded by the
-				 * original connect budget.
+				 * Re-punch as a fresh client -- a new ICE identity, a
+				 * new punch and a new claim -- re-attaching to the
+				 * session that lives on the host. Triggered when the
+				 * link stayed down past the grace window
+				 * (SSHC_RECONNECT), or when an already-established
+				 * session could not bring SSH up over the connected
+				 * path: a stale ICE pair, or a host worker not serving
+				 * this connection, is not recovered by hammering the
+				 * same path, so drop it and gather afresh. Only a grace
+				 * reconnect resets the deadline; an ssh-fail re-punch
+				 * stays bounded by it so it cannot loop forever.
 				 */
+				dbg_logf("session: re-punch (%s)",
+					r == SSHC_RECONNECT ? "grace" :
+					"ssh-bringup-failed");
 				nat_destroy(s.c.nat);
 				s.c.nat = NULL;
 				conn_gen_ice(&s.c);
+				s.ice_attempt = 0;
 				s.have_local_sdp = 0;
 				s.have_peer_sdp = 0;
 				s.remote_set = 0;
 				s.local_sdp[0] = '\0';
 				s.peer_sdp[0] = '\0';
-				deadline = now_ms() +
-					(uint64_t)cfg->connect_timeout_s * 1000;
+				s.peer_state = SESSION_PEER_SEEN;
+				if (r == SSHC_RECONNECT)
+					deadline = now_ms() +
+						(uint64_t)cfg->connect_timeout_s * 1000;
 				if (nat_setup(&s.c))
 					st = ST_FAIL;
 				else
 					st = ST_GATHER;
-			} else if (now_ms() + 10000 < deadline) {
-				/* ICE reported a path but the peer is not serving
-				 * yet; keep signalling and re-check rather than
-				 * give up, so the reverse channel can complete. */
+			} else if (r < 0 && !s.established_fired &&
+				   now_ms() + 10000 < deadline) {
+				/* Initial connect: ICE reported a path but the peer is
+				 * not serving yet; keep signalling so the reverse
+				 * channel can complete. */
 				st = ST_WAIT_ICE;
 			} else {
 				st = ST_FAIL;
