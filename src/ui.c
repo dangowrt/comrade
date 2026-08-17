@@ -522,26 +522,52 @@ static void um_token(struct ui *u, const char *tok)
 
 static void um_peer(struct ui *u, int state, const char *addr)
 {
+	int have_addr = addr && addr[0] && addr[0] != '-';
 	struct peerrow *p;
+	int i;
 
 	if (!u->anim) {
 		vlog(u, "peer   %s %s", state == SESSION_PEER_LIVE ? "live" :
-		     state == SESSION_PEER_PUNCHING ? "punching" : "seen",
-		     addr && addr[0] && addr[0] != '-' ? addr : "");
+		     state == SESSION_PEER_PUNCHING ? "punching" :
+		     state == SESSION_PEER_GONE ? "gone" : "seen",
+		     have_addr ? addr : "");
 		return;
 	}
-	if (state == SESSION_PEER_SEEN || !u->npeer) {
+	/* A reaped peer leaves; drop its row so the dashboard stops claiming it
+	 * is live (the host keys the row by the endpoint it reported at SEEN). */
+	if (state == SESSION_PEER_GONE) {
+		for (i = 0; i < u->npeer; i++)
+			if (!strcmp(u->peer[i].addr, have_addr ? addr : "")) {
+				memmove(&u->peer[i], &u->peer[i + 1],
+					(u->npeer - i - 1) * sizeof(u->peer[0]));
+				u->npeer--;
+				u->dirty = 1;
+				return;
+			}
+		return;
+	}
+	/* Update the row for this endpoint if we know it (multi-user host);
+	 * else the last row for an endpoint-less progress tick (client
+	 * punching, where the address is briefly ""); else append. */
+	p = NULL;
+	if (have_addr) {
+		for (i = 0; i < u->npeer; i++)
+			if (!strcmp(u->peer[i].addr, addr)) {
+				p = &u->peer[i];
+				break;
+			}
+	} else if (u->npeer && state != SESSION_PEER_SEEN) {
+		p = &u->peer[u->npeer - 1];
+	}
+	if (!p) {
 		if (u->npeer >= 8)
 			return;
 		p = &u->peer[u->npeer++];
-		p->state = state;
-		snprintf(p->addr, sizeof(p->addr), "%s", addr ? addr : "");
-	} else {
-		p = &u->peer[u->npeer - 1];
-		p->state = state;
-		if (addr && addr[0] && addr[0] != '-')
-			snprintf(p->addr, sizeof(p->addr), "%s", addr);
+		p->addr[0] = '\0';
 	}
+	p->state = state;
+	if (have_addr)
+		snprintf(p->addr, sizeof(p->addr), "%s", addr);
 	u->dirty = 1;
 }
 

@@ -35,7 +35,8 @@ enum {					/* how a path was learnt, for obs.net */
 enum {					/* peer lifecycle for obs.peer */
 	SESSION_PEER_SEEN,		/* mailbox read: peer endpoints known */
 	SESSION_PEER_PUNCHING,		/* negotiating a path */
-	SESSION_PEER_LIVE		/* a path carries the session */
+	SESSION_PEER_LIVE,		/* a path carries the session */
+	SESSION_PEER_GONE		/* this peer's connection ended (reaped) */
 };
 enum {					/* per-family rendezvous progress (spinner) */
 	RDV_COLD,			/* the DHT is not warm yet */

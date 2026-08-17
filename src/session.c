@@ -1426,6 +1426,9 @@ static int host_turnstile(struct sess *s)
 		for (i = 0; i < HOST_MAX_WORKERS; i++) {
 			if (ws[i].used && ws[i].done) {
 				pthread_join(ws[i].th, NULL);
+				if (o && o->peer)
+					o->peer(o->arg, SESSION_PEER_GONE,
+						ws[i].c->status_peer);
 				conn_free(ws[i].c);
 				ws[i].used = 0;
 				served++;
@@ -1512,7 +1515,11 @@ static int host_turnstile(struct sess *s)
 						cand_addr(rem, addr,
 							  sizeof(addr));
 					/* SEEN adds a peer row, LIVE marks it
-					 * up (see the view's um_peer). */
+					 * up (see the view's um_peer); the addr
+					 * also keys the row for GONE at reap. */
+					snprintf(listen->status_peer,
+						 sizeof(listen->status_peer),
+						 "%s", addr);
 					o->peer(o->arg, SESSION_PEER_SEEN, addr);
 					o->peer(o->arg, SESSION_PEER_LIVE, addr);
 				}
