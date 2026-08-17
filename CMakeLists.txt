@@ -499,7 +499,70 @@ if(WIN32)
 		comrade_statusbar comrade_conn PkgConfig::LIBSSH)
 endif()
 
+# --- build identity (comrade --version) --------------------------------------
+# The commit hash, date and, on a tagged build, the release version are baked
+# into the binary. In a git checkout these come from git; a `git archive` source
+# tarball carries no .git, so src/gitident.txt holds $Format:...$ placeholders
+# that git expands at archive time (see .gitattributes). One path serves both.
+set(COMRADE_GIT_HASH "unknown")
+set(COMRADE_GIT_DATE "unknown")
+set(_cr_refs "")
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/src/gitident.txt" _cr_ident)
+string(REGEX MATCH "COMRADE_GIT_HASH=([^\r\n]*)" _cr_m "${_cr_ident}")
+set(_cr_hash "${CMAKE_MATCH_1}")
+if(_cr_hash MATCHES "Format:")
+	# Working tree (placeholders unexpanded): ask git. -c safe.directory keeps
+	# it working on a foreign-owned tree, e.g. the deb build container.
+	find_package(Git QUIET)
+	if(GIT_FOUND)
+		set(_cr_git ${GIT_EXECUTABLE}
+			-c safe.directory=${CMAKE_CURRENT_SOURCE_DIR}
+			-C ${CMAKE_CURRENT_SOURCE_DIR})
+		execute_process(COMMAND ${_cr_git} rev-parse HEAD
+			OUTPUT_VARIABLE COMRADE_GIT_HASH
+			OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+		execute_process(COMMAND ${_cr_git} show -s --format=%cs HEAD
+			OUTPUT_VARIABLE COMRADE_GIT_DATE
+			OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+		execute_process(COMMAND ${_cr_git} log -1 --format=%D HEAD
+			OUTPUT_VARIABLE _cr_refs
+			OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+	endif()
+else()
+	# Expanded by `git archive`: trust the baked-in identity, no git needed.
+	set(COMRADE_GIT_HASH "${_cr_hash}")
+	if(_cr_ident MATCHES "COMRADE_GIT_DATE=([^\r\n]*)")
+		set(COMRADE_GIT_DATE "${CMAKE_MATCH_1}")
+	endif()
+	if(_cr_ident MATCHES "COMRADE_GIT_REFS=([^\r\n]*)")
+		set(_cr_refs "${CMAKE_MATCH_1}")
+	endif()
+	if(_cr_refs MATCHES "Format:")
+		set(_cr_refs "")
+	endif()
+endif()
+if(COMRADE_GIT_HASH STREQUAL "")
+	set(COMRADE_GIT_HASH "unknown")
+endif()
+if(COMRADE_GIT_DATE STREQUAL "")
+	set(COMRADE_GIT_DATE "unknown")
+endif()
+if(NOT COMRADE_GIT_HASH STREQUAL "unknown")
+	string(SUBSTRING "${COMRADE_GIT_HASH}" 0 12 COMRADE_GIT_HASH)
+endif()
+# A release is a commit an exact tag points at: a "tag: <name>" ref decoration
+# (%D). Reliable in a `git archive` tarball, unlike %(describe) which servers
+# such as GitHub may not expand.
+set(COMRADE_RELEASE "")
+if(_cr_refs MATCHES "tag: ([^,\r\n]+)")
+	string(STRIP "${CMAKE_MATCH_1}" _cr_tag)
+	string(REGEX REPLACE "^v" "" COMRADE_RELEASE "${_cr_tag}")
+endif()
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/src/version.h.in"
+	"${CMAKE_CURRENT_BINARY_DIR}/version.h" @ONLY)
+
 add_executable(comrade src/main.c)
+target_include_directories(comrade PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 target_link_libraries(comrade
 	comrade_host
 	comrade_session

@@ -1,0 +1,3 @@
+COMRADE_GIT_HASH=$Format:%H$
+COMRADE_GIT_DATE=$Format:%cs$
+COMRADE_GIT_REFS=$Format:%D$

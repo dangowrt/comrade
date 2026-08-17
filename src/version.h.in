@@ -1,0 +1,11 @@
+/* SPDX-License-Identifier: AGPL-3.0-or-later */
+/* Copyright (C) 2026 Daniel Golle <daniel@makrotopia.org> */
+/* Generated from version.h.in by CMake at configure time; do not edit. */
+#ifndef COMRADE_VERSION_H
+#define COMRADE_VERSION_H
+
+#define COMRADE_GIT_HASH "@COMRADE_GIT_HASH@"
+#define COMRADE_GIT_DATE "@COMRADE_GIT_DATE@"
+#define COMRADE_RELEASE  "@COMRADE_RELEASE@"
+
+#endif

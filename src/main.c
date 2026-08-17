@@ -10,6 +10,7 @@
 #include "stunlist.h"
 #include "token.h"
 #include "ui.h"			/* UI_* enums used by main() in every build */
+#include "version.h"		/* generated: COMRADE_GIT_HASH/DATE/RELEASE */
 #include "wsock.h"		/* WSAStartup before any socket is created */
 
 #include "sig.h"
@@ -31,11 +32,23 @@ static int usage(int ret)
 		"       comrade show       print the tokens of the running session\n"
 		"       comrade stun-update  refresh the STUN server list\n"
 		"opts:  -v, --verbose      log lines instead of the dashboard\n"
+		"       -V, --version      print the version and exit\n"
 		"       --no-multicast     skip link-local discovery, DHT/STUN only\n"
 		"client: -L [bind:]port:host:hostport  forward a local port via the host\n"
 		"        -R [bind:]port:host:hostport  forward a host-side port back here\n"
 		"host:  --no-forwarding    decline all client port forwarding\n");
 	return ret;
+}
+
+static int print_version(void)
+{
+	if (COMRADE_RELEASE[0])
+		printf("comrade %s (%s, %s)\n", COMRADE_RELEASE,
+		       COMRADE_GIT_HASH, COMRADE_GIT_DATE);
+	else
+		printf("comrade %s (%s)\n", COMRADE_GIT_HASH,
+		       COMRADE_GIT_DATE);
+	return 0;
 }
 
 #define FWD_SPECS_MAX 8
@@ -150,6 +163,8 @@ int main(int argc, char **argv)
 	for (i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help"))
 			return usage(0);
+		if (!strcmp(argv[i], "-V") || !strcmp(argv[i], "--version"))
+			return print_version();
 		if (!strcmp(argv[i], "-v") || !strcmp(argv[i], "--verbose"))
 			ui_mode = UI_VERBOSE;
 		else if (!strcmp(argv[i], "--no-multicast"))
