@@ -109,6 +109,8 @@ int main(int argc, char **argv)
 			cfg.connect_timeout_s = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--serve") && i + 1 < argc)
 			cfg.host_serve_max = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--hold-ms") && i + 1 < argc)
+			cfg.test_hold_ms = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--log") && i + 1 < argc)
 			cfg.log_level = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--mcast"))
