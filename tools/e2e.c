@@ -111,6 +111,8 @@ int main(int argc, char **argv)
 			cfg.host_serve_max = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--hold-ms") && i + 1 < argc)
 			cfg.test_hold_ms = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--single"))
+			cfg.test_single_conn = 1;
 		else if (!strcmp(argv[i], "--log") && i + 1 < argc)
 			cfg.log_level = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--mcast"))
@@ -151,7 +153,18 @@ int main(int argc, char **argv)
 		cfg.test_recv_len = &rx_got;
 	}
 
-	rc = session_run(&cfg);
+	if (is_host && cfg.test_single_conn && cfg.host_serve_max > 0) {
+		/* Mirror the product host's run_service: serve one client per
+		 * session_run, again after each, so the sequential re-serve
+		 * (client roams/vanishes -> reap -> serve the next) is exercised. */
+		int n;
+
+		rc = 0;
+		for (n = 0; n < cfg.host_serve_max && !rc; n++)
+			rc = session_run(&cfg);
+	} else {
+		rc = session_run(&cfg);
+	}
 	if (cfg.hostkey)
 		sshd_hostkey_free(cfg.hostkey);
 
