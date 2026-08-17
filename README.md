@@ -210,9 +210,9 @@ release architecture. Add the key and the source once, then install and
 update through apt like any other package:
 
     sudo install -d -m 0755 /etc/apt/keyrings
-    sudo curl -fsSL https://dangowrt.github.io/comrade/comrade-archive-keyring.asc \
+    sudo curl -fsSL https://comrade.makrotopia.org/comrade-archive-keyring.asc \
         -o /etc/apt/keyrings/comrade.asc
-    echo "deb [signed-by=/etc/apt/keyrings/comrade.asc] https://dangowrt.github.io/comrade stable main" \
+    echo "deb [signed-by=/etc/apt/keyrings/comrade.asc] https://comrade.makrotopia.org stable main" \
         | sudo tee /etc/apt/sources.list.d/comrade.list
     sudo apt update
     sudo apt install comrade

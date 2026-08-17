@@ -28,9 +28,9 @@ into apt's trusted-keyring directory and pinned to this source alone with
 `signed-by`, so it can never vouch for any other repository.
 
     sudo install -d -m 0755 /etc/apt/keyrings
-    sudo curl -fsSL https://dangowrt.github.io/comrade/comrade-archive-keyring.asc \
+    sudo curl -fsSL https://comrade.makrotopia.org/comrade-archive-keyring.asc \
         -o /etc/apt/keyrings/comrade.asc
-    echo "deb [signed-by=/etc/apt/keyrings/comrade.asc] https://dangowrt.github.io/comrade stable main" \
+    echo "deb [signed-by=/etc/apt/keyrings/comrade.asc] https://comrade.makrotopia.org stable main" \
         | sudo tee /etc/apt/sources.list.d/comrade.list
     sudo apt-get update
     sudo apt-get install comrade
