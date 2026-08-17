@@ -1483,6 +1483,20 @@ static int host_turnstile(struct sess *s)
 					 pending);
 				have_served = 1;
 				dbg_logf("host: connected -> spawn worker");
+				if (o && o->peer) {
+					char loc[192], rem[192], addr[80];
+
+					addr[0] = '\0';
+					if (!nat_selected(listen->nat, loc,
+							  sizeof(loc), rem,
+							  sizeof(rem)))
+						cand_addr(rem, addr,
+							  sizeof(addr));
+					/* SEEN adds a peer row, LIVE marks it
+					 * up (see the view's um_peer). */
+					o->peer(o->arg, SESSION_PEER_SEEN, addr);
+					o->peer(o->arg, SESSION_PEER_LIVE, addr);
+				}
 				if (worker_spawn(ws, listen))
 					conn_free(listen);	/* table full */
 				listen = NULL;
@@ -1529,6 +1543,44 @@ static int host_turnstile(struct sess *s)
 	return 0;
 }
 
+/*
+ * Create the signalling (and, for multicast, the link-local transport),
+ * subscribe the callbacks and seed the rendezvous. Used at start and, for a
+ * client, again on a roam: a fresh sig binds a new DHT socket on the new
+ * network, whereas the old one stays stuck on the interface that just vanished
+ * (which is why a manual restart reconnects instantly but a reused socket does
+ * not). Returns 0 on success.
+ */
+static int sig_setup(struct sess *s)
+{
+	const struct session_cfg *cfg = s->cfg;
+
+	s->sig = sig_create(cfg->tok.rdv, cfg->sig_flags, cfg->is_host);
+	if (!s->sig)
+		return -1;
+	sig_subscribe(s->sig, on_peer_offer, &s->c);
+	if (cfg->sig_flags & SIG_MCAST) {
+		s->lan = lanlink_create(on_transport_recv, &s->c);
+		if (s->lan) {
+			sig_set_direct_port(s->sig, lanlink_port(s->lan));
+			sig_subscribe_direct(s->sig, on_direct_peer, s);
+			if (cfg->obs && cfg->obs->link) {
+				struct sig_mcast_if ifs[16];
+				int ni = sig_link_ifaces(s->sig, ifs, 16), k;
+
+				for (k = 0; k < ni; k++)
+					cfg->obs->link(cfg->obs->arg, ifs[k].name,
+						       ifs[k].has4, ifs[k].has6);
+			}
+		}
+	}
+	if (!cfg->is_host)
+		client_seed_rendezvous(s);
+	else
+		host_seed_anchor(s);
+	return 0;
+}
+
 int session_run(const struct session_cfg *cfg)
 {
 	struct sess s;
@@ -1551,29 +1603,8 @@ int session_run(const struct session_cfg *cfg)
 
 	conn_gen_ice(&s.c);
 
-	s.sig = sig_create(cfg->tok.rdv, cfg->sig_flags, cfg->is_host);
-	if (!s.sig)
+	if (sig_setup(&s))
 		return 1;
-	sig_subscribe(s.sig, on_peer_offer, &s.c);
-	if (cfg->sig_flags & SIG_MCAST) {
-		s.lan = lanlink_create(on_transport_recv, &s.c);
-		if (s.lan) {
-			sig_set_direct_port(s.sig, lanlink_port(s.lan));
-			sig_subscribe_direct(s.sig, on_direct_peer, &s);
-			if (cfg->obs && cfg->obs->link) {
-				struct sig_mcast_if ifs[16];
-				int ni = sig_link_ifaces(s.sig, ifs, 16), k;
-
-				for (k = 0; k < ni; k++)
-					cfg->obs->link(cfg->obs->arg, ifs[k].name,
-						       ifs[k].has4, ifs[k].has6);
-			}
-		}
-	}
-	if (!cfg->is_host)
-		client_seed_rendezvous(&s);
-	else
-		host_seed_anchor(&s);
 
 	s.start_ms = now_ms();
 	deadline = s.start_ms + (uint64_t)cfg->connect_timeout_s * 1000;
@@ -1763,13 +1794,31 @@ int session_run(const struct session_cfg *cfg)
 				s.local_sdp[0] = '\0';
 				s.peer_sdp[0] = '\0';
 				s.peer_state = SESSION_PEER_SEEN;
-				if (r == SSHC_RECONNECT)
+				if (r == SSHC_RECONNECT) {
+					/*
+					 * A roam: rebuild signalling so its DHT
+					 * socket rebinds to the new network, then
+					 * restart from ST_WAIT_DHT exactly like a
+					 * fresh connect (which reconnects instantly).
+					 * The reused socket stays stuck on the
+					 * interface that just vanished.
+					 */
+					sig_destroy(s.sig);
+					if (s.lan) {
+						lanlink_destroy(s.lan);
+						s.lan = NULL;
+					}
 					deadline = now_ms() +
 						(uint64_t)cfg->connect_timeout_s * 1000;
-				if (nat_setup(&s.c))
+					if (sig_setup(&s))
+						st = ST_FAIL;
+					else
+						st = ST_WAIT_DHT;
+				} else if (nat_setup(&s.c)) {
 					st = ST_FAIL;
-				else
+				} else {
 					st = ST_GATHER;
+				}
 			} else if (r < 0 && !s.established_fired &&
 				   now_ms() + 10000 < deadline) {
 				/* Initial connect: ICE reported a path but the peer is
