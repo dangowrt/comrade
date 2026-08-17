@@ -546,28 +546,22 @@ static void um_peer(struct ui *u, int state, const char *addr)
 			}
 		return;
 	}
-	/* Update the row for this endpoint if we know it (multi-user host);
-	 * else the last row for an endpoint-less progress tick (client
-	 * punching, where the address is briefly ""); else append. */
-	p = NULL;
-	if (have_addr) {
-		for (i = 0; i < u->npeer; i++)
-			if (!strcmp(u->peer[i].addr, addr)) {
-				p = &u->peer[i];
-				break;
-			}
-	} else if (u->npeer && state != SESSION_PEER_SEEN) {
-		p = &u->peer[u->npeer - 1];
-	}
-	if (!p) {
+	/* SEEN opens a new peer row; later states refine the last one (the
+	 * address only firms up at LIVE, so a single connection stays one row
+	 * as it advances SEEN -> punching -> live). Joins are serialised, so
+	 * the last row is always the one being brought up. */
+	if (state == SESSION_PEER_SEEN || !u->npeer) {
 		if (u->npeer >= 8)
 			return;
 		p = &u->peer[u->npeer++];
-		p->addr[0] = '\0';
+		p->state = state;
+		snprintf(p->addr, sizeof(p->addr), "%s", have_addr ? addr : "");
+	} else {
+		p = &u->peer[u->npeer - 1];
+		p->state = state;
+		if (have_addr)
+			snprintf(p->addr, sizeof(p->addr), "%s", addr);
 	}
-	p->state = state;
-	if (have_addr)
-		snprintf(p->addr, sizeof(p->addr), "%s", addr);
 	u->dirty = 1;
 }
 

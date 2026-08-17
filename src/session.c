@@ -1148,17 +1148,32 @@ static int conn_run(struct conn *c, int drive_sig)
 			pthread_mutex_unlock(&c->hb_lock);
 			publish_status(c, state);
 			c->next_status_ms = now + 500;
-			/* A host worker (no sig to drive) reaps itself once its
-			 * client has been silent too long -- the bridge would
-			 * otherwise never end for a client that vanished without
-			 * a clean disconnect. The client's own loop stays up on
-			 * loss (it shows the outage and lets the user quit). */
-			if (!drive_sig && c->lost_since_ms &&
+			/* A host reaps a client that has been silent too long --
+			 * the bridge would otherwise never end for one that
+			 * vanished (roamed) without a clean disconnect, leaving
+			 * the host wedged on a dead link and unable to re-serve.
+			 * This holds for both the worker (drive_sig 0) and the
+			 * single-connection host (drive_sig 1); only the client
+			 * (never is_host) stays up on loss, showing the outage
+			 * and letting the user quit or roam. */
+			if (s->cfg->is_host && c->lost_since_ms &&
 			    now - c->lost_since_ms > HOST_REAP_MS)
 				done = 1;
 		}
 	}
 
+	/*
+	 * Unblock the ssh thread before joining. When a peer roams away it stops
+	 * answering without ever closing the transport, so the thread is parked
+	 * in a blocking libssh read that never sees EOF -- joining it directly
+	 * would hang the reap forever (the very wedge that kept a host from
+	 * re-serving). Shutting our ends of the ssh and control socketpairs hands
+	 * the thread the EOF it is waiting for, so it returns and the join below
+	 * completes. A clean end has already exited the thread; the shutdown is
+	 * then a harmless no-op.
+	 */
+	shutdown(sp[0], SHUT_RDWR);
+	shutdown(cp[0], SHUT_RDWR);
 	pthread_join(th, NULL);
 	sshbridge_destroy(br);
 	close(sp[0]);			/* sp[1] is closed by the ssh module */
@@ -1643,7 +1658,7 @@ int session_run(const struct session_cfg *cfg)
 	 * isolated LAN that has no internet.
 	 */
 	if (cfg->is_host && (cfg->sig_flags & SIG_DHT) &&
-	    !(cfg->sig_flags & SIG_MCAST)) {
+	    !(cfg->sig_flags & SIG_MCAST) && !cfg->test_single_conn) {
 		rc = host_turnstile(&s);
 		goto done;
 	}
@@ -1788,6 +1803,14 @@ int session_run(const struct session_cfg *cfg)
 			}
 			r = run_ssh(&s);
 			dbg_logf("session: run_ssh rc=%d", r);
+			/* The host's connection just ended (the client left or was
+			 * reaped); drop its dashboard row so the next serve does not
+			 * stack a stale peer over the real one. */
+			if (cfg->is_host && o && o->peer &&
+			    s.peer_state >= SESSION_PEER_LIVE) {
+				o->peer(o->arg, SESSION_PEER_GONE, s.c.status_peer);
+				s.peer_state = SESSION_PEER_SEEN;
+			}
 			if (r == 0) {
 				st = ST_DONE;
 			} else if (r == SSHC_RECONNECT) {
