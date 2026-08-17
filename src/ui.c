@@ -41,7 +41,7 @@ static void ui_on_signal(int n) { (void)n; ui_abort_flag = 1; }
 struct netrow { int family; int scope; int via; char addr[80]; };
 struct linkrow { char name[32]; int has4, has6; };
 struct rdvrow { int family; int ready; char addr[80]; };
-struct peerrow { int state; char addr[80]; };
+struct peerrow { int id; int state; char addr[80]; };
 
 struct ui {
 	int role;
@@ -520,11 +520,10 @@ static void um_token(struct ui *u, const char *tok)
 		u->dirty = 1;
 }
 
-static void um_peer(struct ui *u, int state, const char *addr)
+static void um_peer(struct ui *u, int id, int state, const char *addr)
 {
 	int have_addr = addr && addr[0] && addr[0] != '-';
-	struct peerrow *p;
-	int i;
+	int i, at = -1;
 
 	if (!u->anim) {
 		vlog(u, "peer   %s %s", state == SESSION_PEER_LIVE ? "live" :
@@ -533,35 +532,33 @@ static void um_peer(struct ui *u, int state, const char *addr)
 		     have_addr ? addr : "");
 		return;
 	}
-	/* A reaped peer leaves; drop its row so the dashboard stops claiming it
-	 * is live (the host keys the row by the endpoint it reported at SEEN). */
+	/* Rows are keyed by the connection's id, so each attached client owns one
+	 * row that its own updates (address, state) and GONE address, independent
+	 * of the others; the single-connection client uses id 0. */
+	for (i = 0; i < u->npeer; i++)
+		if (u->peer[i].id == id) {
+			at = i;
+			break;
+		}
 	if (state == SESSION_PEER_GONE) {
-		for (i = 0; i < u->npeer; i++)
-			if (!strcmp(u->peer[i].addr, have_addr ? addr : "")) {
-				memmove(&u->peer[i], &u->peer[i + 1],
-					(u->npeer - i - 1) * sizeof(u->peer[0]));
-				u->npeer--;
-				u->dirty = 1;
-				return;
-			}
+		if (at >= 0) {
+			memmove(&u->peer[at], &u->peer[at + 1],
+				(u->npeer - at - 1) * sizeof(u->peer[0]));
+			u->npeer--;
+			u->dirty = 1;
+		}
 		return;
 	}
-	/* SEEN opens a new peer row; later states refine the last one (the
-	 * address only firms up at LIVE, so a single connection stays one row
-	 * as it advances SEEN -> punching -> live). Joins are serialised, so
-	 * the last row is always the one being brought up. */
-	if (state == SESSION_PEER_SEEN || !u->npeer) {
+	if (at < 0) {
 		if (u->npeer >= 8)
 			return;
-		p = &u->peer[u->npeer++];
-		p->state = state;
-		snprintf(p->addr, sizeof(p->addr), "%s", have_addr ? addr : "");
-	} else {
-		p = &u->peer[u->npeer - 1];
-		p->state = state;
-		if (have_addr)
-			snprintf(p->addr, sizeof(p->addr), "%s", addr);
+		at = u->npeer++;
+		u->peer[at].id = id;
+		u->peer[at].addr[0] = '\0';
 	}
+	u->peer[at].state = state;
+	if (have_addr)
+		snprintf(u->peer[at].addr, sizeof(u->peer[at].addr), "%s", addr);
 	u->dirty = 1;
 }
 
@@ -610,7 +607,7 @@ static void cb_link(void *a, const char *n, int h4, int h6) { um_link(a, n, h4, 
 static void cb_rdv(void *a, int f, const char *ad, int rd) { um_rdv(a, f, rd, ad); }
 static void cb_rdv_stage(void *a, int f, int st) { um_rdv_stage(a, f, st); }
 static void cb_token(void *a, const char *t) { um_token(a, t); }
-static void cb_peer(void *a, int s, const char *ad) { um_peer(a, s, ad); }
+static void cb_peer(void *a, int id, int s, const char *ad) { um_peer(a, id, s, ad); }
 static void cb_reset(void *a) { um_reset(a); }
 static void cb_esc(void *a, const char *w) { um_escalate(a, w); }
 static void cb_tick(void *a)
@@ -678,9 +675,9 @@ static void em_token(void *a, const char *t)
 {
 	dprintf(((struct ui_emit *)a)->fd, "T %s\n", t);
 }
-static void em_peer(void *a, int s, const char *ad)
+static void em_peer(void *a, int id, int s, const char *ad)
 {
-	dprintf(((struct ui_emit *)a)->fd, "P %d %s\n", s,
+	dprintf(((struct ui_emit *)a)->fd, "P %d %d %s\n", id, s,
 		ad && ad[0] ? ad : "-");
 }
 static void em_reset(void *a)
@@ -758,8 +755,8 @@ static void feed(struct ui *u, char *ln)
 		break;
 	case 'P':
 		s[0] = '\0';
-		if (sscanf(ln + 1, "%d %79[^\n]", &a, s) >= 1)
-			um_peer(u, a, s);
+		if (sscanf(ln + 1, "%d %d %79[^\n]", &a, &b, s) >= 2)
+			um_peer(u, a, b, s);
 		break;
 	case 'E':
 		if (sscanf(ln + 1, " %159[^\n]", s) == 1)

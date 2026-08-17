@@ -59,8 +59,11 @@ struct session_obs {
 	void (*rdv_stage)(void *arg, int family, int stage);
 	/* The invite token is minted and ready to share (host). */
 	void (*token)(void *arg, const char *token_str);
-	/* The peer advanced to `state` (SESSION_PEER_*); addr may be "". */
-	void (*peer)(void *arg, int state, const char *addr);
+	/* A peer identified by `id` advanced to `state` (SESSION_PEER_*); addr may
+	 * be "". `id` is stable for one connection's lifetime, so a multi-user
+	 * host addresses each attached client's row independently (and can update
+	 * its address as ICE re-nominates); the single-connection client uses 0. */
+	void (*peer)(void *arg, int id, int state, const char *addr);
 	/* The connection context was torn down and is being rebuilt (a roam or
 	 * reconnect): drop stale local candidates, the peer, and the "link up"
 	 * state, so the dashboard reflects the fresh attempt rather than the

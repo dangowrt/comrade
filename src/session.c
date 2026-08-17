@@ -153,6 +153,7 @@ struct conn {
 	pthread_mutex_t status_lock;
 	struct conn_status status;
 	char status_peer[80];		/* address of the chosen pair, once live */
+	int dash_id;			/* this connection's dashboard peer-row id */
 	uint64_t next_status_ms;
 };
 
@@ -1410,7 +1411,7 @@ static int host_turnstile(struct sess *s)
 	char filtered[NAT_SDP_MAX];
 	char pending[NAT_SDP_MAX], last_served[NAT_SDP_MAX];
 	int end_fd = cfg->ssh_end_fd;
-	int served = 0, have_served = 0, i;
+	int served = 0, have_served = 0, dash_seq = 0, i;
 
 	memset(ws, 0, sizeof(ws));
 
@@ -1442,14 +1443,35 @@ static int host_turnstile(struct sess *s)
 			if (ws[i].used && ws[i].done) {
 				pthread_join(ws[i].th, NULL);
 				if (o && o->peer)
-					o->peer(o->arg, SESSION_PEER_GONE,
+					o->peer(o->arg, ws[i].c->dash_id,
+						SESSION_PEER_GONE,
 						ws[i].c->status_peer);
 				conn_free(ws[i].c);
 				ws[i].used = 0;
 				served++;
 			}
-			if (ws[i].used)
-				active = 1;
+			if (!ws[i].used)
+				continue;
+			active = 1;
+			/* Relay the pair actually carrying this worker now, so the
+			 * dashboard tracks ICE re-nomination instead of freezing the
+			 * address captured at connect. status.peer is the in-use
+			 * remote (see publish_status); status_peer caches what the
+			 * row last showed. */
+			if (o && o->peer) {
+				char cur[80];
+
+				pthread_mutex_lock(&ws[i].c->status_lock);
+				snprintf(cur, sizeof(cur), "%s", ws[i].c->status.peer);
+				pthread_mutex_unlock(&ws[i].c->status_lock);
+				if (cur[0] && strcmp(cur, ws[i].c->status_peer)) {
+					snprintf(ws[i].c->status_peer,
+						 sizeof(ws[i].c->status_peer),
+						 "%s", cur);
+					o->peer(o->arg, ws[i].c->dash_id,
+						SESSION_PEER_LIVE, cur);
+				}
+			}
 		}
 
 		switch (ts) {
@@ -1529,14 +1551,17 @@ static int host_turnstile(struct sess *s)
 							  sizeof(rem)))
 						cand_addr(rem, addr,
 							  sizeof(addr));
-					/* SEEN adds a peer row, LIVE marks it
-					 * up (see the view's um_peer); the addr
-					 * also keys the row for GONE at reap. */
+					/* SEEN opens this client's row, LIVE marks it
+					 * up (see the view's um_peer); dash_id keys
+					 * the row for later address updates and GONE. */
+					listen->dash_id = ++dash_seq;
 					snprintf(listen->status_peer,
 						 sizeof(listen->status_peer),
 						 "%s", addr);
-					o->peer(o->arg, SESSION_PEER_SEEN, addr);
-					o->peer(o->arg, SESSION_PEER_LIVE, addr);
+					o->peer(o->arg, listen->dash_id,
+						SESSION_PEER_SEEN, addr);
+					o->peer(o->arg, listen->dash_id,
+						SESSION_PEER_LIVE, addr);
 				}
 				if (worker_spawn(ws, listen))
 					conn_free(listen);	/* table full */
@@ -1723,7 +1748,7 @@ int session_run(const struct session_cfg *cfg)
 
 				b[0] = '\0';
 				sdp_first_addr(s.peer_sdp, b, sizeof(b));
-				o->peer(o->arg, SESSION_PEER_SEEN, b);
+				o->peer(o->arg, 0, SESSION_PEER_SEEN, b);
 				s.peer_state = SESSION_PEER_SEEN;
 			}
 		}
@@ -1762,7 +1787,7 @@ int session_run(const struct session_cfg *cfg)
 				s.ice_attempt_start = now_ms();
 				if (o && o->peer &&
 				    s.peer_state < SESSION_PEER_PUNCHING) {
-					o->peer(o->arg, SESSION_PEER_PUNCHING, "");
+					o->peer(o->arg, 0, SESSION_PEER_PUNCHING, "");
 					s.peer_state = SESSION_PEER_PUNCHING;
 				}
 				st = ST_WAIT_ICE;
@@ -1785,7 +1810,7 @@ int session_run(const struct session_cfg *cfg)
 							 sizeof(s.c.status_peer),
 							 "%s", s.direct_addr);
 					if (o && o->peer)
-						o->peer(o->arg,
+						o->peer(o->arg, 0,
 							SESSION_PEER_LIVE,
 							s.c.status_peer);
 					s.peer_state = SESSION_PEER_LIVE;
@@ -1819,7 +1844,8 @@ int session_run(const struct session_cfg *cfg)
 			 * stack a stale peer over the real one. */
 			if (cfg->is_host && o && o->peer &&
 			    s.peer_state >= SESSION_PEER_LIVE) {
-				o->peer(o->arg, SESSION_PEER_GONE, s.c.status_peer);
+				o->peer(o->arg, 0, SESSION_PEER_GONE,
+					s.c.status_peer);
 				s.peer_state = SESSION_PEER_SEEN;
 			}
 			if (r == 0) {
