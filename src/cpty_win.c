@@ -367,9 +367,14 @@ int cpty_close(struct cpty *p)
 		p->h_write = NULL;
 	}
 	if (p->have_in) {
-		/* Parked in recv() on the bridge end; closing the caller's end
-		 * is not enough, shut this one down explicitly. */
-		sock_shutdown(p->br_in, SHUT_RDWR);
+		/*
+		 * Parked in recv() on the bridge end; closing the caller's end
+		 * is not enough, and shutdown() here does not reliably wake a
+		 * blocking recv() on another thread on Windows -- closesocket()
+		 * does.
+		 */
+		sock_close(p->br_in);
+		p->br_in = INVALID_SOCK;
 		pthread_join(p->th_in, NULL);
 	}
 	if (p->have_out)

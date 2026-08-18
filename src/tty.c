@@ -219,26 +219,24 @@ sock_t tty_sock_err(void)
 	return pump_start(&p_err, 2, pump_out_fn);
 }
 
+/*
+ * Stops and releases an output pump (p_out/p_err). p_in is never stopped
+ * here: it is parked in a blocking console read that nothing can interrupt,
+ * so once started it is a process-lifetime singleton, reused as-is across
+ * repeated tty_sock_in() calls (a host that returns to its dashboard after a
+ * detach calls it again) -- tearing it down and starting a second reader on
+ * the same console would race the first for every keystroke.
+ */
 static void pump_stop(struct pump *p)
 {
 	if (!p->running)
 		return;
 	p->stop = 1;
-	/*
-	 * The input thread is parked in a blocking console read that nothing
-	 * can interrupt, so it is detached rather than joined: it exits when
-	 * the process does. The output threads unblock as soon as their socket
-	 * closes, so those do join.
-	 */
-	if (p == &p_in) {
-		pthread_detach(p->th);
-	} else {
-		sock_shutdown(p->pump, SHUT_RDWR);
-		pthread_join(p->th, NULL);
-	}
+	/* shutdown() does not reliably wake a blocking recv() on another
+	 * thread here; closesocket() does. */
+	sock_close(p->pump);
+	pthread_join(p->th, NULL);
 	sock_close(p->app);
-	if (p != &p_in)
-		sock_close(p->pump);
 	p->app = p->pump = INVALID_SOCK;
 	p->running = 0;
 }
@@ -247,7 +245,6 @@ void tty_sock_release(void)
 {
 	pump_stop(&p_out);
 	pump_stop(&p_err);
-	pump_stop(&p_in);
 }
 
 #else /* !_WIN32 */
