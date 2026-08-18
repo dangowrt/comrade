@@ -452,22 +452,37 @@ int sshc_connect_fd(sock_t fd, const struct sshc_opts *o)
 		goto out;
 	ssh_options_set(s, SSH_OPTIONS_HOST, host);
 	ssh_options_set(s, SSH_OPTIONS_FD, &sock);
+	if (o->connect_timeout_s > 0) {
+		long tov = (long)o->connect_timeout_s;
+
+		ssh_options_set(s, SSH_OPTIONS_TIMEOUT, &tov);
+	}
+	dbg_logf("sshc: ssh_connect starting");
 	if (ssh_connect(s) != SSH_OK) {
+		dbg_logf("sshc: ssh_connect failed: %s", ssh_get_error(s));
 		fprintf(stderr, "comrade: ssh_connect: %s\n", ssh_get_error(s));
 		goto out;
 	}
+	dbg_logf("sshc: ssh_connect ok, pin_hostkey");
 	if (pin_hostkey(s, o->host_fp)) {
+		dbg_logf("sshc: pin_hostkey mismatch");
 		fprintf(stderr, "comrade: host key mismatch, refusing to connect\n");
 		goto out;
 	}
+	dbg_logf("sshc: pin_hostkey ok, userauth");
 	if (ssh_userauth_password(s, NULL, password) != SSH_AUTH_SUCCESS) {
+		dbg_logf("sshc: userauth failed: %s", ssh_get_error(s));
 		fprintf(stderr, "comrade: authentication failed\n");
 		goto out;
 	}
+	dbg_logf("sshc: userauth ok, channel open");
 
 	chan = ssh_channel_new(s);
-	if (!chan || ssh_channel_open_session(chan) != SSH_OK)
+	if (!chan || ssh_channel_open_session(chan) != SSH_OK) {
+		dbg_logf("sshc: channel open failed: %s", ssh_get_error(s));
 		goto out;
+	}
+	dbg_logf("sshc: channel open ok");
 	if (o->interactive) {
 		const char *term = getenv("TERM");
 		int reserve, prows, rows, cols;

@@ -152,6 +152,7 @@ struct conn {
 	pthread_mutex_t hb_lock;
 	uint64_t hb_last_pong;		/* when a pong last came back */
 	int hb_rtt;			/* round trip from the last pong, ms */
+	int hb_pong_seen;		/* a pong has ever come back on this conn */
 	uint64_t lost_since_ms;		/* when the link was first seen lost, 0 if live */
 
 	/* The peer's rendezvous announcement, handed from the ctl reader to the
@@ -792,6 +793,7 @@ static void ctl_dispatch(void *arg, int type, const uint8_t *pl, size_t plen)
 		pthread_mutex_lock(&c->hb_lock);
 		c->hb_last_pong = now;
 		c->hb_rtt = (int)(now - ctl_get_u64(pl));
+		c->hb_pong_seen = 1;
 		pthread_mutex_unlock(&c->hb_lock);
 	} else if (type == CTLM_RDV && plen >= CTL_RDV_PLEN) {
 		struct sockaddr_storage sa;
@@ -1173,6 +1175,7 @@ static void *ssh_cli_thread(void *p)
 	memcpy(o.auth, s->auth, sizeof(o.auth));
 	o.interactive = s->cfg->interactive;
 	o.read_only = (s->cfg->tok.flags & TOKEN_FLAG_RO) != 0;
+	o.connect_timeout_s = s->cfg->connect_timeout_s;
 	o.ctl_fd = c->ssh_ctl_fd;
 	o.fwd_l = s->cfg->fwd_l;
 	o.nfwd_l = s->cfg->nfwd_l;
@@ -1289,7 +1292,7 @@ static int conn_run(struct conn *c, int drive_sig)
 	pthread_t th;
 	sock_t sp[2], cp[2];
 	int done = 0;
-	uint64_t next_hb;
+	uint64_t next_hb, conn_start;
 
 	/* Both pairs must be sockets, not pipes: they are polled in the same
 	 * set as the transport, and WSAPoll takes nothing else (see wsock.h). */
@@ -1315,8 +1318,11 @@ static int conn_run(struct conn *c, int drive_sig)
 	c->ssh_ctl_fd = cp[1];
 	c->ctl_fd = cp[0];
 	c->ctl_rf.len = 0;
+	dbg_logf("conn_run: sock_pair ok sp=%d/%d cp=%d/%d, starting ssh thread",
+		 (int)sp[0], (int)sp[1], (int)cp[0], (int)cp[1]);
 	if (pthread_create(&th, NULL,
 			   s->cfg->is_host ? ssh_srv_thread : ssh_cli_thread, c)) {
+		dbg_logf("conn_run: pthread_create failed");
 		sock_close(sp[0]);
 		sock_close(sp[1]);
 		sock_close(cp[0]);
@@ -1332,9 +1338,11 @@ static int conn_run(struct conn *c, int drive_sig)
 	/* The path is up on entry, so start the liveness clock as alive. */
 	pthread_mutex_lock(&c->hb_lock);
 	c->hb_last_pong = now_ms();
+	c->hb_pong_seen = 0;
 	c->lost_since_ms = 0;
 	pthread_mutex_unlock(&c->hb_lock);
 	next_hb = now_ms();
+	conn_start = now_ms();
 
 	if (drive_sig) {
 		/* Capture a rendezvous node per family for reconnection (the host
@@ -1396,15 +1404,18 @@ static int conn_run(struct conn *c, int drive_sig)
 			rdv_maintain(c);
 		if (now_ms() >= c->next_status_ms) {
 			uint64_t now = now_ms(), lp;
-			int state;
+			int state, pong_seen;
 
 			pthread_mutex_lock(&c->hb_lock);
 			lp = c->hb_last_pong;
-			if (now - lp > HB_LOST_MS) {
-				if (!c->lost_since_ms)
-					c->lost_since_ms = now;
-			} else {
-				c->lost_since_ms = 0;
+			pong_seen = c->hb_pong_seen;
+			if (pong_seen) {
+				if (now - lp > HB_LOST_MS) {
+					if (!c->lost_since_ms)
+						c->lost_since_ms = now;
+				} else {
+					c->lost_since_ms = 0;
+				}
 			}
 			state = c->lost_since_ms ? CONN_LOST : CONN_LIVE;
 			pthread_mutex_unlock(&c->hb_lock);
@@ -1417,10 +1428,26 @@ static int conn_run(struct conn *c, int drive_sig)
 			 * This holds for both the worker (drive_sig 0) and the
 			 * single-connection host (drive_sig 1); only the client
 			 * (never is_host) stays up on loss, showing the outage
-			 * and letting the user quit or roam. */
-			if (s->cfg->is_host && c->lost_since_ms &&
-			    now - c->lost_since_ms > HOST_REAP_MS)
-				done = 1;
+			 * and letting the user quit or roam. Before the first pong,
+			 * the comrade-ctl channel may still be mid-handshake, so
+			 * silence is bounded by connect_timeout_s instead of the
+			 * tighter heartbeat-loss window. */
+			if (s->cfg->is_host) {
+				if (pong_seen && c->lost_since_ms &&
+				    now - c->lost_since_ms > HOST_REAP_MS)
+					done = 1;
+				else if (!pong_seen && now - conn_start >
+					 (uint64_t)s->cfg->connect_timeout_s * 1000) {
+					done = 1;
+					if (s->cfg->obs && s->cfg->obs->escalate)
+						s->cfg->obs->escalate(
+							s->cfg->obs->arg,
+							"a peer connected but never "
+							"finished the handshake -- "
+							"check your firewall allows "
+							"comrade");
+				}
+			}
 		}
 	}
 
@@ -1912,16 +1939,18 @@ static void punch_scan(struct sess *s, struct worker *ws, struct conn **punching
 		if (!c)
 			continue;
 		if (!punch_stuck[i] && nat_connected(c->nat)) {
+			char loc[192], rem[192], addr[80];
+
 			snprintf(last_served_ufrag, 40, "%.39s", punch_ufrag[i]);
 			*have_served = 1;
-			dbg_logf("host: punch connected -> spawn worker");
+			addr[0] = '\0';
+			if (!nat_selected(c->nat, loc, sizeof(loc), rem,
+					  sizeof(rem))) {
+				cand_addr(rem, addr, sizeof(addr));
+				dbg_logf("host: punch connected -> spawn worker "
+					 "loc=[%s] rem=[%s]", loc, rem);
+			}
 			if (o && o->peer) {
-				char loc[192], rem[192], addr[80];
-
-				addr[0] = '\0';
-				if (!nat_selected(c->nat, loc, sizeof(loc), rem,
-						  sizeof(rem)))
-					cand_addr(rem, addr, sizeof(addr));
 				/* SEEN opens this client's row, LIVE marks it up;
 				 * dash_id keys the row for updates and GONE. */
 				c->dash_id = ++*dash_seq;
@@ -2482,9 +2511,13 @@ int session_run(const struct session_cfg *cfg)
 					s.c.status_peer[0] = '\0';
 					if (nat_connected(s.c.nat) &&
 					    !nat_selected(s.c.nat, loc, sizeof(loc),
-							  rem, sizeof(rem)))
+							  rem, sizeof(rem))) {
+						dbg_logf("client: ice connected "
+							 "loc=[%s] rem=[%s]",
+							 loc, rem);
 						cand_addr(rem, s.c.status_peer,
 							  sizeof(s.c.status_peer));
+					}
 					else if (s.c.direct_addr[0])
 						snprintf(s.c.status_peer,
 							 sizeof(s.c.status_peer),

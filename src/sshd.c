@@ -424,6 +424,7 @@ int sshd_serve_fd(sock_t fd, const struct sshd_opts *o)
 
 	if (!o || !o->hostkey)
 		return -1;
+	dbg_logf("sshd_serve_fd: entered");
 	if (!base64url_encode(o->auth, TOKEN_AUTH_LEN, password, sizeof(password)))
 		return -1;
 	password_ro[0] = '\0';
@@ -445,18 +446,32 @@ int sshd_serve_fd(sock_t fd, const struct sshd_opts *o)
 	if (ssh_bind_accept_fd(bind, s, fd) != SSH_OK)
 		goto out;
 	gave_fd = 1;
-	if (ssh_handle_key_exchange(s) != SSH_OK)
+	dbg_logf("sshd: accept_fd ok, key exchange starting");
+	if (ssh_handle_key_exchange(s) != SSH_OK) {
+		dbg_logf("sshd: key exchange failed: %s", ssh_get_error(s));
 		goto out;
-	if (do_auth(s, password, o->have_ro ? password_ro : NULL, &read_only))
+	}
+	dbg_logf("sshd: key exchange ok, auth starting");
+	if (do_auth(s, password, o->have_ro ? password_ro : NULL, &read_only)) {
+		dbg_logf("sshd: auth failed/aborted");
 		goto out;
+	}
 	if (o->ro_out)
 		*o->ro_out = read_only;
+	dbg_logf("sshd: auth ok (read_only=%d), channel open", read_only);
 	chan = do_channel(s);
-	if (!chan)
+	if (!chan) {
+		dbg_logf("sshd: channel open failed/aborted");
 		goto out;
+	}
+	dbg_logf("sshd: channel open ok, shell request");
 	term[0] = '\0';
-	if (do_shell_request(s, &want_pty, &rows, &cols, term, sizeof(term)))
+	if (do_shell_request(s, &want_pty, &rows, &cols, term, sizeof(term))) {
+		dbg_logf("sshd: shell request failed/aborted");
 		goto out;
+	}
+	dbg_logf("sshd: shell request ok want_pty=%d rows=%d cols=%d term=%s",
+		 want_pty, rows, cols, term);
 
 	/* Size the terminal from the client's request so the remote command
 	 * (tmux) uses exactly the rows it asked for. The client reserves its own
@@ -464,8 +479,11 @@ int sshd_serve_fd(sock_t fd, const struct sshd_opts *o)
 	 * what keeps tmux off that row. */
 	cmd = (read_only && o->command_ro) ? o->command_ro : o->command;
 	child = cpty_spawn(cmd, o->use_pty || want_pty, rows, cols, term);
-	if (!child)
+	if (!child) {
+		dbg_logf("sshd: cpty_spawn failed");
 		goto out;
+	}
+	dbg_logf("sshd: cpty_spawn ok, entering pump");
 
 	/* Live resizes arrive as window-change requests; the pump applies them
 	 * to the pty. A second channel requesting the comrade-ctl subsystem is

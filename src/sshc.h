@@ -27,6 +27,7 @@ struct sshc_opts {
 	uint8_t auth[TOKEN_AUTH_LEN];	/* session password material */
 
 	int interactive;		/* bridge local stdin/stdout raw */
+	int connect_timeout_s;		/* SSH_OPTIONS_TIMEOUT; 0 = libssh default */
 
 	/*
 	 * View-only grade (the token carried TOKEN_FLAG_RO). Keystrokes never
