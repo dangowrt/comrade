@@ -107,7 +107,10 @@ struct sig *sig_create(const uint8_t rdv[TOKEN_RDV_LEN], unsigned flags,
 
 	if (!s)
 		return NULL;
-	keys_derive(&s->keys, rdv);
+	if (keys_derive(&s->keys, rdv)) {
+		free(s);
+		return NULL;
+	}
 	s->flags = flags;
 	s->is_host = is_host;
 	mailbox_init(&s->mb, is_host);

@@ -4,9 +4,7 @@
 #include <string.h>
 #include <sys/random.h>
 
-#include <monocypher.h>
-#include <monocypher-ed25519.h>
-
+#include "ccrypto.h"
 #include "keys.h"
 
 int random_bytes(void *buf, size_t len)
@@ -24,18 +22,18 @@ int random_bytes(void *buf, size_t len)
 	return 0;
 }
 
-void keys_derive(struct session_keys *keys, const uint8_t rdv[TOKEN_RDV_LEN])
+int keys_derive(struct session_keys *keys, const uint8_t rdv[TOKEN_RDV_LEN])
 {
 	static const char sig_info[] = "comrade1 sig key";
 	static const char seed_info[] = "comrade1 bep44 seed";
 	uint8_t seed[32];
 
-	crypto_blake2b_keyed(keys->sig_key, sizeof(keys->sig_key),
-			     rdv, TOKEN_RDV_LEN,
-			     (const uint8_t *)sig_info, sizeof(sig_info) - 1);
-	crypto_blake2b_keyed(seed, sizeof(seed), rdv, TOKEN_RDV_LEN,
-			     (const uint8_t *)seed_info, sizeof(seed_info) - 1);
-	crypto_ed25519_key_pair(keys->bep44_sk, keys->bep44_pk, seed);
+	cc_blake2b_keyed(keys->sig_key, sizeof(keys->sig_key),
+			 rdv, TOKEN_RDV_LEN,
+			 (const uint8_t *)sig_info, sizeof(sig_info) - 1);
+	cc_blake2b_keyed(seed, sizeof(seed), rdv, TOKEN_RDV_LEN,
+			 (const uint8_t *)seed_info, sizeof(seed_info) - 1);
+	return cc_ed25519_key_pair(keys->bep44_sk, keys->bep44_pk, seed);
 }
 
 int msg_seal(uint8_t *dst, size_t dst_len, const uint8_t key[32],
@@ -45,8 +43,9 @@ int msg_seal(uint8_t *dst, size_t dst_len, const uint8_t key[32],
 		return -1;
 	if (random_bytes(dst, 24))
 		return -1;
-	crypto_aead_lock(dst + 40, dst + 24, key, dst, NULL, 0,
-			 plain, plain_len);
+	if (cc_aead_lock(dst + 40, dst + 24, key, dst, NULL, 0,
+			 plain, plain_len))
+		return -1;
 	return (int)(plain_len + SEAL_OVERHEAD);
 }
 
@@ -60,8 +59,8 @@ int msg_open(uint8_t *dst, size_t dst_len, const uint8_t key[32],
 	plain_len = sealed_len - SEAL_OVERHEAD;
 	if (dst_len < plain_len)
 		return -1;
-	if (crypto_aead_unlock(dst, sealed + 24, key, sealed, NULL, 0,
-			       sealed + 40, plain_len))
+	if (cc_aead_unlock(dst, sealed + 24, key, sealed, NULL, 0,
+			   sealed + 40, plain_len))
 		return -1;
 	return (int)plain_len;
 }

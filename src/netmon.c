@@ -8,7 +8,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 
-#include <monocypher.h>
+#include "ccrypto.h"
 
 #include "netmon.h"
 
@@ -69,19 +69,27 @@ size_t netmon_snapshot(struct netmon_addr *out, size_t max)
 	return n;
 }
 
+/* The fingerprint is process-local roam state, never persisted or sent, so
+ * it need not be stable across builds or backends (and with the OpenSSL
+ * backend it is truncated BLAKE2b-512, not BLAKE2b-256). Keep it that way:
+ * putting it on the wire or on disk would turn the backend choice into an
+ * interop break. */
 void netmon_fingerprint(uint8_t fp[32], struct netmon_addr *addrs, size_t n)
 {
-	crypto_blake2b_ctx ctx;
+	struct cc_blake2b ctx;
 	size_t i;
 
 	qsort(addrs, n, sizeof(*addrs), addr_cmp);
-	crypto_blake2b_init(&ctx, 32);
-	for (i = 0; i < n; i++) {
-		crypto_blake2b_update(&ctx, (const uint8_t *)addrs[i].ifname,
-				      sizeof(addrs[i].ifname));
-		crypto_blake2b_update(&ctx, &addrs[i].addr[0], addrs[i].addrlen);
+	if (cc_blake2b_init(&ctx, 32)) {
+		memset(fp, 0, 32);
+		return;
 	}
-	crypto_blake2b_final(&ctx, fp);
+	for (i = 0; i < n; i++) {
+		cc_blake2b_update(&ctx, (const uint8_t *)addrs[i].ifname,
+				  sizeof(addrs[i].ifname));
+		cc_blake2b_update(&ctx, &addrs[i].addr[0], addrs[i].addrlen);
+	}
+	cc_blake2b_final(&ctx, fp);
 }
 
 void netmon_init(struct netmon *m)

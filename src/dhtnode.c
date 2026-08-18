@@ -12,7 +12,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 
-#include <monocypher.h>
+#include "ccrypto.h"
 
 #include "appdir.h"
 #include "dht.h"
@@ -629,15 +629,18 @@ void dht_hash(void *hash_return, int hash_size,
 	      const void *v2, int len2,
 	      const void *v3, int len3)
 {
-	crypto_blake2b_ctx ctx;
+	struct cc_blake2b ctx;
 	uint8_t out[64];
 	size_t want = hash_size > 64 ? 64 : (size_t)hash_size;
 
-	crypto_blake2b_init(&ctx, 64);
-	crypto_blake2b_update(&ctx, v1, (size_t)len1);
-	crypto_blake2b_update(&ctx, v2, (size_t)len2);
-	crypto_blake2b_update(&ctx, v3, (size_t)len3);
-	crypto_blake2b_final(&ctx, out);
+	if (cc_blake2b_init(&ctx, 64)) {
+		memset(hash_return, 0, (size_t)hash_size);
+		return;
+	}
+	cc_blake2b_update(&ctx, v1, (size_t)len1);
+	cc_blake2b_update(&ctx, v2, (size_t)len2);
+	cc_blake2b_update(&ctx, v3, (size_t)len3);
+	cc_blake2b_final(&ctx, out);
 
 	memcpy(hash_return, out, want);
 	if ((size_t)hash_size > want)

@@ -16,10 +16,9 @@ static int debug_on(void)
 	return b44_debug;
 }
 
-#include <monocypher-ed25519.h>
-
 #include "bencode.h"
 #include "bep44.h"
+#include "ccrypto.h"
 #include "sha1.h"
 
 /*
@@ -411,7 +410,10 @@ static int put_send(struct b44_op *op, int node)
 		req->in_use = 0;
 		return -1;
 	}
-	crypto_ed25519_sign(sig, op->sk, sigbuf, sigbuf_len);
+	if (cc_ed25519_sign(sig, op->sk, sigbuf, sigbuf_len)) {
+		req->in_use = 0;
+		return -1;
+	}
 
 	benc_buf_init(&b, msg, sizeof(msg));
 	benc_raw_add(&b, "d1:ad", 5);
@@ -771,7 +773,7 @@ static void value_check(struct b44_op *op, const struct sockaddr *from,
 
 	sigbuf_len = bep44_sig_buffer(sigbuf, sizeof(sigbuf), op->salt, seq,
 				      v, v_len);
-	if (!sigbuf_len || crypto_ed25519_check(sig, op->pk, sigbuf, sigbuf_len))
+	if (!sigbuf_len || cc_ed25519_check(sig, op->pk, sigbuf, sigbuf_len))
 		return;
 
 	if (op->have_best && seq <= op->best_seq) {
