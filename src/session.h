@@ -68,6 +68,9 @@ struct session_obs {
 	 * host addresses each attached client's row independently (and can update
 	 * its address as ICE re-nominates); the single-connection client uses 0. */
 	void (*peer)(void *arg, int id, int state, const char *addr);
+	/* The peer identified by `id` authenticated read-only (view-only guest);
+	 * fired once, after its row exists, so the dashboard can mark it. */
+	void (*peer_ro)(void *arg, int id);
 	/* The connection context was torn down and is being rebuilt (a roam or
 	 * reconnect): drop stale local candidates, the peer, and the "link up"
 	 * state, so the dashboard reflects the fresh attempt rather than the

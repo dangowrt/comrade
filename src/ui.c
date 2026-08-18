@@ -49,7 +49,7 @@ static void ui_on_signal(int n) { (void)n; ui_abort_flag = 1; }
 struct netrow { int family; int scope; int via; char addr[80]; };
 struct linkrow { char name[32]; int has4, has6; };
 struct rdvrow { int family; int ready; char addr[80]; };
-struct peerrow { int id; int state; char addr[80]; };
+struct peerrow { int id; int state; int read_only; char addr[80]; };
 
 struct ui {
 	int role;
@@ -335,9 +335,10 @@ static void draw(struct ui *u)
 					 p->state == SESSION_PEER_PUNCHING ?
 					 YEL "punching" RST : CYN "seen    " RST;
 
-			line("  " BGR "#%d" RST " %s  " CYN "%s" RST,
+			line("  " BGR "#%d" RST " %s  " CYN "%s" RST "%s",
 			     i + 1, st, p->addr[0] && p->addr[0] != '-' ?
-			     p->addr : "");
+			     p->addr : "",
+			     p->read_only ? "  " YEL "view-only" RST : "");
 		}
 		line("");
 		line(DIM "[ " BYE "ENTER" DIM " / " BYE "SPACE" DIM
@@ -571,11 +572,29 @@ static void um_peer(struct ui *u, int id, int state, const char *addr)
 		at = u->npeer++;
 		u->peer[at].id = id;
 		u->peer[at].addr[0] = '\0';
+		u->peer[at].read_only = 0;
 	}
 	u->peer[at].state = state;
 	if (have_addr)
 		snprintf(u->peer[at].addr, sizeof(u->peer[at].addr), "%s", addr);
 	u->dirty = 1;
+}
+
+/* Mark an existing peer row as a view-only guest (host dashboard). */
+static void um_peer_ro(struct ui *u, int id)
+{
+	int i;
+
+	if (!u->anim) {
+		vlog(u, "peer   %d read-only", id);
+		return;
+	}
+	for (i = 0; i < u->npeer; i++)
+		if (u->peer[i].id == id) {
+			u->peer[i].read_only = 1;
+			u->dirty = 1;
+			return;
+		}
 }
 
 static void um_escalate(struct ui *u, const char *why)
@@ -635,6 +654,7 @@ static void cb_rdv_stage(void *a, int f, int st) { um_rdv_stage(a, f, st); }
 static void cb_token(void *a, const char *t) { um_token(a, t); }
 static void cb_token_ro(void *a, const char *t) { um_token_ro(a, t); }
 static void cb_peer(void *a, int id, int s, const char *ad) { um_peer(a, id, s, ad); }
+static void cb_peer_ro(void *a, int id) { um_peer_ro(a, id); }
 static void cb_reset(void *a) { um_reset(a); }
 static void cb_net_reset(void *a) { um_net_reset(a); }
 static void cb_esc(void *a, const char *w) { um_escalate(a, w); }
@@ -676,6 +696,7 @@ void ui_bind(struct ui *u, struct session_obs *obs)
 	obs->token = cb_token;
 	obs->token_ro = cb_token_ro;
 	obs->peer = cb_peer;
+	obs->peer_ro = cb_peer_ro;
 	obs->reset = cb_reset;
 	obs->net_reset = cb_net_reset;
 	obs->escalate = cb_esc;
@@ -735,6 +756,10 @@ static void em_peer(void *a, int id, int s, const char *ad)
 {
 	emitf(a, "P %d %d %s\n", id, s, ad && ad[0] ? ad : "-");
 }
+static void em_peer_ro(void *a, int id)
+{
+	emitf(a, "O %d\n", id);
+}
 static void em_reset(void *a)
 {
 	emitf(a, "X\n");
@@ -768,6 +793,7 @@ void ui_emitter(struct session_obs *obs, sock_t fd)
 	obs->token = em_token;
 	obs->token_ro = em_token_ro;
 	obs->peer = em_peer;
+	obs->peer_ro = em_peer_ro;
 	obs->reset = em_reset;
 	obs->net_reset = em_net_reset;
 	obs->escalate = em_esc;
@@ -833,6 +859,10 @@ static void feed(struct ui *u, char *ln)
 		s[0] = '\0';
 		if (sscanf(ln + 1, "%d %d %79[^\n]", &a, &b, s) >= 2)
 			um_peer(u, a, b, s);
+		break;
+	case 'O':
+		if (sscanf(ln + 1, "%d", &a) == 1)
+			um_peer_ro(u, a);
 		break;
 	case 'E':
 		if (sscanf(ln + 1, " %159[^\n]", s) == 1)

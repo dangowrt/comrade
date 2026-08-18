@@ -61,6 +61,13 @@ struct sshd_opts {
 	 * a host operator opts out with --no-forwarding.
 	 */
 	int no_fwd;
+	/*
+	 * Optional out-parameter for the read-only grade. Only the auth exchange
+	 * knows which secret a client presented, so when non-NULL this is set to
+	 * 1/0 once the client has authenticated, letting the controller mark that
+	 * worker read-only in the view. Read from another thread, so volatile.
+	 */
+	volatile int *ro_out;
 };
 
 /*

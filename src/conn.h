@@ -27,6 +27,7 @@ struct conn_status {
 	char rdv6[80];			/* IPv6 rendezvous node, "" if none */
 	int rtt_ms;			/* smoothed RTT, 0 if unknown */
 	int since_s;			/* seconds in the current state (loss age) */
+	int read_only;			/* this side is a view-only guest */
 };
 
 /* Serialise/parse to a tmpfs file. Return 0 on success, -1 on failure. */

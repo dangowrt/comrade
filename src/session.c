@@ -167,6 +167,12 @@ struct conn {
 	char status_peer[80];		/* address of the chosen pair, once live */
 	int dash_id;			/* this connection's dashboard peer-row id */
 	uint64_t next_status_ms;
+
+	/* Read-only grade (host): the ssh thread sets it once the client has
+	 * authenticated (which secret it used), the main loop reports it to the
+	 * dashboard once. Written from the ssh thread, so volatile like done. */
+	volatile int read_only;
+	int ro_reported;		/* main-thread only: sent to the view yet */
 };
 
 struct sess {
@@ -443,6 +449,11 @@ static void publish_status(struct conn *c, int state)
 
 	memset(&cs, 0, sizeof(cs));
 	cs.state = state;
+	/* A view-only client marks its own status line; the host's operator is
+	 * never view-only, so its status line (this same struct, via the tmpfs
+	 * file) leaves it clear and marks read-only guests on the dashboard. */
+	cs.read_only = !s->cfg->is_host &&
+		       (s->cfg->tok.flags & TOKEN_FLAG_RO) != 0;
 	/* Show the endpoint that is actually carrying KCP right now: the
 	 * link-local direct peer when that path is up (it is preferred in
 	 * transport_send), otherwise the selected -- proven -- ICE pair. Never a
@@ -1146,6 +1157,7 @@ static void *ssh_srv_thread(void *p)
 	o.end_fd = s->cfg->ssh_end_fd;
 	o.ctl_fd = c->ssh_ctl_fd;
 	o.no_fwd = s->cfg->no_fwd;
+	o.ro_out = &c->read_only;
 	sshd_serve_fd(c->ssh_fd, &o);
 	return NULL;
 }
@@ -2056,6 +2068,13 @@ static int host_turnstile(struct sess *s)
 					o->peer(o->arg, ws[i].c->dash_id,
 						SESSION_PEER_LIVE, cur);
 				}
+			}
+			/* The ssh thread learns the grade a beat after the row
+			 * appears (it is decided at auth); mark it once known. */
+			if (o && o->peer_ro && ws[i].c->read_only &&
+			    !ws[i].c->ro_reported) {
+				ws[i].c->ro_reported = 1;
+				o->peer_ro(o->arg, ws[i].c->dash_id);
 			}
 		}
 

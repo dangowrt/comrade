@@ -49,8 +49,11 @@ void statusbar_render(int rows, int cols, const struct conn_status *st)
 	if (rows < 1 || w < 1)
 		return;
 
-	/* Data -> display text (ASCII, so the width maths below stay simple). */
-	p = snprintf(text, sizeof(text), "comrade  %s", state_word(st->state));
+	/* Data -> display text (ASCII, so the width maths below stay simple). The
+	 * view-only badge sits right after the name so it survives truncation on a
+	 * narrow terminal. */
+	p = snprintf(text, sizeof(text), "comrade%s  %s",
+		     st->read_only ? " [view-only]" : "", state_word(st->state));
 	if (p > 0 && p < (int)sizeof(text) && st->since_s > 0 &&
 	    st->state == CONN_LOST)
 		p += snprintf(text + p, sizeof(text) - p, " %ds", st->since_s);

@@ -449,6 +449,8 @@ int sshd_serve_fd(sock_t fd, const struct sshd_opts *o)
 		goto out;
 	if (do_auth(s, password, o->have_ro ? password_ro : NULL, &read_only))
 		goto out;
+	if (o->ro_out)
+		*o->ro_out = read_only;
 	chan = do_channel(s);
 	if (!chan)
 		goto out;

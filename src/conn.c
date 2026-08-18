@@ -19,9 +19,10 @@ int conn_write(const char *path, const struct conn_status *st)
 	f = fopen(tmp, "w");
 	if (!f)
 		return -1;
-	fprintf(f, "%d\t%s\t%s\t%d\t%d\t%s\n", st->state,
+	fprintf(f, "%d\t%s\t%s\t%d\t%d\t%s\t%d\n", st->state,
 		st->peer[0] ? st->peer : "-", st->rdv[0] ? st->rdv : "-",
-		st->rtt_ms, st->since_s, st->rdv6[0] ? st->rdv6 : "-");
+		st->rtt_ms, st->since_s, st->rdv6[0] ? st->rdv6 : "-",
+		st->read_only);
 	fclose(f);
 	if (os_rename_replace(tmp, path)) {
 		remove(tmp);
@@ -69,6 +70,9 @@ int conn_read(const char *path, struct conn_status *st)
 		case 5:
 			if (strcmp(tok, "-"))
 				snprintf(st->rdv6, sizeof(st->rdv6), "%s", tok);
+			break;
+		case 6:
+			st->read_only = atoi(tok);
 			break;
 		default:
 			break;
