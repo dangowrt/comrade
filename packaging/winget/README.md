@@ -23,9 +23,9 @@ real terminal offers to run) that exact command.
 ## How the manifest is produced
 
 The three YAML files here are templates. The Windows release CI, after building
-`comrade-x64.exe` and `comrade-arm64.exe` and attaching them to a GitHub
+`comrade-x64.exe` and `comrade-arm64.exe` and attaching them to the tagged GitHub
 release, fills the placeholders (`@VERSION@`, `@TAG@`, `@DATE@`, the two
-`@SHA256_*@`) and submits the result.
+`@SHA256_*@`), producing the manifest ready for submission.
 
 - `dangowrt.comrade.yaml` — version manifest
 - `dangowrt.comrade.installer.yaml` — the two per-arch portable installers
@@ -35,7 +35,7 @@ release, fills the placeholders (`@VERSION@`, `@TAG@`, `@DATE@`, the two
 
 The public `microsoft/winget-pkgs` community repository validates a manifest by
 downloading its `InstallerUrl`, so the release assets (and thus the repository)
-must be **public** before submission, the same gate as the OpenWrt feed and the
-public apt repository. Until then the manifest is generated and kept current by
-CI so a submission is a single step once comrade goes public. A private winget
-source can consume the same manifest in the meantime.
+must be **public** -- which they now are. The CI keeps the manifest current for
+each tagged release; submitting it to `winget-pkgs` (so `winget install
+dangowrt.comrade` resolves for everyone) is the remaining one-off step. A private
+winget source can consume the same manifest directly.

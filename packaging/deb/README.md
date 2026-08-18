@@ -1,6 +1,6 @@
-# comrade rolling-release apt channel
+# comrade apt channel
 
-A signed apt repository, rebuilt from `main` and published to GitHub Pages, so
+A signed apt repository, built for each tagged release and published to GitHub Pages, so
 Debian and Ubuntu users install comrade and receive updates through their
 package manager like any other source. No `curl | bash`, no self-updating
 binary: provenance, dependency resolution and security updates stay where they
@@ -36,7 +36,7 @@ into apt's trusted-keyring directory and pinned to this source alone with
     sudo apt-get install comrade
 
 Use `testing` in place of `stable` on a Debian testing system. `apt-get upgrade`
-then tracks the rolling release; `unattended-upgrades` keeps it current
+then pulls each new tagged release; `unattended-upgrades` keeps it current
 automatically once you allow the `comrade:stable` origin.
 
 ## Coverage

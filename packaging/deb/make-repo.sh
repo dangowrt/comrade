@@ -23,8 +23,8 @@ GPG_KEY_ID="${GPG_KEY_ID:-}"
 GPG_PASSPHRASE="${GPG_PASSPHRASE:-}"
 
 ORIGIN="comrade"
-LABEL="comrade rolling"
-DESCRIPTION="comrade rolling-release packages"
+LABEL="comrade"
+DESCRIPTION="comrade release packages"
 
 command -v apt-ftparchive >/dev/null 2>&1 || {
 	export DEBIAN_FRONTEND=noninteractive

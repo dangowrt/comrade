@@ -198,10 +198,10 @@ The DHT sees the introduction, not the conversation. PROTOCOL.md carries the ful
 ## Installation
 
 Packaged for the systems below; to build from source instead, see
-Building. The apt and Homebrew channels are rolling releases rebuilt from
-`main`, so an ordinary `apt upgrade` or `brew upgrade` tracks the latest
-commit. Hosting a session needs tmux; joining one never does, so tmux is
-a recommendation you can leave out on a join-only machine.
+Building. Every channel tracks the tagged releases, so an ordinary
+`apt upgrade` or `brew upgrade` moves to the newest version. Hosting a
+session needs tmux; joining one never does, so tmux is a recommendation
+you can leave out on a join-only machine.
 
 ### Debian and Ubuntu
 
@@ -221,12 +221,12 @@ On a Debian testing system use `testing` in place of `stable`.
 
 ### macOS
 
-From the Homebrew tap. The formula tracks `main`, so it installs and updates
-from the newest commit:
+From the Homebrew tap. `brew install` fetches a prebuilt bottle for the latest
+release, and `brew upgrade` moves to the next one:
 
     brew tap dangowrt/comrade
-    brew install --HEAD comrade
-    brew upgrade --fetch-HEAD comrade
+    brew trust dangowrt/comrade   # Homebrew 4.3+ requires trusting a third-party tap
+    brew install comrade
 
 ### OpenWrt
 
@@ -258,7 +258,10 @@ carry. Run it without installing, or add it to a profile:
 
 ### Windows
 
-A single portable `comrade.exe` (x64 or arm64), no installer:
+A single portable `comrade.exe` (x64 or arm64), no installer. Download
+`comrade-x64.exe` or `comrade-arm64.exe` from the [latest
+release](https://github.com/dangowrt/comrade/releases/latest) and put it on
+`PATH` -- or, once the manifest is accepted into winget-pkgs:
 
     winget install dangowrt.comrade
 

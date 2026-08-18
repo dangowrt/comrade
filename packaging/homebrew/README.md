@@ -1,4 +1,4 @@
-# Homebrew tap (macOS rolling release)
+# Homebrew tap (macOS)
 
 This directory is the **dangowrt/comrade** Homebrew tap. It carries four
 formulae: `comrade` plus the three dependencies Homebrew core does not ship
@@ -16,24 +16,26 @@ linked with `-export_dynamic` so the shared libdht resolves them back at runtime
 
 ```
 brew tap dangowrt/comrade
-brew install --HEAD comrade   # hosting a session also needs: brew install tmux
-brew upgrade --fetch-HEAD comrade
+brew trust dangowrt/comrade   # Homebrew 4.3+ requires trusting a third-party tap
+brew install comrade          # hosting a session also needs: brew install tmux
 ```
 
-## Rolling updates
+## Updates
 
-comrade has no upstream tags yet, so the formula does not pin a revision: it is
-`head`-only and tracks the tip of `main` directly. `brew install --HEAD` builds
-the current commit, and `brew upgrade --fetch-HEAD` re-fetches main and rebuilds
-whenever it has moved. There is nothing to restamp; the build date comes from
-the commit itself (`SOURCE_DATE_EPOCH`, honoured by the CMake build), so a given
-commit always builds the same bytes.
+Each tagged release publishes a prebuilt **bottle** per macOS arch, and the CI
+pins this tap's `comrade` formula to that release: a stable `url` at the tag's
+commit plus the matching bottle block. So `brew install comrade` fetches a binary
+rather than compiling on the user's machine, and `brew upgrade` moves to the next
+release. `brew install --HEAD comrade` still builds the current tip of `main` for
+anyone who wants it; the build date comes from the commit itself
+(`SOURCE_DATE_EPOCH`, honoured by the CMake build), so a given commit always
+builds the same bytes.
 
-The `brew` CI job only keeps the tap repo **dangowrt/homebrew-comrade** in step
-with the formulae in this tree (for example when a dependency version is
-bumped), committing them under `Formula/`. It needs a token with write access to
-that repo, exposed as the `HOMEBREW_TAP_TOKEN` secret, the macOS counterpart of
-the apt repo's signing secret.
+The release CI builds the bottle and pushes the updated formulae to the tap repo
+**dangowrt/homebrew-comrade** under `Formula/` (also when a dependency version is
+bumped). It needs a token with write access to that repo, exposed as the
+`HOMEBREW_TAP_TOKEN` secret, the macOS counterpart of the apt repo's signing
+secret.
 
 ## Dependency formulae and pins
 

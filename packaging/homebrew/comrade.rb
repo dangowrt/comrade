@@ -1,11 +1,11 @@
 class Comrade < Formula
   desc "Serverless peer-to-peer terminal sharing over a punched p2p link"
   homepage "https://github.com/dangowrt/comrade"
-  # No upstream tags yet: rather than pin a commit that goes stale, build the
-  # current tip of main. `brew install --HEAD comrade` and `brew upgrade
-  # --fetch-HEAD comrade` always track the latest source, and the build date is
-  # taken from the checked-out commit (SOURCE_DATE_EPOCH, honoured by the CMake
-  # build) so the result is reproducible.
+  # The release CI stamps a stable `url` (the tagged commit) and a bottle block
+  # into this formula when it pushes the tap, so `brew install comrade` fetches a
+  # prebuilt bottle. `head` stays for `brew install --HEAD comrade`, which builds
+  # the current tip of main; the build date is taken from the checked-out commit
+  # (SOURCE_DATE_EPOCH, honoured by the CMake build) so the result is reproducible.
   head "https://github.com/dangowrt/comrade.git", branch: "main"
   license "AGPL-3.0-or-later"
 
@@ -19,9 +19,9 @@ class Comrade < Formula
   depends_on "openssl@3"
 
   def install
-    # Reproducible build date from the commit being built, not the clock. A
-    # --HEAD checkout has a .git to read; a release tarball does not, so the
-    # date is simply left to the CMake build's own fallback there.
+    # Reproducible build date from the commit being built, not the clock. Both
+    # the tagged (git url + revision) and --HEAD sources are git checkouts with a
+    # .git to read, so this applies to a release build too.
     if File.directory?(".git")
       epoch = Utils.safe_popen_read("git", "log", "-1", "--format=%ct").strip
       ENV["SOURCE_DATE_EPOCH"] = epoch unless epoch.empty?
