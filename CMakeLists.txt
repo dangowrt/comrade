@@ -33,12 +33,68 @@ find_package(kcp CONFIG QUIET)
 #
 # Crypto backend. Every primitive comrade needs is byte-identical across the
 # backends, so the choice is purely about which library is already on the
-# box -- ideally the one libssh itself uses, so comrade adds no second
-# crypto library.
+# box: by default follow libssh's own crypto backend, so comrade never pulls
+# in a second one. Override with -DCOMRADE_CRYPTO=<backend>.
 #
-set(COMRADE_CRYPTO "openssl" CACHE STRING
-	"Crypto backend: openssl, gcrypt or monocypher")
-set(COMRADE_CRYPTO_RESOLVED "${COMRADE_CRYPTO}")
+set(COMRADE_CRYPTO "auto" CACHE STRING
+	"Crypto backend: auto (follow libssh), openssl, gcrypt or monocypher")
+
+# Which crypto library is this libssh linked against? libssh exposes that
+# neither in its headers nor in its pkg-config file, so read the DT_NEEDED
+# names out of the library itself. file(STRINGS) needs no external tool and
+# works when cross-compiling, since it reads the target binary directly.
+function(comrade_detect_libssh_crypto out)
+	set(${out} "" PARENT_SCOPE)
+	find_library(COMRADE_LIBSSH_PATH NAMES ssh
+		HINTS ${LIBSSH_LIBRARY_DIRS} ${LIBSSH_LIBDIR})
+	if(NOT COMRADE_LIBSSH_PATH)
+		return()
+	endif()
+	file(STRINGS "${COMRADE_LIBSSH_PATH}" NEEDED
+		REGEX "^lib(crypto|gcrypt|mbedcrypto)\\.so" ENCODING UTF-8)
+	foreach(dep IN LISTS NEEDED)
+		if(dep MATCHES "^libcrypto")
+			set(${out} "openssl" PARENT_SCOPE)
+			return()
+		elseif(dep MATCHES "^libgcrypt")
+			set(${out} "gcrypt" PARENT_SCOPE)
+			return()
+		elseif(dep MATCHES "^libmbedcrypto")
+			set(${out} "mbedtls" PARENT_SCOPE)
+			return()
+		endif()
+	endforeach()
+endfunction()
+
+if(COMRADE_CRYPTO STREQUAL "auto")
+	comrade_detect_libssh_crypto(COMRADE_LIBSSH_CRYPTO)
+	if(COMRADE_LIBSSH_CRYPTO STREQUAL "mbedtls")
+		# mbedTLS implements neither BLAKE2b nor Ed25519, both of which are
+		# comrade wire formats, so it cannot back ccrypto on its own.
+		# Monocypher is the right partner here: ~70 KB and self-contained,
+		# where falling back to libcrypto or libgcrypt would pull in the
+		# megabytes a mbedTLS-based libssh was chosen to avoid.
+		set(COMRADE_CRYPTO_RESOLVED "monocypher")
+		set(COMRADE_CRYPTO_WHY "libssh uses mbedTLS, which has no BLAKE2b or Ed25519")
+	elseif(COMRADE_LIBSSH_CRYPTO)
+		set(COMRADE_CRYPTO_RESOLVED "${COMRADE_LIBSSH_CRYPTO}")
+		set(COMRADE_CRYPTO_WHY "follows libssh")
+	else()
+		set(COMRADE_CRYPTO_RESOLVED "openssl")
+		set(COMRADE_CRYPTO_WHY "libssh backend not detected, assuming OpenSSL")
+	endif()
+else()
+	set(COMRADE_CRYPTO_RESOLVED "${COMRADE_CRYPTO}")
+	set(COMRADE_CRYPTO_WHY "requested")
+endif()
+
+if(COMRADE_CRYPTO_RESOLVED STREQUAL "mbedtls")
+	message(FATAL_ERROR
+		"COMRADE_CRYPTO=mbedtls is not possible on its own: mbedTLS "
+		"implements neither BLAKE2b nor Ed25519, which comrade needs on the "
+		"wire. Use -DCOMRADE_CRYPTO=monocypher (small and self-contained) "
+		"alongside a mbedTLS-based libssh.")
+endif()
 
 if(COMRADE_CRYPTO_RESOLVED STREQUAL "monocypher")
 	pkg_check_modules(MONOCYPHER IMPORTED_TARGET monocypher)
@@ -61,10 +117,10 @@ elseif(COMRADE_CRYPTO_RESOLVED STREQUAL "gcrypt")
 		endif()
 	endif()
 else()
-	message(FATAL_ERROR "COMRADE_CRYPTO must be openssl, gcrypt or "
+	message(FATAL_ERROR "COMRADE_CRYPTO must be auto, openssl, gcrypt or "
 		"monocypher, not '${COMRADE_CRYPTO}'")
 endif()
-message(STATUS "Crypto backend: ${COMRADE_CRYPTO_RESOLVED}")
+message(STATUS "Crypto backend: ${COMRADE_CRYPTO_RESOLVED} (${COMRADE_CRYPTO_WHY})")
 
 set(COMRADE_DHT_DIR "" CACHE PATH "Directory containing dht.c and dht.h from jech/dht")
 
