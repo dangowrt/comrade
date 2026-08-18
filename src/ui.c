@@ -443,64 +443,64 @@ static void um_net(struct ui *u, int family, int scope, int via, const char *add
 {
 	int i;
 
-	if (!u->anim) {
-		vlog(u, "net    %s %-40s %s", family == 6 ? "ipv6" : "ipv4",
-		     addr, scope_word(scope, via));
-		return;
-	}
 	for (i = 0; i < u->nnet; i++)		/* de-dup trickled candidates */
 		if (u->net[i].family == family && u->net[i].via == via &&
 		    !strcmp(u->net[i].addr, addr))
 			return;
-	if (u->nnet < 12) {
-		u->net[u->nnet].family = family;
-		u->net[u->nnet].scope = scope;
-		u->net[u->nnet].via = via;
-		snprintf(u->net[u->nnet].addr, sizeof(u->net[0].addr), "%s", addr);
-		u->nnet++;
+	if (u->nnet >= 12)
+		return;
+	u->net[u->nnet].family = family;
+	u->net[u->nnet].scope = scope;
+	u->net[u->nnet].via = via;
+	snprintf(u->net[u->nnet].addr, sizeof(u->net[0].addr), "%s", addr);
+	u->nnet++;
+	if (u->anim)
 		u->dirty = 1;
-	}
+	else
+		vlog(u, "net    %s %-40s %s", family == 6 ? "ipv6" : "ipv4",
+		     addr, scope_word(scope, via));
 }
 
 static void um_link(struct ui *u, const char *name, int has4, int has6)
 {
 	int i;
 
-	if (!u->anim) {
-		vlog(u, "link   %s %s%s%s", name, has4 ? "v4" : "",
-		     has4 && has6 ? "+" : "", has6 ? "v6" : "");
-		return;
-	}
 	for (i = 0; i < u->nlink; i++)
 		if (!strcmp(u->link[i].name, name))
 			return;
-	if (u->nlink < 8) {
-		snprintf(u->link[u->nlink].name, sizeof(u->link[0].name), "%s",
-			 name);
-		u->link[u->nlink].has4 = has4;
-		u->link[u->nlink].has6 = has6;
-		u->nlink++;
+	if (u->nlink >= 8)
+		return;
+	snprintf(u->link[u->nlink].name, sizeof(u->link[0].name), "%s", name);
+	u->link[u->nlink].has4 = has4;
+	u->link[u->nlink].has6 = has6;
+	u->nlink++;
+	if (u->anim)
 		u->dirty = 1;
-	}
+	else
+		vlog(u, "link   %s %s%s%s", name, has4 ? "v4" : "",
+		     has4 && has6 ? "+" : "", has6 ? "v6" : "");
 }
 
 static void um_rdv(struct ui *u, int family, int ready, const char *addr)
 {
-	int slot;
-
-	if (!u->anim) {
-		vlog(u, "rdv    v%d %s %s", family, addr,
-		     ready ? "validated, pinned" : "contacting");
-		return;
-	}
 	/* Fixed slots -- v4 above v6 -- so host and client render the two
 	 * rendezvous nodes in the same order regardless of which located first. */
-	slot = family == 4 ? 0 : 1;
+	int slot = family == 4 ? 0 : 1;
+	int changed = u->rdv[slot].family != family ||
+		      u->rdv[slot].ready != ready ||
+		      strcmp(u->rdv[slot].addr, addr) != 0;
+
 	u->rdv[slot].family = family;
 	u->rdv[slot].ready = ready;
 	snprintf(u->rdv[slot].addr, sizeof(u->rdv[slot].addr), "%.*s",
 		 (int)(sizeof(u->rdv[slot].addr) - 1), addr);
-	u->dirty = 1;
+	if (!changed)
+		return;
+	if (u->anim)
+		u->dirty = 1;
+	else
+		vlog(u, "rdv    v%d %s %s", family, addr,
+		     ready ? "validated, pinned" : "contacting");
 }
 
 static void um_rdv_stage(struct ui *u, int family, int stage)
@@ -626,24 +626,22 @@ static void um_live(struct ui *u)
  * the addresses of the network that just vanished. */
 static void um_reset(struct ui *u)
 {
-	if (!u->anim) {
-		vlog(u, "local  reconnecting -- candidates flushed");
-		return;
-	}
 	u->nnet = 0;
 	u->npeer = 0;
 	u->established = 0;
-	u->dirty = 1;
+	if (u->anim)
+		u->dirty = 1;
+	else
+		vlog(u, "local  reconnecting -- candidates flushed");
 }
 
 static void um_net_reset(struct ui *u)
 {
-	if (!u->anim) {
-		vlog(u, "local  network changed -- candidates flushed");
-		return;
-	}
 	u->nnet = 0;
-	u->dirty = 1;
+	if (u->anim)
+		u->dirty = 1;
+	else
+		vlog(u, "local  network changed -- candidates flushed");
 }
 
 /* ---- observer callbacks (client inline; also reused by the foreground) ---- */
@@ -927,6 +925,8 @@ int ui_host_wait(struct ui *u, sock_t fd)
 	/* The local keyboard, as something poll can see: a real descriptor on
 	 * POSIX, a socket fed by the console pump thread on Windows (tty.h). */
 	sock_t kbd = tty_sock_in();
+	int esc_pending = 0;
+	uint64_t esc_deadline = 0;
 
 	ui_abort_flag = 0;
 	oint = signal(SIGINT, ui_on_signal);
@@ -940,6 +940,10 @@ int ui_host_wait(struct ui *u, sock_t fd)
 		struct pollfd fds[2];
 		nfds_t nfds = 1;
 
+		if (esc_pending && now_ms() > esc_deadline) {
+			result = -1;
+			break;
+		}
 		fds[0].fd = fd;
 		fds[0].events = POLLIN;
 		fds[0].revents = 0;
@@ -950,7 +954,7 @@ int ui_host_wait(struct ui *u, sock_t fd)
 			nfds = 2;
 		sock_poll(fds, nfds, 100);
 
-		if (ui_abort_flag) {		/* Ctrl-C / SIGTERM */
+		if (ui_abort_flag) { 		/* Ctrl-C / SIGTERM */
 			result = -1;
 			break;
 		}
@@ -975,18 +979,39 @@ int ui_host_wait(struct ui *u, sock_t fd)
 			}
 		}
 		if (fds[1].revents & (POLLIN | POLLHUP | POLLERR)) {
-			char c;
-			int got = (int)sock_read(kbd, &c, 1);
+			char buf[16];
+			int got = (int)sock_read(kbd, buf, sizeof(buf));
+			int i;
 
 			if (got == 0) {
 				stdin_ok = 0;		/* EOF: stop watching it */
-			} else if (got == 1 && c == 27) {	/* ESC */
-				result = -1;
-				break;
-			} else if (got == 1 &&
-				   (c == '\r' || c == '\n' || c == ' ')) {
-				result = 1;
-				break;
+			} else if (got > 0) {
+				for (i = 0; i < got; i++) {
+					unsigned char c = (unsigned char)buf[i];
+
+					if (esc_pending) {
+						/* A terminal focus-change or other CSI sequence
+						 * starts with Escape; ignore it and only treat a
+						 * truly lone Escape as a quit request. */
+						if (c == 27) {
+							esc_deadline = now_ms() + 80;
+							continue;
+						}
+						esc_pending = 0;
+						continue;
+					}
+					if (c == 27) {
+						esc_pending = 1;
+						esc_deadline = now_ms() + 80;
+						continue;
+					}
+					if (c == '\r' || c == '\n' || c == ' ') {
+						result = 1;
+						break;
+					}
+				}
+				if (result)
+					break;
 			}
 		}
 		if (u->anim) {
