@@ -51,11 +51,12 @@ NPROC="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)"
 CFLAGS="$(dpkg-buildflags --get CFLAGS) $(dpkg-buildflags --get CPPFLAGS)"
 LDFLAGS="$(dpkg-buildflags --get LDFLAGS)"
 
-# Build date and rolling version taken from the commit being built, not pinned:
-# SOURCE_DATE_EPOCH (which the CMake build honours) makes a given commit build
-# the same bytes, and the version is a "~" pre-release of 0.1.0 stamped with the
-# commit's UTC time, so it is monotonic and apt always sees an upgrade. The
-# libraries keep their real upstream versions.
+# Version and build date come from the commit being built. A tagged release
+# carries the tag's version (e.g. 0.1.0, passed in as COMRADE_VERSION); an
+# untagged build (a dry run or a hand build) falls back to a monotonic "~git"
+# snapshot of 0.1.0 stamped with the commit's UTC time, so apt still sees an
+# upgrade. SOURCE_DATE_EPOCH (which the CMake build honours) makes a given commit
+# build the same bytes. The libraries keep their real upstream versions.
 if git -C "$SRCDIR" rev-parse --git-dir >/dev/null 2>&1; then
 	SOURCE_DATE_EPOCH="$(git -C "$SRCDIR" log -1 --format=%ct)"
 	export SOURCE_DATE_EPOCH
@@ -112,6 +113,11 @@ sys_depends() { # elf-file... -> "pkg (>= ver), pkg (>= ver)"
 		_pkg="$(dpkg -S "$_path" 2>/dev/null | head -1 | cut -d: -f1)"
 		[ -n "$_pkg" ] || continue
 		_ver="$(dpkg-query -W -f='${Version}' "$_pkg" 2>/dev/null)"
+		# Depend on the upstream version, not the build container's exact Debian
+		# revision: a point-release/security bump (e.g. libssh-4 0.11.5-0+deb13u1)
+		# keeps the soname and ABI, so pinning it would refuse an as-yet-unpatched
+		# stable system. Strip the Debian revision (everything after the last "-").
+		_ver="${_ver%-*}"
 		printf '%s (>= %s)\n' "$_pkg" "$_ver"
 	done | sort -u | paste -sd, - | sed 's/,/, /g'
 }
