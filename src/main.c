@@ -126,10 +126,19 @@ static int fwd_arg(char **argv, int argc, int *i, struct fwdspec *specs,
 int main(int argc, char **argv)
 {
 	static struct fwdspec fwd_l[FWD_SPECS_MAX], fwd_r[FWD_SPECS_MAX];
+	static char stdout_buf[65536];
 	int nfwd_l = 0, nfwd_r = 0, no_fwd = 0;
 	int ui_mode = UI_AUTO, no_mcast = 0;
 	const char *pos = NULL;
 	int i;
+
+	/*
+	 * Before any other stdout operation (setvbuf's own requirement): a full
+	 * frame of the dashboard's animation is many short writes otherwise, and
+	 * a console handle's default buffering is not guaranteed to coalesce
+	 * them into one -- costly on some Windows consoles.
+	 */
+	setvbuf(stdout, stdout_buf, _IOFBF, sizeof(stdout_buf));
 
 	/* Writes race teardown all over this program -- the ssh socketpair, the
 	 * forwarding bridges, the status pipe -- and a peer closing first must

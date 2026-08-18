@@ -16,6 +16,7 @@
 #include <string.h>
 #include <time.h>
 
+#include "dbg.h"
 #include "oscompat.h"
 #include "tty.h"
 #include "ui.h"
@@ -381,12 +382,14 @@ static void bar(int row, int cols, const char *sgr)
 static void zap(struct ui *u, int snow)
 {
 	int cen, r, y, f;
+	uint64_t t0;
 
 	if (!u->anim)
 		return;
 	winsize(u);
 	cen = u->rows / 2;
 	hide_cursor(u);
+	t0 = os_mono_ms();
 
 	if (snow) {
 		static const char ch[] = "@#%&$*+=-:.|/\\<>()[]{} ";
@@ -422,6 +425,7 @@ static void zap(struct ui *u, int snow)
 	fputs(RST "\033[2J\033[H", stdout);	/* cut to black */
 	fflush(stdout);
 	os_msleep(130);
+	dbg_logf("zap: done total=%ums", (unsigned)(os_mono_ms() - t0));
 }
 
 /* ---- model updates (shared by the inline client and the host foreground) --- */
