@@ -502,7 +502,7 @@ static int attach(const char *id)
 	sigaction(SIGWINCH, &oldwinch, NULL);
 	close(master);
 	waitpid(child, NULL, 0);
-	return 0;
+	return tmux_alive(sock) ? 2 : 0;
 }
 
 /* Encode the current token (and its read-only twin), write both to the token
@@ -664,7 +664,7 @@ static int start_new(int ui_mode, int no_mcast, int no_fwd)
 	void *hostkey;
 	struct ui *ui;
 	pid_t pid;
-	int pfd[2], enter;
+	int pfd[2], enter, rc = 0;
 
 	memset(&v, 0, sizeof(v));
 	v.no_fwd = no_fwd;
@@ -729,14 +729,23 @@ static int start_new(int ui_mode, int no_mcast, int no_fwd)
 	sshd_hostkey_free(hostkey);		/* the service has its own copy */
 
 	/* The view renders the service's progress and blocks until the operator
-	 * enters (1, playing the zap), aborts (-1), or the service exits (0). */
+	 * enters (1, playing the zap), aborts (-1), or the service exits (0). A
+	 * detach (attach() returns 2, session still alive) loops back to the
+	 * dashboard instead of leaving it. */
 	ui = ui_create(UI_ROLE_HOST, ui_mode);
-	enter = ui ? ui_host_wait(ui, pfd[0]) : 0;
+	for (;;) {
+		enter = ui ? ui_host_wait(ui, pfd[0]) : 0;
+		if (enter != 1)
+			break;
+		rc = attach(id);
+		if (rc != 2)
+			break;
+	}
 	ui_destroy(ui);
 	close(pfd[0]);
 
 	if (enter == 1)
-		return attach(id);		/* foreground; execs tmux */
+		return rc;
 	if (enter < 0) {			/* operator aborted */
 		teardown(pid, v.sock, v.tokfile);
 		fprintf(stderr, "comrade: aborted.\n");
@@ -750,12 +759,16 @@ static int start_new(int ui_mode, int no_mcast, int no_fwd)
 int host_run(int ui_mode, int no_mcast, int no_fwd)
 {
 	char id[ID_LEN + 1];
+	int rc;
 
 	sweep_stale();
 	if (find_live(id)) {
 		fprintf(stderr, "comrade: re-attaching to your running session"
 			" (its token: `comrade show`)\n");
-		return attach(id);
+		do {
+			rc = attach(id);
+		} while (rc == 2);
+		return rc;
 	}
 	return start_new(ui_mode, no_mcast, no_fwd);
 }
