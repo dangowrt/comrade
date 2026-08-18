@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "candpolicy.h"
+#include "wsock.h"
 
 static void default_policy_check(void)
 {
@@ -89,10 +90,40 @@ static void sdp_filter_check(void)
 	assert(!strstr(out, "192.168.1.5"));
 }
 
+static void drop_self_check(void)
+{
+	char out[1024];
+	struct netmon_addr local[2];
+	static const char sdp[] =
+		"a=ice-ufrag:abcd\r\n"
+		"a=ice-pwd:secretpwd\r\n"
+		"a=candidate:1 1 UDP 2 192.168.5.164 40000 typ host\r\n"
+		"a=candidate:2 1 UDP 2 192.168.5.170 40001 typ host\r\n"
+		"a=candidate:3 1 UDP 2 203.0.113.9 40002 typ srflx raddr 0.0.0.0 rport 0\r\n";
+
+	memset(local, 0, sizeof(local));
+	local[0].family = AF_INET;
+	local[0].addrlen = 4;
+	assert(inet_pton(AF_INET, "192.168.5.164", local[0].addr) == 1);
+	local[1].family = AF_INET;
+	local[1].addrlen = 4;
+	assert(inet_pton(AF_INET, "203.0.113.9", local[1].addr) == 1);
+
+	cand_sdp_drop_self(sdp, local, 2, out, sizeof(out));
+	assert(strstr(out, "ice-ufrag"));
+	assert(!strstr(out, "192.168.5.164"));
+	assert(strstr(out, "192.168.5.170"));
+	assert(strstr(out, "203.0.113.9"));
+
+	cand_sdp_drop_self(sdp, NULL, 0, out, sizeof(out));
+	assert(strstr(out, "192.168.5.164"));
+}
+
 int main(void)
 {
 	default_policy_check();
 	opt_in_check();
 	sdp_filter_check();
+	drop_self_check();
 	return 0;
 }

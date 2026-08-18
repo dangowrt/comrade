@@ -507,6 +507,20 @@ static void sdp_filter(const char *in, int family, char *out, size_t outlen)
 	cand_sdp_filter(in, family, &pol, out, outlen);
 }
 
+/* Like sdp_filter(), for a peer's SDP: also drops any host candidate that
+ * names one of our own local addresses (see cand_sdp_drop_self). */
+static void sdp_filter_peer(const char *in, int family, char *out, size_t outlen)
+{
+	struct netmon_addr local[NETMON_MAX_ADDRS];
+	size_t nlocal = netmon_snapshot(local, NETMON_MAX_ADDRS);
+	char tmp[NAT_SDP_MAX];
+
+	sdp_filter(in, family, tmp, sizeof(tmp));
+	cand_sdp_drop_self(tmp, local, nlocal, out, outlen);
+	if (strlen(out) != strlen(tmp))
+		dbg_logf("sdp_filter_peer: dropped self-address host candidate(s)");
+}
+
 /* Plant the token's rendezvous node(s) as sticky DHT hints (client). */
 static int client_seed_rendezvous(struct sess *s)
 {
@@ -985,7 +999,7 @@ static void on_peer_offer(void *arg, const uint8_t *data, size_t len)
 	 * once connected, when the mailbox GET keeps redelivering the same set and
 	 * re-adding it only churns the agent (and logs "max candidates"). */
 	if (c->nat && s->remote_set && !nat_connected(c->nat)) {
-		sdp_filter(s->peer_sdp, s->cfg->family, filtered, sizeof(filtered));
+		sdp_filter_peer(s->peer_sdp, s->cfg->family, filtered, sizeof(filtered));
 		nat_set_remote_description(c->nat, filtered);
 	}
 }
@@ -2189,7 +2203,7 @@ static int host_turnstile(struct sess *s)
 				if (pslot < 0 || inflight >= HOST_MAX_WORKERS)
 					break;
 				dbg_logf("host: claim received -> punch (release)");
-				sdp_filter(s->peer_sdp, cfg->family, filtered,
+				sdp_filter_peer(s->peer_sdp, cfg->family, filtered,
 					   sizeof(filtered));
 				if (nat_set_remote_description(listen->nat,
 							       filtered)) {
@@ -2487,7 +2501,7 @@ int session_run(const struct session_cfg *cfg)
 			break;
 		case ST_SIGNAL:
 			if (s.have_peer_sdp && !s.remote_set) {
-				sdp_filter(s.peer_sdp, cfg->family, filtered,
+				sdp_filter_peer(s.peer_sdp, cfg->family, filtered,
 					   sizeof(filtered));
 				if (nat_set_remote_description(s.c.nat, filtered)) {
 					st = ST_FAIL;
