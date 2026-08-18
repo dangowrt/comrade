@@ -256,7 +256,7 @@ carry. Run it without installing, or add it to a profile:
     nix run github:dangowrt/comrade
     nix profile install github:dangowrt/comrade
 
-### Windows
+### Windows (EXPERIMENTAL!)
 
 A single portable `comrade.exe` (x64 or arm64), no installer. Download
 `comrade-x64.exe` or `comrade-arm64.exe` from the [latest
