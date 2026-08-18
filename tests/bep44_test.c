@@ -6,7 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include <monocypher-ed25519.h>
+#include "ccrypto.h"
 
 #include "bencode.h"
 #include "bep44.h"
@@ -122,7 +122,7 @@ static void vector_check(const char *pk_hex, const char *salt,
 
 	len = bep44_sig_buffer(sigbuf, sizeof(sigbuf), salt, 1,
 			       (const uint8_t *)"12:Hello World!", 15);
-	assert(!crypto_ed25519_check(want_sig, pk, sigbuf, len));
+	assert(!cc_ed25519_check(want_sig, pk, sigbuf, len));
 }
 
 static void sign_roundtrip_check(void)
@@ -132,14 +132,14 @@ static void sign_roundtrip_check(void)
 
 	for (i = 0; i < 32; i++)
 		seed[i] = (uint8_t)(i * 3 + 1);
-	crypto_ed25519_key_pair(sk, pk, seed);
+	cc_ed25519_key_pair(sk, pk, seed);
 
 	len = bep44_sig_buffer(sigbuf, sizeof(sigbuf), "comrade", 7,
 			       (const uint8_t *)"3:abc", 5);
-	crypto_ed25519_sign(sig, sk, sigbuf, len);
-	assert(!crypto_ed25519_check(sig, pk, sigbuf, len));
+	cc_ed25519_sign(sig, sk, sigbuf, len);
+	assert(!cc_ed25519_check(sig, pk, sigbuf, len));
 	sig[0] ^= 1;
-	assert(crypto_ed25519_check(sig, pk, sigbuf, len));
+	assert(cc_ed25519_check(sig, pk, sigbuf, len));
 }
 
 static void vectors_check(void)
