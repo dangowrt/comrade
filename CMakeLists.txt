@@ -98,6 +98,10 @@ target_include_directories(comrade_ctlproto PUBLIC src)
 add_library(comrade_conn STATIC src/conn.c)
 target_include_directories(comrade_conn PUBLIC src)
 
+# -L/-R forwarding-spec parsing (no dependencies; the engine lives with ssh).
+add_library(comrade_fwdspec STATIC src/fwdspec.c)
+target_include_directories(comrade_fwdspec PUBLIC src)
+
 add_library(comrade_statusbar STATIC src/statusbar.c)
 target_include_directories(comrade_statusbar PUBLIC src)
 target_link_libraries(comrade_statusbar PUBLIC comrade_conn)
@@ -243,12 +247,12 @@ endif()
 set(COMRADE_HAVE_SSH 0)
 if(LIBSSH_FOUND)
 	set(COMRADE_HAVE_SSH 1)
-	add_library(comrade_ssh STATIC src/sshd.c src/sshc.c)
+	add_library(comrade_ssh STATIC src/sshd.c src/sshc.c src/sshfwd.c)
 	target_include_directories(comrade_ssh PUBLIC src)
 	# The message-based libssh server API is deprecated in favour of the
 	# callback API but is clearer and fully functional; migrate later.
 	target_compile_options(comrade_ssh PRIVATE -Wno-deprecated-declarations)
-	target_link_libraries(comrade_ssh PUBLIC comrade_token comrade_statusbar comrade_dbg comrade_termfilter PkgConfig::LIBSSH Threads::Threads)
+	target_link_libraries(comrade_ssh PUBLIC comrade_token comrade_statusbar comrade_dbg comrade_termfilter comrade_fwdspec PkgConfig::LIBSSH Threads::Threads)
 	find_library(COMRADE_UTIL util)
 	if(COMRADE_UTIL)
 		target_link_libraries(comrade_ssh PUBLIC ${COMRADE_UTIL})
@@ -285,6 +289,7 @@ target_link_libraries(comrade
 	comrade_token
 	comrade_stunlist
 	comrade_statusbar
+	comrade_fwdspec
 )
 if(COMRADE_HAVE_SESSION)
 	target_link_libraries(comrade comrade_session comrade_ui)

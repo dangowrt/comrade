@@ -17,6 +17,7 @@
 #include "base64.h"
 #include "dbg.h"
 #include "sshd.h"
+#include "sshfwd.h"
 
 /* Constant-time equality over a fixed-length buffer. */
 static int ct_equal(const void *a, const void *b, size_t len)
@@ -286,6 +287,7 @@ struct pump_ctx {
 	ssh_channel ctl_chan;		/* the accepted control channel */
 	ssh_connector ctl_in;		/* ctl_fd -> channel */
 	ssh_connector ctl_out;		/* channel -> ctl_fd */
+	struct sshfwd *fwd;		/* port forwarding; NULL = declined */
 	int end_hit;
 };
 
@@ -351,6 +353,11 @@ static void drain_messages(struct pump_ctx *c)
 				continue;
 			}
 		}
+		/* Port forwarding (direct-tcpip, tcpip-forward): the engine
+		 * consumes these when the host allows it; with no engine they
+		 * fall through to the default reply, i.e. are refused. */
+		if (c->fwd && sshfwd_srv_message(c->fwd, m))
+			continue;
 		ssh_message_reply_default(m);
 		ssh_message_free(m);
 	}
@@ -379,8 +386,9 @@ static int on_end_fd(socket_t fd, int revents, void *userdata)
  * output first; then we return and the caller closes the channel to the client.
  */
 static void pump(ssh_session s, ssh_channel chan, int to_child, int from_child,
-		 pid_t child, int end_fd, int ctl_fd)
+		 pid_t child, const struct sshd_opts *o)
 {
+	int end_fd = o->end_fd;
 	struct pump_ctx c;
 	ssh_connector c_in, c_out;	/* shell channel <-> child */
 	int ending = 0, drain = 0;
@@ -388,8 +396,10 @@ static void pump(ssh_session s, ssh_channel chan, int to_child, int from_child,
 	memset(&c, 0, sizeof(c));
 	c.s = s;
 	c.master = to_child;
-	c.ctl_fd = ctl_fd;
+	c.ctl_fd = o->ctl_fd;
 	c.event = ssh_event_new();
+	if (c.event && !o->no_fwd)
+		c.fwd = sshfwd_create(s, c.event);
 	c_in = ssh_connector_new(s);
 	c_out = ssh_connector_new(s);
 	if (!c.event || !c_in || !c_out)
@@ -414,6 +424,7 @@ static void pump(ssh_session s, ssh_channel chan, int to_child, int from_child,
 		if (ssh_event_dopoll(c.event, 200) == SSH_ERROR)
 			break;
 		drain_messages(&c);
+		sshfwd_tick(c.fwd);
 		if (!ending && c.end_hit)
 			ending = 1;
 		if (!ending && waitpid(child, NULL, WNOHANG | WNOWAIT) == child)
@@ -422,6 +433,8 @@ static void pump(ssh_session s, ssh_channel chan, int to_child, int from_child,
 			break;
 	}
 
+	sshfwd_destroy(c.fwd);
+	c.fwd = NULL;
 	if (end_fd > 0)
 		ssh_event_remove_fd(c.event, end_fd);
 	ssh_event_remove_connector(c.event, c_in);
@@ -498,8 +511,9 @@ int sshd_serve_fd(int fd, const struct sshd_opts *o)
 
 	/* Live resizes arrive as window-change requests; the pump applies them
 	 * to the pty. A second channel requesting the comrade-ctl subsystem is
-	 * bridged to o->ctl_fd (both in drain_messages). */
-	pump(s, chan, to_child, from_child, child, o->end_fd, o->ctl_fd);
+	 * bridged to o->ctl_fd, and client port forwards are served unless
+	 * o->no_fwd declines them (all in drain_messages). */
+	pump(s, chan, to_child, from_child, child, o);
 	rc = 0;
 out:
 	if (to_child >= 0)

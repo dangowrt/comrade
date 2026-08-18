@@ -8,6 +8,7 @@
 #include <stdint.h>
 
 #include "conn.h"
+#include "fwdspec.h"
 #include "token.h"
 
 /*
@@ -33,6 +34,18 @@ struct sshc_opts {
 	 * the authenticated SSH session. 0/-1 leaves the single-channel path.
 	 */
 	int ctl_fd;
+
+	/*
+	 * TCP port forwarding, OpenSSH semantics: fwd_l are -L specs (listen
+	 * locally, connect from the host), fwd_r are -R specs (host listens,
+	 * connect back here). Served alongside the shell on the same
+	 * authenticated session; a host may refuse (--no-forwarding), which
+	 * fails the individual forward, never the session.
+	 */
+	const struct fwdspec *fwd_l;
+	int nfwd_l;
+	const struct fwdspec *fwd_r;
+	int nfwd_r;
 
 	/*
 	 * Optional local status. When set, interactive mode reserves the bottom

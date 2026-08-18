@@ -42,6 +42,13 @@ struct sshd_opts {
 	 * disables it, in which case behaviour is exactly the single-channel one.
 	 */
 	int ctl_fd;
+	/*
+	 * Decline all TCP port forwarding (client -L/-R): direct-tcpip channel
+	 * opens and tcpip-forward global requests are refused. The zero value
+	 * allows forwarding, matching the all-tokens-are-equal trust model;
+	 * a host operator opts out with --no-forwarding.
+	 */
+	int no_fwd;
 };
 
 /*

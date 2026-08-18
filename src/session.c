@@ -908,6 +908,7 @@ static void *ssh_srv_thread(void *p)
 	o.use_pty = s->cfg->use_pty;
 	o.end_fd = s->cfg->ssh_end_fd;
 	o.ctl_fd = c->ssh_ctl_fd;
+	o.no_fwd = s->cfg->no_fwd;
 	sshd_serve_fd(c->ssh_fd, &o);
 	return NULL;
 }
@@ -923,6 +924,10 @@ static void *ssh_cli_thread(void *p)
 	memcpy(o.auth, s->auth, sizeof(o.auth));
 	o.interactive = s->cfg->interactive;
 	o.ctl_fd = c->ssh_ctl_fd;
+	o.fwd_l = s->cfg->fwd_l;
+	o.nfwd_l = s->cfg->nfwd_l;
+	o.fwd_r = s->cfg->fwd_r;
+	o.nfwd_r = s->cfg->nfwd_r;
 	o.status = session_status;
 	o.status_arg = c;
 	o.send = s->cfg->test_send;

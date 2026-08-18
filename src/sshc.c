@@ -16,6 +16,7 @@
 #include "base64.h"
 #include "dbg.h"
 #include "sshc.h"
+#include "sshfwd.h"
 #include "statusbar.h"
 #include "termfilter.h"
 
@@ -121,43 +122,82 @@ static int pin_hostkey(ssh_session s, const uint8_t fp[32])
 	return rc;
 }
 
+/* Create the forwarding engine and register the -L/-R specs, when any. */
+static struct sshfwd *fwd_up(ssh_session s, ssh_event ev,
+			     const struct sshc_opts *o)
+{
+	struct sshfwd *f;
+	int i;
+
+	if (!o || (!o->nfwd_l && !o->nfwd_r))
+		return NULL;
+	f = sshfwd_create(s, ev);
+	if (!f)
+		return NULL;
+	for (i = 0; i < o->nfwd_l; i++)
+		sshfwd_cli_local(f, &o->fwd_l[i]);
+	for (i = 0; i < o->nfwd_r; i++)
+		sshfwd_cli_remote(f, &o->fwd_r[i]);
+	return f;
+}
+
 /* Test mode: write the whole request, then read echoed bytes until we have
  * as many as we sent (or the channel ends). */
-static int run_test(ssh_channel chan, const struct sshc_opts *o)
+static int run_test(ssh_session s, ssh_channel chan, const struct sshc_opts *o)
 {
 	size_t got = 0;
+	ssh_event event = NULL;
+	struct sshfwd *fwd = NULL;
+	int rc = -1;
+
+	if (o->nfwd_l || o->nfwd_r) {
+		event = ssh_event_new();
+		if (event)
+			fwd = fwd_up(s, event, o);
+	}
 
 	if (o->send_len &&
 	    ssh_channel_write(chan, o->send, (uint32_t)o->send_len) !=
 	    (int)o->send_len)
-		return -1;
+		goto out;
 
 	while (got < o->send_len && got < o->recv_cap) {
 		int n = ssh_channel_read(chan, o->recv + got,
 					 (uint32_t)(o->recv_cap - got), 0);
 
 		if (n < 0)
-			return -1;
+			goto out;
 		if (n == 0)
 			break;
 		got += (size_t)n;
 	}
 	if (o->recv_len)
 		*o->recv_len = got;
+	rc = 0;
 	/* Hold the session open (the session layer keeps the heartbeat alive on
 	 * its own thread), so a test can keep one client connected while another
-	 * joins -- the case that reveals slot hogging. */
+	 * joins -- the case that reveals slot hogging -- or exercise forwarding
+	 * (the engine is pumped from this loop). */
 	if (o->hold_ms > 0) {
 		uint64_t end = mono_ms() + (uint64_t)o->hold_ms;
 
 		while (mono_ms() < end && ssh_channel_is_open(chan) &&
 		       !ssh_channel_is_eof(chan)) {
-			struct timespec ts = { 0, 50 * 1000 * 1000 };
+			if (fwd) {
+				ssh_event_dopoll(event, 50);
+				sshfwd_tick(fwd);
+			} else {
+				struct timespec ts = { 0, 50 * 1000 * 1000 };
 
-			nanosleep(&ts, NULL);
+				nanosleep(&ts, NULL);
+			}
 		}
 	}
-	return 0;
+out:
+	sshfwd_destroy(fwd);
+	if (event)
+		ssh_event_free(event);
+	return rc;
 }
 
 static volatile sig_atomic_t g_winch;
@@ -191,6 +231,7 @@ static int run_interactive(ssh_session s, ssh_channel chan,
 	ssh_connector c_err = ssh_connector_new(s);	/* channel stderr -> stderr */
 	ssh_channel ctl = NULL;				/* comrade-ctl subsystem */
 	ssh_connector c_ctl_in = NULL, c_ctl_out = NULL;
+	struct sshfwd *fwd = NULL;			/* -L/-R forwarding */
 	int have_tty = isatty(STDIN_FILENO);
 
 	if (!event || !c_out || !c_err)
@@ -263,6 +304,9 @@ static int run_interactive(ssh_session s, ssh_channel chan,
 		}
 	}
 
+	/* -L/-R port forwarding rides the same session; served from this loop. */
+	fwd = fwd_up(s, event, o);
+
 	while (ssh_channel_is_open(chan) && !ssh_channel_is_eof(chan) &&
 	       !quit && !reconnect) {
 		/*
@@ -283,6 +327,7 @@ static int run_interactive(ssh_session s, ssh_channel chan,
 
 			nanosleep(&ts, NULL);
 		}
+		sshfwd_tick(fwd);
 		if (g_winch) {
 			struct winsize ws;
 
@@ -319,6 +364,8 @@ static int run_interactive(ssh_session s, ssh_channel chan,
 			}
 		}
 	}
+	sshfwd_destroy(fwd);
+	fwd = NULL;
 	ssh_event_remove_fd(event, STDIN_FILENO);
 	ssh_event_remove_connector(event, c_out);
 	ssh_event_remove_connector(event, c_err);
@@ -424,7 +471,7 @@ int sshc_connect_fd(int fd, const struct sshc_opts *o)
 	} else {
 		if (ssh_channel_request_shell(chan) != SSH_OK)
 			goto out;
-		rc = run_test(chan, o);
+		rc = run_test(s, chan, o);
 	}
 out:
 	if (chan) {

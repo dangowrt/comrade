@@ -10,6 +10,8 @@
 
 #include "token.h"
 
+struct fwdspec;
+
 /*
  * One comrade session: rendezvous over sig (DHT and/or multicast), punch a path
  * (ICE for routable, direct UDP for link-local), bring up KCP, and run SSH on
@@ -92,6 +94,7 @@ struct session_cfg {
 
 	/* Host only. */
 	void *hostkey;			/* ssh_key (private) */
+	int no_fwd;			/* refuse all client port forwarding */
 	int host_serve_max;		/* stop after serving this many clients
 					 * (0 = until the deadline / operator) */
 	const char *ssh_command;	/* command to serve; NULL => tmux default */
@@ -124,6 +127,12 @@ struct session_cfg {
 
 	/* Client only. */
 	int interactive;		/* bridge the local terminal */
+	/* -L/-R TCP port forwarding specs (OpenSSH semantics), served over
+	 * the session by the SSH layer; NULL/0 for none. */
+	const struct fwdspec *fwd_l;
+	int nfwd_l;
+	const struct fwdspec *fwd_r;
+	int nfwd_r;
 	/* Client non-interactive test mode (e2e): send a buffer, collect echo. */
 	const uint8_t *test_send;
 	size_t test_send_len;

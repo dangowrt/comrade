@@ -7,10 +7,11 @@
 
 #ifndef COMRADE_HAVE_SESSION
 
-int host_run(int ui_mode, int no_mcast)
+int host_run(int ui_mode, int no_mcast, int no_fwd)
 {
 	(void)ui_mode;
 	(void)no_mcast;
+	(void)no_fwd;
 	fprintf(stderr, "comrade: built without the session stack\n");
 	return 1;
 }
@@ -71,6 +72,7 @@ struct svc {
 	char sock[512];
 	char tokfile[512];
 	char statusfile[512];
+	int no_fwd;			/* decline all client port forwarding */
 	struct session_obs obs;		/* view-event emitter to the foreground */
 };
 
@@ -546,6 +548,7 @@ static void run_service(struct svc *v, void *hostkey, int wfd, int no_mcast)
 	cfg.ssh_command = cmd;
 	cfg.use_pty = 1;
 	cfg.ssh_end_fd = end_fd > 0 ? end_fd : 0;
+	cfg.no_fwd = v->no_fwd;
 	cfg.status_path = v->statusfile;
 	cfg.on_rendezvous = on_rendezvous;
 	cfg.arg = v;
@@ -580,7 +583,7 @@ static void teardown(pid_t svc, const char *sock, const char *tokfile)
 	unlink(sock);
 }
 
-static int start_new(int ui_mode, int no_mcast)
+static int start_new(int ui_mode, int no_mcast, int no_fwd)
 {
 	struct svc v;
 	char id[ID_LEN + 1];
@@ -590,6 +593,7 @@ static int start_new(int ui_mode, int no_mcast)
 	int pfd[2], enter;
 
 	memset(&v, 0, sizeof(v));
+	v.no_fwd = no_fwd;
 	gen_id(id);
 	sock_path(v.sock, sizeof(v.sock), id);
 	tok_path(v.tokfile, sizeof(v.tokfile), id);
@@ -663,7 +667,7 @@ static int start_new(int ui_mode, int no_mcast)
 	return 1;
 }
 
-int host_run(int ui_mode, int no_mcast)
+int host_run(int ui_mode, int no_mcast, int no_fwd)
 {
 	char id[ID_LEN + 1];
 
@@ -673,7 +677,7 @@ int host_run(int ui_mode, int no_mcast)
 			" (its token: `comrade show`)\n");
 		return attach(id);
 	}
-	return start_new(ui_mode, no_mcast);
+	return start_new(ui_mode, no_mcast, no_fwd);
 }
 
 int host_show(void)
