@@ -892,6 +892,20 @@ static void raw_on(struct ui *u)
 	 * still aborts (see tty_raw_on). */
 	if (!tty_raw_on(&u->saved, 0))
 		u->raw = 1;
+	/*
+	 * Whatever mouse reporting or bracketed paste a mouse-aware terminal, or
+	 * a prior program that never cleaned up after itself, left enabled means
+	 * nothing to the dashboard -- it reads no mouse events and takes no
+	 * paste -- and every report or paste starts with the same byte as a
+	 * standalone Escape keypress. Force both off before reading a single
+	 * keystroke, rather than trying to tell the two apart from the bytes
+	 * alone.
+	 */
+	if (u->raw) {
+		fputs("\033[?1000l\033[?1002l\033[?1003l\033[?1006l\033[?1015l"
+		      "\033[?2004l", stdout);
+		fflush(stdout);
+	}
 }
 
 static void raw_off(struct ui *u)
