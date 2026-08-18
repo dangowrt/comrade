@@ -244,7 +244,22 @@ jobs:
           INDIR="$PWD/repo-in" REPODIR="$PWD/repo" \
             GPG_KEY_ID="$fpr" GPG_PASSPHRASE="$GPG_PASSPHRASE" \
             sh packaging/deb/make-repo.sh
-          cp packaging/deb/README.md repo/index.md 2>/dev/null || true
+
+      # The landing page and its asciinema demo live in the dangowrt/comrade-web
+      # repository, so this repo carries no web assets. Lay them into the Pages
+      # root next to the apt tree (dists/, pool/) and stamp in the release
+      # version. Resilient: a missing web repo just ships the apt repo alone.
+      - name: Add the landing page
+        if: steps.guard.outputs.skip != 'true'
+        run: |
+          if git clone --depth 1 https://github.com/dangowrt/comrade-web web 2>/dev/null; then
+            cp web/index.html web/.nojekyll repo/ 2>/dev/null || true
+            cp -r web/assets repo/assets 2>/dev/null || true
+            sed -i "s/__COMRADE_VERSION__/${{ needs.prepare.outputs.version }}/g" repo/index.html 2>/dev/null || true
+            rm -rf web
+          else
+            echo "comrade-web unavailable; deploying the apt repo without a landing page" >&2
+          fi
 
       - uses: actions/upload-pages-artifact@v5
         if: steps.guard.outputs.skip != 'true'
