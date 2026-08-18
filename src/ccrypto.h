@@ -44,7 +44,9 @@ int cc_ed25519_check(const uint8_t sig[64], const uint8_t pk[32],
 		     const uint8_t *msg, size_t msg_len);
 
 /* XChaCha20-Poly1305 with a 24-byte nonce, Monocypher's crypto_aead_lock
- * layout and semantics. Returns 0 on success; unlock fails on a bad tag. */
+ * layout and semantics. Returns 0 on success; unlock fails on a bad tag and
+ * leaves no recoverable plaintext in pt. The caller must not read pt on a
+ * non-zero return. */
 int cc_aead_lock(uint8_t *ct, uint8_t mac[16], const uint8_t key[32],
 		 const uint8_t nonce[24], const uint8_t *ad, size_t ad_len,
 		 const uint8_t *pt, size_t pt_len);

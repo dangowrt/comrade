@@ -270,6 +270,8 @@ int cc_aead_unlock(uint8_t *pt, const uint8_t mac[16], const uint8_t key[32],
 		goto out;	/* a tag mismatch fails the final */
 	ok = 1;
 out:
+	if (!ok && ct_len)
+		OPENSSL_cleanse(pt, ct_len);
 	OPENSSL_cleanse(subkey, sizeof(subkey));
 	EVP_CIPHER_CTX_free(c);
 	return ok ? 0 : -1;

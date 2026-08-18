@@ -578,7 +578,7 @@ static void canon_v6(const char *in, const char *src6, char *out, size_t cap)
 		}
 		if (rewrite)
 			sscanf(line, "a=candidate:%*s %*d %*s %*u %n%*s%n", &a0, &a1);
-		if (rewrite && a1 > a0 && a0 > 0) {
+		if (rewrite && a1 > a0 && a0 > 0 && (size_t)a1 <= len) {
 			size_t plen = strlen(src6);
 
 			if (o + (size_t)a0 + plen + (len - (size_t)a1) < cap) {
