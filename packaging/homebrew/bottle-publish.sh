@@ -44,6 +44,13 @@ gh release create "$TAG" \
   --title "comrade $V" \
   --notes "comrade $V. See the apt, winget and Homebrew instructions in the README." \
   2>/dev/null || true
+# `brew bottle` writes the local file with a doubled dash (comrade--<version>),
+# but Homebrew fetches the canonical single-dashed name (comrade-<version>) at
+# install time. Rename so `brew install` resolves them on the release. --merge
+# below reads the JSONs, not the tarballs, so it is unaffected.
+for f in bottles/*--*.bottle.tar.gz; do
+  [ -e "$f" ] && mv "$f" "$(echo "$f" | sed 's/--/-/')"
+done
 gh release upload "$TAG" bottles/*.bottle.tar.gz --clobber
 
 # --merge folds every arch's JSON into one bottle block (each JSON already
