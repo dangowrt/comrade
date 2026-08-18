@@ -1160,6 +1160,7 @@ static void *ssh_cli_thread(void *p)
 	memcpy(o.host_fp, s->cfg->tok.hostpub, 32);
 	memcpy(o.auth, s->auth, sizeof(o.auth));
 	o.interactive = s->cfg->interactive;
+	o.read_only = (s->cfg->tok.flags & TOKEN_FLAG_RO) != 0;
 	o.ctl_fd = c->ssh_ctl_fd;
 	o.fwd_l = s->cfg->fwd_l;
 	o.nfwd_l = s->cfg->nfwd_l;

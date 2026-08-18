@@ -31,7 +31,39 @@ struct stdin_ctx {
 	int eof;
 	const volatile int *interrupted;	/* link is down: keys go nowhere */
 	volatile int *quit;			/* set to bail out of the session */
+	int read_only;				/* view-only: intercept the leave keys */
+	int prefix_pending;			/* saw the tmux prefix, awaiting its key */
+	volatile int *left;			/* set when the user asked to leave */
 };
+
+/*
+ * A view-only client's keystrokes never reach the host's tmux, so the usual
+ * detach/exit keys are dead. Recognise the default tmux prefix (Ctrl-b)
+ * followed by a detach (d) or kill (x, &) key locally and treat it as a
+ * request to leave -- for comrade, detach, exit and leave all just tear the
+ * client down. The prefix may straddle two reads, so the pending state lives
+ * in the context. Ctrl-b is a C0 byte that never appears inside an escape
+ * sequence, so watching for it cannot misfire mid-sequence.
+ */
+#define TMUX_PREFIX 0x02		/* Ctrl-b */
+
+static int ro_wants_leave(struct stdin_ctx *c, const char *buf, size_t n)
+{
+	size_t i;
+
+	for (i = 0; i < n; i++) {
+		unsigned char b = (unsigned char)buf[i];
+
+		if (c->prefix_pending) {
+			c->prefix_pending = 0;
+			if (b == 'd' || b == 'x' || b == '&')
+				return 1;
+		} else if (b == TMUX_PREFIX) {
+			c->prefix_pending = 1;
+		}
+	}
+	return 0;
+}
 
 static int on_stdin(socket_t fd, int revents, void *userdata)
 {
@@ -64,6 +96,11 @@ static int on_stdin(socket_t fd, int revents, void *userdata)
 			*c->quit = 1;
 			return 0;
 		}
+	}
+	if (c->read_only && ro_wants_leave(c, buf, (size_t)n)) {
+		*c->left = 1;
+		*c->quit = 1;
+		return 0;
 	}
 	fn = termfilter_run(c->tf, buf, (size_t)n, fb);
 	if (fn)
@@ -207,7 +244,7 @@ static int run_interactive(ssh_session s, ssh_channel chan,
 {
 	struct tty_saved term;
 	int rows = 0, cols = 0, reserve = 0;
-	volatile int interrupted = 0, quit = 0;
+	volatile int interrupted = 0, quit = 0, left = 0;
 	int reconnect = 0;
 	uint64_t last_status = 0;
 	struct conn_status cur, prev;
@@ -258,6 +295,9 @@ static int run_interactive(ssh_session s, ssh_channel chan,
 	sctx.eof = 0;
 	sctx.interrupted = &interrupted;
 	sctx.quit = &quit;
+	sctx.read_only = o && o->read_only;
+	sctx.prefix_pending = 0;
+	sctx.left = &left;
 	ssh_connector_set_in_channel(c_out, chan, SSH_CONNECTOR_STDOUT);
 	ssh_connector_set_out_fd(c_out, s_out);
 	ssh_connector_set_in_channel(c_err, chan, SSH_CONNECTOR_STDERR);
@@ -370,7 +410,9 @@ static int run_interactive(ssh_session s, ssh_channel chan,
 	tty_resize_watch(0);
 	if (have_tty)
 		tty_raw_off(&term);
-	if (quit)
+	if (left)
+		fprintf(stderr, "comrade: detached.\n");
+	else if (quit)
 		fprintf(stderr, "comrade: link lost -- disconnected.\n");
 out:
 	if (c_ctl_in)

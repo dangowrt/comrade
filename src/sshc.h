@@ -29,6 +29,15 @@ struct sshc_opts {
 	int interactive;		/* bridge local stdin/stdout raw */
 
 	/*
+	 * View-only grade (the token carried TOKEN_FLAG_RO). Keystrokes never
+	 * reach the host's tmux, so the usual detach/exit keys do nothing; the
+	 * interactive client watches for the tmux prefix followed by a
+	 * detach/exit key and leaves locally instead. Ignored for a read-write
+	 * client, whose keys must pass through to the real tmux untouched.
+	 */
+	int read_only;
+
+	/*
 	 * Optional control-plane fd. When > 0, the client opens one extra SSH
 	 * channel (subsystem "comrade-ctl") alongside the shell channel and
 	 * bridges it to this fd, carrying the session's control protocol inside
