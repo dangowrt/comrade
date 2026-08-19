@@ -22,10 +22,10 @@ real terminal offers to run) that exact command.
 
 ## How the manifest is produced
 
-The three YAML files here are templates. The Windows release CI, after building
-`comrade-x64.exe` and `comrade-arm64.exe` and attaching them to the tagged GitHub
-release, fills the placeholders (`@VERSION@`, `@TAG@`, `@DATE@`, the two
-`@SHA256_*@`), producing the manifest ready for submission.
+The three YAML files here are templates. The release CI's `winget-manifest` job,
+once `comrade-x64.exe` and `comrade-arm64.exe` are built, fills the placeholders
+(`@VERSION@`, `@TAG@`, `@DATE@`, the two `@SHA256_*@`) from those executables and
+the tag they are released under, producing the manifest ready for submission.
 
 - `dangowrt.comrade.yaml` — version manifest
 - `dangowrt.comrade.installer.yaml` — the two per-arch portable installers

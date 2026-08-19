@@ -1,10 +1,15 @@
 #!/bin/bash
 # Merge the per-arch bottles built by bottle-build.sh into the tap's comrade
-# formula, upload the bottle tarballs to the tag's GitHub release, and push the
-# tap, so `brew install comrade` fetches a prebuilt binary for either macOS arch.
-# The bottle tarballs and JSONs from every arch are expected under ./bottles.
+# formula and push the tap, so `brew install comrade` fetches a prebuilt binary
+# for either macOS arch. The bottle JSONs from every arch are expected under
+# ./bottles; --merge reads those, not the tarballs.
 #
-# Environment: VERSION, TAP_TOKEN (write access to the tap), GH_TOKEN.
+# The tarballs themselves are already on the tag's GitHub release, put there by
+# the release workflow's `release` job together with every other release asset,
+# so nothing here touches the release. Run this only after that job, or the
+# formula would name bottles that cannot be downloaded yet.
+#
+# Environment: VERSION, TAP_TOKEN (write access to the tap).
 set -euo pipefail
 
 V="$VERSION"
@@ -38,20 +43,6 @@ awk -v url="$GIT_URL" -v tag="$TAG" -v rev="$REVISION" '
   { print }
 ' packaging/homebrew/comrade.rb > "$TAPS/Formula/comrade.rb"
 brew trust "$TAP" 2>/dev/null || true
-
-log "Upload the bottles to the release"
-gh release create "$TAG" \
-  --title "comrade $V" \
-  --notes "comrade $V. See the apt, winget and Homebrew instructions in the README." \
-  2>/dev/null || true
-# `brew bottle` writes the local file with a doubled dash (comrade--<version>),
-# but Homebrew fetches the canonical single-dashed name (comrade-<version>) at
-# install time. Rename so `brew install` resolves them on the release. --merge
-# below reads the JSONs, not the tarballs, so it is unaffected.
-for f in bottles/*--*.bottle.tar.gz; do
-  [ -e "$f" ] && mv "$f" "$(echo "$f" | sed 's/--/-/')"
-done
-gh release upload "$TAG" bottles/*.bottle.tar.gz --clobber
 
 # --merge folds every arch's JSON into one bottle block (each JSON already
 # carries its own os/arch tag and the release root_url set at build time).

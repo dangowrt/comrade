@@ -31,11 +31,14 @@ anyone who wants it; the build date comes from the commit itself
 (`SOURCE_DATE_EPOCH`, honoured by the CMake build), so a given commit always
 builds the same bytes.
 
-The release CI builds the bottle and pushes the updated formulae to the tap repo
+The release CI builds the bottle per arch, and its `release` job attaches both to
+the tagged GitHub release alongside the Windows executables, in the one call that
+creates the release. Only then does it push the updated formulae to the tap repo
 **dangowrt/homebrew-comrade** under `Formula/` (also when a dependency version is
-bumped). It needs a token with write access to that repo, exposed as the
-`HOMEBREW_TAP_TOKEN` secret, the macOS counterpart of the apt repo's signing
-secret.
+bumped), so the formula's bottle block never names a download that is not on the
+release yet. Pushing the tap needs a token with write access to that repo,
+exposed as the `HOMEBREW_TAP_TOKEN` secret, the macOS counterpart of the apt
+repo's signing secret.
 
 ## Dependency formulae and pins
 

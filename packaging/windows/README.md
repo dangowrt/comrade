@@ -32,5 +32,7 @@ supply BLAKE2b or Ed25519.
 
 `.github/workflows/release.yml` builds both arches on a single `windows-latest`
 runner (arm64 is cross-built and compile/import-verified; it cannot execute on
-an AMD64 runner), publishes the executables to the tagged GitHub release, and
-fills the winget manifest templates in `packaging/winget/`.
+an AMD64 runner). Its `release` job then attaches the executables to the tagged
+GitHub release in the same call that attaches the macOS bottles -- the release
+is created once, with every asset, and never edited afterwards -- and its
+`winget-manifest` job fills the templates in `packaging/winget/`.
