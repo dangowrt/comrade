@@ -299,6 +299,8 @@ static int addr_scope(const char *addr)
 			return NET_SCOPE_GLOBAL;
 		if (b[0] == 0xfe && (b[1] & 0xc0) == 0x80)	/* fe80::/10 */
 			return NET_SCOPE_LAN;
+		if (b[0] == 0xfe && (b[1] & 0xc0) == 0xc0)	/* fec0::/10 site-local */
+			return NET_SCOPE_LAN;
 		if ((b[0] & 0xfe) == 0xfc)			/* fc00::/7 ULA */
 			return NET_SCOPE_LAN;
 		return NET_SCOPE_GLOBAL;
