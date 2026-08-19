@@ -265,6 +265,8 @@ void sig_set_mcast_claims(struct sig *s, int on)
 
 int sig_seed_node(struct sig *s, const struct sockaddr *sa, socklen_t len)
 {
+	if (!(s->flags & SIG_DHT))
+		return -1;
 	if (!s->dht_engaged && engage_dht(s))
 		return -1;
 	return bep44_pin_add(s->engine, NULL, sa, len);
@@ -272,6 +274,8 @@ int sig_seed_node(struct sig *s, const struct sockaddr *sa, socklen_t len)
 
 int sig_locate(struct sig *s)
 {
+	if (!(s->flags & SIG_DHT))
+		return -1;
 	if (!s->dht_engaged && engage_dht(s))
 		return -1;
 	s->locate = 1;
@@ -303,6 +307,8 @@ int sig_reinforce(struct sig *s, int family, const struct sockaddr *sa,
 	socklen_t *rl = family == 6 ? &s->rnode6_len : &s->rnode4_len;
 
 	if ((size_t)len > sizeof(*r))
+		return -1;
+	if (!(s->flags & SIG_DHT))
 		return -1;
 	if (!s->dht_engaged && engage_dht(s))
 		return -1;

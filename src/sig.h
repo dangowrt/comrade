@@ -107,6 +107,9 @@ void sig_set_mcast_claims(struct sig *s, int on);
 /*
  * Rendezvous acceleration.
  *
+ * All three engage the DHT, and all three refuse when SIG_DHT is not among the
+ * transports this signaller was created with.
+ *
  * sig_seed_node (client): plant a token's rendezvous node as a sticky DHT
  * hint, queried first, with the global DHT bootstrapping alongside as fallback.
  *
