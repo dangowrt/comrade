@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 /* Copyright (C) 2026 Daniel Golle <daniel@makrotopia.org> */
 
+#include <signal.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -129,6 +130,12 @@ int main(int argc, char **argv)
 	int ui_mode = UI_AUTO, no_mcast = 0;
 	const char *pos = NULL;
 	int i;
+
+	/* Writes race teardown all over this program -- the ssh socketpair, the
+	 * forwarding bridges, the status pipe -- and a peer closing first must
+	 * never kill us outright. The host service already did this for itself;
+	 * do it once here so the client and every other path is covered too. */
+	signal(SIGPIPE, SIG_IGN);
 
 	for (i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help"))

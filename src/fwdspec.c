@@ -40,7 +40,10 @@ static int split(const char *arg, char tok[][256], int maxtok, size_t tlen)
 				return depth ? -1 : n;
 			continue;
 		}
-		if (len + 1 >= tlen)
+		/* Bound the token index here too, not only at a separator: a spec
+		 * with more fields than tok[] holds reaches this write with n
+		 * already past the end. */
+		if (n >= maxtok || len + 1 >= tlen)
 			return -1;
 		tok[n][len++] = c;
 	}
