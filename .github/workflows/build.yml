@@ -1,0 +1,291 @@
+# Build and test comrade on the platforms it supports.
+#
+# kcp and jech/dht are not packaged in most distributions, so they are built from source here. That is
+# deliberate: it exercises the same path a packager walks, and keeps the
+# workflow honest about what comrade actually needs.
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    # A stuck test must fail the job fast rather than tie up a self-hosted
+    # worker until a human cancels it; ctest --timeout below is the per-test
+    # guard, this is the coarse backstop.
+    timeout-minutes: 20
+    env:
+      # Homebrew pulls bottles from ghcr.io, which is anonymous-per-IP on a
+      # shared-egress fleet; the job token lifts the limit.
+      HOMEBREW_GITHUB_API_TOKEN: ${{ github.token }}
+    strategy:
+      fail-fast: false
+      # Self-hosted runners share one egress IP, and GitHub rate-limits
+      # anonymous fetches per IP; fanning the whole matrix out at once trips
+      # 429 on the *Set up job* action download. Cap the burst.
+      max-parallel: 2
+      matrix:
+        include:
+          # Runner labels default to GitHub-hosted, so a fork's CI just works on
+          # the forker's own credits. Point them at a self-hosted fleet by
+          # setting the RUNNER_LINUX / RUNNER_MACOS repository variables to a
+          # JSON runs-on value, for example ["self-hosted","comrade","Linux"].
+          # Add an arm64 entry when such a runner exists.
+          - name: linux (openssl backend)
+            os: ${{ vars.RUNNER_LINUX && fromJSON(vars.RUNNER_LINUX) || 'ubuntu-latest' }}
+            crypto: auto
+          - name: linux (gcrypt backend)
+            os: ${{ vars.RUNNER_LINUX && fromJSON(vars.RUNNER_LINUX) || 'ubuntu-latest' }}
+            crypto: gcrypt
+          - name: linux (monocypher backend)
+            os: ${{ vars.RUNNER_LINUX && fromJSON(vars.RUNNER_LINUX) || 'ubuntu-latest' }}
+            crypto: monocypher
+          # macos-latest is Apple Silicon (arm64); a self-hosted mac may be
+          # Intel x64. The job builds for whichever arch the runner provides,
+          # so it stays valid on both -- the name does not pin an arch.
+          - name: macos
+            os: ${{ vars.RUNNER_MACOS && fromJSON(vars.RUNNER_MACOS) || 'macos-latest' }}
+            crypto: auto
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+
+      # Every out-of-tree dependency is fetched from github.com. Anonymous
+      # clones are rate-limited per source IP, and a shared-egress fleet trips
+      # that limit; routing them through the job token makes them authenticated
+      # (5000 req/hr per repo) instead. Forks use their own token, so a fork's
+      # CI stays charged to the forker.
+      - name: Route GitHub fetches through the job token
+        shell: bash
+        run: |
+          git config --global \
+            url."https://x-access-token:${{ github.token }}@github.com/".insteadOf \
+            "https://github.com/"
+
+      # Dependency versions come from the shared manifest, so CI builds the same
+      # set the packaging pipelines do; see packaging/versions.sh.
+      - name: Load dependency versions
+        run: |
+          . packaging/versions.sh
+          {
+            echo "KCP_VERSION=$KCP_VERSION"
+            echo "JUICE_VERSION=$JUICE_VERSION"
+            echo "DHT_COMMIT=$DHT_COMMIT"
+          } >> "$GITHUB_ENV"
+
+      # Self-hosted runners are not GitHub's images: sudo can be locked (the
+      # Linux runners are containers) and Homebrew can be off PATH (macOS runs
+      # as its own user). Put brew on PATH; the not-yet-packaged deps (libjuice,
+      # kcp, jech/dht, monocypher) build into a user-writable prefix so nothing
+      # needs root. The BASE packages -- a crypto lib, libssh, ninja, pkg-config,
+      # cmake >= 3.20, tmux -- must be provisioned on the runner (a locked
+      # container cannot install them; Configure then fails with a clear list).
+      - name: Put Homebrew on PATH (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          # if...fi, not "&& echo": under the runner's set -e a missing
+          # candidate (e.g. /usr/local/bin on an Apple-Silicon runner, where
+          # brew lives in /opt/homebrew) makes "[ -x ] && echo" return non-zero
+          # and fails the step. A GitHub-hosted mac already has brew on PATH;
+          # this step only matters for a self-hosted mac that keeps it elsewhere.
+          for d in /opt/homebrew/bin /usr/local/bin; do
+            if [ -x "$d/brew" ]; then echo "$d" >> "$GITHUB_PATH"; fi
+          done
+
+      - name: Install base packages (best-effort)
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            SUDO=; [ "$(id -u)" = 0 ] || SUDO="sudo -n"
+            $SUDO apt-get update && $SUDO apt-get install -y --no-install-recommends \
+              cmake ninja-build pkg-config build-essential git curl ca-certificates \
+              libssh-dev tmux libgcrypt20-dev libsodium-dev \
+              || echo "note: could not apt-get; relying on the runner's provisioned packages"
+          else
+            brew install cmake ninja pkg-config libssh tmux libgcrypt \
+              || echo "note: brew install failed; relying on the runner's provisioned packages"
+          fi
+
+      # A user-writable prefix for the built deps, and the pkg-config and
+      # runtime library paths that point at it, exported for every later step.
+      - name: Prepare the dependency prefix
+        run: |
+          DEPS="$HOME/comrade-ci-deps"
+          mkdir -p "$DEPS/lib"
+          {
+            echo "DEPS=$DEPS"
+            echo "PKG_CONFIG_PATH=$DEPS/lib/pkgconfig:$DEPS/lib64/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+            if [ "$RUNNER_OS" = macOS ]; then
+              echo "DYLD_LIBRARY_PATH=$DEPS/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
+            else
+              echo "LD_LIBRARY_PATH=$DEPS/lib:$DEPS/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            fi
+          } >> "$GITHUB_ENV"
+
+      # The VMs are ephemeral, so without this the deps are cloned and rebuilt on
+      # every job -- most of the fetch pressure and minutes. Cache the built
+      # prefix and the jech/dht checkout, keyed on the pinned versions; a
+      # per-dep sentinel lets the build steps below skip on a hit.
+      - name: Cache built dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/comrade-ci-deps
+            dht
+          key: ${{ runner.os }}-cideps-${{ matrix.crypto }}-${{ hashFiles('packaging/versions.sh') }}
+
+      # Monocypher is not in the Ubuntu or Homebrew indexes; build the
+      # release tarball the same way a packager would, into the prefix.
+      - name: Build monocypher
+        if: matrix.crypto == 'monocypher'
+        run: |
+          [ -e "$DEPS/.built-monocypher" ] && { echo "using cached monocypher"; exit 0; }
+          curl --retry 5 --retry-all-errors --retry-delay 5 -fsSL \
+            https://monocypher.org/download/monocypher-4.0.2.tar.gz | tar xz
+          make -C monocypher-4.0.2 -j"$(getconf _NPROCESSORS_ONLN)"
+          make -C monocypher-4.0.2 install PREFIX="$DEPS"
+          touch "$DEPS/.built-monocypher"
+
+      - name: Build libjuice
+        run: |
+          [ -e "$DEPS/.built-libjuice" ] && { echo "using cached libjuice"; exit 0; }
+          n=0; until git clone --depth 1 -b "v$JUICE_VERSION" \
+              https://github.com/paullouisageneau/libjuice; do
+            n=$((n+1)); [ "$n" -ge 5 ] && { echo "libjuice clone failed"; exit 1; }
+            echo "retry $n in $((n*5))s"; sleep $((n*5))
+          done
+          cmake -S libjuice -B libjuice/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$DEPS"
+          cmake --build libjuice/build
+          cmake --install libjuice/build
+          touch "$DEPS/.built-libjuice"
+
+      # Shared, as the distribution recipes package it: upstream honours
+      # BUILD_SHARED_LIBS but sets no SOVERSION, so the packages impose one.
+      - name: Build kcp
+        run: |
+          [ -e "$DEPS/.built-kcp" ] && { echo "using cached kcp"; exit 0; }
+          n=0; until git clone --depth 1 -b "$KCP_VERSION" https://github.com/skywind3000/kcp; do
+            n=$((n+1)); [ "$n" -ge 5 ] && { echo "kcp clone failed"; exit 1; }
+            echo "retry $n in $((n*5))s"; sleep $((n*5))
+          done
+          # kcp pins cmake 4.0 for nothing used here; relax the floor so a
+          # provisioned runner's own cmake (>= 3.20) suffices.
+          sed -i.bak 's/cmake_minimum_required(VERSION[^)]*)/cmake_minimum_required(VERSION 3.20)/I' \
+            kcp/CMakeLists.txt
+          cmake -S kcp -B kcp/build -G Ninja -DBUILD_SHARED_LIBS=ON \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$DEPS"
+          cmake --build kcp/build
+          cmake --install kcp/build
+          touch "$DEPS/.built-kcp"
+
+      # comrade compiles dht.c straight in when given a checkout, and links
+      # a shared libdht when not. Exercise the checkout route here; the
+      # packaging jobs cover the shared-library route.
+      - name: Fetch jech/dht
+        run: |
+          [ -e dht/dht.c ] && { echo "using cached dht"; exit 0; }
+          n=0; until git clone https://github.com/jech/dht dht; do
+            n=$((n+1)); [ "$n" -ge 5 ] && { echo "dht clone failed"; exit 1; }
+            echo "retry $n in $((n*5))s"; sleep $((n*5))
+          done
+          git -C dht checkout "$DHT_COMMIT"
+
+      - name: Configure
+        run: |
+          PP="$DEPS"
+          if [ "$RUNNER_OS" = macOS ]; then
+            PP="$DEPS;$(brew --prefix 2>/dev/null || echo /usr/local)"
+            # Homebrew keeps OpenSSL (and libgcrypt) keg-only, so with
+            # COMRADE_CRYPTO=auto -- which follows libssh's crypto backend, and
+            # Homebrew's libssh links OpenSSL -- comrade's ccrypto cannot find
+            # the library unless the keg is on the prefix path. Add the kegs
+            # explicitly; a brew --prefix miss is harmless. This is the main
+            # divergence between a GitHub-hosted mac and a self-hosted one.
+            for keg in openssl@3 openssl libgcrypt; do
+              p=$(brew --prefix "$keg" 2>/dev/null) && [ -n "$p" ] && PP="$PP;$p"
+            done
+          fi
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$PP" \
+            -DCOMRADE_DHT_DIR="$PWD/dht" \
+            -DCOMRADE_CRYPTO=${{ matrix.crypto }} \
+            -DCOMRADE_WERROR=ON
+
+      - name: Build
+        run: cmake --build build
+
+      # --output-on-failure so a flake in CI arrives with its output attached
+      # rather than as a bare red cross; --timeout 120 so a hung test fails fast
+      # with diagnostics instead of stalling the worker (the e2e tests carry
+      # their own longer per-test TIMEOUT in the CMake).
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --timeout 120
+
+      - name: Smoke test the binary
+        run: |
+          ./build/comrade --help
+          ./build/comrade show || true   # exits 1 with no session, as designed
+
+  # comrade also builds on Windows (static, llvm-mingw clang/UCRT). The e2e
+  # harness is POSIX-only, so this is a build plus a --help smoke test rather
+  # than the full ctest suite, and it mirrors the release build so a break shows
+  # up on every commit rather than only when a tag is cut. x64 only: an AMD64
+  # runner cannot run an arm64 binary, and the release job compile-checks arm64.
+  windows:
+    name: windows (x64)
+    runs-on: ${{ vars.RUNNER_WINDOWS && fromJSON(vars.RUNNER_WINDOWS) || 'windows-latest' }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+
+      # build.ps1 clones libssh/mbedtls/monocypher/libjuice from github.com;
+      # authenticate them through the job token so the shared-egress fleet does
+      # not hit the anonymous per-IP limit.
+      - name: Route GitHub fetches through the job token
+        shell: pwsh
+        run: |
+          git config --global "url.https://x-access-token:${{ github.token }}@github.com/.insteadOf" "https://github.com/"
+
+      - name: Install ninja and pkg-config
+        run: choco install ninja pkgconfiglite --no-progress -y --allow-empty-checksums
+
+      - name: Fetch llvm-mingw
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $v = "20260616"
+          $u = "https://github.com/mstorsjo/llvm-mingw/releases/download/$v/llvm-mingw-$v-ucrt-x86_64.zip"
+          Invoke-WebRequest $u -OutFile "$env:RUNNER_TEMP\llvm-mingw.zip" `
+            -Headers @{ Authorization = "Bearer $env:GH_TOKEN" } `
+            -MaximumRetryCount 5 -RetryIntervalSec 10
+          Expand-Archive "$env:RUNNER_TEMP\llvm-mingw.zip" -DestinationPath $env:RUNNER_TEMP
+          "LLVM_MINGW=$env:RUNNER_TEMP\llvm-mingw-$v-ucrt-x86_64" | Out-File -Append $env:GITHUB_ENV
+
+      - name: Build comrade.exe
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}   # build.ps1 authenticates its GitHub fetches with this
+        run: >
+          pwsh packaging/windows/build.ps1
+          -Triple x86_64-w64-mingw32 -Toolchain $env:LLVM_MINGW
+          -Root "$env:RUNNER_TEMP\winbuild" -Out "$env:RUNNER_TEMP\out"
+          -Werror ON
+
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          & "$env:RUNNER_TEMP\out\comrade-x64.exe" --help
