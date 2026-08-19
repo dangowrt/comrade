@@ -10,7 +10,7 @@ static uint32_t rotl(uint32_t x, int n)
 	return x << n | x >> (32 - n);
 }
 
-static void sha1_block(struct sha1_ctx *ctx, const uint8_t *p)
+static void cc_sha1_block(struct cc_sha1_ctx *ctx, const uint8_t *p)
 {
 	uint32_t w[80];
 	uint32_t a, b, c, d, e, f, k, t;
@@ -57,7 +57,7 @@ static void sha1_block(struct sha1_ctx *ctx, const uint8_t *p)
 	ctx->h[4] += e;
 }
 
-void sha1_init(struct sha1_ctx *ctx)
+void cc_sha1_init(struct cc_sha1_ctx *ctx)
 {
 	ctx->h[0] = 0x67452301;
 	ctx->h[1] = 0xefcdab89;
@@ -67,7 +67,7 @@ void sha1_init(struct sha1_ctx *ctx)
 	ctx->len = 0;
 }
 
-void sha1_update(struct sha1_ctx *ctx, const void *data, size_t len)
+void cc_sha1_update(struct cc_sha1_ctx *ctx, const void *data, size_t len)
 {
 	const uint8_t *p = data;
 	size_t fill = ctx->len % 64;
@@ -84,15 +84,15 @@ void sha1_update(struct sha1_ctx *ctx, const void *data, size_t len)
 		len -= n;
 		if (fill + n < 64)
 			return;
-		sha1_block(ctx, ctx->buf);
+		cc_sha1_block(ctx, ctx->buf);
 	}
 	for (; len >= 64; p += 64, len -= 64)
-		sha1_block(ctx, p);
+		cc_sha1_block(ctx, p);
 	if (len)
 		memcpy(ctx->buf, p, len);
 }
 
-void sha1_final(struct sha1_ctx *ctx, uint8_t digest[SHA1_LEN])
+void cc_sha1_final(struct cc_sha1_ctx *ctx, uint8_t digest[SHA1_LEN])
 {
 	uint64_t bits = ctx->len * 8;
 	uint8_t pad[72];
@@ -104,7 +104,7 @@ void sha1_final(struct sha1_ctx *ctx, uint8_t digest[SHA1_LEN])
 	pad[0] = 0x80;
 	for (i = 0; i < 8; i++)
 		pad[padlen + i] = (uint8_t)(bits >> (56 - 8 * i));
-	sha1_update(ctx, pad, padlen + 8);
+	cc_sha1_update(ctx, pad, padlen + 8);
 
 	for (i = 0; i < 5; i++) {
 		digest[i * 4] = (uint8_t)(ctx->h[i] >> 24);
@@ -114,11 +114,11 @@ void sha1_final(struct sha1_ctx *ctx, uint8_t digest[SHA1_LEN])
 	}
 }
 
-void sha1(uint8_t digest[SHA1_LEN], const void *data, size_t len)
+void cc_sha1(uint8_t digest[SHA1_LEN], const void *data, size_t len)
 {
-	struct sha1_ctx ctx;
+	struct cc_sha1_ctx ctx;
 
-	sha1_init(&ctx);
-	sha1_update(&ctx, data, len);
-	sha1_final(&ctx, digest);
+	cc_sha1_init(&ctx);
+	cc_sha1_update(&ctx, data, len);
+	cc_sha1_final(&ctx, digest);
 }

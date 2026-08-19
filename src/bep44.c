@@ -175,13 +175,13 @@ size_t bep44_sig_buffer(uint8_t *dst, size_t dst_len, const char *salt,
 
 void bep44_target(uint8_t target[20], const uint8_t pk[32], const char *salt)
 {
-	struct sha1_ctx ctx;
+	struct cc_sha1_ctx ctx;
 
-	sha1_init(&ctx);
-	sha1_update(&ctx, pk, 32);
+	cc_sha1_init(&ctx);
+	cc_sha1_update(&ctx, pk, 32);
 	if (salt)
-		sha1_update(&ctx, salt, strlen(salt));
-	sha1_final(&ctx, target);
+		cc_sha1_update(&ctx, salt, strlen(salt));
+	cc_sha1_final(&ctx, target);
 }
 
 struct bep44_engine *bep44_create(const uint8_t myid[20], int s4, int s6)
