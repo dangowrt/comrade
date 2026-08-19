@@ -282,19 +282,53 @@ if(COMRADE_HAVE_CRYPTO)
 	target_link_libraries(comrade_mailbox PUBLIC comrade_crypto)
 endif()
 
+#
+# jech/dht comes either as a plain source checkout (-DCOMRADE_DHT_DIR, which
+# compiles dht.c straight in) or as an installed shared library, which is
+# preferred when no checkout is given: distributions package it (OpenWrt's
+# libdht, which transmission already links), and comrade is an ordinary
+# consumer of it. Nothing about the callback design forces the source route --
+# comrade calls only dht.h's public API and defines the four symbols the
+# library deliberately leaves undefined (dht_hash, dht_random_bytes,
+# dht_blacklisted, dht_sendto), which the dynamic linker resolves back into
+# the executable.
+#
+find_path(COMRADE_DHT_INCLUDE_DIR dht.h PATH_SUFFIXES dht)
+find_library(COMRADE_DHT_LIBRARY dht)
+
+# BEP 44 is a self-contained engine: it speaks the mainline protocol over a
+# socket the caller owns and makes no call into jech/dht, so it is its own
+# target and consumers that only want put/get (bep44_test) never drag in the
+# DHT library.
+if(COMRADE_HAVE_CRYPTO)
+	add_library(comrade_bep44 STATIC src/bep44.c)
+	target_include_directories(comrade_bep44 PUBLIC src)
+	target_link_libraries(comrade_bep44 PUBLIC comrade_crypto)
+endif()
+
 set(COMRADE_HAVE_DHT 0)
+set(COMRADE_DHT_HOW "")
 if(COMRADE_HAVE_CRYPTO AND COMRADE_DHT_DIR AND EXISTS "${COMRADE_DHT_DIR}/dht.c")
 	set(COMRADE_HAVE_DHT 1)
-	add_library(comrade_dht STATIC
-		${COMRADE_DHT_DIR}/dht.c
-		src/bep44.c
-		src/dhtnode.c
-	)
+	set(COMRADE_DHT_HOW "dht.c compiled in from ${COMRADE_DHT_DIR}")
+	add_library(comrade_dht STATIC ${COMRADE_DHT_DIR}/dht.c src/dhtnode.c)
 	target_include_directories(comrade_dht PUBLIC src ${COMRADE_DHT_DIR})
-	target_compile_definitions(comrade_dht PRIVATE _GNU_SOURCE)
 	set_source_files_properties(${COMRADE_DHT_DIR}/dht.c PROPERTIES
 		COMPILE_OPTIONS "-w")
-	target_link_libraries(comrade_dht PUBLIC comrade_crypto comrade_appdir Threads::Threads)
+elseif(COMRADE_HAVE_CRYPTO AND COMRADE_DHT_INCLUDE_DIR AND COMRADE_DHT_LIBRARY)
+	set(COMRADE_HAVE_DHT 1)
+	set(COMRADE_DHT_HOW "linking ${COMRADE_DHT_LIBRARY}")
+	# dhtnode.c both drives libdht and defines the four callbacks it leaves
+	# undefined, so any target that links the library also pulls those in.
+	add_library(comrade_dht STATIC src/dhtnode.c)
+	target_include_directories(comrade_dht PUBLIC src ${COMRADE_DHT_INCLUDE_DIR})
+	target_link_libraries(comrade_dht PUBLIC ${COMRADE_DHT_LIBRARY})
+endif()
+if(COMRADE_HAVE_DHT)
+	target_compile_definitions(comrade_dht PRIVATE _GNU_SOURCE)
+	target_link_libraries(comrade_dht PUBLIC comrade_bep44 comrade_crypto
+		comrade_appdir Threads::Threads)
+	message(STATUS "DHT: ${COMRADE_DHT_HOW}")
 endif()
 
 set(COMRADE_HAVE_SIG 0)
