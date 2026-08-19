@@ -292,6 +292,43 @@ finished receiver LINGERS on `ikcp_waitsnd` until its own sent tail is acked.
 
 ---
 
+### Transport probe (`session.c`, `PROBE_MAGIC`)
+
+The transport carries one more thing beside the KCP stream, and the two are told
+apart for the cost of one compare: every KCP datagram opens with the 4-byte
+conversation id and `ikcp_input` rejects a mismatch, and comrade uses the single
+fixed `SESSION_CONV`, so a datagram opening with a different magic is
+unambiguously not stream data.
+
+```
+  PROBE_MAGIC 0x434d5250 ("CMRP")
+  [4 magic][seal(sig_key, [1 type][8 nonce][1 ulen][ulen claimant ufrag])]
+  type: 1 = PING, 2 = PONG (echoes the nonce)
+```
+
+`deliver_stream()` splits probes off ahead of `stream_input()`. The seal is not
+defending against the peer, who holds the token and is trusted by construction
+(§12); it stops a stranger who can guess an endpoint from forging a reply.
+
+**A path is qualified when a probe round-trips on it**, and nothing else
+qualifies a path. That is strictly stronger than a transport reporting a pair: it
+proves reachability in both directions, and -- because the probe carries the
+**claimant ufrag** and a host worker answers only for the claimant it was
+admitted for -- it proves the far end is serving *this* client rather than
+somebody who happened to read the same offer (§12). A client sends a probe on
+every candidate path every `PROBE_EVERY_MS`; the host answers and never sends.
+
+**Path preference.** Qualification says a path works; class says which working
+path to use, lowest first:
+
+| class | recognised by | why |
+|---|---|---|
+| LAN | a qualified lanlink endpoint | same segment: no NAT binding, no ICE keepalive, no gateway, lowest RTT |
+| ICE local | qualified ICE whose remote is LAN-scope | on-segment, but pays ICE overhead |
+| ICE reflexive | anything else | leaves the segment; for two peers behind one NAT this is the hairpin case, which is slower and which many routers cannot do |
+
+---
+
 ## 10. SSH session (`src/sshd.c`, `src/sshc.c`, `src/sshbridge.c`)
 
 libssh server (host) and client (joiner) over the KCP byte stream
@@ -368,8 +405,9 @@ advances each in-flight punch: a connected one becomes a worker (its dashboard r
 opens there); a failed one, or one past `ICE_ATTEMPT_MS = 90000`, is freed. A
 stuck punch therefore never head-of-line-blocks the next joiner. A **stale-claim
 guard keyed by the claimant's ICE ufrag** (`have_served`/`last_served_ufrag`, plus
-`ufrag_in_flight` over `punching[]`) ignores a lagging DHT re-read of an
-already-served or in-flight answer, so no client is punched twice.
+`ufrag_admitted` over `punching[]` and `lan_ufrag_claimed` over the direct path)
+ignores a lagging DHT re-read of an already-served or in-flight answer, so no
+client is punched twice.
 
 **LAN direct path, admission queue.** A sealed multicast answer from a LAN-scope
 source becomes a direct claim (§6): `on_direct_claim` appends its

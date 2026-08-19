@@ -81,13 +81,12 @@ static int fam_idx(int family)
 #define STUN_WARN_MS 8000
 
 /*
- * How long a client waits for an adopted direct endpoint to prove itself before
- * running the session on it unproven. Comfortably beyond one announcement
- * interval plus the host's admission, so a real segment always proves inside
- * it, while an endpoint that can never answer costs only this much.
+ * A path is qualified when an authenticated probe has round-tripped on it, so
+ * these bound the wait rather than the truth: how often to re-probe a path that
+ * has not answered, and how long a client keeps probing before it concludes it
+ * lost the turnstile round and claims again. See PROTOCOL.md, "Transport probe".
  */
-#define LAN_PROBE_MS 3000
-
+#define PROBE_EVERY_MS 200
 /*
  * Post-teardown linger for the bridge. The host keeps flushing generously, to
  * land the dedicated end-of-session signal (the channel exit-status and close)
@@ -149,14 +148,20 @@ struct conn {
 	struct sockaddr_in6 lan_peer;
 	int have_lan_peer;
 	/*
-	 * Whether that endpoint has ever delivered a datagram, and when it was
-	 * adopted. The announcement it is learnt from proves the peer reached us,
-	 * never that we can reach it back, so the two decide when it may carry the
-	 * session (see lan_usable / lan_established). Set from the receive callback,
-	 * read by the loop.
+	 * Path qualification. A transport reporting a pair says only that packets
+	 * move; it does not say the far end is serving *us* -- a host answers a
+	 * losing claimant's ICE checks with credentials every reader of its offer
+	 * holds. So each path carries the session only once a probe has
+	 * round-tripped on it bearing our own claimant identity, and among
+	 * qualified paths the lowest class wins (see path_class).
 	 */
-	volatile int lan_rx;
-	uint64_t lan_since_ms;
+	volatile int lan_qualified;
+	volatile int ice_qualified;
+	volatile int lan_rtt_ms;
+	volatile int ice_rtt_ms;
+	uint64_t probe_start_ms;	/* first probe of this attempt, for rtt */
+	uint64_t next_probe_ms;
+	uint64_t probe_nonce;
 	char direct_addr[80];		/* the lan_peer, printable (view) */
 	/* The claimant's ICE ufrag, carried for the worker's whole lifetime so the
 	 * host recognises the same client arriving over the other transport. */
@@ -206,6 +211,7 @@ struct sess {
 
 	struct sig *sig;
 	struct lanlink *lan;
+	struct session_keys keys;	/* sig_key, for sealing transport probes */
 
 	struct netmon netmon;		/* detect a roam while still waiting */
 
@@ -623,8 +629,6 @@ static void client_direct_connect(struct sess *s)
 			if (!lanlink_map_peer((struct sockaddr *)&a, sizeof(a),
 					      &s->c.lan_peer)) {
 				s->c.have_lan_peer = 1;
-				s->c.lan_rx = 0;
-				s->c.lan_since_ms = now_ms();
 				fmt_sockaddr((struct sockaddr *)&a, sizeof(a),
 					     s->c.direct_addr,
 					     sizeof(s->c.direct_addr));
@@ -645,8 +649,6 @@ static void client_direct_connect(struct sess *s)
 			if (!lanlink_map_peer((struct sockaddr *)&a, sizeof(a),
 					      &s->c.lan_peer)) {
 				s->c.have_lan_peer = 1;
-				s->c.lan_rx = 0;
-				s->c.lan_since_ms = now_ms();
 				fmt_sockaddr((struct sockaddr *)&a, sizeof(a),
 					     s->c.direct_addr,
 					     sizeof(s->c.direct_addr));
@@ -773,42 +775,6 @@ static void on_ice_candidate(void *arg, const char *cand)
 	pthread_mutex_unlock(&s->trickle_lock);
 }
 
-/*
- * May the direct endpoint carry the stream? Once it has delivered a datagram it
- * is proven in both directions and always wins: stable address, no NAT binding
- * to expire. Until then it is a claim, not a path -- a user-mode network stack
- * relaying the announcement it was learnt from (passt, SLIRP) rewrites the
- * source to its own host's address, which routes straight back to us -- so it
- * is used only while there is nothing better, which covers every isolated LAN
- * and every host LAN worker, where lanlink is the only transport there is.
- */
-static int lan_usable(const struct conn *c)
-{
-	if (!c->have_lan_peer)
-		return 0;
-	if (c->lan_rx)
-		return 1;
-	return !(c->nat && nat_connected(c->nat));
-}
-
-/*
- * May the session start on the direct endpoint? A host says yes as soon as it
- * has one: the host speaks first (its sshd sends the SSH banner unprompted),
- * and that datagram is exactly what lets the client prove the path. A client
- * waits for the proof, so it neither seizes the terminal nor gives up the DHT
- * for an endpoint that will never answer -- but not forever: after the probe it
- * proceeds anyway, so an isolated LAN whose host is slow to admit it is not
- * left waiting for an ICE pair that is never coming. Even then lan_usable keeps
- * the bytes off the unproven endpoint once a connected ICE pair exists.
- */
-static int lan_established(const struct conn *c)
-{
-	if (!c->have_lan_peer)
-		return 0;
-	if (c->sess->cfg->is_host || c->lan_rx)
-		return 1;
-	return now_ms() - c->lan_since_ms > LAN_PROBE_MS;
-}
 
 /* Send over whichever transport carries the stream right now (see the priority
  * in on_stream_output). Used for the KCP stream and the liveness heartbeat. */
@@ -816,10 +782,18 @@ static int transport_send(struct conn *c, const uint8_t *data, size_t len)
 {
 	struct sess *s = c->sess;
 
-	if (lan_usable(c))
+	/*
+	 * Class before anything else: a qualified LAN path stays on the segment,
+	 * needs no NAT binding and no ICE keepalive, and never asks the gateway to
+	 * reflect a packet back at the segment it came from. A host has nothing to
+	 * qualify -- see path_ready -- so it keeps the old preference.
+	 */
+	if (c->lan_qualified || (s->cfg->is_host && c->have_lan_peer))
 		return lanlink_send(s->lan, &c->lan_peer, data, len);
 	if (c->nat && nat_connected(c->nat))
 		return nat_send(c->nat, data, len);
+	if (c->have_lan_peer)
+		return lanlink_send(s->lan, &c->lan_peer, data, len);
 	return -1;
 }
 
@@ -914,15 +888,172 @@ static void ctl_readable(struct conn *c)
  * everything arriving on the raw path is KCP stream data. May run on
  * libjuice's thread.
  */
-/* Deliver received transport bytes into the conn's KCP stream, under the lock
- * that guards a concurrent teardown clearing c->stream from another thread. */
-static void deliver_stream(struct conn *c, const uint8_t *data, size_t len)
+/*
+ * The transport probe. Every KCP datagram opens with the conversation id, which
+ * ikcp_input rejects on mismatch, and comrade uses one fixed conv -- so a
+ * datagram opening with a different 32-bit magic is unambiguously not stream
+ * data and can be split off ahead of it for the cost of one compare.
+ *
+ *   [4 magic][sealed: [1 type][8 nonce][1 ulen][ulen claimant ufrag]]
+ *
+ * The seal is not defending against the peer, who holds the token and is trusted
+ * by construction; it stops a stranger who can guess an endpoint from forging a
+ * reply and making us adopt a path that does not work.
+ *
+ * The ufrag is the claimant identity the turnstile already uses. A host answers
+ * only for the claimant its worker was admitted for, and that single test is
+ * what separates the winner of a turnstile round from the losers whose checks
+ * its agent answered on the way past.
+ */
+#define PROBE_MAGIC 0x434d5250U		/* "CMRP"; must differ from SESSION_CONV */
+#define PROBE_PING 1
+#define PROBE_PONG 2
+#define PROBE_PLAIN_MAX (1 + 8 + 1 + 40)
+#define PROBE_MAX (4 + PROBE_PLAIN_MAX + SEAL_OVERHEAD)
+
+static void probe_put32(uint8_t *p, uint32_t v)
 {
+	p[0] = (uint8_t)(v >> 24);
+	p[1] = (uint8_t)(v >> 16);
+	p[2] = (uint8_t)(v >> 8);
+	p[3] = (uint8_t)v;
+}
+
+static uint32_t probe_get32(const uint8_t *p)
+{
+	return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+	       ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
+
+/* Build one probe into out (>= PROBE_MAX); returns its length, or 0. */
+static size_t probe_build(struct conn *c, int type, uint64_t nonce,
+			  uint8_t *out)
+{
+	uint8_t plain[PROBE_PLAIN_MAX];
+	size_t ul = strlen(c->claim_ufrag);
+	int n, i;
+
+	if (ul > 40)
+		return 0;
+	plain[0] = (uint8_t)type;
+	for (i = 0; i < 8; i++)
+		plain[1 + i] = (uint8_t)(nonce >> (8 * (7 - i)));
+	plain[9] = (uint8_t)ul;
+	memcpy(plain + 10, c->claim_ufrag, ul);
+	probe_put32(out, PROBE_MAGIC);
+	n = msg_seal(out + 4, PROBE_MAX - 4, c->sess->keys.sig_key, plain,
+		     10 + ul);
+	return n < 0 ? 0 : (size_t)n + 4;
+}
+
+/*
+ * A probe arrived on `lan` (1) or ICE (0). A ping addressed to the claimant we
+ * serve is answered on the transport it came in on; a pong qualifies that path
+ * and records its round trip. Anything else is dropped in silence.
+ */
+static void probe_recv(struct conn *c, const uint8_t *data, size_t len, int lan)
+{
+	uint8_t plain[PROBE_PLAIN_MAX + 1], out[PROBE_MAX];
+	struct sess *s = c->sess;
+	uint64_t nonce = 0;
+	size_t ul, o;
+	int n, i;
+
+	n = msg_open(plain, sizeof(plain), s->keys.sig_key, data + 4, len - 4);
+	if (n < 10)
+		return;
+	for (i = 0; i < 8; i++)
+		nonce = (nonce << 8) | plain[1 + i];
+	ul = plain[9];
+	if ((size_t)n < 10 + ul || ul > 40)
+		return;
+	if (ul != strlen(c->claim_ufrag) ||
+	    memcmp(plain + 10, c->claim_ufrag, ul))
+		return;			/* not the claimant this conn serves */
+
+	if (plain[0] == PROBE_PING) {
+		o = probe_build(c, PROBE_PONG, nonce, out);
+		if (!o)
+			return;
+		if (lan)
+			lanlink_send(s->lan, &c->lan_peer, out, o);
+		else if (c->nat)
+			nat_send(c->nat, out, o);
+		return;
+	}
+	if (plain[0] != PROBE_PONG || nonce != c->probe_nonce)
+		return;
+	if (lan) {
+		c->lan_rtt_ms = (int)(now_ms() - c->probe_start_ms);
+		c->lan_qualified = 1;
+	} else {
+		c->ice_rtt_ms = (int)(now_ms() - c->probe_start_ms);
+		c->ice_qualified = 1;
+	}
+	dbg_logf("path qualified: %s rtt~%dms", lan ? "LAN" : "ICE",
+		 lan ? c->lan_rtt_ms : c->ice_rtt_ms);
+}
+
+/* Deliver received transport bytes into the conn's KCP stream, under the lock
+ * that guards a concurrent teardown clearing c->stream from another thread.
+ * A probe is split off first: it is not stream data (see probe_recv). */
+static void deliver_stream_from(struct conn *c, const uint8_t *data, size_t len,
+				int lan)
+{
+	if (len >= 4 && probe_get32(data) == PROBE_MAGIC) {
+		probe_recv(c, data, len, lan);
+		return;
+	}
 	pthread_mutex_lock(&c->stream_lock);
 	if (c->stream)
 		stream_input(c->stream, data, len);
 	pthread_mutex_unlock(&c->stream_lock);
 }
+
+static void deliver_stream(struct conn *c, const uint8_t *data, size_t len)
+{
+	deliver_stream_from(c, data, len, 0);
+}
+
+/*
+ * Send a probe on every path this conn has a candidate for. Cheap enough to
+ * repeat: two datagrams of ~70 bytes, and only while nothing has qualified.
+ */
+static void probe_pump(struct conn *c)
+{
+	struct sess *s = c->sess;
+	uint8_t out[PROBE_MAX];
+	size_t n;
+
+	if (s->cfg->is_host || !c->claim_ufrag[0])
+		return;
+	if (!c->probe_start_ms)
+		c->probe_start_ms = now_ms();
+	if (now_ms() < c->next_probe_ms)
+		return;
+	c->next_probe_ms = now_ms() + PROBE_EVERY_MS;
+	c->probe_nonce = now_ms();
+	n = probe_build(c, PROBE_PING, c->probe_nonce, out);
+	if (!n)
+		return;
+	if (c->have_lan_peer && !c->lan_qualified)
+		lanlink_send(s->lan, &c->lan_peer, out, n);
+	if (c->nat && nat_connected(c->nat) && !c->ice_qualified)
+		nat_send(c->nat, out, n);
+}
+
+/*
+ * Is any path qualified? A host is exempt: it answers probes rather than sending
+ * them, and its worker exists only because the turnstile already decided this
+ * client is the one it serves.
+ */
+static int path_ready(const struct conn *c)
+{
+	if (c->sess->cfg->is_host)
+		return c->have_lan_peer || (c->nat && nat_connected(c->nat));
+	return c->lan_qualified || c->ice_qualified;
+}
+
 
 static void on_transport_recv(void *arg, const uint8_t *data, size_t len)
 {
@@ -938,21 +1069,7 @@ static void client_lan_recv(void *arg, const struct sockaddr *src,
 
 	(void)src;
 	(void)srclen;
-	/*
-	 * The first datagram proves the direct path in both directions. Only now
-	 * does a client stop advertising its answer: it will carry the session
-	 * over lanlink, so it frees the turnstile slot for a genuinely remote
-	 * client and stops the host serving it twice -- once here and once over
-	 * ICE if it had also picked up the DHT answer. Withdrawing on the
-	 * announcement alone would surrender the DHT for a path that may never
-	 * answer. A host learns its claimants differently and never withdraws.
-	 */
-	if (!c->lan_rx) {
-		c->lan_rx = 1;
-		if (!c->sess->cfg->is_host)
-			sig_withdraw(c->sess->sig);
-	}
-	deliver_stream(c, data, len);
+	deliver_stream_from(c, data, len, 1);
 }
 
 /*
@@ -993,16 +1110,13 @@ static void on_direct_peer(void *arg, const struct sockaddr *peer, socklen_t len
 	/*
 	 * The same peer is heard from every address it has, so these announcements
 	 * differ in source but carry the one lanlink port that identifies it. Once
-	 * one of those addresses has answered, keep it -- the others are the same
-	 * peer, and moving to an untried one would discard the proof. Only a
-	 * genuinely different peer starts a fresh probe.
+	 * one of those addresses has answered a probe, keep it -- the others are
+	 * the same peer, and moving to an untried one would discard the proof.
 	 */
-	if (!c->have_lan_peer || !lan_peer_same(&c->lan_peer, &np)) {
-		c->lan_rx = 0;
-		c->lan_since_ms = now_ms();
-	} else if (c->lan_rx) {
+	if (!c->have_lan_peer || !lan_peer_same(&c->lan_peer, &np))
+		c->lan_qualified = 0;
+	else if (c->lan_qualified)
 		return;
-	}
 	c->lan_peer = np;
 	c->have_lan_peer = 1;
 	fmt_sockaddr(peer, len, c->direct_addr, sizeof(c->direct_addr));
@@ -1132,8 +1246,7 @@ static void host_lan_recv(void *arg, const struct sockaddr *src, socklen_t srcle
 		struct conn *c = s->lan_conns[i];
 
 		if (c && c->have_lan_peer && lan_peer_same(&c->lan_peer, &mapped)) {
-			c->lan_rx = 1;
-			deliver_stream(c, data, len);
+			deliver_stream_from(c, data, len, 1);
 			return;
 		}
 	}
@@ -1167,6 +1280,7 @@ static void on_peer_offer(void *arg, const uint8_t *data, size_t len)
 	}
 	snprintf(s->peer_sdp, sizeof(s->peer_sdp), "%s", incoming);
 	if (lan_ufrag_claimed(s, ufrag)) {
+		dbg_logf("session: claimant already served over lanlink -- drop");
 		s->have_peer_sdp = 0;
 		return;
 	}
@@ -1268,6 +1382,15 @@ static void conn_gen_ice(struct conn *c)
 	c->ice_pwd[32] = '\0';
 	random_bytes(rb, 2);
 	c->bind_port = (uint16_t)(40000 + (((rb[0] << 8) | rb[1]) % 20000));
+	/* A client probes under its own identity; a host overwrites this with the
+	 * claimant it admitted (lan_drain, and the turnstile at pickup). */
+	if (c->sess && !c->sess->cfg->is_host)
+		snprintf(c->claim_ufrag, sizeof(c->claim_ufrag), "%s",
+			 c->ice_ufrag);
+	c->lan_qualified = 0;
+	c->ice_qualified = 0;
+	c->probe_start_ms = 0;
+	c->next_probe_ms = 0;
 	c->remote_ufrag[0] = '\0';
 }
 
@@ -1677,6 +1800,7 @@ static int conn_run(struct conn *c, int drive_sig)
 		return 0;
 	return c->ssh_cli_rc;
 }
+
 
 /* The single-connection path (client, or a host serving one connection): run
  * the session's one connection, driving signalling from the same loop. */
@@ -2553,6 +2677,8 @@ int session_run(const struct session_cfg *cfg)
 	pthread_mutex_init(&s.c.rdv_lock, NULL);
 	pthread_mutex_init(&s.c.stream_lock, NULL);
 	netmon_init(&s.netmon);
+	if (keys_derive(&s.keys, cfg->tok.rdv))
+		return 1;
 	if (cfg->stun_auto)
 		s.stun_servers = stunlist_load(&s.stun_count);
 	nat_log_level(cfg->log_level);	/* < 0 silences libjuice (see nat_log_level) */
@@ -2689,6 +2815,8 @@ int session_run(const struct session_cfg *cfg)
 				sdp_ufrag(s.peer_sdp, ufrag);
 				snprintf(s.c.remote_ufrag, sizeof(s.c.remote_ufrag),
 					 "%s", ufrag);
+				sig_post(s.sig, (const uint8_t *)s.local_sdp,
+					 strlen(s.local_sdp));
 				s.remote_set = 1;
 				s.ice_attempt_start = now_ms();
 				if (o && o->peer &&
@@ -2700,7 +2828,18 @@ int session_run(const struct session_cfg *cfg)
 			}
 			break;
 		case ST_WAIT_ICE:
-			if (nat_connected(s.c.nat) || lan_established(&s.c)) {
+			/*
+			 * ICE connecting does not mean this client is the one
+			 * being served: until the host retires the agent it
+			 * offered, it answers every claimant's checks with the
+			 * credentials they all read, so a client that lost the
+			 * round nominates a pair that belongs to the winner. Only
+			 * a probe round-tripped under our own claimant identity
+			 * settles that, and only the two rules below get a client
+			 * that lost back into the running.
+			 */
+			probe_pump(&s.c);
+			if (path_ready(&s.c)) {
 				if (s.peer_state < SESSION_PEER_LIVE) {
 					char loc[192], rem[192];
 
@@ -2769,9 +2908,6 @@ int session_run(const struct session_cfg *cfg)
 				 * original connect budget.
 				 */
 				dbg_logf("session: rejoin (roam)");
-				/* Flush the dashboard's stale view (old candidates,
-				 * the dead peer, the "link up") before re-gathering
-				 * on the new network. */
 				if (o && o->reset)
 					o->reset(o->arg);
 				s.established_fired = 0;
@@ -2784,7 +2920,7 @@ int session_run(const struct session_cfg *cfg)
 				s.local_sdp[0] = '\0';
 				s.peer_sdp[0] = '\0';
 				pthread_mutex_lock(&s.trickle_lock);
-				s.trickle_sdp[0] = '\0';	/* drop the old agent's trickle */
+				s.trickle_sdp[0] = '\0';
 				s.trickle_dirty = 0;
 				pthread_mutex_unlock(&s.trickle_lock);
 				s.peer_state = SESSION_PEER_SEEN;

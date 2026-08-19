@@ -58,7 +58,10 @@ int sig_subscribe(struct sig *s, sig_recv_cb *cb, void *arg);
  * Multi-client turnstile. The mailbox is used as a
  * mutex: the host advertises one offer and clears the answer slot to release
  * it; a client claims by writing its answer only into an empty answer slot,
- * with CAS, so exactly one client ever holds a given offer.
+ * with CAS, so exactly one client ever holds a given offer. Which client that
+ * is, though, is not something ICE can tell: the host answers a loser's
+ * connectivity checks with the credentials every reader of the offer holds. The
+ * transport probe (PROTOCOL.md, "Transport probe") is what settles it.
  */
 
 /* The client's view of the answer slot in the last mailbox read. */
@@ -78,6 +81,9 @@ void sig_withdraw(struct sig *s);
 /* Host: publish a fresh offer and release (clear) the answer slot in one
  * atomic rotate, readying the turnstile for the next client. */
 int sig_rotate(struct sig *s, const uint8_t *offer, size_t len);
+
+/* The tag the peer's slot last carried, "" if none. */
+void sig_peer_tag(struct sig *s, char *out, size_t n);
 
 /*
  * Link-local direct bypass (multicast only). Our own direct-transport port is
