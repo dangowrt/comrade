@@ -88,6 +88,15 @@ static int fam_idx(int family)
  */
 #define PROBE_EVERY_MS 200
 /*
+ * How long a client keeps probing after its claim has left the answer slot
+ * before concluding it was not the pickup. Only ever measured from that moment,
+ * never from the start of the attempt: a claim still sitting in the slot is
+ * queued, however long the queue, and a timeout that cannot tell those two
+ * apart livelocks one case or the other (measured, both ways).
+ */
+#define PATH_PROBE_MS 2500
+
+/*
  * Post-teardown linger for the bridge. The host keeps flushing generously, to
  * land the dedicated end-of-session signal (the channel exit-status and close)
  * on the client even over a lossy link -- it returns as soon as the client
@@ -159,6 +168,15 @@ struct conn {
 	volatile int ice_qualified;
 	volatile int lan_rtt_ms;
 	volatile int ice_rtt_ms;
+	/*
+	 * The turnstile's answer slot is the mutex, so it -- not a clock -- says
+	 * whether this client is still in the running. held_seen records that our
+	 * claim reached the slot; released_ms is when it left again, which is the
+	 * host picking somebody up. If that somebody was us a worker now exists and
+	 * a probe answers within a round trip; if it was not, nothing ever will.
+	 */
+	int claim_held_seen;
+	uint64_t claim_released_ms;
 	uint64_t probe_start_ms;	/* first probe of this attempt, for rtt */
 	uint64_t next_probe_ms;
 	uint64_t probe_nonce;
@@ -230,6 +248,22 @@ struct sess {
 	char peer_sdp[NAT_SDP_MAX];
 	volatile int have_peer_sdp;
 	int remote_set;
+	/*
+	 * The ufrag of the newest offer seen in the peer slot, recorded even when
+	 * the agent declines to adopt it. Release-on-pickup rotates a fresh ICE
+	 * identity every time the host serves somebody, and it punches a claim with
+	 * whatever listener is current when it *reads* it -- so a client still
+	 * queued against an older offer would be punched by an agent whose
+	 * credentials it does not hold, and could never pair.
+	 */
+	char cur_offer_ufrag[40];
+	/*
+	 * The offer we last re-gathered because of. Every pickup rotates, so N
+	 * queued clients all go stale at the same instant; without this they
+	 * re-gather in lockstep, collide on the answer slot and make no progress
+	 * (measured: 10 re-claims for 4 pickups, 2 of 4 served).
+	 */
+	char regathered_for[40];
 	struct conn *offer_conn;		/* live conn the peer-offer callback feeds */
 
 	uint64_t ice_attempt_start;
@@ -1054,6 +1088,65 @@ static int path_ready(const struct conn *c)
 	return c->lan_qualified || c->ice_qualified;
 }
 
+/*
+ * Has this attempt run out of probing? A client that has qualified nothing by
+ * now has almost certainly lost a turnstile round -- its checks were answered by
+ * an agent serving somebody else -- and only a fresh identity and a fresh claim
+ * recover.
+ */
+static int path_probe_expired(const struct conn *c)
+{
+	if (path_ready(c) || !c->claim_released_ms)
+		return 0;
+	return now_ms() - c->claim_released_ms > PATH_PROBE_MS;
+}
+
+/*
+ * Has the host rotated past the offer this agent is primed against? Only
+ * meaningful for a client that has primed one and not yet qualified: it means
+ * somebody else was served, and that this agent can no longer pair with the
+ * listener a pickup would use. Re-gathering against the current offer is the
+ * only way back -- ICE credentials cannot be swapped into a live agent.
+ */
+static int offer_moved_on(const struct conn *c)
+{
+	const struct sess *s = c->sess;
+
+	if (s->cfg->is_host || path_ready(c))
+		return 0;
+	if (!c->remote_ufrag[0] || !s->cur_offer_ufrag[0])
+		return 0;
+	if (!strcmp(s->cur_offer_ufrag, c->remote_ufrag))
+		return 0;
+	/*
+	 * Only a client that has actually reached the answer slot is queued
+	 * against the stale offer; one still working its way in will prime
+	 * against whatever is current when it gets there. And act once per
+	 * rotation, so a burst of joiners does not re-gather in lockstep.
+	 */
+	return strcmp(s->cur_offer_ufrag, s->regathered_for) != 0;
+}
+
+/*
+ * Track the claim through the turnstile. Called each pass while a client is
+ * waiting for a path; a host has no claim of its own to watch.
+ */
+static void claim_watch(struct conn *c)
+{
+	enum sig_claim st;
+
+	if (c->sess->cfg->is_host)
+		return;
+	st = sig_claim_status(c->sess->sig);
+	if (st == SIG_CLAIM_HELD) {
+		c->claim_held_seen = 1;
+		c->claim_released_ms = 0;
+		return;
+	}
+	if (c->claim_held_seen && !c->claim_released_ms &&
+	    (st == SIG_CLAIM_FREE || st == SIG_CLAIM_BUSY))
+		c->claim_released_ms = now_ms();
+}
 
 static void on_transport_recv(void *arg, const uint8_t *data, size_t len)
 {
@@ -1274,6 +1367,7 @@ static void on_peer_offer(void *arg, const uint8_t *data, size_t len)
 	memcpy(incoming, data, len);
 	incoming[len] = '\0';
 	sdp_ufrag(incoming, ufrag);
+	snprintf(s->cur_offer_ufrag, sizeof(s->cur_offer_ufrag), "%s", ufrag);
 	if (c->remote_ufrag[0] && strcmp(ufrag, c->remote_ufrag)) {
 		dbg_logf("session: ignore rotated offer while punching");
 		return;
@@ -1391,6 +1485,8 @@ static void conn_gen_ice(struct conn *c)
 	c->ice_qualified = 0;
 	c->probe_start_ms = 0;
 	c->next_probe_ms = 0;
+	c->claim_held_seen = 0;
+	c->claim_released_ms = 0;
 	c->remote_ufrag[0] = '\0';
 }
 
@@ -1801,6 +1897,45 @@ static int conn_run(struct conn *c, int drive_sig)
 	return c->ssh_cli_rc;
 }
 
+/*
+ * Drop this attempt's ICE identity and start over: destroy the agent, mint a
+ * fresh ufrag/pwd/port, flush the descriptions gathered against the old one and
+ * re-enter ST_GATHER, which re-posts and claims again. Both callers have proof
+ * the current agent is finished -- a roam, or a turnstile race this client lost
+ * -- and neither can recover by re-entering ST_WAIT_ICE, because the agent
+ * still reports the pair it nominated as connected. Returns 0, or -1 if the new
+ * agent could not be created.
+ */
+static int client_regather(struct sess *s)
+{
+	const struct session_obs *o = s->cfg->obs;
+
+	if (o && o->reset)
+		o->reset(o->arg);
+	s->established_fired = 0;
+	if (s->c.nat)
+		nat_destroy(s->c.nat);
+	s->c.nat = NULL;
+	conn_gen_ice(&s->c);
+	s->have_local_sdp = 0;
+	s->have_peer_sdp = 0;
+	s->remote_set = 0;
+	s->local_sdp[0] = '\0';
+	s->peer_sdp[0] = '\0';
+	pthread_mutex_lock(&s->trickle_lock);
+	s->trickle_sdp[0] = '\0';	/* drop the old agent's trickle */
+	s->trickle_dirty = 0;
+	pthread_mutex_unlock(&s->trickle_lock);
+	s->peer_state = SESSION_PEER_SEEN;
+	s->c.lan_qualified = 0;
+	s->c.ice_qualified = 0;
+	s->c.probe_start_ms = 0;
+	s->c.next_probe_ms = 0;
+	s->c.claim_held_seen = 0;
+	s->c.claim_released_ms = 0;
+	sig_redeliver(s->sig);		/* we discarded the offer we were given */
+	return nat_setup(&s->c) ? -1 : 0;
+}
 
 /* The single-connection path (client, or a host serving one connection): run
  * the session's one connection, driving signalling from the same loop. */
@@ -2838,7 +2973,30 @@ int session_run(const struct session_cfg *cfg)
 			 * settles that, and only the two rules below get a client
 			 * that lost back into the running.
 			 */
+			claim_watch(&s.c);
 			probe_pump(&s.c);
+			if (offer_moved_on(&s.c)) {
+				snprintf(s.regathered_for,
+					 sizeof(s.regathered_for), "%s",
+					 s.cur_offer_ufrag);
+				dbg_logf("session: offer rotated past us -- "
+					 "re-claiming against the current one");
+				st = client_regather(&s) ? ST_FAIL : ST_GATHER;
+				break;
+			}
+			if (path_probe_expired(&s.c)) {
+				/*
+				 * Nothing answered. On a busy host that means a
+				 * turnstile round this client lost: its checks
+				 * were answered by an agent serving somebody
+				 * else, so re-entering here would only find the
+				 * same pair still nominated.
+				 */
+				dbg_logf("session: claim taken up by another "
+					 "peer -- re-claiming");
+				st = client_regather(&s) ? ST_FAIL : ST_GATHER;
+				break;
+			}
 			if (path_ready(&s.c)) {
 				if (s.peer_state < SESSION_PEER_LIVE) {
 					char loc[192], rem[192];
@@ -2908,32 +3066,24 @@ int session_run(const struct session_cfg *cfg)
 				 * original connect budget.
 				 */
 				dbg_logf("session: rejoin (roam)");
-				if (o && o->reset)
-					o->reset(o->arg);
-				s.established_fired = 0;
-				nat_destroy(s.c.nat);
-				s.c.nat = NULL;
-				conn_gen_ice(&s.c);
-				s.have_local_sdp = 0;
-				s.have_peer_sdp = 0;
-				s.remote_set = 0;
-				s.local_sdp[0] = '\0';
-				s.peer_sdp[0] = '\0';
-				pthread_mutex_lock(&s.trickle_lock);
-				s.trickle_sdp[0] = '\0';
-				s.trickle_dirty = 0;
-				pthread_mutex_unlock(&s.trickle_lock);
-				s.peer_state = SESSION_PEER_SEEN;
 				deadline = now_ms() +
 					(uint64_t)cfg->connect_timeout_s * 1000;
-				if (nat_setup(&s.c))
-					st = ST_FAIL;
-				else
-					st = ST_GATHER;
+				st = client_regather(&s) ? ST_FAIL : ST_GATHER;
+			} else if (!cfg->is_host && now_ms() + 10000 < deadline) {
+				/*
+				 * The nominated pair never carried a session. It is
+				 * not a host that is merely slow to serve: the SSH
+				 * bring-up ran to its own timeout against it. The
+				 * usual cause is a turnstile race this client lost,
+				 * whose agent answers our checks while serving
+				 * somebody else, so re-entering ST_WAIT_ICE would
+				 * only find the same pair still "connected".
+				 */
+				dbg_logf("session: bring-up failed -- re-claiming");
+				st = client_regather(&s) ? ST_FAIL : ST_GATHER;
 			} else if (now_ms() + 10000 < deadline) {
-				/* ICE reported a path but the peer is not serving
-				 * yet; keep signalling and re-check rather than give
-				 * up, so the reverse channel can complete. */
+				/* A host retries its own listener rather than
+				 * re-gathering: the turnstile owns the offer. */
 				st = ST_WAIT_ICE;
 			} else {
 				st = ST_FAIL;

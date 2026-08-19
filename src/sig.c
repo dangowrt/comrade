@@ -2,6 +2,7 @@
 /* Copyright (C) 2026 Daniel Golle <daniel@makrotopia.org> */
 
 #include "wsock.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -244,6 +245,11 @@ int sig_rotate(struct sig *s, const uint8_t *offer, size_t len)
 	mailbox_arm_release(&s->mb);	/* omit the answer slot on the next write */
 	s->have_last = 0;	/* re-deliver the next answer even if identical */
 	return 0;
+}
+
+void sig_redeliver(struct sig *s)
+{
+	s->have_last = 0;
 }
 
 void sig_set_direct_port(struct sig *s, uint16_t port)

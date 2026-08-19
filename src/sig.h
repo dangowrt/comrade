@@ -82,6 +82,14 @@ void sig_withdraw(struct sig *s);
  * atomic rotate, readying the turnstile for the next client. */
 int sig_rotate(struct sig *s, const uint8_t *offer, size_t len);
 
+/*
+ * Deliver the peer's slot again even if it has not changed. A peer slot is
+ * delivered once per distinct value, so a side that discards what it was given
+ * -- a client re-claiming after losing a turnstile round -- would otherwise wait
+ * for an offer it has already consumed and the host has no reason to rewrite.
+ */
+void sig_redeliver(struct sig *s);
+
 /* The tag the peer's slot last carried, "" if none. */
 void sig_peer_tag(struct sig *s, char *out, size_t n);
 

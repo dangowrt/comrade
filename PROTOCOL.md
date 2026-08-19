@@ -409,6 +409,45 @@ guard keyed by the claimant's ICE ufrag** (`have_served`/`last_served_ufrag`, pl
 ignores a lagging DHT re-read of an already-served or in-flight answer, so no
 client is punched twice.
 
+**Losing a round.** One offer is readable by every client that reads the mailbox
+before the rotate, and its ICE credentials stay valid at the host until that
+agent is retired -- so a client that lost the CAS still completes a connectivity
+check, against an agent that is punching or serving somebody else. ICE reporting
+a pair therefore says nothing about who is being served; only the probe does, and
+a loser is never answered because the worker checks the claimant ufrag. A client
+that has qualified nothing recovers by re-claiming with a fresh ICE identity
+(`session.c:client_regather`), triggered by either of:
+
+- **its claim leaving the answer slot** without a path qualifying within
+  `PATH_PROBE_MS`. The slot is the mutex, so a claim still in it is queued
+  however long the queue -- which a clock cannot tell apart, and a clock-driven
+  re-claim livelocks one case or the other (measured, both directions).
+- **the offer rotating past the one its agent is primed against**. Release-on-
+  pickup mints a fresh ICE identity every time somebody is served, so a queued
+  client would be punched by a listener whose credentials it never had. Acted on
+  once per rotation, so a burst of joiners does not re-gather in lockstep.
+
+A client also re-claims when an SSH bring-up fails outright. A host never
+re-gathers: the turnstile owns its offer, and it retries its own listener. The
+direct LAN path is exempt from all of it -- its admission queue is per claimant
+and there is no shared offer to lose.
+
+Because a re-claiming client discards the offer it was given, and the host has no
+reason to rewrite an offer nobody has taken, `sig_redeliver()` makes the next
+read deliver the current offer again rather than dedupe it away.
+
+**The host does not reject a claim that answers a retired offer.** It punches
+with whatever is listening when it reads the claim, which is the point of
+release-on-pickup: rejecting stalls exactly the joiners that arrive while a punch
+is wedged (measured, and what `turnstile_stuck.sh` exists to catch). A claimant
+paired with an agent it never primed against simply never qualifies, and the
+rules above recover it.
+
+Concurrent DHT admission is partial beyond two clients: the turnstile is serial
+by construction, so N clients cost N rotations and each rotation strands the
+others. The LAN path has no such limit -- no shared offer -- and admits N
+concurrently.
+
 **LAN direct path, admission queue.** A sealed multicast answer from a LAN-scope
 source becomes a direct claim (§6): `on_direct_claim` appends its
 `(source, announced-port)` endpoint to a small pending queue, deduped against the
