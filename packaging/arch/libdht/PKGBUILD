@@ -1,0 +1,39 @@
+# Maintainer: Daniel Golle <daniel@makrotopia.org>
+#
+# comrade's other residual dependency. jech/dht ships a plain Makefile that
+# builds a test binary rather than a library, so the shared object is built
+# here directly -- the same two commands OpenWrt's libdht package uses.
+#
+# dht.c deliberately leaves four symbols undefined (dht_hash,
+# dht_random_bytes, dht_blacklisted, dht_sendto) for the application to
+# supply; the dynamic linker resolves them back into the executable, so a
+# shared library is perfectly usable despite that. Consumers today:
+# transmission and comrade.
+
+pkgname=libdht
+pkgver=2023.03.18
+pkgrel=1
+_commit=0bbb8f4a5bd914b60de5e9fbb51573aa33a1cf18
+pkgdesc='Kademlia distributed hash table (BitTorrent mainline DHT) library'
+arch=('x86_64' 'aarch64')
+url='https://github.com/jech/dht'
+license=('MIT')
+depends=('glibc')
+makedepends=('git')
+source=("git+$url.git#commit=$_commit")
+sha256sums=('SKIP')
+
+build() {
+	cd "$srcdir/dht"
+	${CC:-cc} $CFLAGS $CPPFLAGS -fPIC -Wall -c -o dht.o dht.c
+	${CC:-cc} $LDFLAGS -shared -Wl,-soname,libdht.so.0 -o libdht.so.0 dht.o
+	ln -sf libdht.so.0 libdht.so
+}
+
+package() {
+	cd "$srcdir/dht"
+	install -Dm755 libdht.so.0 "$pkgdir/usr/lib/libdht.so.0"
+	ln -sf libdht.so.0 "$pkgdir/usr/lib/libdht.so"
+	install -Dm644 dht.h "$pkgdir/usr/include/dht/dht.h"
+	install -Dm644 LICENCE "$pkgdir/usr/share/licenses/$pkgname/LICENCE"
+}

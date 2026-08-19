@@ -1,0 +1,50 @@
+# Maintainer: Daniel Golle <daniel@makrotopia.org>
+#
+# One of comrade's two residual dependencies that no distribution packages
+# yet.
+#
+# Built as a shared library. Upstream's CMakeLists honours BUILD_SHARED_LIBS
+# but sets no VERSION/SOVERSION, so the soname is imposed here: without one
+# the library installs as a bare libkcp.so, which leaves no way to express an
+# ABI break. Upstream offers no ABI guarantee either way, so treat 0 as
+# "packaged ABI epoch" and bump it if the exported ikcp_* surface changes.
+#
+# Shared rather than static also sidesteps a trap: makepkg enables LTO by
+# default, and a static archive built that way carries slim-LTO bytecode
+# instead of symbols, so every consumer built without LTO fails to link.
+
+pkgname=kcp
+pkgver=2.1.1
+pkgrel=1
+_soversion=0
+pkgdesc='A fast and reliable ARQ protocol over UDP'
+arch=('x86_64' 'aarch64')
+url='https://github.com/skywind3000/kcp'
+license=('MIT')
+depends=('glibc')
+makedepends=('cmake' 'ninja')
+provides=("libkcp.so")
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/$pkgver.tar.gz")
+sha256sums=('54d3c80928d206529f67cba6f96f2c98007182b46e3112819b200d914f96e425')
+
+prepare() {
+	# CMake sets the soname itself, so a linker flag cannot win; the target
+	# property is the only thing it honours.
+	printf '\nset_target_properties(kcp PROPERTIES VERSION %s SOVERSION %s)\n' \
+		"$pkgver" "$_soversion" >> "$pkgname-$pkgver/CMakeLists.txt"
+}
+
+build() {
+	cmake -S "$pkgname-$pkgver" -B build -G Ninja \
+		-DCMAKE_BUILD_TYPE=None \
+		-DCMAKE_INSTALL_PREFIX=/usr \
+		-DCMAKE_C_FLAGS="$CFLAGS" \
+		-DBUILD_SHARED_LIBS=ON
+	cmake --build build
+}
+
+package() {
+	DESTDIR="$pkgdir" cmake --install build
+	install -Dm644 "$pkgname-$pkgver/README.md" \
+		"$pkgdir/usr/share/doc/$pkgname/README.md"
+}

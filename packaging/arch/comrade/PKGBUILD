@@ -1,0 +1,54 @@
+# Maintainer: Daniel Golle <daniel@makrotopia.org>
+#
+# comrade follows whatever crypto library libssh is linked against, so it
+# adds no second one. Arch's libssh is built against OpenSSL, hence the
+# openssl dependency below rather than libgcrypt or monocypher.
+
+pkgname=comrade
+pkgver=0.1.0.r0.gfe5f13b
+pkgrel=1
+pkgdesc='Serverless peer-to-peer terminal sharing over a punched p2p link'
+arch=('x86_64' 'aarch64')
+url='https://github.com/dangowrt/comrade'
+license=('AGPL-3.0-or-later')
+depends=('libssh' 'libjuice' 'openssl' 'kcp' 'libdht')
+optdepends=('tmux: required to host a session (not to join one)')
+makedepends=('cmake' 'ninja' 'git')
+source=("git+$url.git")
+sha256sums=('SKIP')
+
+pkgver() {
+	cd "$srcdir/$pkgname"
+	# No tagged release yet; derive an ordered version from the commit date.
+	printf '0.1.0.r%s.g%s' \
+		"$(date -u -d "@$(git log -1 --format=%ct)" +%Y%m%d%H%M%S)" \
+		"$(git rev-parse --short HEAD)"
+}
+
+build() {
+	# Reproducible build date from the commit being built.
+	export SOURCE_DATE_EPOCH="$(git -C "$pkgname" log -1 --format=%ct)"
+	# Without -DCOMRADE_DHT_DIR the build finds and links the shared
+	# libdht that the libdht package provides.
+	cmake -S "$pkgname" -B build -G Ninja \
+		-DCMAKE_BUILD_TYPE=None \
+		-DCMAKE_INSTALL_PREFIX=/usr \
+		-DCMAKE_C_FLAGS="$CFLAGS" \
+		-DBUILD_TESTING=OFF
+	cmake --build build
+}
+
+check() {
+	cmake -S "$pkgname" -B build-test -G Ninja \
+		-DCMAKE_BUILD_TYPE=None -DCMAKE_INSTALL_PREFIX=/usr
+	cmake --build build-test
+	ctest --test-dir build-test --output-on-failure
+}
+
+package() {
+	DESTDIR="$pkgdir" cmake --install build
+	install -Dm644 "$pkgname/LICENSE" \
+		"$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+	install -Dm644 "$pkgname/README.md" \
+		"$pkgdir/usr/share/doc/$pkgname/README.md"
+}

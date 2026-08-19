@@ -1,0 +1,9 @@
+# makepkg build artifacts: run makepkg from a copy, not the work tree
+*/src/
+*/pkg/
+*.pkg.tar.zst
+*.tar.gz
+
+# makepkg mirrors git+ VCS sources into the PKGBUILD directory
+libdht/dht/
+comrade/comrade/
