@@ -132,6 +132,9 @@ struct conn {
 	uint16_t bind_port;
 	char ice_ufrag[16];
 	char ice_pwd[40];
+	/* The peer ICE identity that primed this agent. Candidate trickles from
+	 * a rotated offer must not be sent to an agent for an older offer. */
+	char remote_ufrag[40];
 
 	struct nat_agent *nat;
 	struct stream *stream;
@@ -1140,16 +1143,29 @@ static void on_peer_offer(void *arg, const uint8_t *data, size_t len)
 {
 	struct sess *s = arg;
 	struct conn *c = s->offer_conn;
+	char incoming[NAT_SDP_MAX];
 	char filtered[NAT_SDP_MAX];
 	char ufrag[40];
 
 	if (!c)
 		return;
-	if (len >= sizeof(s->peer_sdp))
-		len = sizeof(s->peer_sdp) - 1;
-	memcpy(s->peer_sdp, data, len);
-	s->peer_sdp[len] = '\0';
-	sdp_ufrag(s->peer_sdp, ufrag);
+	/*
+	 * Stage the arrival before adopting it. The host rotates a fresh offer the
+	 * instant it picks a claim up, so a description belonging to the offer that
+	 * replaced this agent's can still arrive; it names a different peer identity
+	 * and feeding it to an agent already primed with another would churn the
+	 * punch. Whatever is rejected here must not have overwritten peer_sdp.
+	 */
+	if (len >= sizeof(incoming))
+		len = sizeof(incoming) - 1;
+	memcpy(incoming, data, len);
+	incoming[len] = '\0';
+	sdp_ufrag(incoming, ufrag);
+	if (c->remote_ufrag[0] && strcmp(ufrag, c->remote_ufrag)) {
+		dbg_logf("session: ignore rotated offer while punching");
+		return;
+	}
+	snprintf(s->peer_sdp, sizeof(s->peer_sdp), "%s", incoming);
 	if (lan_ufrag_claimed(s, ufrag)) {
 		s->have_peer_sdp = 0;
 		return;
@@ -1252,6 +1268,7 @@ static void conn_gen_ice(struct conn *c)
 	c->ice_pwd[32] = '\0';
 	random_bytes(rb, 2);
 	c->bind_port = (uint16_t)(40000 + (((rb[0] << 8) | rb[1]) % 20000));
+	c->remote_ufrag[0] = '\0';
 }
 
 static int nat_setup(struct conn *c)
@@ -2368,6 +2385,8 @@ static int host_turnstile(struct sess *s)
 					ts = TS_GATHER;
 					break;
 				}
+				snprintf(listen->remote_ufrag,
+					 sizeof(listen->remote_ufrag), "%s", cu);
 				/* Release on pickup: hand the punch to the in-flight
 				 * set and rotate a fresh offer at once, so the next
 				 * client is admitted without waiting for this punch. */
@@ -2659,12 +2678,17 @@ int session_run(const struct session_cfg *cfg)
 			break;
 		case ST_SIGNAL:
 			if (s.have_peer_sdp && !s.remote_set) {
+				char ufrag[40];
+
 				sdp_filter_peer(s.peer_sdp, cfg->family, filtered,
 					   sizeof(filtered));
 				if (nat_set_remote_description(s.c.nat, filtered)) {
 					st = ST_FAIL;
 					break;
 				}
+				sdp_ufrag(s.peer_sdp, ufrag);
+				snprintf(s.c.remote_ufrag, sizeof(s.c.remote_ufrag),
+					 "%s", ufrag);
 				s.remote_set = 1;
 				s.ice_attempt_start = now_ms();
 				if (o && o->peer &&
