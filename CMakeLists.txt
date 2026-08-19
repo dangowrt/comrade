@@ -373,7 +373,21 @@ endif()
 set(COMRADE_HAVE_SSH 0)
 if(LIBSSH_FOUND)
 	set(COMRADE_HAVE_SSH 1)
+	# ssh_pki_generate_key() replaced the (now deprecated) ssh_pki_generate()
+	# in a recent libssh; Debian stable and Ubuntu LTS still ship the older
+	# one. Probe rather than pin a version, so both build.
+	include(CheckSymbolExists)
+	set(CMAKE_REQUIRED_INCLUDES ${LIBSSH_INCLUDE_DIRS})
+	set(CMAKE_REQUIRED_LIBRARIES ${LIBSSH_LIBRARIES})
+	check_symbol_exists(ssh_pki_generate_key "libssh/libssh.h"
+		COMRADE_HAVE_PKI_GENERATE_KEY)
+	unset(CMAKE_REQUIRED_INCLUDES)
+	unset(CMAKE_REQUIRED_LIBRARIES)
 	add_library(comrade_ssh STATIC src/sshd.c src/sshc.c src/sshfwd.c)
+	if(COMRADE_HAVE_PKI_GENERATE_KEY)
+		target_compile_definitions(comrade_ssh
+			PRIVATE COMRADE_HAVE_PKI_GENERATE_KEY=1)
+	endif()
 	target_include_directories(comrade_ssh PUBLIC src)
 	# The message-based libssh server API is deprecated in favour of the
 	# callback API but is clearer and fully functional; migrate later.

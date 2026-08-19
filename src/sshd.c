@@ -43,8 +43,16 @@ void *sshd_hostkey_new(uint8_t fp[32])
 	ssh_key key = NULL;
 	ssh_key pub = NULL;
 
+	/* ssh_pki_generate() is deprecated on new libssh and the only option on
+	 * the older releases distributions still ship; the build probes for the
+	 * replacement (see CMakeLists.txt). Ed25519 ignores the parameter. */
+#ifdef COMRADE_HAVE_PKI_GENERATE_KEY
 	if (ssh_pki_generate_key(SSH_KEYTYPE_ED25519, NULL, &key) != SSH_OK)
 		return NULL;
+#else
+	if (ssh_pki_generate(SSH_KEYTYPE_ED25519, 0, &key) != SSH_OK)
+		return NULL;
+#endif
 	if (ssh_pki_export_privkey_to_pubkey(key, &pub) != SSH_OK)
 		goto fail;
 	if (ssh_get_publickey_hash(pub, SSH_PUBLICKEY_HASH_SHA256,
