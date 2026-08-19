@@ -14,6 +14,9 @@
 #include "dht.h"
 #include "bep44.h"
 #include "dhtnode.h"
+
+/* Bound a drain that keeps erroring; see lanlink.c for why it does not stop. */
+#define DRAIN_MAX_ERRS 16
 #include "keys.h"
 #include "netmon.h"
 #include "oscompat.h"
@@ -93,6 +96,8 @@ static sock_t udp_socket(int af, uint16_t port)
 	s = socket(af, SOCK_DGRAM, 0);
 	if (!sock_valid(s))
 		return INVALID_SOCK;
+	if (sock_udp_disable_connreset(s))
+		goto fail;
 	if (sock_set_nonblock(s))
 		goto fail;
 
@@ -593,7 +598,7 @@ int dhtnode_prepare(struct dhtnode *n, struct pollfd *fds, int maxfds,
 void dhtnode_dispatch(struct dhtnode *n, const struct pollfd *fds, int nfds)
 {
 	uint8_t buf[2048];
-	int i;
+	int i, errs;
 
 	for (i = 0; i < nfds; i++) {
 		sock_t s = fds[i].fd;
@@ -604,14 +609,21 @@ void dhtnode_dispatch(struct dhtnode *n, const struct pollfd *fds, int nfds)
 			continue;
 		if (s != n->s4 && s != n->s6)
 			continue;
-		for (;;) {
+		for (errs = 0; ; ) {
 			struct sockaddr_storage from;
 			socklen_t fromlen = sizeof(from);
 			int rc = recvfrom(s, (char *)buf, (int)sizeof(buf) - 1, 0,
 					  (struct sockaddr *)&from, &fromlen);
 
-			if (rc <= 0)
-				break;
+			if (rc < 0) {
+				if (sock_err_would_block(sock_errno()))
+					break;
+				if (++errs >= DRAIN_MAX_ERRS)
+					break;
+				continue;
+			}
+			if (rc == 0)
+				continue;
 			packet_route(n, buf, (size_t)rc,
 				     (struct sockaddr *)&from, fromlen);
 		}

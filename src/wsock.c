@@ -7,6 +7,12 @@
 
 #ifdef _WIN32
 
+#include <mstcpip.h>
+
+#ifndef SIO_UDP_CONNRESET
+#define SIO_UDP_CONNRESET (IOC_IN | IOC_VENDOR | 12)
+#endif
+
 static LONG wsock_refs;
 
 int wsock_init(void)
@@ -43,6 +49,15 @@ int sock_set_nonblock(sock_t s)
 	u_long one = 1;
 
 	return ioctlsocket(s, FIONBIO, &one) == 0 ? 0 : -1;
+}
+
+int sock_udp_disable_connreset(sock_t s)
+{
+	BOOL off = FALSE;
+	DWORD bytes;
+
+	return WSAIoctl(s, SIO_UDP_CONNRESET, &off, sizeof(off), NULL, 0,
+			&bytes, NULL, NULL) == 0 ? 0 : -1;
 }
 
 int sock_errno(void)
@@ -186,6 +201,12 @@ int sock_set_nonblock(sock_t s)
 	if (f < 0)
 		return -1;
 	return fcntl(s, F_SETFL, f | O_NONBLOCK) < 0 ? -1 : 0;
+}
+
+int sock_udp_disable_connreset(sock_t s)
+{
+	(void)s;
+	return 0;
 }
 
 int sock_errno(void)

@@ -85,10 +85,13 @@ int sig_rotate(struct sig *s, const uint8_t *offer, size_t len);
  * link-local source -- proving a clear layer-2 path that needs no ICE -- cb
  * fires with the peer's endpoint (that source address, keeping its zone id,
  * and the announced direct port). ICE still runs on the routable candidates in
- * the same announcement; the two race and whichever carries KCP first wins.
+ * the same announcement; the two race and whichever carries KCP first wins. The
+ * sealed candpack is handed over with the endpoint: it is authenticated, so the
+ * ICE ufrag inside it identifies the claimant across the direct and ICE paths
+ * alike, and a host can tell that both are the same client.
  */
 typedef void sig_direct_cb(void *arg, const struct sockaddr *peer,
-			   socklen_t len);
+			   socklen_t len, const uint8_t *sdp, size_t sdp_len);
 void sig_set_direct_port(struct sig *s, uint16_t port);
 int sig_subscribe_direct(struct sig *s, sig_direct_cb *cb, void *arg);
 

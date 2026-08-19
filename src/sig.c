@@ -465,14 +465,15 @@ static void deliver_peer_mcast(struct sig *s, const uint8_t *sealed, size_t len,
 	if (slen >= 0 && s->cb && !(s->is_host && s->mcast_claims))
 		s->cb(s->arg, (const uint8_t *)sdp, (size_t)slen);
 
-	if (s->direct_cb && dport && addr_is_lan_scope(src) &&
+	if (slen >= 0 && s->direct_cb && dport && addr_is_lan_scope(src) &&
 	    (size_t)srclen <= sizeof(ep)) {
 		memcpy(&ep, src, srclen);
 		if (ep.ss_family == AF_INET6)
 			((struct sockaddr_in6 *)&ep)->sin6_port = htons(dport);
 		else
 			((struct sockaddr_in *)&ep)->sin_port = htons(dport);
-		s->direct_cb(s->direct_arg, (struct sockaddr *)&ep, srclen);
+		s->direct_cb(s->direct_arg, (struct sockaddr *)&ep, srclen,
+			     (const uint8_t *)sdp, (size_t)slen);
 	}
 }
 

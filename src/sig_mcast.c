@@ -35,6 +35,7 @@
 #define MCAST_MAX_IF 16
 #define MCAST_MAX_SALT 64
 #define MCAST_MAX_PKT 1300
+#define DRAIN_MAX_ERRS 16	/* see lanlink.c: bound a drain that keeps erroring */
 
 struct sig_mcast {
 	sock_t s4;
@@ -171,6 +172,10 @@ static sock_t open4(struct sig_mcast *m)
 
 	if (!sock_valid(s))
 		return INVALID_SOCK;
+	if (sock_udp_disable_connreset(s)) {
+		sock_close(s);
+		return INVALID_SOCK;
+	}
 	setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char *)&on, sizeof(on));
 #ifdef SO_REUSEPORT
 	setsockopt(s, SOL_SOCKET, SO_REUSEPORT, (const char *)&on, sizeof(on));
@@ -221,6 +226,10 @@ static sock_t open6(struct sig_mcast *m)
 
 	if (!sock_valid(s))
 		return INVALID_SOCK;
+	if (sock_udp_disable_connreset(s)) {
+		sock_close(s);
+		return INVALID_SOCK;
+	}
 	setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char *)&on, sizeof(on));
 #ifdef SO_REUSEPORT
 	setsockopt(s, SOL_SOCKET, SO_REUSEPORT, (const char *)&on, sizeof(on));
@@ -394,6 +403,7 @@ static void drain(sock_t s, sig_mcast_recv_cb *cb, void *arg)
 {
 	uint8_t buf[MCAST_MAX_PKT + 1];
 	char salt[MCAST_MAX_SALT + 1];
+	int errs = 0;
 
 	for (;;) {
 		struct sockaddr_storage src;
@@ -402,8 +412,15 @@ static void drain(sock_t s, sig_mcast_recv_cb *cb, void *arg)
 				  (struct sockaddr *)&src, &srclen);
 		size_t salt_len, payload;
 
+		if (rc < 0) {
+			if (sock_err_would_block(sock_errno()))
+				break;
+			if (++errs >= DRAIN_MAX_ERRS)
+				break;
+			continue;
+		}
 		if (rc <= MCAST_MAGIC_LEN + 1)
-			break;
+			continue;
 		if (memcmp(buf, MCAST_MAGIC, MCAST_MAGIC_LEN))
 			continue;
 		salt_len = buf[MCAST_MAGIC_LEN];

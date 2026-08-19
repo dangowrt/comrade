@@ -8,6 +8,14 @@
 
 #include "lanlink.h"
 
+/*
+ * A datagram we sent that bounced (an ICMP port-unreachable, reported by the
+ * next receive) must not end the drain and strand the datagrams behind it, but
+ * an error that never clears must not spin the loop that owns the session
+ * either. Bound the run, and let the next poll pick up whatever is left.
+ */
+#define DRAIN_MAX_ERRS 16
+
 struct lanlink {
 	sock_t fd;			/* dual-stack v6 UDP socket, shared */
 	uint16_t port;
@@ -34,6 +42,8 @@ struct lanlink *lanlink_create(lanlink_recv_cb *on_recv, void *arg,
 	l->arg = arg;
 	l->fd = socket(AF_INET6, SOCK_DGRAM, 0);
 	if (!sock_valid(l->fd))
+		goto fail;
+	if (sock_udp_disable_connreset(l->fd))
 		goto fail;
 	/* Dual stack: one socket carries both v6 (incl. link-local) and, as
 	 * v4-mapped, v4. */
@@ -116,7 +126,7 @@ int lanlink_prepare(struct lanlink *l, struct pollfd *fds, int maxfds,
 void lanlink_dispatch(struct lanlink *l, const struct pollfd *fds, int nfds)
 {
 	uint8_t buf[2048];
-	int i;
+	int i, errs;
 
 	for (i = 0; i < nfds; i++) {
 		/* POLLHUP/POLLERR arrive without POLLIN under WSAPoll, so they
@@ -124,14 +134,20 @@ void lanlink_dispatch(struct lanlink *l, const struct pollfd *fds, int nfds)
 		if (fds[i].fd != l->fd ||
 		    !(fds[i].revents & (POLLIN | POLLHUP | POLLERR)))
 			continue;
-		for (;;) {
+		for (errs = 0; errs < DRAIN_MAX_ERRS; ) {
 			struct sockaddr_storage src;
 			socklen_t srclen = sizeof(src);
 			int rc = recvfrom(l->fd, (char *)buf, (int)sizeof(buf), 0,
 					  (struct sockaddr *)&src, &srclen);
 
-			if (rc <= 0)
-				break;
+			if (rc < 0) {
+				if (sock_err_would_block(sock_errno()))
+					break;
+				errs++;		/* a bounced datagram; keep draining */
+				continue;
+			}
+			if (rc == 0)
+				continue;
 			if (l->on_recv)
 				l->on_recv(l->arg, (struct sockaddr *)&src,
 					   srclen, buf, (size_t)rc);

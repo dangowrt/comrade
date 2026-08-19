@@ -134,10 +134,10 @@ struct session_cfg {
 	/*
 	 * Called for an isolated (LAN-only) family instead of on_rendezvous:
 	 * with the host's own direct endpoint (address + lanlink port) for that
-	 * family. The host embeds it in the token with TOKEN_FLAG_EPx_RDV clear
-	 * and sets TOKEN_FLAG_NODHT, so the client skips the DHT and reaches the
-	 * host over multicast + lanlink. Optional; when NULL an isolated family
-	 * is not advertised.
+	 * family. The host embeds it in the token with TOKEN_FLAG_EPx_RDV clear.
+	 * It sets TOKEN_FLAG_NODHT only when neither family has a rendezvous node,
+	 * so a mixed-family token still reaches its DHT-backed family. Optional;
+	 * when NULL an isolated family is not advertised.
 	 */
 	void (*on_endpoint)(void *arg, const struct sockaddr *sa, socklen_t len);
 	void *arg;

@@ -121,6 +121,13 @@ int sock_shutdown(sock_t s, int how);
 /* ioctlsocket(FIONBIO) / fcntl(O_NONBLOCK). Returns 0 on success. */
 int sock_set_nonblock(sock_t s);
 
+/*
+ * Disable Winsock's asynchronous ICMP port-unreachable reporting for an
+ * unconnected UDP socket. POSIX has no equivalent behaviour, so this is a
+ * no-op there.
+ */
+int sock_udp_disable_connreset(sock_t s);
+
 /* WSAGetLastError() / errno, and the three tests worth naming. */
 int sock_errno(void);
 int sock_err_would_block(int e);

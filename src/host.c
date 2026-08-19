@@ -552,12 +552,13 @@ static void on_rendezvous(void *arg, const struct sockaddr *sa, socklen_t len)
 		v->tok.ep4_port = ntohs(a->sin_port);
 		v->tok.flags |= TOKEN_FLAG_EP4_RDV;
 	}
+	v->tok.flags &= ~TOKEN_FLAG_NODHT;
 	svc_emit_token(v);
 }
 
 /* The isolated-LAN sibling of on_rendezvous: embed our own direct endpoint for
- * the family (EPx_RDV clear) and mark the whole token NODHT, so the client
- * skips the DHT and reaches us over multicast + lanlink. */
+ * the family (EPx_RDV clear). A token skips the DHT only when no family has a
+ * rendezvous node. */
 static void on_endpoint(void *arg, const struct sockaddr *sa, socklen_t len)
 {
 	struct svc *v = arg;
@@ -576,7 +577,10 @@ static void on_endpoint(void *arg, const struct sockaddr *sa, socklen_t len)
 		v->tok.ep4_port = ntohs(a->sin_port);
 		v->tok.flags &= ~TOKEN_FLAG_EP4_RDV;
 	}
-	v->tok.flags |= TOKEN_FLAG_NODHT;
+	if (v->tok.flags & (TOKEN_FLAG_EP6_RDV | TOKEN_FLAG_EP4_RDV))
+		v->tok.flags &= ~TOKEN_FLAG_NODHT;
+	else
+		v->tok.flags |= TOKEN_FLAG_NODHT;
 	svc_emit_token(v);
 }
 

@@ -81,6 +81,14 @@ static int fam_idx(int family)
 #define STUN_WARN_MS 8000
 
 /*
+ * How long a client waits for an adopted direct endpoint to prove itself before
+ * running the session on it unproven. Comfortably beyond one announcement
+ * interval plus the host's admission, so a real segment always proves inside
+ * it, while an endpoint that can never answer costs only this much.
+ */
+#define LAN_PROBE_MS 3000
+
+/*
  * Post-teardown linger for the bridge. The host keeps flushing generously, to
  * land the dedicated end-of-session signal (the channel exit-status and close)
  * on the client even over a lossy link -- it returns as soon as the client
@@ -137,7 +145,19 @@ struct conn {
 	 * matches the source. */
 	struct sockaddr_in6 lan_peer;
 	int have_lan_peer;
+	/*
+	 * Whether that endpoint has ever delivered a datagram, and when it was
+	 * adopted. The announcement it is learnt from proves the peer reached us,
+	 * never that we can reach it back, so the two decide when it may carry the
+	 * session (see lan_usable / lan_established). Set from the receive callback,
+	 * read by the loop.
+	 */
+	volatile int lan_rx;
+	uint64_t lan_since_ms;
 	char direct_addr[80];		/* the lan_peer, printable (view) */
+	/* The claimant's ICE ufrag, carried for the worker's whole lifetime so the
+	 * host recognises the same client arriving over the other transport. */
+	char claim_ufrag[40];
 
 	sock_t ssh_fd;			/* the ssh thread's socketpair end */
 	sock_t ssh_ctl_fd;		/* the ssh thread's comrade-ctl end */
@@ -233,16 +253,23 @@ struct sess {
 	char stun_host[128];		/* the current attempt's host, split out */
 
 	/*
-	 * Host LAN admission registry, all touched only on the host main thread
-	 * (no lock): the active direct workers (for source-demux and dedup) and a
-	 * small bounded queue of newly-claimed endpoints awaiting a worker.
+	 * Host admission registry, all touched only on the host main thread (no
+	 * lock): the active direct workers (for source-demux and dedup), a small
+	 * bounded queue of newly-claimed endpoints awaiting a worker, and the
+	 * claimant identities in flight -- one ufrag per punch slot, plus the most
+	 * recently served one -- which both transports consult so a client is
+	 * admitted once however it reached us.
 	 */
 	struct conn *lan_conns[HOST_MAX_WORKERS];
 	struct {
 		struct sockaddr_storage sa;
 		socklen_t len;
+		char ufrag[40];
 	} lan_pending[HOST_MAX_WORKERS];
 	int lan_pending_n;
+	char punch_ufrag[HOST_MAX_WORKERS][40];	/* each punch's claimant id */
+	char last_served_ufrag[40];		/* the most recently served one */
+	int have_served;
 
 	struct conn c;			/* the (single, for now) connection */
 };
@@ -593,6 +620,8 @@ static void client_direct_connect(struct sess *s)
 			if (!lanlink_map_peer((struct sockaddr *)&a, sizeof(a),
 					      &s->c.lan_peer)) {
 				s->c.have_lan_peer = 1;
+				s->c.lan_rx = 0;
+				s->c.lan_since_ms = now_ms();
 				fmt_sockaddr((struct sockaddr *)&a, sizeof(a),
 					     s->c.direct_addr,
 					     sizeof(s->c.direct_addr));
@@ -613,6 +642,8 @@ static void client_direct_connect(struct sess *s)
 			if (!lanlink_map_peer((struct sockaddr *)&a, sizeof(a),
 					      &s->c.lan_peer)) {
 				s->c.have_lan_peer = 1;
+				s->c.lan_rx = 0;
+				s->c.lan_since_ms = now_ms();
 				fmt_sockaddr((struct sockaddr *)&a, sizeof(a),
 					     s->c.direct_addr,
 					     sizeof(s->c.direct_addr));
@@ -739,13 +770,50 @@ static void on_ice_candidate(void *arg, const char *cand)
 	pthread_mutex_unlock(&s->trickle_lock);
 }
 
+/*
+ * May the direct endpoint carry the stream? Once it has delivered a datagram it
+ * is proven in both directions and always wins: stable address, no NAT binding
+ * to expire. Until then it is a claim, not a path -- a user-mode network stack
+ * relaying the announcement it was learnt from (passt, SLIRP) rewrites the
+ * source to its own host's address, which routes straight back to us -- so it
+ * is used only while there is nothing better, which covers every isolated LAN
+ * and every host LAN worker, where lanlink is the only transport there is.
+ */
+static int lan_usable(const struct conn *c)
+{
+	if (!c->have_lan_peer)
+		return 0;
+	if (c->lan_rx)
+		return 1;
+	return !(c->nat && nat_connected(c->nat));
+}
+
+/*
+ * May the session start on the direct endpoint? A host says yes as soon as it
+ * has one: the host speaks first (its sshd sends the SSH banner unprompted),
+ * and that datagram is exactly what lets the client prove the path. A client
+ * waits for the proof, so it neither seizes the terminal nor gives up the DHT
+ * for an endpoint that will never answer -- but not forever: after the probe it
+ * proceeds anyway, so an isolated LAN whose host is slow to admit it is not
+ * left waiting for an ICE pair that is never coming. Even then lan_usable keeps
+ * the bytes off the unproven endpoint once a connected ICE pair exists.
+ */
+static int lan_established(const struct conn *c)
+{
+	if (!c->have_lan_peer)
+		return 0;
+	if (c->sess->cfg->is_host || c->lan_rx)
+		return 1;
+	return now_ms() - c->lan_since_ms > LAN_PROBE_MS;
+}
+
 /* Send over whichever transport carries the stream right now (see the priority
  * in on_stream_output). Used for the KCP stream and the liveness heartbeat. */
 static int transport_send(struct conn *c, const uint8_t *data, size_t len)
 {
 	struct sess *s = c->sess;
 
-	if (c->have_lan_peer)
+	if (lan_usable(c))
 		return lanlink_send(s->lan, &c->lan_peer, data, len);
 	if (c->nat && nat_connected(c->nat))
 		return nat_send(c->nat, data, len);
@@ -863,43 +931,25 @@ static void on_transport_recv(void *arg, const uint8_t *data, size_t len)
 static void client_lan_recv(void *arg, const struct sockaddr *src,
 			    socklen_t srclen, const uint8_t *data, size_t len)
 {
+	struct conn *c = arg;
+
 	(void)src;
 	(void)srclen;
-	deliver_stream((struct conn *)arg, data, len);
-}
-
-static void on_direct_peer(void *arg, const struct sockaddr *peer, socklen_t len)
-{
-	struct conn *c = arg;
-	struct sockaddr_in6 np;
-
-	if (lanlink_map_peer(peer, len, &np))
-		return;
 	/*
-	 * Prefer a non-link-local endpoint. A host on several interfaces announces
-	 * from each, so its link-local IPv6 source can arrive last and overwrite a
-	 * usable v4 or loopback endpoint (such as the one preloaded from the token);
-	 * but a link-local lanlink target needs a zone id that does not reliably
-	 * survive the announcement path, so it often cannot be reached. Never
-	 * downgrade a usable endpoint to a link-local one; a non-link-local wins.
+	 * The first datagram proves the direct path in both directions. Only now
+	 * does a client stop advertising its answer: it will carry the session
+	 * over lanlink, so it frees the turnstile slot for a genuinely remote
+	 * client and stops the host serving it twice -- once here and once over
+	 * ICE if it had also picked up the DHT answer. Withdrawing on the
+	 * announcement alone would surrender the DHT for a path that may never
+	 * answer. A host learns its claimants differently and never withdraws.
 	 */
-	if (c->have_lan_peer && IN6_IS_ADDR_LINKLOCAL(&np.sin6_addr) &&
-	    !IN6_IS_ADDR_LINKLOCAL(&c->lan_peer.sin6_addr))
-		return;
-	c->lan_peer = np;
-	c->have_lan_peer = 1;
-	fmt_sockaddr(peer, len, c->direct_addr, sizeof(c->direct_addr));
-	/*
-	 * We share the host's segment and will carry the session over lanlink, so
-	 * a client stops contending for the DHT turnstile slot at once: it frees
-	 * the slot for a genuinely remote client and, more importantly, stops the
-	 * host serving us twice -- once over lanlink here, and once over ICE if it
-	 * had also picked up our DHT answer. Safe by the link-scope invariant: a
-	 * host we can hear over multicast is reachable over lanlink. A host learns
-	 * its claimants differently (on_direct_claim) and never withdraws.
-	 */
-	if (!c->sess->cfg->is_host)
-		sig_withdraw(c->sess->sig);
+	if (!c->lan_rx) {
+		c->lan_rx = 1;
+		if (!c->sess->cfg->is_host)
+			sig_withdraw(c->sess->sig);
+	}
+	deliver_stream(c, data, len);
 }
 
 /*
@@ -916,6 +966,45 @@ static int lan_peer_same(const struct sockaddr_in6 *a, const struct sockaddr_in6
 	return a->sin6_port == b->sin6_port;
 }
 
+static void on_direct_peer(void *arg, const struct sockaddr *peer, socklen_t len,
+			   const uint8_t *sdp, size_t sdp_len)
+{
+	struct conn *c = arg;
+	struct sockaddr_in6 np;
+
+	(void)sdp;
+	(void)sdp_len;
+	if (lanlink_map_peer(peer, len, &np))
+		return;
+	/*
+	 * Prefer a non-link-local endpoint. A host on several interfaces announces
+	 * from each, so its link-local IPv6 source can arrive last and overwrite a
+	 * usable v4 or loopback endpoint (such as the one preloaded from the token);
+	 * but a link-local lanlink target needs a zone id that does not reliably
+	 * survive the announcement path, so it often cannot be reached. Never
+	 * downgrade a usable endpoint to a link-local one; a non-link-local wins.
+	 */
+	if (c->have_lan_peer && IN6_IS_ADDR_LINKLOCAL(&np.sin6_addr) &&
+	    !IN6_IS_ADDR_LINKLOCAL(&c->lan_peer.sin6_addr))
+		return;
+	/*
+	 * The same peer is heard from every address it has, so these announcements
+	 * differ in source but carry the one lanlink port that identifies it. Once
+	 * one of those addresses has answered, keep it -- the others are the same
+	 * peer, and moving to an untried one would discard the proof. Only a
+	 * genuinely different peer starts a fresh probe.
+	 */
+	if (!c->have_lan_peer || !lan_peer_same(&c->lan_peer, &np)) {
+		c->lan_rx = 0;
+		c->lan_since_ms = now_ms();
+	} else if (c->lan_rx) {
+		return;
+	}
+	c->lan_peer = np;
+	c->have_lan_peer = 1;
+	fmt_sockaddr(peer, len, c->direct_addr, sizeof(c->direct_addr));
+}
+
 /* Is this endpoint already an active LAN worker? (host main thread only) */
 static int lan_conn_active(struct sess *s, const struct sockaddr_in6 *peer)
 {
@@ -928,22 +1017,85 @@ static int lan_conn_active(struct sess *s, const struct sockaddr_in6 *peer)
 	return 0;
 }
 
+/* The ICE ufrag of an answer (its client's single-use identity), into out
+ * (>= 40 bytes). candpack round-trips it, so it is stable across the mailbox. */
+static void sdp_ufrag(const char *sdp, char *out)
+{
+	const char *p = strstr(sdp, "ice-ufrag:");
+
+	out[0] = '\0';
+	if (p)
+		sscanf(p, "ice-ufrag:%39s", out);
+}
+
+/* Is this claimant already admitted over the direct path -- served by a LAN
+ * worker, or queued for one? (host main thread only) */
+static int lan_ufrag_claimed(const struct sess *s, const char *ufrag)
+{
+	int i;
+
+	if (!ufrag[0])
+		return 0;
+	for (i = 0; i < HOST_MAX_WORKERS; i++)
+		if (s->lan_conns[i] &&
+		    !strcmp(s->lan_conns[i]->claim_ufrag, ufrag))
+			return 1;
+	for (i = 0; i < s->lan_pending_n; i++)
+		if (!strcmp(s->lan_pending[i].ufrag, ufrag))
+			return 1;
+	return 0;
+}
+
+/* Is this claimant one of the ICE punches already in flight? (host main
+ * thread only) */
+static int ufrag_admitted(const struct sess *s, const char *ufrag)
+{
+	int i;
+
+	if (!ufrag[0])
+		return 0;
+	for (i = 0; i < HOST_MAX_WORKERS; i++)
+		if (!strcmp(s->punch_ufrag[i], ufrag))
+			return 1;
+	return 0;
+}
+
 /*
- * Host: a sealed multicast answer from a LAN-scope source is a direct claim. Its
- * (source, announced-port) endpoint is its identity; queue it for admission
- * unless it is already active or already queued (deduped by endpoint). Runs on
- * the host main thread (from sig_dispatch in pump_once); no worker work here.
+ * Host: a sealed multicast answer from a LAN-scope source is a direct claim.
+ * Its (source, announced-port) endpoint is where it is served, but its identity
+ * is the ICE ufrag inside the seal -- the same one its DHT answer carries, so a
+ * claimant that reaches us over both transports is admitted once, not once per
+ * path. Queue it unless it is already served, punching, active or queued, and
+ * drop any pending offer of its own that the turnstile is still holding. Runs
+ * on the host main thread (from sig_dispatch in pump_once); no worker work here.
  */
-static void on_direct_claim(void *arg, const struct sockaddr *src, socklen_t srclen)
+static void on_direct_claim(void *arg, const struct sockaddr *src, socklen_t srclen,
+			    const uint8_t *sdp, size_t sdp_len)
 {
 	struct sess *s = arg;
 	struct sockaddr_in6 mapped, qmapped;
+	char claim_sdp[NAT_SDP_MAX], ufrag[40], queued[40];
 	int i;
 
+	if (!sdp || sdp_len >= NAT_SDP_MAX)
+		return;
+	memcpy(claim_sdp, sdp, sdp_len);
+	claim_sdp[sdp_len] = '\0';
+	sdp_ufrag(claim_sdp, ufrag);
 	if (lanlink_map_peer(src, srclen, &mapped))
+		return;
+	if (ufrag_admitted(s, ufrag) ||
+	    (s->have_served && !strcmp(ufrag, s->last_served_ufrag)))
 		return;
 	if (lan_conn_active(s, &mapped))
 		return;
+	if (lan_ufrag_claimed(s, ufrag))
+		return;
+	if (s->have_peer_sdp) {
+		sdp_ufrag(s->peer_sdp, queued);
+		if (!strcmp(ufrag, queued))
+			s->have_peer_sdp = 0;
+	}
 	for (i = 0; i < s->lan_pending_n; i++)
 		if (lanlink_map_peer((struct sockaddr *)&s->lan_pending[i].sa,
 				     s->lan_pending[i].len, &qmapped) == 0 &&
@@ -953,6 +1105,8 @@ static void on_direct_claim(void *arg, const struct sockaddr *src, socklen_t src
 		return;			/* full: the 1 Hz re-broadcast re-offers */
 	memcpy(&s->lan_pending[s->lan_pending_n].sa, src, srclen);
 	s->lan_pending[s->lan_pending_n].len = srclen;
+	snprintf(s->lan_pending[s->lan_pending_n].ufrag,
+		 sizeof(s->lan_pending[s->lan_pending_n].ufrag), "%s", ufrag);
 	s->lan_pending_n++;
 }
 
@@ -975,6 +1129,7 @@ static void host_lan_recv(void *arg, const struct sockaddr *src, socklen_t srcle
 		struct conn *c = s->lan_conns[i];
 
 		if (c && c->have_lan_peer && lan_peer_same(&c->lan_peer, &mapped)) {
+			c->lan_rx = 1;
 			deliver_stream(c, data, len);
 			return;
 		}
@@ -986,6 +1141,7 @@ static void on_peer_offer(void *arg, const uint8_t *data, size_t len)
 	struct sess *s = arg;
 	struct conn *c = s->offer_conn;
 	char filtered[NAT_SDP_MAX];
+	char ufrag[40];
 
 	if (!c)
 		return;
@@ -993,6 +1149,11 @@ static void on_peer_offer(void *arg, const uint8_t *data, size_t len)
 		len = sizeof(s->peer_sdp) - 1;
 	memcpy(s->peer_sdp, data, len);
 	s->peer_sdp[len] = '\0';
+	sdp_ufrag(s->peer_sdp, ufrag);
+	if (lan_ufrag_claimed(s, ufrag)) {
+		s->have_peer_sdp = 0;
+		return;
+	}
 	s->have_peer_sdp = 1;
 	/* Later arrivals are fresh candidates (multicast trickles one source at
 	 * a time); feed them straight into the already-primed agent -- but not
@@ -1882,6 +2043,14 @@ static void lan_drain(struct sess *s, struct worker *ws, int *dash_seq)
 			break;
 		c->lan_peer = mapped;
 		c->have_lan_peer = 1;		/* c->nat stays NULL: lanlink only */
+		snprintf(c->claim_ufrag, sizeof(c->claim_ufrag), "%s",
+			 s->lan_pending[p].ufrag);
+		if (c->claim_ufrag[0]) {
+			snprintf(s->last_served_ufrag,
+				 sizeof(s->last_served_ufrag), "%s",
+				 c->claim_ufrag);
+			s->have_served = 1;
+		}
 		fmt_sockaddr((struct sockaddr *)&s->lan_pending[p].sa,
 			     s->lan_pending[p].len, c->direct_addr,
 			     sizeof(c->direct_addr));
@@ -1906,29 +2075,6 @@ static void lan_drain(struct sess *s, struct worker *ws, int *dash_seq)
 	s->lan_pending_n = 0;			/* drained; overflow re-offered */
 }
 
-/* The ICE ufrag of an answer (its client's single-use identity), into out
- * (>= 40 bytes). candpack round-trips it, so it is stable across the mailbox. */
-static void sdp_ufrag(const char *sdp, char *out)
-{
-	const char *p = strstr(sdp, "ice-ufrag:");
-
-	out[0] = '\0';
-	if (p)
-		sscanf(p, "ice-ufrag:%39s", out);
-}
-
-/* Is this ufrag one of the punches already in flight? (host main thread only) */
-static int ufrag_in_flight(struct conn **punching, char punch_ufrag[][40],
-			   const char *cu)
-{
-	int i;
-
-	for (i = 0; i < HOST_MAX_WORKERS; i++)
-		if (punching[i] && !strcmp(punch_ufrag[i], cu))
-			return 1;
-	return 0;
-}
-
 /*
  * Advance each in-flight ICE punch. Release-on-pickup means the listener has
  * already rotated on, so a wedged punch here never head-of-line-blocks the next
@@ -1941,8 +2087,7 @@ static int ufrag_in_flight(struct conn **punching, char punch_ufrag[][40],
  */
 static void punch_scan(struct sess *s, struct worker *ws, struct conn **punching,
 		       uint64_t *punch_start, int *punch_stuck,
-		       char punch_ufrag[][40], char *last_served_ufrag,
-		       int *have_served, int *dash_seq)
+		       int *dash_seq)
 {
 	const struct session_obs *o = s->cfg->obs;
 	int i;
@@ -1955,8 +2100,9 @@ static void punch_scan(struct sess *s, struct worker *ws, struct conn **punching
 		if (!punch_stuck[i] && nat_connected(c->nat)) {
 			char loc[192], rem[192], addr[80];
 
-			snprintf(last_served_ufrag, 40, "%.39s", punch_ufrag[i]);
-			*have_served = 1;
+			snprintf(s->last_served_ufrag, sizeof(s->last_served_ufrag),
+				 "%.39s", s->punch_ufrag[i]);
+			s->have_served = 1;
 			addr[0] = '\0';
 			if (!nat_selected(c->nat, loc, sizeof(loc), rem,
 					  sizeof(rem))) {
@@ -1976,13 +2122,16 @@ static void punch_scan(struct sess *s, struct worker *ws, struct conn **punching
 					addr);
 			}
 			punching[i] = NULL;
-			if (worker_spawn(ws, c))
+			if (worker_spawn(ws, c)) {
+				s->punch_ufrag[i][0] = '\0';
 				conn_free(c);		/* table full */
+			}
 		} else if (now_ms() - punch_start[i] > ICE_ATTEMPT_MS ||
 			   (!punch_stuck[i] && nat_failed(c->nat))) {
 			dbg_logf("host: punch %s -> drop",
 				 punch_stuck[i] ? "wedged (test)" : "failed");
 			punching[i] = NULL;
+			s->punch_ufrag[i][0] = '\0';
 			conn_free(c);
 		}
 	}
@@ -2009,20 +2158,20 @@ static int host_turnstile(struct sess *s)
 	struct conn *punching[HOST_MAX_WORKERS];	/* in-flight ICE punches */
 	uint64_t punch_start[HOST_MAX_WORKERS];
 	int punch_stuck[HOST_MAX_WORKERS];		/* test: never connect */
-	char punch_ufrag[HOST_MAX_WORKERS][40];		/* each punch's claimant id */
 	enum { TS_GATHER, TS_WAIT_CLAIM } ts = TS_GATHER;
 	uint64_t deadline = now_ms() + (uint64_t)cfg->connect_timeout_s * 1000;
 	uint64_t last_active = now_ms();
 	char filtered[NAT_SDP_MAX];
-	char last_served_ufrag[40];	/* the most recently served claimant id */
 	sock_t end_fd = cfg->ssh_end_fd;
-	int served = 0, have_served = 0, dash_seq = 0, i, j;
+	int served = 0, dash_seq = 0, i, j;
 	int stuck_left = cfg->test_stuck_punches;
 
 	memset(ws, 0, sizeof(ws));
 	memset(punching, 0, sizeof(punching));
 	memset(punch_stuck, 0, sizeof(punch_stuck));
-	last_served_ufrag[0] = '\0';
+	s->last_served_ufrag[0] = '\0';
+	s->have_served = 0;
+	memset(s->punch_ufrag, 0, sizeof(s->punch_ufrag));
 
 	while (cfg->host_serve_max == 0 || served < cfg->host_serve_max) {
 		int active = 0;
@@ -2086,6 +2235,13 @@ static int host_turnstile(struct sess *s)
 				for (j = 0; j < HOST_MAX_WORKERS; j++)
 					if (s->lan_conns[j] == ws[i].c)
 						s->lan_conns[j] = NULL;
+				if (ws[i].c->claim_ufrag[0])
+					for (j = 0; j < HOST_MAX_WORKERS; j++)
+						if (!strcmp(s->punch_ufrag[j],
+							    ws[i].c->claim_ufrag)) {
+							s->punch_ufrag[j][0] = '\0';
+							break;
+						}
 				conn_free(ws[i].c);
 				ws[i].used = 0;
 				served++;
@@ -2124,8 +2280,7 @@ static int host_turnstile(struct sess *s)
 		/* Advance in-flight punches (connect -> worker, wedged -> freed),
 		 * concurrently with the listener below. An in-flight punch keeps the
 		 * host non-idle. */
-		punch_scan(s, ws, punching, punch_start, punch_stuck, punch_ufrag,
-			   last_served_ufrag, &have_served, &dash_seq);
+		punch_scan(s, ws, punching, punch_start, punch_stuck, &dash_seq);
 		for (i = 0; i < HOST_MAX_WORKERS; i++)
 			if (punching[i])
 				active = 1;
@@ -2179,10 +2334,10 @@ static int host_turnstile(struct sess *s)
 				 * keyed by ufrag so it covers concurrent punches.
 				 */
 				sdp_ufrag(s->peer_sdp, cu);
-				if (cu[0] && ((have_served &&
-					       !strcmp(cu, last_served_ufrag)) ||
-					      ufrag_in_flight(punching, punch_ufrag,
-							      cu))) {
+				if (cu[0] && ((s->have_served &&
+					       !strcmp(cu, s->last_served_ufrag)) ||
+					      ufrag_admitted(s, cu) ||
+					      lan_ufrag_claimed(s, cu))) {
 					dbg_logf("host: ignore stale/in-flight claim");
 					s->have_peer_sdp = 0;
 					break;
@@ -2217,11 +2372,14 @@ static int host_turnstile(struct sess *s)
 				 * set and rotate a fresh offer at once, so the next
 				 * client is admitted without waiting for this punch. */
 				punching[pslot] = listen;
+				snprintf(listen->claim_ufrag,
+					 sizeof(listen->claim_ufrag), "%s", cu);
 				punch_start[pslot] = now_ms();
 				punch_stuck[pslot] = stuck_left > 0;
 				if (stuck_left > 0)
 					stuck_left--;
-				snprintf(punch_ufrag[pslot], sizeof(punch_ufrag[pslot]),
+				snprintf(s->punch_ufrag[pslot],
+					 sizeof(s->punch_ufrag[pslot]),
 					 "%s", cu);
 				listen = NULL;
 				ts = TS_GATHER;
@@ -2290,15 +2448,15 @@ static int host_is_multiuser(const struct session_cfg *cfg)
  */
 /*
  * The lanlink port a host should re-bind: the shared port already printed in a
- * carried-forward NODHT endpoint token, so it stays valid across the re-serve
+ * carried-forward direct endpoint token, so it stays valid across the re-serve
  * loop. Either family's endpoint carries the one shared port. 0 (ephemeral) for
- * a client, or a host with no such token.
+ * a client, or a host with no direct endpoint.
  */
 static uint16_t carried_lanlink_port(const struct session_cfg *cfg)
 {
 	const struct token *t = &cfg->tok;
 
-	if (!cfg->is_host || !(t->flags & TOKEN_FLAG_NODHT))
+	if (!cfg->is_host)
 		return 0;
 	if (!(t->flags & TOKEN_FLAG_EP6_RDV) && t->ep6_port)
 		return t->ep6_port;
@@ -2518,7 +2676,7 @@ int session_run(const struct session_cfg *cfg)
 			}
 			break;
 		case ST_WAIT_ICE:
-			if (nat_connected(s.c.nat) || s.c.have_lan_peer) {
+			if (nat_connected(s.c.nat) || lan_established(&s.c)) {
 				if (s.peer_state < SESSION_PEER_LIVE) {
 					char loc[192], rem[192];
 
