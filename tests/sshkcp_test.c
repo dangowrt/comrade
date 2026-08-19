@@ -12,6 +12,7 @@
 
 #include <assert.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -111,6 +112,9 @@ int main(void)
 	int done_a = 0, done_b = 0;
 	uint32_t deadline;
 	size_t i;
+
+	/* A peer closing first must not kill the test outright. */
+	signal(SIGPIPE, SIG_IGN);
 
 	for (i = 0; i < sizeof(auth); i++)
 		auth[i] = (uint8_t)(i * 31 + 7);

@@ -17,6 +17,7 @@
 
 #include <assert.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -137,6 +138,9 @@ int main(void)
 	uint8_t fp[32], auth[TOKEN_AUTH_LEN];
 	void *hostkey;
 	size_t i;
+
+	/* A peer closing first must not kill the test outright. */
+	signal(SIGPIPE, SIG_IGN);
 
 	for (i = 0; i < sizeof(auth); i++)
 		auth[i] = (uint8_t)(i * 31 + 7);

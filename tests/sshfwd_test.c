@@ -62,6 +62,16 @@ static void parse_checks(void)
 
 	assert(fwdspec_parse("8080", &sp));		/* too few parts */
 	assert(fwdspec_parse("a:b:c:d:e", &sp));	/* too many */
+	/* Overlong in both directions: more fields than the token table holds,
+	 * and a field longer than one token. Both used to run off the end. */
+	assert(fwdspec_parse("a:b:c:d:e:f:g:h:i:j:k", &sp));
+	{
+		char big[1024];
+
+		memset(big, 'x', sizeof(big) - 1);
+		big[sizeof(big) - 1] = '\0';
+		assert(fwdspec_parse(big, &sp));
+	}
 	assert(fwdspec_parse("x:localhost:80", &sp));	/* bad port */
 	assert(fwdspec_parse("8080::80", &sp));		/* empty host */
 	assert(fwdspec_parse("8080:h:0", &sp));		/* zero target port */
