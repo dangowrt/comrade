@@ -35,9 +35,9 @@ static void sha1_check(void)
 		0x25, 0x71, 0x78, 0x50, 0xc2, 0x6c, 0x9c, 0xd0, 0xd8, 0x9d
 	};
 
-	sha1(d, "", 0);
+	cc_sha1(d, "", 0);
 	assert(!memcmp(d, empty, 20));
-	sha1(d, "abc", 3);
+	cc_sha1(d, "abc", 3);
 	assert(!memcmp(d, abc, 20));
 }
 
