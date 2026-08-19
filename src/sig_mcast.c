@@ -72,9 +72,16 @@ static void collect_ifaces(struct sig_mcast *m)
 	for (a = aa; a && m->nif < MCAST_MAX_IF; a = a->Next) {
 		IP_ADAPTER_UNICAST_ADDRESS *u;
 
-		/* Loopback kept for same-host linking (see the POSIX branch). */
+		/*
+		 * Loopback is skipped here, unlike the POSIX branch below, which
+		 * keeps it so two instances on one box can link. The Windows
+		 * loopback pseudo-interface accepts the join and then delivers
+		 * nothing, so keeping it only costs a socket that never receives
+		 * and an interface row on the dashboard that never carries a peer.
+		 */
 		if (a->OperStatus != IfOperStatusUp ||
-		    (a->Flags & IP_ADAPTER_NO_MULTICAST))
+		    (a->Flags & IP_ADAPTER_NO_MULTICAST) ||
+		    a->IfType == IF_TYPE_SOFTWARE_LOOPBACK)
 			continue;
 		slot = m->nif;
 		m->ifhas4[slot] = 0;

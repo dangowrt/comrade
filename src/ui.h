@@ -31,11 +31,12 @@ void ui_bind(struct ui *u, struct session_obs *obs);
  * processes. Both halves of that bridge -- the wire framing and the render
  * loop -- stay here in the view layer.
  *
- * ui_emitter: service side. Fills obs to serialise each event to fd, the
- * channel back to the foreground -- a socketpair end, because on Windows the
- * two halves are separate processes and a socket is the only thing both can
- * poll. ui_emitter_token posts the minted invite; ui_emitter_token_ro posts
- * its read-only twin, shown alongside it.
+ * ui_emitter: service side. Fills obs to queue each serialised event for the
+ * channel back to the foreground, so foreground backpressure cannot stall the
+ * service. The channel is a socketpair end because on Windows the two halves
+ * are separate processes and a socket is the only thing both can poll.
+ * ui_emitter_token posts the minted invite; ui_emitter_token_ro posts its
+ * read-only twin, shown alongside it.
  */
 void ui_emitter(struct session_obs *obs, sock_t fd);
 void ui_emitter_token(const struct session_obs *obs, const char *token_str);

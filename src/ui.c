@@ -10,6 +10,7 @@
  * nothing outside this file formats output.
  */
 
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -83,7 +84,26 @@ struct ui {
 	int raw;
 };
 
-struct ui_emit { sock_t fd; };
+/*
+ * One queued dashboard event. line is over-allocated to len bytes; the trailing
+ * [1] is the C89 spelling of what a flexible array member says in C99.
+ */
+struct ui_event {
+	struct ui_event *next;
+	size_t len;
+	size_t off;
+	char line[1];
+};
+
+struct ui_emit {
+	sock_t fd;
+	pthread_mutex_t lock;
+	pthread_cond_t ready;
+	pthread_t writer;
+	struct ui_event *head;
+	struct ui_event *tail;
+	int closed;
+};
 
 static uint64_t now_ms(void)
 {
@@ -715,19 +735,88 @@ void ui_bind(struct ui *u, struct session_obs *obs)
  * a socket), and Windows has no dprintf and no write() that can see a SOCKET.
  * Same wire format, same one-line-per-event framing.
  */
+static void *emit_writer(void *arg)
+{
+	struct ui_emit *e = arg;
+
+	for (;;) {
+		struct ui_event *ev;
+		ssize_t n;
+
+		pthread_mutex_lock(&e->lock);
+		while (!e->closed && !e->head)
+			pthread_cond_wait(&e->ready, &e->lock);
+		if (e->closed) {
+			pthread_mutex_unlock(&e->lock);
+			return NULL;
+		}
+		ev = e->head;
+		pthread_mutex_unlock(&e->lock);
+
+		n = sock_write(e->fd, ev->line + ev->off, ev->len - ev->off);
+		if (n > 0) {
+			pthread_mutex_lock(&e->lock);
+			ev->off += (size_t)n;
+			if (ev->off == ev->len) {
+				e->head = ev->next;
+				if (!e->head)
+					e->tail = NULL;
+				free(ev);
+			}
+			pthread_mutex_unlock(&e->lock);
+		} else if (n < 0 && sock_err_intr(sock_errno())) {
+			continue;
+		} else {
+			pthread_mutex_lock(&e->lock);
+			e->closed = 1;
+			while ((ev = e->head) != NULL) {
+				e->head = ev->next;
+				free(ev);
+			}
+			e->tail = NULL;
+			pthread_mutex_unlock(&e->lock);
+			return NULL;
+		}
+	}
+}
+
 static void emitf(void *a, const char *fmt, ...)
 {
 	struct ui_emit *e = a;
+	struct ui_event *ev;
 	char line[512];
 	va_list ap;
 	int n;
+	size_t len;
 
 	va_start(ap, fmt);
 	n = vsnprintf(line, sizeof(line), fmt, ap);
 	va_end(ap);
-	if (n > 0)
-		sock_write(e->fd, line, (size_t)(n < (int)sizeof(line)
-						 ? n : (int)sizeof(line) - 1));
+	if (n <= 0)
+		return;
+	len = (size_t)(n < (int)sizeof(line) ? n : (int)sizeof(line) - 1);
+	ev = malloc(sizeof(*ev) + len);
+	if (!ev) {
+		dbg_logf("ui: unable to queue foreground event");
+		return;
+	}
+	ev->next = NULL;
+	ev->len = len;
+	ev->off = 0;
+	memcpy(ev->line, line, len);
+
+	pthread_mutex_lock(&e->lock);
+	if (!e->closed) {
+		if (e->tail)
+			e->tail->next = ev;
+		else
+			e->head = ev;
+		e->tail = ev;
+		pthread_cond_signal(&e->ready);
+		ev = NULL;
+	}
+	pthread_mutex_unlock(&e->lock);
+	free(ev);
 }
 
 static void em_net(void *a, int f, int sc, int v, const char *ad)
@@ -781,11 +870,27 @@ static void em_live(void *a)
 
 void ui_emitter(struct session_obs *obs, sock_t fd)
 {
-	struct ui_emit *e = malloc(sizeof(*e));	/* lives until the service exits */
+	struct ui_emit *e = calloc(1, sizeof(*e)); /* lives until the service exits */
 
 	memset(obs, 0, sizeof(*obs));
 	if (!e)
 		return;
+	if (pthread_mutex_init(&e->lock, NULL)) {
+		free(e);
+		return;
+	}
+	if (pthread_cond_init(&e->ready, NULL)) {
+		pthread_mutex_destroy(&e->lock);
+		free(e);
+		return;
+	}
+	if (pthread_create(&e->writer, NULL, emit_writer, e)) {
+		pthread_cond_destroy(&e->ready);
+		pthread_mutex_destroy(&e->lock);
+		free(e);
+		return;
+	}
+	pthread_detach(e->writer);
 	e->fd = fd;
 	obs->arg = e;
 	obs->net = em_net;
@@ -960,8 +1065,18 @@ int ui_host_wait(struct ui *u, sock_t fd)
 		}
 		/* POLLHUP without POLLIN signals the service closed the pipe. */
 		if (fds[0].revents & (POLLIN | POLLHUP | POLLERR)) {
-			int got = (int)sock_read(fd, buf + len,
-						 sizeof(buf) - 1 - len);
+			int got;
+
+			/*
+			 * Emitters cap their records well below this buffer, so a
+			 * full one with no newline in it is malformed. Drop it:
+			 * leaving it would size the next read at zero bytes, which
+			 * reads back as EOF and retires a live service.
+			 */
+			if (len == (int)sizeof(buf) - 1)
+				len = 0;
+			got = (int)sock_read(fd, buf + len,
+					     sizeof(buf) - 1 - len);
 
 			if (got <= 0)
 				eof = 1;

@@ -139,9 +139,9 @@ int sock_err_intr(int e);
  * AF_UNIX has no socketpair() at all), so this is emulated over a loopback TCP
  * connection: bind 127.0.0.1:0, listen, connect, accept, drop the listener.
  * Both ends stay sockets, which is what keeps the unified WSAPoll loop possible
- * -- see the header comment. Nagle is disabled (the bridge is latency
- * sensitive) and both ends come back non-blocking on Windows, matching how
- * every caller uses them.
+ * -- see the header comment. Nagle is disabled because the bridge is latency
+ * sensitive. Callers that need non-blocking operation must call
+ * sock_set_nonblock() explicitly.
  */
 int sock_pair(sock_t sv[2]);
 

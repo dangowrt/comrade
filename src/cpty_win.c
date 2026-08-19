@@ -170,6 +170,7 @@ static HANDLE spawn_conpty(struct cpty *p, char *cmd, char *env,
 	SIZE_T asz = 0;
 	HANDLE in_r = NULL, out_w = NULL, ret = NULL;
 	COORD sz;
+	int attrs_ready = 0;
 
 	sz.X = (SHORT)(cols > 0 ? cols : 80);
 	sz.Y = (SHORT)(rows > 0 ? rows : 24);
@@ -208,8 +209,10 @@ static HANDLE spawn_conpty(struct cpty *p, char *cmd, char *env,
 	si.lpAttributeList = HeapAlloc(GetProcessHeap(), 0, asz);
 	if (!si.lpAttributeList)
 		return NULL;
-	if (!InitializeProcThreadAttributeList(si.lpAttributeList, 1, 0, &asz) ||
-	    !UpdateProcThreadAttribute(si.lpAttributeList, 0,
+	if (!InitializeProcThreadAttributeList(si.lpAttributeList, 1, 0, &asz))
+		goto out;
+	attrs_ready = 1;
+	if (!UpdateProcThreadAttribute(si.lpAttributeList, 0,
 				       PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
 				       p->pc, sizeof(p->pc), NULL, NULL))
 		goto out;
@@ -222,7 +225,8 @@ static HANDLE spawn_conpty(struct cpty *p, char *cmd, char *env,
 		ret = pi.hProcess;
 	}
 out:
-	DeleteProcThreadAttributeList(si.lpAttributeList);
+	if (attrs_ready)
+		DeleteProcThreadAttributeList(si.lpAttributeList);
 	HeapFree(GetProcessHeap(), 0, si.lpAttributeList);
 	return ret;
 }
