@@ -640,10 +640,31 @@ static int transport_send(struct conn *c, const uint8_t *data, size_t len)
 	return -1;
 }
 
+/*
+ * Suppress SIGPIPE for writes on fd. Linux carries that per-write in
+ * ctl_send's MSG_NOSIGNAL; macOS has no such flag and wants the socket option
+ * instead, so the two together cover both. Returns 0 when nothing was needed.
+ */
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
+
+static int nosigpipe(int fd)
+{
+#ifdef SO_NOSIGPIPE
+	int on = 1;
+
+	return setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on));
+#else
+	(void)fd;
+	return 0;
+#endif
+}
+
 /* Send one control message to the peer over the comrade-ctl channel. Best
- * effort: MSG_NOSIGNAL so a closed channel during teardown cannot raise
- * SIGPIPE, and a full/short write only ever drops a heartbeat, which the next
- * tick repeats. */
+ * effort: SIGPIPE is suppressed (see nosigpipe) so a closed channel during
+ * teardown cannot kill us, and a full/short write only ever drops a
+ * heartbeat, which the next tick repeats. */
 static void ctl_send(struct conn *c, int type, const uint8_t *payload,
 		     size_t plen)
 {
@@ -1046,6 +1067,9 @@ static int conn_run(struct conn *c, int drive_sig)
 		close(sp[0]);
 		close(sp[1]);
 		return -1;
+	}
+	if (nosigpipe(cp[0])) {		/* see ctl_send */
+		/* best effort: without it a closed channel raises SIGPIPE */
 	}
 	c->stream = stream_create(SESSION_CONV, on_stream_output, c);
 	if (!c->stream) {

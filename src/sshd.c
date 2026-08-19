@@ -3,7 +3,11 @@
 
 #include <fcntl.h>
 #include <poll.h>
+#ifdef __APPLE__
+#include <util.h>			/* forkpty lives here, not in pty.h */
+#else
 #include <pty.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

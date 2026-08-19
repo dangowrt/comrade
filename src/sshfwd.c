@@ -126,7 +126,9 @@ static int start_connect(const char *host, uint16_t port)
 	snprintf(portstr, sizeof(portstr), "%u", port);
 	if (getaddrinfo(host, portstr, &hints, &res) || !res)
 		return -1;
-	fd = socket(res->ai_family, SOCK_STREAM | SOCK_NONBLOCK, 0);
+	fd = socket(res->ai_family, SOCK_STREAM, 0);
+	if (fd >= 0)
+		set_nonblock(fd);	/* SOCK_NONBLOCK is Linux-only */
 	if (fd >= 0 && connect(fd, res->ai_addr, res->ai_addrlen) &&
 	    errno != EINPROGRESS) {
 		close(fd);
@@ -185,9 +187,10 @@ static int listen_on(const char *addr, uint16_t port, uint16_t *bound)
 		a6->sin6_port = htons(port);
 		sl = sizeof(*a6);
 	}
-	fd = socket(ss.ss_family, SOCK_STREAM | SOCK_NONBLOCK, 0);
+	fd = socket(ss.ss_family, SOCK_STREAM, 0);
 	if (fd < 0)
 		return -1;
+	set_nonblock(fd);		/* SOCK_NONBLOCK is Linux-only */
 	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
 	if (bind(fd, (struct sockaddr *)&ss, sl) || listen(fd, 8)) {
 		close(fd);

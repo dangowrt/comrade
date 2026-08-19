@@ -7,17 +7,32 @@
 #include "ccrypto.h"
 #include "keys.h"
 
+/*
+ * Randomness straight from the kernel, no library RNG in between. Linux
+ * spells that getrandom(2); macOS has only getentropy(2), which is the same
+ * syscall-direct guarantee but refuses more than 256 bytes at a time, hence
+ * the chunking. Every caller here asks for far less than that.
+ */
 int random_bytes(void *buf, size_t len)
 {
 	uint8_t *p = buf;
 
 	while (len) {
-		ssize_t n = getrandom(p, len, 0);
+#ifdef __APPLE__
+		size_t n = len > 256 ? 256 : len;
 
-		if (n < 0)
+		if (getentropy(p, n))
 			return -1;
+#else
+		ssize_t rc = getrandom(p, len, 0);
+		size_t n;
+
+		if (rc < 0)
+			return -1;
+		n = (size_t)rc;
+#endif
 		p += n;
-		len -= (size_t)n;
+		len -= n;
 	}
 	return 0;
 }

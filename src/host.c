@@ -30,7 +30,11 @@ int host_show(void)
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
+#ifdef __APPLE__
+#include <util.h>			/* forkpty lives here, not in pty.h */
+#else
 #include <pty.h>
+#endif
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
