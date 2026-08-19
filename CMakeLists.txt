@@ -145,8 +145,13 @@ elseif(COMRADE_CRYPTO_RESOLVED STREQUAL "gcrypt")
 elseif(NOT TARGET OpenSSL::Crypto)
 	list(APPEND COMRADE_MISSING "OpenSSL libcrypto (CMake package OpenSSL)")
 endif()
-if(NOT (COMRADE_DHT_DIR AND EXISTS "${COMRADE_DHT_DIR}/dht.c"))
-	list(APPEND COMRADE_MISSING "dht (jech/dht checkout, set COMRADE_DHT_DIR)")
+# Either route to jech/dht satisfies the build (see the comrade_dht block).
+find_path(COMRADE_DHT_INCLUDE_DIR dht.h PATH_SUFFIXES dht)
+find_library(COMRADE_DHT_LIBRARY dht)
+if(NOT (COMRADE_DHT_DIR AND EXISTS "${COMRADE_DHT_DIR}/dht.c") AND
+   NOT (COMRADE_DHT_INCLUDE_DIR AND COMRADE_DHT_LIBRARY))
+	list(APPEND COMRADE_MISSING
+		"dht (installed libdht, or a jech/dht checkout via COMRADE_DHT_DIR)")
 endif()
 if(COMRADE_MISSING)
 	list(JOIN COMRADE_MISSING "\n   " COMRADE_MISSING_TEXT)
@@ -291,10 +296,8 @@ endif()
 # comrade calls only dht.h's public API and defines the four symbols the
 # library deliberately leaves undefined (dht_hash, dht_random_bytes,
 # dht_blacklisted, dht_sendto), which the dynamic linker resolves back into
-# the executable.
+# the executable. (Both are located up with the dependency summary.)
 #
-find_path(COMRADE_DHT_INCLUDE_DIR dht.h PATH_SUFFIXES dht)
-find_library(COMRADE_DHT_LIBRARY dht)
 
 # BEP 44 is a self-contained engine: it speaks the mainline protocol over a
 # socket the caller owns and makes no call into jech/dht, so it is its own

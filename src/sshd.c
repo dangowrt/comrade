@@ -3,6 +3,7 @@
 
 #include <fcntl.h>
 #include <poll.h>
+#include <signal.h>			/* kill: implicit via other headers on Linux */
 #ifdef __APPLE__
 #include <util.h>			/* forkpty lives here, not in pty.h */
 #else
