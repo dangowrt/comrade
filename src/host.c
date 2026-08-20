@@ -115,18 +115,20 @@ static void status_path(char *out, size_t n, const char *id)
 	snprintf(out, n, "%s/%s.status", state_dir(), id);
 }
 
-static void gen_id(char *out)
+static int gen_id(char *out)
 {
 	static const char hx[] = "0123456789abcdef";
 	uint8_t rb[ID_LEN / 2];
 	int i;
 
-	random_bytes(rb, sizeof(rb));
+	if (random_bytes(rb, sizeof(rb)))
+		return -1;
 	for (i = 0; i < ID_LEN / 2; i++) {
 		out[i * 2] = hx[rb[i] >> 4];
 		out[i * 2 + 1] = hx[rb[i] & 0xf];
 	}
 	out[ID_LEN] = '\0';
+	return 0;
 }
 
 /* Run argv to completion; return its exit status, or -1 on spawn failure. */
@@ -598,7 +600,10 @@ static int start_new(int ui_mode, int no_mcast, int no_fwd)
 
 	memset(&v, 0, sizeof(v));
 	v.no_fwd = no_fwd;
-	gen_id(id);
+	if (gen_id(id)) {
+		fprintf(stderr, "comrade: random generation failed\n");
+		return 1;
+	}
 	sock_path(v.sock, sizeof(v.sock), id);
 	tok_path(v.tokfile, sizeof(v.tokfile), id);
 	status_path(v.statusfile, sizeof(v.statusfile), id);
@@ -609,8 +614,11 @@ static int start_new(int ui_mode, int no_mcast, int no_fwd)
 		fprintf(stderr, "comrade: host key generation failed\n");
 		return 1;
 	}
-	random_bytes(v.tok.rdv, TOKEN_RDV_LEN);
-	random_bytes(v.tok.auth, TOKEN_AUTH_LEN);
+	if (random_bytes(v.tok.rdv, TOKEN_RDV_LEN) ||
+	    random_bytes(v.tok.auth, TOKEN_AUTH_LEN)) {
+		fprintf(stderr, "comrade: random generation failed\n");
+		return 1;
+	}
 
 	{
 		char *mk[] = { "tmux", "-S", v.sock, "new-session", "-d",
