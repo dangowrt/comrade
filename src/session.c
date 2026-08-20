@@ -1,17 +1,12 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 /* Copyright (C) 2026 Daniel Golle <daniel@makrotopia.org> */
 
-#include <arpa/inet.h>
-#include <fcntl.h>
-#include <netdb.h>
-#include <poll.h>
+#include "wsock.h"
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
 #include <time.h>
-#include <unistd.h>
 
 #include "candpolicy.h"
 #include "conn.h"
@@ -128,9 +123,9 @@ struct conn {
 	struct nat_agent *nat;
 	struct stream *stream;
 
-	int ssh_fd;			/* the ssh thread's socketpair end */
-	int ssh_ctl_fd;			/* the ssh thread's comrade-ctl end */
-	int ctl_fd;			/* our end of the comrade-ctl socketpair */
+	sock_t ssh_fd;			/* the ssh thread's socketpair end */
+	sock_t ssh_ctl_fd;		/* the ssh thread's comrade-ctl end */
+	sock_t ctl_fd;			/* our end of the comrade-ctl socketpair */
 	struct ctl_reframer ctl_rf;	/* reassembles ctl messages across reads */
 	int ssh_cli_rc;
 
@@ -655,12 +650,13 @@ static int transport_send(struct conn *c, const uint8_t *data, size_t len)
 #define MSG_NOSIGNAL 0
 #endif
 
-static int nosigpipe(int fd)
+static int nosigpipe(sock_t fd)
 {
 #ifdef SO_NOSIGPIPE
 	int on = 1;
 
-	return setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on));
+	return setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, (const char *)&on,
+			  sizeof(on));
 #else
 	(void)fd;
 	return 0;
@@ -679,9 +675,9 @@ static void ctl_send(struct conn *c, int type, const uint8_t *payload,
 	ssize_t w;
 
 	n = ctl_frame(buf, type, payload, plen);
-	if (c->ctl_fd < 0 || !n)
+	if (!sock_valid(c->ctl_fd) || !n)
 		return;
-	w = send(c->ctl_fd, buf, n, MSG_NOSIGNAL);
+	w = send(c->ctl_fd, (const char *)buf, (int)n, MSG_NOSIGNAL);
 	(void)w;
 }
 
@@ -724,7 +720,7 @@ static void ctl_dispatch(void *arg, int type, const uint8_t *pl, size_t plen)
 static void ctl_readable(struct conn *c)
 {
 	uint8_t tmp[64];
-	ssize_t n = read(c->ctl_fd, tmp, sizeof(tmp));
+	ssize_t n = sock_read(c->ctl_fd, tmp, sizeof(tmp));
 
 	if (n > 0)
 		ctl_reframer_feed(&c->ctl_rf, tmp, (size_t)n, ctl_dispatch, c);
@@ -797,10 +793,13 @@ static int source_addr(int family, char *out, size_t outlen)
 	static const char *probe4 = "192.0.2.1";
 	struct sockaddr_storage ss;
 	socklen_t slen = sizeof(ss);
-	int fd, rc = -1;
+	sock_t fd;
+	int rc = -1;
 
+	if (wsock_init())
+		return -1;
 	fd = socket(family, SOCK_DGRAM, 0);
-	if (fd < 0)
+	if (!sock_valid(fd))
 		return -1;
 	memset(&ss, 0, sizeof(ss));
 	if (family == AF_INET6) {
@@ -830,7 +829,7 @@ static int source_addr(int family, char *out, size_t outlen)
 		rc = inet_ntop(AF_INET, &((struct sockaddr_in *)&ss)->sin_addr,
 			       out, outlen) ? 0 : -1;
 out:
-	close(fd);
+	sock_close(fd);
 	return rc;
 }
 
@@ -916,7 +915,7 @@ static void pump_once(struct sess *s, int timeout_cap_ms)
 		lnf = lanlink_prepare(s->lan, fds + nfds, 6 - nfds, &timeout);
 	if (timeout > timeout_cap_ms)
 		timeout = timeout_cap_ms;
-	poll(fds, (nfds_t)(nfds + lnf), timeout);
+	sock_poll(fds, (nfds_t)(nfds + lnf), timeout);
 	sig_dispatch(s->sig, fds, nfds);
 	if (s->lan)
 		lanlink_dispatch(s->lan, fds + nfds, lnf);
@@ -1063,15 +1062,17 @@ static int conn_run(struct conn *c, int drive_sig)
 	struct sess *s = c->sess;
 	struct sshbridge *br;
 	pthread_t th;
-	int sp[2], cp[2];
+	sock_t sp[2], cp[2];
 	int done = 0;
 	uint64_t next_hb;
 
-	if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp))
+	/* Both pairs must be sockets, not pipes: they are polled in the same
+	 * set as the transport, and WSAPoll takes nothing else (see wsock.h). */
+	if (sock_pair(sp))
 		return -1;
-	if (socketpair(AF_UNIX, SOCK_STREAM, 0, cp)) {
-		close(sp[0]);
-		close(sp[1]);
+	if (sock_pair(cp)) {
+		sock_close(sp[0]);
+		sock_close(sp[1]);
 		return -1;
 	}
 	if (nosigpipe(cp[0])) {		/* see ctl_send */
@@ -1079,10 +1080,10 @@ static int conn_run(struct conn *c, int drive_sig)
 	}
 	c->stream = stream_create(SESSION_CONV, on_stream_output, c);
 	if (!c->stream) {
-		close(sp[0]);
-		close(sp[1]);
-		close(cp[0]);
-		close(cp[1]);
+		sock_close(sp[0]);
+		sock_close(sp[1]);
+		sock_close(cp[0]);
+		sock_close(cp[1]);
 		return -1;
 	}
 	c->ssh_fd = sp[1];
@@ -1091,11 +1092,11 @@ static int conn_run(struct conn *c, int drive_sig)
 	c->ctl_rf.len = 0;
 	if (pthread_create(&th, NULL,
 			   s->cfg->is_host ? ssh_srv_thread : ssh_cli_thread, c)) {
-		close(sp[0]);
-		close(sp[1]);
-		close(cp[0]);
-		close(cp[1]);
-		c->ctl_fd = -1;
+		sock_close(sp[0]);
+		sock_close(sp[1]);
+		sock_close(cp[0]);
+		sock_close(cp[1]);
+		c->ctl_fd = INVALID_SOCK;
 		stream_destroy(c->stream);
 		c->stream = NULL;
 		return -1;
@@ -1148,7 +1149,7 @@ static int conn_run(struct conn *c, int drive_sig)
 		fds[cidx].fd = c->ctl_fd;
 		fds[cidx].events = POLLIN;
 		fds[cidx].revents = 0;
-		poll(fds, (nfds_t)(cidx + 1), timeout);
+		sock_poll(fds, (nfds_t)(cidx + 1), timeout);
 		if (drive_sig) {
 			sig_dispatch(s->sig, fds, nfds);
 			if (s->lan)
@@ -1208,17 +1209,17 @@ static int conn_run(struct conn *c, int drive_sig)
 	 * completes. A clean end has already exited the thread; the shutdown is
 	 * then a harmless no-op.
 	 */
-	shutdown(sp[0], SHUT_RDWR);
-	shutdown(cp[0], SHUT_RDWR);
+	sock_shutdown(sp[0], SHUT_RDWR);
+	sock_shutdown(cp[0], SHUT_RDWR);
 	pthread_join(th, NULL);
 	sshbridge_destroy(br);
-	close(sp[0]);			/* sp[1] is closed by the ssh module */
+	sock_close(sp[0]);		/* sp[1] is closed by the ssh module */
 	/* Both control-socket ends are ours to close: the ssh module bridges
 	 * cp[1] but never closes it. Mark the fd gone first so a stray ctl_send
 	 * is a no-op. */
-	c->ctl_fd = -1;
-	close(cp[0]);
-	close(cp[1]);
+	c->ctl_fd = INVALID_SOCK;
+	sock_close(cp[0]);
+	sock_close(cp[1]);
 	stream_destroy(c->stream);
 	c->stream = NULL;
 
@@ -1366,7 +1367,7 @@ static struct conn *conn_alloc(struct sess *s)
 	if (!c)
 		return NULL;
 	c->sess = s;
-	c->ctl_fd = -1;
+	c->ctl_fd = INVALID_SOCK;
 	pthread_mutex_init(&c->hb_lock, NULL);
 	pthread_mutex_init(&c->rdv_lock, NULL);
 	pthread_mutex_init(&c->status_lock, NULL);
@@ -1645,10 +1646,10 @@ static int host_turnstile(struct sess *s)
 		if (end_fd > 0) {
 			struct pollfd ef;
 
-			ef.fd = end_fd;
+			ef.fd = (sock_t)end_fd;
 			ef.events = POLLIN;
 			ef.revents = 0;
-			if (poll(&ef, 1, 0) > 0 &&
+			if (sock_poll(&ef, 1, 0) > 0 &&
 			    (ef.revents & (POLLIN | POLLHUP | POLLERR)))
 				break;
 		} else if (now_ms() >= deadline) {
@@ -1730,7 +1731,7 @@ int session_run(const struct session_cfg *cfg)
 	memset(&s, 0, sizeof(s));
 	s.cfg = cfg;
 	s.c.sess = &s;
-	s.c.ctl_fd = -1;			/* no control channel until run_ssh */
+	s.c.ctl_fd = INVALID_SOCK;		/* no control channel until run_ssh */
 	memcpy(s.auth, cfg->tok.auth, TOKEN_AUTH_LEN);
 	pthread_mutex_init(&s.trickle_lock, NULL);
 	pthread_mutex_init(&s.c.status_lock, NULL);	/* s.c.status zeroed = connecting */

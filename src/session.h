@@ -6,7 +6,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#include <sys/socket.h>
+#include "wsock.h"
 
 #include "token.h"
 
