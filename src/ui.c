@@ -597,6 +597,16 @@ static void um_reset(struct ui *u)
 	u->dirty = 1;
 }
 
+static void um_net_reset(struct ui *u)
+{
+	if (!u->anim) {
+		vlog(u, "local  network changed -- candidates flushed");
+		return;
+	}
+	u->nnet = 0;
+	u->dirty = 1;
+}
+
 /* ---- observer callbacks (client inline; also reused by the foreground) ---- */
 
 static void cb_net(void *a, int f, int sc, int v, const char *ad)
@@ -609,6 +619,7 @@ static void cb_rdv_stage(void *a, int f, int st) { um_rdv_stage(a, f, st); }
 static void cb_token(void *a, const char *t) { um_token(a, t); }
 static void cb_peer(void *a, int id, int s, const char *ad) { um_peer(a, id, s, ad); }
 static void cb_reset(void *a) { um_reset(a); }
+static void cb_net_reset(void *a) { um_net_reset(a); }
 static void cb_esc(void *a, const char *w) { um_escalate(a, w); }
 static void cb_tick(void *a)
 {
@@ -648,6 +659,7 @@ void ui_bind(struct ui *u, struct session_obs *obs)
 	obs->token = cb_token;
 	obs->peer = cb_peer;
 	obs->reset = cb_reset;
+	obs->net_reset = cb_net_reset;
 	obs->escalate = cb_esc;
 	obs->established = cb_established;
 	obs->tick = cb_tick;
@@ -684,6 +696,10 @@ static void em_reset(void *a)
 {
 	dprintf(((struct ui_emit *)a)->fd, "X\n");
 }
+static void em_net_reset(void *a)
+{
+	dprintf(((struct ui_emit *)a)->fd, "Y\n");
+}
 static void em_esc(void *a, const char *w)
 {
 	dprintf(((struct ui_emit *)a)->fd, "E %s\n", w);
@@ -709,6 +725,7 @@ void ui_emitter(struct session_obs *obs, int fd)
 	obs->token = em_token;
 	obs->peer = em_peer;
 	obs->reset = em_reset;
+	obs->net_reset = em_net_reset;
 	obs->escalate = em_esc;
 	obs->established = em_live;
 	/* tick is local to the view; the foreground animates on its own clock */
@@ -767,6 +784,9 @@ static void feed(struct ui *u, char *ln)
 		break;
 	case 'X':
 		um_reset(u);
+		break;
+	case 'Y':
+		um_net_reset(u);
 		break;
 	default:
 		break;

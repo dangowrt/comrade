@@ -20,6 +20,7 @@
 #include "keys.h"
 #include "lanlink.h"
 #include "nat.h"
+#include "netmon.h"
 #include "session.h"
 #include "sig.h"
 #include "sshbridge.h"
@@ -164,6 +165,8 @@ struct sess {
 
 	struct sig *sig;
 	struct lanlink *lan;
+
+	struct netmon netmon;		/* detect a roam while still waiting */
 
 	char local_sdp[NAT_SDP_MAX];
 	volatile int have_local_sdp;
@@ -354,18 +357,19 @@ static void report_candidates(struct sess *s, const char *sdp)
 				else if (fam == 4 && via == NET_VIA_DIRECT &&
 					 scope != NET_SCOPE_GLOBAL)
 					s->have_priv4 = 1;
-				/* A global v6 only ever matters at the address we
-				 * source outbound from (source_addr's connect
+				/* A STUN-reflexive global v6 is the public address a
+				 * NAT66 host presents to peers, so always surface it
+				 * -- it is exactly the "global v6" the dashboard must
+				 * show. For a *direct* global v6 only the address we
+				 * source outbound from matters (source_addr's connect
 				 * trick, as canon_v6 already enforces for the sent
-				 * SDP). libjuice also enumerates the stable/DHCPv6
-				 * address, which we neither source from nor listen
-				 * on for punching -- never surface it. Only when we
-				 * know our source do we judge; otherwise show what
-				 * was gathered, matching canon_v6. */
+				 * SDP): libjuice also enumerates the stable/DHCPv6
+				 * address, which we neither source from nor listen on
+				 * for punching, so drop that one once we know our
+				 * source; otherwise show what was gathered. */
 				drop6 = fam == 6 && scope == NET_SCOPE_GLOBAL &&
-					s->src6[0] &&
-					(via != NET_VIA_DIRECT ||
-					 strcmp(addr, s->src6));
+					via == NET_VIA_DIRECT && s->src6[0] &&
+					strcmp(addr, s->src6);
 				if (!drop6)
 					o->net(o->arg, fam, scope, via, addr);
 			}
@@ -1453,6 +1457,31 @@ static int host_turnstile(struct sess *s)
 		maybe_announce_rendezvous(s);	/* mint and advertise the token */
 		rdv_keep_warm(s);
 
+		/*
+		 * Roamed while waiting for the next client: the current offer
+		 * advertises the old network's candidates, so drop the listening
+		 * agent and re-gather on the new interfaces, and flush the stale
+		 * local addresses from the dashboard (the live client rows stay).
+		 */
+		if (netmon_changed(&s->netmon, now_ms())) {
+			if (listen) {
+				conn_free(listen);
+				listen = NULL;
+			}
+			s->have_local_sdp = 0;
+			s->have_peer_sdp = 0;
+			s->remote_set = 0;
+			s->local_sdp[0] = '\0';
+			s->peer_sdp[0] = '\0';
+			pthread_mutex_lock(&s->trickle_lock);
+			s->trickle_sdp[0] = '\0';
+			s->trickle_dirty = 0;
+			pthread_mutex_unlock(&s->trickle_lock);
+			ts = TS_GATHER;
+			if (o && o->net_reset)
+				o->net_reset(o->arg);
+		}
+
 		if (o) {			/* dashboard: local candidates */
 			if (o->net && s->trickle_dirty) {
 				char buf[NAT_SDP_MAX];
@@ -1707,6 +1736,7 @@ int session_run(const struct session_cfg *cfg)
 	pthread_mutex_init(&s.c.status_lock, NULL);	/* s.c.status zeroed = connecting */
 	pthread_mutex_init(&s.c.hb_lock, NULL);
 	pthread_mutex_init(&s.c.rdv_lock, NULL);
+	netmon_init(&s.netmon);
 	if (cfg->stun_auto)
 		s.stun_servers = stunlist_load(&s.stun_count);
 	nat_log_level(cfg->log_level);	/* < 0 silences libjuice (see nat_log_level) */
@@ -1736,6 +1766,30 @@ int session_run(const struct session_cfg *cfg)
 
 		pump_once(&s, 100);
 		maybe_announce_rendezvous(&s);
+		/*
+		 * Roamed before the link came up: re-gather on the new interfaces
+		 * and flush the dashboard's stale local addresses. Once running, a
+		 * roam instead drops the link and returns through SSHC_RECONNECT.
+		 */
+		if (st != ST_RUN && netmon_changed(&s.netmon, now_ms())) {
+			if (s.c.nat) {
+				nat_destroy(s.c.nat);
+				s.c.nat = NULL;
+			}
+			conn_gen_ice(&s.c);
+			s.have_local_sdp = 0;
+			s.have_peer_sdp = 0;
+			s.remote_set = 0;
+			s.local_sdp[0] = '\0';
+			s.peer_sdp[0] = '\0';
+			pthread_mutex_lock(&s.trickle_lock);
+			s.trickle_sdp[0] = '\0';
+			s.trickle_dirty = 0;
+			pthread_mutex_unlock(&s.trickle_lock);
+			st = ST_WAIT_DHT;
+			if (o && o->net_reset)
+				o->net_reset(o->arg);
+		}
 		if (now_ms() >= s.c.next_status_ms) {
 			publish_status(&s.c,
 				       st == ST_WAIT_ICE ? CONN_PUNCHING :

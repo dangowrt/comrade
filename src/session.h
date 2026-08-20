@@ -71,6 +71,11 @@ struct session_obs {
 	 * state, so the dashboard reflects the fresh attempt rather than the
 	 * addresses of the network that just went away. */
 	void (*reset)(void *arg);
+	/* The local network changed (a roam while still waiting, not an
+	 * established-link drop): drop the stale local-candidate rows so the
+	 * dashboard shows only the current interfaces, while leaving any peer
+	 * rows in place (a multi-user host keeps its live clients listed). */
+	void (*net_reset)(void *arg);
 	/* The client had to fall back from a seeded node to a full DHT warm. */
 	void (*escalate)(void *arg, const char *why);
 	/* A path is up and the session is about to seize the terminal. */
