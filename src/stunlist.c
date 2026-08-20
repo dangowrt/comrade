@@ -4,12 +4,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <sys/wait.h>
 
 #include "appdir.h"
+#include "oscompat.h"
 #include "stunlist.h"
 #include "stun_bundle.inc"		/* static const char *const stun_bundle[] */
 
@@ -137,32 +136,16 @@ void stunlist_free(char **list, int n)
 	free(list);
 }
 
-/* fork+exec argv, return its exit status (127 if it could not run). */
-static int run_wait(char *const argv[])
-{
-	pid_t pid = fork();
-	int status;
-
-	if (pid < 0)
-		return -1;
-	if (pid == 0) {
-		execvp(argv[0], argv);
-		_exit(127);
-	}
-	if (waitpid(pid, &status, 0) < 0)
-		return -1;
-	return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-}
-
-/* Fetch url to out, trying wget then curl (uclient-fetch provides wget). */
+/* Fetch url to out, trying wget then curl (uclient-fetch provides wget;
+ * Windows 10+ ships curl.exe in System32). */
 static int run_fetch(const char *url, const char *out)
 {
 	char *wget[] = { "wget", "-q", "-O", (char *)out, (char *)url, NULL };
 	char *curl[] = { "curl", "-fsSL", "-o", (char *)out, (char *)url, NULL };
 
-	if (run_wait(wget) == 0)
+	if (os_spawn_wait(wget) == 0)
 		return 0;
-	if (run_wait(curl) == 0)
+	if (os_spawn_wait(curl) == 0)
 		return 0;
 	return -1;
 }
@@ -186,7 +169,7 @@ int stunlist_update(int *count)
 		STUN_UPDATE_URL);
 	if (run_fetch(STUN_UPDATE_URL, tmp)) {
 		fprintf(stderr, "comrade: fetch failed (need wget or curl)\n");
-		unlink(tmp);
+		remove(tmp);
 		return -1;
 	}
 	f = fopen(tmp, "r");
@@ -196,13 +179,13 @@ int stunlist_update(int *count)
 	if (!list || n == 0) {
 		fprintf(stderr, "comrade: fetched list was empty or unparseable\n");
 		stunlist_free(list, n);
-		unlink(tmp);
+		remove(tmp);
 		return -1;
 	}
 	stunlist_free(list, n);
-	if (rename(tmp, path)) {
+	if (os_rename_replace(tmp, path)) {
 		fprintf(stderr, "comrade: could not save %s\n", path);
-		unlink(tmp);
+		remove(tmp);
 		return -1;
 	}
 	if (count)

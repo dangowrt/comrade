@@ -1,16 +1,12 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 /* Copyright (C) 2026 Daniel Golle <daniel@makrotopia.org> */
 
-#include <fcntl.h>
-#include <netdb.h>
+#include "wsock.h"
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <unistd.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
 
 #include "ccrypto.h"
 
@@ -20,6 +16,7 @@
 #include "dhtnode.h"
 #include "keys.h"
 #include "netmon.h"
+#include "oscompat.h"
 
 #define DHTNODE_SEED_INTERVAL_MS 1000
 #define DHTNODE_BOOTSTRAP_INTERVAL_MS 10000
@@ -46,8 +43,8 @@ static const struct {
 };
 
 struct dhtnode {
-	int s4;
-	int s6;
+	sock_t s4;
+	sock_t s6;
 	uint8_t myid[20];
 	struct bep44_engine *engine;
 	int dht_ready;
@@ -85,17 +82,18 @@ static uint64_t now_ms(void)
 	return (uint64_t)ts.tv_sec * 1000 + (uint64_t)(ts.tv_nsec / 1000000);
 }
 
-static int udp_socket(int af, uint16_t port)
+static sock_t udp_socket(int af, uint16_t port)
 {
 	struct sockaddr_storage ss;
 	socklen_t sslen;
-	int s = socket(af, SOCK_DGRAM, 0);
-	int flags;
+	sock_t s;
 
-	if (s < 0)
-		return -1;
-	flags = fcntl(s, F_GETFL, 0);
-	if (flags < 0 || fcntl(s, F_SETFL, flags | O_NONBLOCK) < 0)
+	if (wsock_init())
+		return INVALID_SOCK;
+	s = socket(af, SOCK_DGRAM, 0);
+	if (!sock_valid(s))
+		return INVALID_SOCK;
+	if (sock_set_nonblock(s))
 		goto fail;
 
 	memset(&ss, 0, sizeof(ss));
@@ -103,7 +101,8 @@ static int udp_socket(int af, uint16_t port)
 		struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&ss;
 		int on = 1;
 
-		setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, &on, sizeof(on));
+		setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, (const char *)&on,
+			   sizeof(on));
 		sin6->sin6_family = AF_INET6;
 		sin6->sin6_port = htons(port);
 		sslen = sizeof(*sin6);
@@ -118,8 +117,8 @@ static int udp_socket(int af, uint16_t port)
 		goto fail;
 	return s;
 fail:
-	close(s);
-	return -1;
+	sock_close(s);
+	return INVALID_SOCK;
 }
 
 /* Side thread: resolve the routers (blocking getaddrinfo) into boot_addr. */
@@ -193,8 +192,8 @@ static void bootstrap_ping(struct dhtnode *n)
 	for (i = 0; i < cnt; i++) {
 		int fam = addr[i].ss_family;
 
-		if ((fam == AF_INET && n->s4 < 0) ||
-		    (fam == AF_INET6 && n->s6 < 0))
+		if ((fam == AF_INET && !sock_valid(n->s4)) ||
+		    (fam == AF_INET6 && !sock_valid(n->s6)))
 			continue;
 		dht_ping_node((struct sockaddr *)&addr[i], len[i]);
 		bep44_bootstrap_add(n->engine, (struct sockaddr *)&addr[i],
@@ -291,9 +290,9 @@ static void dhtcache_load(struct dhtnode *n)
 {
 	int loaded = 0;
 
-	if (n->s4 >= 0)
+	if (sock_valid(n->s4))
 		loaded += cache_load_family(n, AF_INET);
-	if (n->s6 >= 0)
+	if (sock_valid(n->s6))
 		loaded += cache_load_family(n, AF_INET6);
 	n->cache_was_empty = loaded == 0;
 }
@@ -317,8 +316,8 @@ static int cache_write4(const struct sockaddr_in *sin, int num)
 		fwrite(&sin[i].sin_port, 1, 2, f);
 	}
 	fclose(f);
-	if (rename(tmp, path)) {
-		unlink(tmp);
+	if (os_rename_replace(tmp, path)) {
+		remove(tmp);
 		return 0;
 	}
 	return 1;
@@ -342,8 +341,8 @@ static int cache_write6(const struct sockaddr_in6 *sin6, int num)
 		fwrite(&sin6[i].sin6_port, 1, 2, f);
 	}
 	fclose(f);
-	if (rename(tmp, path)) {
-		unlink(tmp);
+	if (os_rename_replace(tmp, path)) {
+		remove(tmp);
 		return 0;
 	}
 	return 1;
@@ -360,9 +359,9 @@ static int dhtcache_save(struct dhtnode *n)
 	if (!n->cache_enabled)
 		return 0;
 	dht_get_nodes(sin, &num, sin6, &num6);
-	if (n->s4 >= 0)
+	if (sock_valid(n->s4))
 		wrote |= cache_write4(sin, num);
-	if (n->s6 >= 0)
+	if (sock_valid(n->s6))
 		wrote |= cache_write6(sin6, num6);
 	return wrote;
 }
@@ -375,12 +374,19 @@ static struct dhtnode *dhtnode_create_impl(int do_bootstrap)
 		return NULL;
 	n->s4 = udp_socket(AF_INET, DHTNODE_DHT_PORT);
 	n->s6 = udp_socket(AF_INET6, DHTNODE_DHT_PORT);
-	if (n->s4 < 0 && n->s6 < 0)
+	if (!sock_valid(n->s4) && !sock_valid(n->s6))
 		goto fail;
 	if (random_bytes(n->myid, sizeof(n->myid)))
 		goto fail;
 
-	if (dht_init(n->s4, n->s6, n->myid, NULL) < 0)
+	/*
+	 * jech/dht's public API takes plain ints, and its own Windows support
+	 * does the same. Windows socket handles are documented as values whose
+	 * upper 32 bits are always clear, so the narrowing is safe -- but it is
+	 * the one place in comrade where a SOCKET is not carried as sock_t, so
+	 * it is spelled out rather than left to an implicit conversion.
+	 */
+	if (dht_init((int)n->s4, (int)n->s6, n->myid, NULL) < 0)
 		goto fail;
 	n->dht_ready = 1;
 
@@ -448,10 +454,10 @@ void dhtnode_free(struct dhtnode *n)
 		bep44_free(n->engine);
 	if (n->dht_ready)
 		dht_uninit();
-	if (n->s4 >= 0)
-		close(n->s4);
-	if (n->s6 >= 0)
-		close(n->s6);
+	if (sock_valid(n->s4))
+		sock_close(n->s4);
+	if (sock_valid(n->s6))
+		sock_close(n->s6);
 	free(n);
 }
 
@@ -564,12 +570,12 @@ int dhtnode_prepare(struct dhtnode *n, struct pollfd *fds, int maxfds,
 	int nfds = 0;
 	int64_t wait;
 
-	if (n->s4 >= 0 && nfds < maxfds) {
+	if (sock_valid(n->s4) && nfds < maxfds) {
 		fds[nfds].fd = n->s4;
 		fds[nfds].events = POLLIN;
 		nfds++;
 	}
-	if (n->s6 >= 0 && nfds < maxfds) {
+	if (sock_valid(n->s6) && nfds < maxfds) {
 		fds[nfds].fd = n->s6;
 		fds[nfds].events = POLLIN;
 		nfds++;
@@ -590,17 +596,19 @@ void dhtnode_dispatch(struct dhtnode *n, const struct pollfd *fds, int nfds)
 	int i;
 
 	for (i = 0; i < nfds; i++) {
-		int s = fds[i].fd;
+		sock_t s = fds[i].fd;
 
-		if (!(fds[i].revents & POLLIN))
+		/* WSAPoll raises POLLHUP/POLLERR without POLLIN, so a socket in
+		 * that state has to be drained here or the loop spins on it. */
+		if (!(fds[i].revents & (POLLIN | POLLHUP | POLLERR)))
 			continue;
 		if (s != n->s4 && s != n->s6)
 			continue;
 		for (;;) {
 			struct sockaddr_storage from;
 			socklen_t fromlen = sizeof(from);
-			ssize_t rc = recvfrom(s, buf, sizeof(buf) - 1, 0,
-					      (struct sockaddr *)&from, &fromlen);
+			int rc = recvfrom(s, (char *)buf, (int)sizeof(buf) - 1, 0,
+					  (struct sockaddr *)&from, &fromlen);
 
 			if (rc <= 0)
 				break;
@@ -611,10 +619,13 @@ void dhtnode_dispatch(struct dhtnode *n, const struct pollfd *fds, int nfds)
 	housekeep(n);
 }
 
+/* One of the four callbacks jech/dht leaves for the application. Its int
+ * sockfd is the narrowed SOCKET from dht_init; see the comment there. */
 int dht_sendto(int sockfd, const void *buf, int len, int flags,
 	       const struct sockaddr *to, int tolen)
 {
-	return (int)sendto(sockfd, buf, (size_t)len, flags, to, (socklen_t)tolen);
+	return (int)sendto((sock_t)sockfd, (const char *)buf, len, flags, to,
+			   (socklen_t)tolen);
 }
 
 int dht_blacklisted(const struct sockaddr *sa, int salen)

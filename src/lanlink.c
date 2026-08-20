@@ -2,31 +2,20 @@
 /* Copyright (C) 2026 Daniel Golle <daniel@makrotopia.org> */
 
 #define _GNU_SOURCE
-#include <arpa/inet.h>
-#include <fcntl.h>
-#include <netinet/in.h>
+#include "wsock.h"
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
 #include "lanlink.h"
 
 struct lanlink {
-	int fd;				/* dual-stack v6 UDP socket */
+	sock_t fd;			/* dual-stack v6 UDP socket */
 	uint16_t port;
 	struct sockaddr_in6 peer;	/* v4 peers kept v4-mapped */
 	int have_peer;
 	lanlink_recv_cb *on_recv;
 	void *arg;
 };
-
-static void set_nonblock(int s)
-{
-	int f = fcntl(s, F_GETFL, 0);
-
-	if (f >= 0)
-		fcntl(s, F_SETFL, f | O_NONBLOCK);
-}
 
 struct lanlink *lanlink_create(lanlink_recv_cb *on_recv, void *arg)
 {
@@ -37,14 +26,20 @@ struct lanlink *lanlink_create(lanlink_recv_cb *on_recv, void *arg)
 
 	if (!l)
 		return NULL;
+	if (wsock_init()) {
+		free(l);
+		return NULL;
+	}
+	l->fd = INVALID_SOCK;		/* calloc's 0 is a legal SOCKET value */
 	l->on_recv = on_recv;
 	l->arg = arg;
 	l->fd = socket(AF_INET6, SOCK_DGRAM, 0);
-	if (l->fd < 0)
+	if (!sock_valid(l->fd))
 		goto fail;
 	/* Dual stack: one socket carries both v6 (incl. link-local) and, as
 	 * v4-mapped, v4. */
-	setsockopt(l->fd, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof(off));
+	setsockopt(l->fd, IPPROTO_IPV6, IPV6_V6ONLY, (const char *)&off,
+		   sizeof(off));
 	memset(&a, 0, sizeof(a));
 	a.sin6_family = AF_INET6;
 	a.sin6_addr = in6addr_any;
@@ -53,7 +48,7 @@ struct lanlink *lanlink_create(lanlink_recv_cb *on_recv, void *arg)
 	if (getsockname(l->fd, (struct sockaddr *)&a, &alen))
 		goto fail;
 	l->port = ntohs(a.sin6_port);
-	set_nonblock(l->fd);
+	sock_set_nonblock(l->fd);
 	return l;
 fail:
 	lanlink_destroy(l);
@@ -64,8 +59,8 @@ void lanlink_destroy(struct lanlink *l)
 {
 	if (!l)
 		return;
-	if (l->fd >= 0)
-		close(l->fd);
+	if (sock_valid(l->fd))
+		sock_close(l->fd);
 	free(l);
 }
 
@@ -123,10 +118,13 @@ void lanlink_dispatch(struct lanlink *l, const struct pollfd *fds, int nfds)
 	int i;
 
 	for (i = 0; i < nfds; i++) {
-		if (fds[i].fd != l->fd || !(fds[i].revents & POLLIN))
+		/* POLLHUP/POLLERR arrive without POLLIN under WSAPoll, so they
+		 * are drained here rather than ignored (see wsock.h). */
+		if (fds[i].fd != l->fd ||
+		    !(fds[i].revents & (POLLIN | POLLHUP | POLLERR)))
 			continue;
 		for (;;) {
-			ssize_t rc = recv(l->fd, buf, sizeof(buf), 0);
+			int rc = recv(l->fd, (char *)buf, (int)sizeof(buf), 0);
 
 			if (rc <= 0)
 				break;
@@ -140,8 +138,8 @@ int lanlink_send(struct lanlink *l, const uint8_t *data, size_t len)
 {
 	if (!l->have_peer)
 		return -1;
-	if (sendto(l->fd, data, len, 0, (struct sockaddr *)&l->peer,
-		   sizeof(l->peer)) < 0)
+	if (sendto(l->fd, (const char *)data, (int)len, 0,
+		   (struct sockaddr *)&l->peer, sizeof(l->peer)) < 0)
 		return -1;
 	return 0;
 }

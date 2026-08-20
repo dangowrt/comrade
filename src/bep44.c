@@ -5,7 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <netinet/in.h>
+#include "wsock.h"
 
 static int b44_debug = -1;
 
@@ -120,8 +120,8 @@ struct b44_seed {
 
 struct bep44_engine {
 	uint8_t myid[20];
-	int s4;
-	int s6;
+	sock_t s4;
+	sock_t s6;
 	uint16_t tid_seq;
 	struct sockaddr_storage bootstrap[B44_BOOTSTRAP_MAX];
 	socklen_t bootstrap_len[B44_BOOTSTRAP_MAX];
@@ -184,7 +184,7 @@ void bep44_target(uint8_t target[20], const uint8_t pk[32], const char *salt)
 	cc_sha1_final(&ctx, target);
 }
 
-struct bep44_engine *bep44_create(const uint8_t myid[20], int s4, int s6)
+struct bep44_engine *bep44_create(const uint8_t myid[20], sock_t s4, sock_t s6)
 {
 	struct bep44_engine *e = calloc(1, sizeof(*e));
 
@@ -217,7 +217,8 @@ void bep44_free(struct bep44_engine *e)
 int bep44_bootstrap_add(struct bep44_engine *e, const struct sockaddr *sa,
 			socklen_t salen)
 {
-	if (e->nbootstrap >= B44_BOOTSTRAP_MAX || salen > sizeof(e->bootstrap[0]))
+	if (e->nbootstrap >= B44_BOOTSTRAP_MAX ||
+	    (size_t)salen > sizeof(e->bootstrap[0]))
 		return -1;
 	memcpy(&e->bootstrap[e->nbootstrap], sa, salen);
 	e->bootstrap_len[e->nbootstrap] = salen;
@@ -228,11 +229,12 @@ int bep44_bootstrap_add(struct bep44_engine *e, const struct sockaddr *sa,
 static int msg_send(struct bep44_engine *e, const struct sockaddr_storage *ss,
 		    socklen_t sslen, const uint8_t *buf, size_t len)
 {
-	int s = ss->ss_family == AF_INET6 ? e->s6 : e->s4;
+	sock_t s = ss->ss_family == AF_INET6 ? e->s6 : e->s4;
 
-	if (s < 0)
+	if (!sock_valid(s))
 		return -1;
-	return (int)sendto(s, buf, len, 0, (const struct sockaddr *)ss, sslen);
+	return (int)sendto(s, (const char *)buf, (int)len, 0,
+			 (const struct sockaddr *)ss, sslen);
 }
 
 static void dist_calc(uint8_t dist[20], const uint8_t id[20],
@@ -1016,7 +1018,7 @@ int bep44_seed_add(struct bep44_engine *e, const uint8_t id[20],
 	struct b44_seed *seed;
 	int i;
 
-	if (salen > sizeof(seed->ss))
+	if ((size_t)salen > sizeof(seed->ss))
 		return -1;
 	for (i = 0; i < B44_SEEDS_MAX; i++) {
 		seed = &e->seeds[i];

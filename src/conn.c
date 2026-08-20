@@ -1,29 +1,30 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 /* Copyright (C) 2026 Daniel Golle <daniel@makrotopia.org> */
 
-#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
 #include "conn.h"
+#include "oscompat.h"
 
 int conn_write(const char *path, const struct conn_status *st)
 {
 	char tmp[600];
-	int fd;
+	FILE *f;
 
 	snprintf(tmp, sizeof(tmp), "%s.tmp", path);
-	fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-	if (fd < 0)
+	/* stdio rather than open()+dprintf(): dprintf is POSIX-only and the
+	 * write is one short line, so the buffering costs nothing. */
+	f = fopen(tmp, "w");
+	if (!f)
 		return -1;
-	dprintf(fd, "%d\t%s\t%s\t%d\t%d\t%s\n", st->state,
+	fprintf(f, "%d\t%s\t%s\t%d\t%d\t%s\n", st->state,
 		st->peer[0] ? st->peer : "-", st->rdv[0] ? st->rdv : "-",
 		st->rtt_ms, st->since_s, st->rdv6[0] ? st->rdv6 : "-");
-	close(fd);
-	if (rename(tmp, path)) {
-		unlink(tmp);
+	fclose(f);
+	if (os_rename_replace(tmp, path)) {
+		remove(tmp);
 		return -1;
 	}
 	return 0;

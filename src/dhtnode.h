@@ -4,8 +4,7 @@
 #ifndef COMRADE_DHTNODE_H
 #define COMRADE_DHTNODE_H
 
-#include <poll.h>
-#include <sys/socket.h>
+#include "wsock.h"
 
 struct bep44_engine;
 struct dhtnode;

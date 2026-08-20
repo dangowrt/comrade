@@ -6,7 +6,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#include <sys/socket.h>
+#include "wsock.h"
 
 #define BEP44_MAX_VALUE 1000
 #define BEP44_MAX_SALT 64
@@ -28,7 +28,7 @@ typedef void bep44_put_cb(void *arg, int stored, const struct sockaddr *node,
 typedef void bep44_get_cb(void *arg, const uint8_t *v, size_t v_len, int64_t seq,
 			  const struct sockaddr *node, socklen_t node_len);
 
-struct bep44_engine *bep44_create(const uint8_t myid[20], int s4, int s6);
+struct bep44_engine *bep44_create(const uint8_t myid[20], sock_t s4, sock_t s6);
 void bep44_free(struct bep44_engine *e);
 int bep44_bootstrap_add(struct bep44_engine *e, const struct sockaddr *sa,
 			socklen_t salen);

@@ -2,11 +2,12 @@
 /* Copyright (C) 2026 Daniel Golle <daniel@makrotopia.org> */
 
 #define _GNU_SOURCE
-#include <arpa/inet.h>
+#include "wsock.h"
 #include <string.h>
 #include <stdint.h>
 
 #include "candpolicy.h"
+#include "oscompat.h"
 
 void cand_policy_default(struct cand_policy *p)
 {
@@ -80,7 +81,7 @@ int cand_addr_keep(const char *addr, int family_filter,
 
 static int line_addr(const char *line, size_t len, char *buf, size_t buflen)
 {
-	const char *p = memmem(line, len, "candidate:", 10);
+	const char *p = os_memmem(line, len, "candidate:", 10);
 	const char *end = line + len;
 	const char *start;
 	int spaces = 0;
@@ -118,7 +119,7 @@ void cand_sdp_filter(const char *in, int family_filter,
 		int keep = 1;
 		char addr[64];
 
-		if (memmem(line, len, "candidate:", 10)) {
+		if (os_memmem(line, len, "candidate:", 10)) {
 			if (line_addr(line, len, addr, sizeof(addr)) ||
 			    !cand_addr_keep(addr, family_filter, p, NULL))
 				keep = 0;

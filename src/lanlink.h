@@ -4,10 +4,9 @@
 #ifndef COMRADE_LANLINK_H
 #define COMRADE_LANLINK_H
 
-#include <poll.h>
+#include "wsock.h"
 #include <stddef.h>
 #include <stdint.h>
-#include <sys/socket.h>
 
 /*
  * Direct UDP transport for the shared layer-2 segment. On the same link there

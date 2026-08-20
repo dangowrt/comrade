@@ -2,7 +2,7 @@
 /* Copyright (C) 2026 Daniel Golle <daniel@makrotopia.org> */
 
 #define _GNU_SOURCE
-#include <arpa/inet.h>
+#include "wsock.h"
 #include <stdio.h>
 #include <string.h>
 
