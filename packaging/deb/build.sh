@@ -101,7 +101,15 @@ JUICE_PKG="lib$(echo "$JUICE_SONAME" | sed -n 's/^libjuice\.so\.\([0-9]*\).*/jui
 # fall out per arch and suite (including Debian's 64-bit time_t renames such as
 # libssl3 -> libssl3t64). Our own three libraries are not dpkg-owned here, so
 # they are skipped by this scan and named explicitly on comrade's Depends.
-sys_depends() { # elf-file... -> "pkg (>= ver), pkg (>= ver)"
+#
+# No version constraint is emitted: the package name already carries the ABI
+# (the soname is baked into it, e.g. libssh-4, libssl3t64), which is exactly
+# what Depends needs to express. Pinning to the version found in the build
+# container instead pins to that container's distribution and point in time,
+# which does not generalise to every distribution installing this .deb (e.g.
+# a same-ABI libssh-4 that happens to be an older upstream point release on
+# another distribution would be refused for no ABI reason).
+sys_depends() { # elf-file... -> "pkg, pkg"
 	for _f in "$@"; do
 		objdump -p "$_f" 2>/dev/null | awk '/NEEDED/{print $2}'
 	done | sort -u | while read -r _soname; do
@@ -112,13 +120,7 @@ sys_depends() { # elf-file... -> "pkg (>= ver), pkg (>= ver)"
 		[ -n "$_path" ] || continue
 		_pkg="$(dpkg -S "$_path" 2>/dev/null | head -1 | cut -d: -f1)"
 		[ -n "$_pkg" ] || continue
-		_ver="$(dpkg-query -W -f='${Version}' "$_pkg" 2>/dev/null)"
-		# Depend on the upstream version, not the build container's exact Debian
-		# revision: a point-release/security bump (e.g. libssh-4 0.11.5-0+deb13u1)
-		# keeps the soname and ABI, so pinning it would refuse an as-yet-unpatched
-		# stable system. Strip the Debian revision (everything after the last "-").
-		_ver="${_ver%-*}"
-		printf '%s (>= %s)\n' "$_pkg" "$_ver"
+		printf '%s\n' "$_pkg"
 	done | sort -u | paste -sd, - | sed 's/,/, /g'
 }
 
@@ -173,10 +175,13 @@ printf 'Description: Kademlia distributed hash table (mainline DHT) library\n %s
 mkdeb libdht0 "$DHT_VERSION" libs "" "$WORK/dht.desc" "$DR"
 
 # comrade: install into a package root, then name its dependency on our own
-# three libraries explicitly (the ELF scan cannot map them to a package).
+# three libraries explicitly (the ELF scan cannot map them to a package). No
+# version constraint here either, for the same reason as sys_depends above:
+# the package name already carries the ABI (the trailing digit is the soname
+# major, e.g. libjuice1, libkcp0, libdht0).
 CR="$STAGE/comrade"
 DESTDIR="$CR" cmake --install "$WORK/comrade" >/dev/null
-COMRADE_LIBDEPS="$JUICE_PKG (>= $JUICE_VERSION), libkcp0 (>= $KCP_VERSION), libdht0 (>= $DHT_VERSION)"
+COMRADE_LIBDEPS="$JUICE_PKG, libkcp0, libdht0"
 {
 	printf 'Description: Serverless peer-to-peer terminal sharing\n'
 	printf ' Peer-to-peer terminal sharing with tmate-like semantics and no central\n'
