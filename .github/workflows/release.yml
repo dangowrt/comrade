@@ -1,0 +1,491 @@
+# Tagged release pipeline: pushing a v* tag builds comrade and its dependencies
+# for every platform and publishes them -- a signed apt repository on GitHub
+# Pages (Debian and Ubuntu), the Windows executables with a winget manifest, and
+# the Homebrew bottles with the tap formula (macOS). The version is taken from
+# the tag (v0.1.0 becomes 0.1.0). workflow_dispatch runs the same pipeline by
+# hand with a rolling pre-release version, for a dry run before tagging.
+#
+# Publishing each channel takes its own deliberate switch, so an unconfigured
+# fork or a dry run never deploys anything: the apt repo needs the signing key
+# secret (COMRADE_APT_GPG_KEY, see packaging/deb/README.md) and the
+# COMRADE_PUBLISH variable set to "true" with Pages enabled; the tap update needs
+# HOMEBREW_TAP_TOKEN. Each publish job skips itself until its switch is set.
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: true
+
+# Runner labels default to GitHub-hosted, so a fork or a PR branch runs this
+# pipeline on its own credits with no setup. Point the jobs at a self-hosted
+# fleet by setting the RUNNER_LINUX, RUNNER_MACOS and RUNNER_WINDOWS repository
+# variables to a JSON runs-on value, for example ["self-hosted","comrade","Linux"].
+# The deb builder-image cache is likewise opt-in through COMRADE_CACHE_REGISTRY
+# (see the builder-image job); unset, the build falls back to a bare debian
+# container.
+jobs:
+  prepare:
+    runs-on: ${{ vars.RUNNER_LINUX && fromJSON(vars.RUNNER_LINUX) || 'ubuntu-latest' }}
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - id: v
+        # A tag build takes its version straight from the tag (v0.1.0 -> 0.1.0).
+        # A manual dry run has no tag, so it falls back to a rolling pre-release
+        # of 0.1.0 from the commit: "~" sorts before the eventual release and the
+        # commit's UTC time keeps it monotonic.
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            epoch=$(git log -1 --format=%ct)
+            stamp=$(date -u -d "@$epoch" +%Y%m%d%H%M%S)
+            sha=$(git rev-parse --short=8 HEAD)
+            version="0.1.0~git${stamp}.g${sha}"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  # Build the intermediate deb builder image (the apt toolchain plus comrade's
+  # three dependency libraries) once per suite and cache it in the local registry
+  # shared by all runners, so the slow per-architecture dependency compiles are
+  # not repeated on every package build. The registry endpoint is the
+  # COMRADE_CACHE_REGISTRY repository variable (for example registry.internal:5000)
+  # and must be reachable and trusted by every runner's docker/buildkit. When it
+  # is unset this job no-ops and the build job falls back to a bare debian image
+  # that builds the prerequisites itself, so the pipeline still works without the
+  # cache.
+  builder-image:
+    needs: prepare
+    runs-on: ${{ vars.RUNNER_LINUX && fromJSON(vars.RUNNER_LINUX) || 'ubuntu-latest' }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        suite: [stable, testing]
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check for the local cache registry
+        id: reg
+        run: |
+          if [ -n "${{ vars.COMRADE_CACHE_REGISTRY }}" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "COMRADE_CACHE_REGISTRY is not set; skipping the prebuilt image." >&2
+            echo "The build job will build the prerequisites in a bare debian container." >&2
+          fi
+
+      - uses: docker/setup-qemu-action@v4
+        if: steps.reg.outputs.enabled == 'true'
+
+      - uses: docker/setup-buildx-action@v4
+        if: steps.reg.outputs.enabled == 'true'
+
+      # cache-to/from keep the image's layers in the same registry, so a run that
+      # changes nothing is a cache hit rather than a rebuild.
+      - name: Build and cache the builder image
+        if: steps.reg.outputs.enabled == 'true'
+        env:
+          REG: ${{ vars.COMRADE_CACHE_REGISTRY }}
+          SUITE: ${{ matrix.suite }}
+        run: |
+          img="$REG/comrade-deb-builder:$SUITE"
+          cache="$REG/comrade-deb-builder:cache-$SUITE"
+          docker buildx build \
+            --platform linux/amd64,linux/arm64,linux/arm/v7,linux/386,linux/ppc64le,linux/s390x,linux/riscv64 \
+            -f packaging/deb/Dockerfile \
+            --build-arg SUITE="$SUITE" \
+            --cache-from "type=registry,ref=$cache" \
+            --cache-to "type=registry,ref=$cache,mode=max" \
+            -t "$img" \
+            --push \
+            .
+
+  build:
+    needs: [prepare, builder-image]
+    runs-on: ${{ vars.RUNNER_LINUX && fromJSON(vars.RUNNER_LINUX) || 'ubuntu-latest' }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      # Fourteen suite/arch jobs share one egress IP; cap the burst so the
+      # checkout download does not trip the anonymous per-IP limit.
+      max-parallel: 4
+      matrix:
+        suite:
+          - { name: stable  }   # trixie
+          - { name: testing }   # forky
+        arch:
+          - { deb: amd64,   platform: linux/amd64   }
+          - { deb: arm64,   platform: linux/arm64   }
+          - { deb: armhf,   platform: linux/arm/v7  }
+          - { deb: i386,    platform: linux/386     }
+          - { deb: ppc64el, platform: linux/ppc64le }
+          - { deb: s390x,   platform: linux/s390x   }
+          - { deb: riscv64, platform: linux/riscv64 }
+    name: ${{ matrix.suite.name }} ${{ matrix.arch.deb }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          submodules: true
+
+      # binfmt for the foreign architectures; a no-op for the native one.
+      - uses: docker/setup-qemu-action@v4
+
+      # The prebuilt builder image from the local registry when configured, else
+      # a bare debian image (build.sh then builds the prerequisites itself).
+      - name: Select the builder image
+        id: img
+        env:
+          REG: ${{ vars.COMRADE_CACHE_REGISTRY }}
+        run: |
+          if [ -n "$REG" ]; then
+            echo "image=$REG/comrade-deb-builder:${{ matrix.suite.name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "image=debian:${{ matrix.suite.name }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build packages
+        run: |
+          mkdir -p out
+          docker run --rm --platform ${{ matrix.arch.platform }} \
+            -v "$PWD":/src -v "$PWD/out":/out \
+            -e SRCDIR=/src -e OUTDIR=/out \
+            -e SUITE=${{ matrix.suite.name }} \
+            -e COMRADE_VERSION=${{ needs.prepare.outputs.version }} \
+            -e COMRADE_WERROR=1 \
+            -e GH_TOKEN=${{ github.token }} \
+            ${{ steps.img.outputs.image }} \
+            sh /src/packaging/deb/build.sh
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: debs-${{ matrix.suite.name }}-${{ matrix.arch.deb }}
+          path: out/*.deb
+          if-no-files-found: error
+
+  publish:
+    needs: [prepare, build]
+    runs-on: ${{ vars.RUNNER_LINUX && fromJSON(vars.RUNNER_LINUX) || 'ubuntu-latest' }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    env:
+      GPG_KEY: ${{ secrets.COMRADE_APT_GPG_KEY }}
+      GPG_PASSPHRASE: ${{ secrets.COMRADE_APT_GPG_PASSPHRASE }}
+      PUBLISH: ${{ vars.COMRADE_PUBLISH }}
+    steps:
+      - uses: actions/checkout@v5
+
+      # Both switches must be on to deploy the live apt repo: the signing key
+      # secret present, and the COMRADE_PUBLISH repo variable set to "true".
+      # Either one missing skips the whole job, so staging the key alone stays
+      # green rather than failing on a Pages deploy that was never enabled.
+      - name: Guard on tag, signing key and publish switch
+        id: guard
+        run: |
+          if [ "$GITHUB_REF_TYPE" != tag ]; then
+            echo "not a tag build; skipping publish (dry run)." >&2
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+          if [ -z "$GPG_KEY" ]; then
+            echo "COMRADE_APT_GPG_KEY is not set; skipping publish." >&2
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+          if [ "$PUBLISH" != "true" ]; then
+            echo "COMRADE_PUBLISH is not \"true\"; skipping publish (not live yet)." >&2
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/download-artifact@v7
+        if: steps.guard.outputs.skip != 'true'
+        with:
+          path: artifacts
+
+      - name: Group packages by suite
+        if: steps.guard.outputs.skip != 'true'
+        run: |
+          mkdir -p repo-in
+          for d in artifacts/debs-*; do
+            suite=$(basename "$d" | sed -E 's/^debs-([a-z]+)-.*/\1/')
+            mkdir -p "repo-in/$suite"
+            cp "$d"/*.deb "repo-in/$suite/"
+          done
+          find repo-in -name '*.deb' | sort
+
+      - name: Assemble and sign the repository
+        if: steps.guard.outputs.skip != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends apt-utils gpg gpg-agent
+          export GNUPGHOME="$RUNNER_TEMP/gnupg"
+          mkdir -p "$GNUPGHOME"; chmod 700 "$GNUPGHOME"
+          printf '%s' "$GPG_KEY" | gpg --batch --import
+          fpr=$(gpg --list-keys --with-colons | awk -F: '/^fpr:/{print $10; exit}')
+          INDIR="$PWD/repo-in" REPODIR="$PWD/repo" \
+            GPG_KEY_ID="$fpr" GPG_PASSPHRASE="$GPG_PASSPHRASE" \
+            sh packaging/deb/make-repo.sh
+          cp packaging/deb/README.md repo/index.md 2>/dev/null || true
+
+      - uses: actions/upload-pages-artifact@v5
+        if: steps.guard.outputs.skip != 'true'
+        with:
+          path: repo
+
+      - id: deploy
+        if: steps.guard.outputs.skip != 'true'
+        uses: actions/deploy-pages@v5
+
+  # macOS binaries: build a Homebrew bottle for comrade on each arch and attach
+  # both to the tag's release, so `brew install comrade` fetches a prebuilt binary
+  # on Intel and Apple Silicon alike; the three small dependency formulae still
+  # build from source. A macOS bottle must be built natively per arch, so this
+  # matrixes over an Intel runner (self-hosted, or GitHub's macos-13 for a fork)
+  # and a GitHub-hosted Apple-Silicon runner. Only on a tag, and only when
+  # HOMEBREW_TAP_TOKEN (write access to the tap) is set. bottle-publish then
+  # merges both arches into the tap. See bottle-build.sh and bottle-publish.sh.
+  bottle-build:
+    needs: prepare
+    if: ${{ github.ref_type == 'tag' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, arm64]
+    runs-on: ${{ matrix.arch == 'arm64' && 'macos-latest' || vars.RUNNER_MACOS && fromJSON(vars.RUNNER_MACOS) || 'macos-13' }}
+    timeout-minutes: 45
+    env:
+      TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+      # Homebrew pulls bottles/deps from ghcr.io and the GitHub API, anonymous
+      # per-IP on a shared-egress fleet; the job token lifts the limit.
+      HOMEBREW_GITHUB_API_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+
+      # A self-hosted mac may not have Homebrew on the login PATH; GitHub's
+      # runners keep it under a different prefix per arch (/opt/homebrew on
+      # Apple Silicon, /usr/local on Intel). Add whichever exists so the
+      # bottle scripts' bare `brew` calls resolve on either.
+      - name: Put Homebrew on PATH
+        run: |
+          for d in /opt/homebrew/bin /usr/local/bin; do
+            if [ -x "$d/brew" ]; then echo "$d" >> "$GITHUB_PATH"; fi
+          done
+
+      # bottle-build.sh builds the dependency formulae from source, cloning
+      # from github.com; authenticate those through the job token.
+      - name: Route GitHub fetches through the job token
+        run: |
+          git config --global \
+            url."https://x-access-token:${{ github.token }}@github.com/".insteadOf \
+            "https://github.com/"
+
+      - name: Guard on the tap token
+        id: guard
+        run: |
+          if [ -z "$TAP_TOKEN" ]; then
+            echo "HOMEBREW_TAP_TOKEN is not set; skipping the bottle." >&2
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build the bottle
+        if: steps.guard.outputs.skip != 'true'
+        run: bash packaging/homebrew/bottle-build.sh
+
+      - uses: actions/upload-artifact@v6
+        if: steps.guard.outputs.skip != 'true'
+        with:
+          name: bottle-${{ matrix.arch }}
+          path: |
+            *.bottle.tar.gz
+            *.bottle.json
+          if-no-files-found: error
+
+  bottle-publish:
+    needs: [prepare, bottle-build]
+    if: ${{ github.ref_type == 'tag' }}
+    runs-on: ${{ vars.RUNNER_MACOS && fromJSON(vars.RUNNER_MACOS) || 'macos-13' }}
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+      GH_TOKEN: ${{ github.token }}
+      HOMEBREW_GITHUB_API_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Put Homebrew on PATH
+        run: |
+          for d in /opt/homebrew/bin /usr/local/bin; do
+            if [ -x "$d/brew" ]; then echo "$d" >> "$GITHUB_PATH"; fi
+          done
+
+      - name: Guard on the tap token
+        id: guard
+        run: |
+          if [ -z "$TAP_TOKEN" ]; then
+            echo "HOMEBREW_TAP_TOKEN is not set; skipping publish." >&2
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/download-artifact@v7
+        if: steps.guard.outputs.skip != 'true'
+        with:
+          pattern: bottle-*
+          path: bottles
+          merge-multiple: true
+
+      - name: Merge bottles and push the tap
+        if: steps.guard.outputs.skip != 'true'
+        run: bash packaging/homebrew/bottle-publish.sh
+
+  # Windows release binaries: one static comrade-<arch>.exe per architecture,
+  # built with llvm-mingw (clang, UCRT). Both x64 and arm64 cross-build from a
+  # single Windows runner; arm64 is compile/link/import-verified only, since an
+  # AMD64 runner cannot execute it. See packaging/windows/build.ps1.
+  windows:
+    needs: prepare
+    runs-on: ${{ vars.RUNNER_WINDOWS && fromJSON(vars.RUNNER_WINDOWS) || 'windows-latest' }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      # Both arch jobs share one egress IP; cap the burst so the action and
+      # dependency downloads do not trip the anonymous per-IP limit.
+      max-parallel: 1
+      matrix:
+        include:
+          - { triple: x86_64-w64-mingw32,  arch: x64 }
+          - { triple: aarch64-w64-mingw32, arch: arm64 }
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+
+      # build.ps1 clones libssh/mbedtls/monocypher/libjuice from github.com;
+      # authenticate them through the job token so the shared-egress fleet does
+      # not hit the anonymous per-IP limit.
+      - name: Route GitHub fetches through the job token
+        shell: pwsh
+        run: |
+          git config --global "url.https://x-access-token:${{ github.token }}@github.com/.insteadOf" "https://github.com/"
+
+      - name: Install ninja and pkg-config
+        # comrade's CMake uses pkg-config for libssh and monocypher; the runner
+        # has neither ninja nor pkg-config out of the box (the VM had them via
+        # MSYS2). pkgconfiglite provides pkg-config.exe on PATH.
+        #
+        # --allow-empty-checksums: pkgconfiglite fetches pkg-config-lite from
+        # SourceForge with no checksum, which Chocolatey 2.7.0+ (rolling onto
+        # the runners now) refuses by default. This is a build-time tool only,
+        # never part of the shipped executable.
+        run: choco install ninja pkgconfiglite --no-progress -y --allow-empty-checksums
+
+      - name: Fetch llvm-mingw
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $v = "20260616"
+          $u = "https://github.com/mstorsjo/llvm-mingw/releases/download/$v/llvm-mingw-$v-ucrt-x86_64.zip"
+          Invoke-WebRequest $u -OutFile "$env:RUNNER_TEMP\llvm-mingw.zip" `
+            -Headers @{ Authorization = "Bearer $env:GH_TOKEN" } `
+            -MaximumRetryCount 5 -RetryIntervalSec 10
+          Expand-Archive "$env:RUNNER_TEMP\llvm-mingw.zip" -DestinationPath $env:RUNNER_TEMP
+          "LLVM_MINGW=$env:RUNNER_TEMP\llvm-mingw-$v-ucrt-x86_64" | Out-File -Append $env:GITHUB_ENV
+
+      - name: Build comrade.exe
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}   # build.ps1 authenticates its GitHub fetches with this
+        run: >
+          pwsh packaging/windows/build.ps1
+          -Triple ${{ matrix.triple }} -Toolchain $env:LLVM_MINGW
+          -Root "$env:RUNNER_TEMP\winbuild" -Out "$env:RUNNER_TEMP\out"
+          -Werror ON
+
+      - name: Smoke test the x64 binary
+        if: matrix.arch == 'x64'
+        shell: pwsh
+        run: |
+          & "$env:RUNNER_TEMP\out\comrade-x64.exe" --help
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: comrade-windows-${{ matrix.arch }}
+          path: ${{ runner.temp }}\out\comrade-${{ matrix.arch }}.exe
+          if-no-files-found: error
+
+  # Publish the two Windows executables to the tag's GitHub release and fill the
+  # winget manifest templates. Uses GITHUB_TOKEN, no extra secret. A manual dry
+  # run (no tag) builds and uploads the exes as artifacts but creates no release.
+  windows-publish:
+    needs: [prepare, windows]
+    runs-on: ${{ vars.RUNNER_LINUX && fromJSON(vars.RUNNER_LINUX) || 'ubuntu-latest' }}
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: comrade-windows-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release and generate the winget manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            tag="$GITHUB_REF_NAME"
+            # Attach the exes to the tag's release, creating it if a prior job
+            # (brew) has not already; --clobber refreshes on a re-run.
+            gh release create "$tag" dist/comrade-x64.exe dist/comrade-arm64.exe \
+              --title "comrade $VERSION" \
+              --notes "comrade $VERSION for Windows: one static exe per arch (x64, arm64). Hosting also needs tmux: winget install arndawg.tmux-windows" \
+              2>/dev/null \
+              || gh release upload "$tag" dist/comrade-x64.exe dist/comrade-arm64.exe --clobber
+          else
+            tag=windows-latest
+            echo "dry run (no tag): exes are uploaded as artifacts, no release created" >&2
+          fi
+          # Fill the winget manifest templates for later winget-pkgs submission.
+          wver=$(echo "$VERSION" | tr '~' '-')
+          date=$(date -u +%Y-%m-%d)
+          sx=$(sha256sum dist/comrade-x64.exe | cut -d' ' -f1)
+          sa=$(sha256sum dist/comrade-arm64.exe | cut -d' ' -f1)
+          mkdir -p out/winget
+          for f in packaging/winget/*.yaml; do
+            sed -e "s/@VERSION@/$wver/g" -e "s/@TAG@/$tag/g" -e "s/@DATE@/$date/g" \
+                -e "s/@SHA256_X64@/$sx/g" -e "s/@SHA256_ARM64@/$sa/g" \
+                "$f" > "out/winget/$(basename "$f")"
+          done
+          echo "=== generated winget manifest ==="; cat out/winget/*.installer.yaml
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: winget-manifest
+          path: out/winget
