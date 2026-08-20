@@ -1,12 +1,17 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 /* Copyright (C) 2026 Daniel Golle <daniel@makrotopia.org> */
 
-#include <ifaddrs.h>
-#include <net/if.h>
 #include <stdlib.h>
 #include <string.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
+
+#include "wsock.h"
+
+#ifdef _WIN32
+#include <iphlpapi.h>
+#else
+#include <ifaddrs.h>
+#include <net/if.h>
+#endif
 
 #include "ccrypto.h"
 
@@ -23,6 +28,86 @@ static int addr_cmp(const void *a, const void *b)
 		return x->family - y->family;
 	return memcmp(x->addr, y->addr, sizeof(x->addr));
 }
+
+#ifdef _WIN32
+
+/*
+ * Windows has no getifaddrs; GetAdaptersAddresses walks the same ground and
+ * also carries the operational state, so the IFF_UP/IFF_RUNNING test becomes
+ * OperStatus == IfOperStatusUp. The buffer is sized by asking once with a
+ * generous guess and growing on ERROR_BUFFER_OVERFLOW, as the API expects.
+ */
+size_t netmon_snapshot(struct netmon_addr *out, size_t max)
+{
+	ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
+		      GAA_FLAG_SKIP_DNS_SERVER | GAA_FLAG_SKIP_FRIENDLY_NAME;
+	IP_ADAPTER_ADDRESSES *aa = NULL, *a;
+	ULONG size = 16384;
+	size_t n = 0;
+	int tries;
+
+	for (tries = 0; tries < 4; tries++) {
+		ULONG rc;
+
+		aa = malloc(size);
+		if (!aa)
+			return 0;
+		rc = GetAdaptersAddresses(AF_UNSPEC, flags, NULL, aa, &size);
+		if (rc == NO_ERROR)
+			break;
+		free(aa);
+		aa = NULL;
+		if (rc != ERROR_BUFFER_OVERFLOW)
+			return 0;
+	}
+	if (!aa)
+		return 0;
+
+	for (a = aa; a && n < max; a = a->Next) {
+		IP_ADAPTER_UNICAST_ADDRESS *u;
+
+		if (a->OperStatus != IfOperStatusUp)
+			continue;
+		if (a->IfType == IF_TYPE_SOFTWARE_LOOPBACK)
+			continue;
+		for (u = a->FirstUnicastAddress; u && n < max; u = u->Next) {
+			struct sockaddr *sa = u->Address.lpSockaddr;
+			struct netmon_addr *rec = &out[n];
+
+			if (!sa)
+				continue;
+			memset(rec, 0, sizeof(*rec));
+			/*
+			 * The adapter name is the GUID string; it is stable
+			 * across a run, which is all the fingerprint needs (it
+			 * is never persisted or sent -- see netmon_fingerprint).
+			 */
+			strncpy(rec->ifname, a->AdapterName,
+				sizeof(rec->ifname) - 1);
+			rec->family = sa->sa_family;
+			if (rec->family == AF_INET) {
+				struct sockaddr_in *sin = (struct sockaddr_in *)sa;
+
+				memcpy(rec->addr, &sin->sin_addr, 4);
+				rec->addrlen = 4;
+			} else if (rec->family == AF_INET6) {
+				struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)sa;
+
+				if (IN6_IS_ADDR_LINKLOCAL(&s6->sin6_addr))
+					continue;
+				memcpy(rec->addr, &s6->sin6_addr, 16);
+				rec->addrlen = 16;
+			} else {
+				continue;
+			}
+			n++;
+		}
+	}
+	free(aa);
+	return n;
+}
+
+#else /* !_WIN32 */
 
 size_t netmon_snapshot(struct netmon_addr *out, size_t max)
 {
@@ -68,6 +153,8 @@ size_t netmon_snapshot(struct netmon_addr *out, size_t max)
 	freeifaddrs(ifa);
 	return n;
 }
+
+#endif /* _WIN32 */
 
 /* The fingerprint is process-local roam state, never persisted or sent, so
  * it need not be stable across builds or backends (and with the OpenSSL
