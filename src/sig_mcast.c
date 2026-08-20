@@ -2,18 +2,84 @@
 /* Copyright (C) 2026 Daniel Golle <daniel@makrotopia.org> */
 
 #define _GNU_SOURCE
-#include <fcntl.h>
-#include <ifaddrs.h>
-#include <net/if.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
+#include "wsock.h"
 
 #include "sig_mcast.h"
+
+#ifdef _WIN32
+
+/*
+ * Link-local discovery is off on Windows for now.
+ *
+ * Nothing here is impossible -- Windows has IP_ADD_MEMBERSHIP and
+ * IPV6_JOIN_GROUP, and GetAdaptersAddresses supplies the interface list that
+ * netmon.c already walks. What it does not have is Linux's `struct ip_mreqn`,
+ * whose imr_ifindex is how this module joins and sources per interface: on
+ * Winsock the v4 join takes an interface *address*, so every interface's IPv4
+ * address has to be collected and threaded through open4()/sig_mcast_send()
+ * as well as its index. That is a real change to the module's shape, and it
+ * cannot be tested here without a second machine on the segment.
+ *
+ * Returning NULL is a supported outcome: sig_create() drops SIG_MCAST and
+ * engages the DHT immediately (see sig.c), which is the path a client on a
+ * different network takes anyway. The cost on Windows is that two peers on one
+ * LAN take the DHT/STUN route instead of the direct one.
+ */
+struct sig_mcast *sig_mcast_open(void)
+{
+	return NULL;
+}
+
+void sig_mcast_close(struct sig_mcast *m)
+{
+	(void)m;
+}
+
+int sig_mcast_ifaces(struct sig_mcast *m, struct sig_mcast_if *out, int max)
+{
+	(void)m;
+	(void)out;
+	(void)max;
+	return 0;
+}
+
+int sig_mcast_send(struct sig_mcast *m, const char *salt,
+		   const uint8_t *data, size_t len)
+{
+	(void)m;
+	(void)salt;
+	(void)data;
+	(void)len;
+	return -1;
+}
+
+int sig_mcast_prepare(struct sig_mcast *m, struct pollfd *fds, int maxfds)
+{
+	(void)m;
+	(void)fds;
+	(void)maxfds;
+	return 0;
+}
+
+void sig_mcast_dispatch(struct sig_mcast *m, const struct pollfd *fds, int nfds,
+			sig_mcast_recv_cb *cb, void *arg)
+{
+	(void)m;
+	(void)fds;
+	(void)nfds;
+	(void)cb;
+	(void)arg;
+}
+
+#else /* !_WIN32 */
+
+#include <fcntl.h>
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <unistd.h>
 
 #define MCAST_PORT 47654
 #define MCAST_V4 "224.0.0.224"
@@ -314,3 +380,5 @@ void sig_mcast_dispatch(struct sig_mcast *m, const struct pollfd *fds, int nfds,
 			drain(fds[i].fd, cb, arg);
 	}
 }
+
+#endif /* _WIN32 */

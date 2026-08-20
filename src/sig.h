@@ -4,10 +4,9 @@
 #ifndef COMRADE_SIG_H
 #define COMRADE_SIG_H
 
-#include <poll.h>
+#include "wsock.h"
 #include <stddef.h>
 #include <stdint.h>
-#include <sys/socket.h>
 
 #include "sig_mcast.h"		/* struct sig_mcast_if */
 #include "token.h"

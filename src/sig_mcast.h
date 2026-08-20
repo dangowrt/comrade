@@ -4,10 +4,9 @@
 #ifndef COMRADE_SIG_MCAST_H
 #define COMRADE_SIG_MCAST_H
 
-#include <poll.h>
+#include "wsock.h"
 #include <stddef.h>
 #include <stdint.h>
-#include <sys/socket.h>
 
 /*
  * Link-local multicast signalling transport for isolated LANs with no DHT

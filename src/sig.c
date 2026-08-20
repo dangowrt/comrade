@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 /* Copyright (C) 2026 Daniel Golle <daniel@makrotopia.org> */
 
-#include <netinet/in.h>
+#include "wsock.h"
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
