@@ -30,6 +30,50 @@ find_package(Threads REQUIRED)
 pkg_check_modules(LIBSSH IMPORTED_TARGET libssh)
 find_package(LibJuice CONFIG QUIET)
 find_package(kcp CONFIG QUIET)
+
+#
+# Windows (MinGW-w64/UCRT, x86_64 and aarch64). The port is client-only for
+# now: hosting forks, opens a pty and runs tmux, none of which exist here
+# (see src/host.c). Everything below is about linking one self-contained
+# comrade.exe that imports nothing but system DLLs.
+#
+if(WIN32)
+	# comrade's own crypto is monocypher regardless of what libssh links.
+	# libssh here is backed by mbedTLS, which implements neither BLAKE2b nor
+	# Ed25519 -- both comrade wire formats -- so the "follow libssh" default
+	# cannot apply; monocypher is ~100 KB and pulls in no DLL.
+	set(COMRADE_CRYPTO "monocypher" CACHE STRING "" FORCE)
+
+	# Static libssh and static libjuice both declare their API
+	# __declspec(dllimport) unless told otherwise, so without these the link
+	# fails on __imp_ssh_* / __imp_juice_*.
+	add_compile_definitions(LIBSSH_STATIC JUICE_STATIC)
+
+	# libssh's pkg-config file lists only -lssh; its crypto backend is a
+	# private dependency that a static link still has to name. everest and
+	# p256m are mbedcrypto's own bundled pieces and must follow it.
+	foreach(l mbedtls mbedx509 mbedcrypto everest p256m)
+		find_library(COMRADE_LIB_${l} ${l})
+		if(COMRADE_LIB_${l})
+			list(APPEND COMRADE_WIN_CRYPTO ${COMRADE_LIB_${l}})
+		endif()
+	endforeach()
+
+	# ws2_32: sockets. bcrypt: BCryptGenRandom in keys.c, plus libjuice's
+	# own crypto. iphlpapi: GetAdaptersAddresses in netmon.c.
+	set(COMRADE_WIN_LIBS ws2_32 bcrypt iphlpapi ${COMRADE_WIN_CRYPTO})
+
+	# One executable, no redistributable runtime: static libgcc/libstdc++
+	# and static winpthreads, so the only imports left are system DLLs.
+	set(COMRADE_WIN_LINK -static -static-libgcc)
+
+	# The suite drives the host path (forkpty, tmux) and the tools are
+	# POSIX-only; neither is part of the client milestone.
+	set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+	set(COMRADE_BUILD_TOOLS OFF)
+else()
+	set(COMRADE_BUILD_TOOLS ON)
+endif()
 #
 # Crypto backend. Every primitive comrade needs is byte-identical across the
 # backends, so the choice is purely about which library is already on the
@@ -158,26 +202,44 @@ if(COMRADE_MISSING)
 	message(STATUS "Missing dependencies, tolerated while the modules using them are stubs:\n   ${COMRADE_MISSING_TEXT}")
 endif()
 
+#
+# Platform compat: sockets/poll (wsock), the local terminal (tty) and the few
+# remaining OS calls that differ (oscompat). On POSIX these compile to what
+# the code always did; on Windows they are where winsock, the console API and
+# the missing fork/rename semantics are dealt with, once, instead of as
+# #ifdefs spread through the modules.
+#
+add_library(comrade_compat STATIC src/wsock.c src/tty.c src/oscompat.c)
+target_include_directories(comrade_compat PUBLIC src)
+target_link_libraries(comrade_compat PUBLIC Threads::Threads)
+if(WIN32)
+	target_link_libraries(comrade_compat PUBLIC ${COMRADE_WIN_LIBS})
+endif()
+
 add_library(comrade_token STATIC src/base64.c src/base58.c src/token.c src/tokgen.c)
 target_include_directories(comrade_token PUBLIC src)
 
 # Per-user application data directory (STUN list, cached DHT nodes).
 add_library(comrade_appdir STATIC src/appdir.c)
 target_include_directories(comrade_appdir PUBLIC src)
+target_link_libraries(comrade_appdir PUBLIC comrade_compat)
 
 # Structured connection status (controller fills it, view renders it) and the
 # view that paints it on the reserved bottom terminal row.
 add_library(comrade_dbg STATIC src/dbg.c)
 target_include_directories(comrade_dbg PUBLIC src)
+target_link_libraries(comrade_dbg PUBLIC comrade_compat)
 
 add_library(comrade_termfilter STATIC src/termfilter.c)
 target_include_directories(comrade_termfilter PUBLIC src)
 
 add_library(comrade_ctlproto STATIC src/ctlproto.c)
 target_include_directories(comrade_ctlproto PUBLIC src)
+target_link_libraries(comrade_ctlproto PUBLIC comrade_compat)
 
 add_library(comrade_conn STATIC src/conn.c)
 target_include_directories(comrade_conn PUBLIC src)
+target_link_libraries(comrade_conn PUBLIC comrade_compat)
 
 # -L/-R forwarding-spec parsing (no dependencies; the engine lives with ssh).
 add_library(comrade_fwdspec STATIC src/fwdspec.c)
@@ -185,7 +247,7 @@ target_include_directories(comrade_fwdspec PUBLIC src)
 
 add_library(comrade_statusbar STATIC src/statusbar.c)
 target_include_directories(comrade_statusbar PUBLIC src)
-target_link_libraries(comrade_statusbar PUBLIC comrade_conn)
+target_link_libraries(comrade_statusbar PUBLIC comrade_conn comrade_compat)
 
 # STUN server pool. The default set is baked in at configure time from the
 # always-online-stun submodule (its RFC 5780-capable list, which also serves
@@ -252,6 +314,7 @@ if(COMRADE_CRYPTO_RESOLVED STREQUAL "monocypher")
 		set(COMRADE_HAVE_CRYPTO 1)
 		add_library(comrade_crypto STATIC ${COMRADE_CRYPTO_SRC} src/ccrypto_monocypher.c)
 		target_include_directories(comrade_crypto PUBLIC src)
+		target_link_libraries(comrade_crypto PUBLIC comrade_compat)
 		if(TARGET PkgConfig::MONOCYPHER)
 			target_link_libraries(comrade_crypto PUBLIC PkgConfig::MONOCYPHER)
 		else()
@@ -264,7 +327,7 @@ elseif(COMRADE_CRYPTO_RESOLVED STREQUAL "gcrypt")
 		set(COMRADE_HAVE_CRYPTO 1)
 		add_library(comrade_crypto STATIC ${COMRADE_CRYPTO_SRC} src/ccrypto_gcrypt.c)
 		target_include_directories(comrade_crypto PUBLIC src)
-		target_link_libraries(comrade_crypto PUBLIC Threads::Threads)
+		target_link_libraries(comrade_crypto PUBLIC Threads::Threads comrade_compat)
 		if(TARGET PkgConfig::GCRYPT)
 			target_link_libraries(comrade_crypto PUBLIC PkgConfig::GCRYPT)
 		else()
@@ -276,7 +339,7 @@ elseif(TARGET OpenSSL::Crypto)
 	set(COMRADE_HAVE_CRYPTO 1)
 	add_library(comrade_crypto STATIC ${COMRADE_CRYPTO_SRC} src/ccrypto_openssl.c)
 	target_include_directories(comrade_crypto PUBLIC src)
-	target_link_libraries(comrade_crypto PUBLIC OpenSSL::Crypto)
+	target_link_libraries(comrade_crypto PUBLIC OpenSSL::Crypto comrade_compat)
 endif()
 
 # The rendezvous mailbox: the two-slot container plus turnstile claim logic
@@ -306,7 +369,7 @@ endif()
 if(COMRADE_HAVE_CRYPTO)
 	add_library(comrade_bep44 STATIC src/bep44.c)
 	target_include_directories(comrade_bep44 PUBLIC src)
-	target_link_libraries(comrade_bep44 PUBLIC comrade_crypto)
+	target_link_libraries(comrade_bep44 PUBLIC comrade_crypto comrade_compat)
 endif()
 
 set(COMRADE_HAVE_DHT 0)
@@ -330,7 +393,7 @@ endif()
 if(COMRADE_HAVE_DHT)
 	target_compile_definitions(comrade_dht PRIVATE _GNU_SOURCE)
 	target_link_libraries(comrade_dht PUBLIC comrade_bep44 comrade_crypto
-		comrade_appdir Threads::Threads)
+		comrade_appdir comrade_compat Threads::Threads)
 	message(STATUS "DHT: ${COMRADE_DHT_HOW}")
 endif()
 
@@ -339,7 +402,7 @@ if(COMRADE_HAVE_DHT)
 	set(COMRADE_HAVE_SIG 1)
 	add_library(comrade_sig STATIC src/sig.c src/sig_mcast.c)
 	target_include_directories(comrade_sig PUBLIC src)
-	target_link_libraries(comrade_sig PUBLIC comrade_dht comrade_mailbox)
+	target_link_libraries(comrade_sig PUBLIC comrade_dht comrade_mailbox comrade_compat)
 endif()
 
 find_package(Threads REQUIRED)
@@ -350,6 +413,7 @@ target_include_directories(comrade_nat PUBLIC src)
 
 add_library(comrade_lanlink STATIC src/lanlink.c)
 target_include_directories(comrade_lanlink PUBLIC src)
+target_link_libraries(comrade_lanlink PUBLIC comrade_compat)
 if(TARGET LibJuice::LibJuice)
 	target_link_libraries(comrade_nat PUBLIC LibJuice::LibJuice)
 	set(COMRADE_HAVE_NAT 1)
@@ -367,7 +431,7 @@ endif()
 if(COMRADE_HAVE_STREAM)
 	add_library(comrade_bridge STATIC src/sshbridge.c)
 	target_include_directories(comrade_bridge PUBLIC src)
-	target_link_libraries(comrade_bridge PUBLIC comrade_stream)
+	target_link_libraries(comrade_bridge PUBLIC comrade_stream comrade_compat)
 endif()
 
 set(COMRADE_HAVE_SSH 0)
@@ -379,10 +443,20 @@ if(LIBSSH_FOUND)
 	include(CheckSymbolExists)
 	set(CMAKE_REQUIRED_INCLUDES ${LIBSSH_INCLUDE_DIRS})
 	set(CMAKE_REQUIRED_LIBRARIES ${LIBSSH_LIBRARIES})
+	if(WIN32)
+		# The probe links for real, so it needs the same static-libssh
+		# treatment the build does: LIBSSH_STATIC (or the symbol resolves
+		# to __imp_ssh_pki_generate_key) and libssh's crypto backend.
+		set(CMAKE_REQUIRED_DEFINITIONS -DLIBSSH_STATIC)
+		list(APPEND CMAKE_REQUIRED_LIBRARIES ${COMRADE_WIN_LIBS})
+		list(APPEND CMAKE_REQUIRED_LINK_OPTIONS ${COMRADE_WIN_LINK})
+	endif()
 	check_symbol_exists(ssh_pki_generate_key "libssh/libssh.h"
 		COMRADE_HAVE_PKI_GENERATE_KEY)
 	unset(CMAKE_REQUIRED_INCLUDES)
 	unset(CMAKE_REQUIRED_LIBRARIES)
+	unset(CMAKE_REQUIRED_DEFINITIONS)
+	unset(CMAKE_REQUIRED_LINK_OPTIONS)
 	add_library(comrade_ssh STATIC src/sshd.c src/sshc.c src/sshfwd.c)
 	if(COMRADE_HAVE_PKI_GENERATE_KEY)
 		target_compile_definitions(comrade_ssh
@@ -392,7 +466,7 @@ if(LIBSSH_FOUND)
 	# The message-based libssh server API is deprecated in favour of the
 	# callback API but is clearer and fully functional; migrate later.
 	target_compile_options(comrade_ssh PRIVATE -Wno-deprecated-declarations)
-	target_link_libraries(comrade_ssh PUBLIC comrade_token comrade_statusbar comrade_dbg comrade_termfilter comrade_fwdspec PkgConfig::LIBSSH Threads::Threads)
+	target_link_libraries(comrade_ssh PUBLIC comrade_token comrade_statusbar comrade_dbg comrade_termfilter comrade_fwdspec comrade_compat PkgConfig::LIBSSH Threads::Threads)
 	find_library(COMRADE_UTIL util)
 	if(COMRADE_UTIL)
 		target_link_libraries(comrade_ssh PUBLIC ${COMRADE_UTIL})
@@ -412,7 +486,7 @@ if(COMRADE_HAVE_SIG AND COMRADE_HAVE_NAT AND COMRADE_HAVE_STREAM AND COMRADE_HAV
 	# The view: the only module that draws to the terminal (MVC).
 	add_library(comrade_ui STATIC src/ui.c)
 	target_include_directories(comrade_ui PUBLIC src)
-	target_link_libraries(comrade_ui PUBLIC comrade_token)
+	target_link_libraries(comrade_ui PUBLIC comrade_token comrade_compat)
 endif()
 
 add_library(comrade_host STATIC src/host.c)
@@ -434,6 +508,13 @@ target_link_libraries(comrade
 if(COMRADE_HAVE_SESSION)
 	target_link_libraries(comrade comrade_session comrade_ui)
 	target_compile_definitions(comrade PRIVATE COMRADE_HAVE_SESSION=1)
+endif()
+if(WIN32)
+	# The system import libraries go last so they resolve the references the
+	# static archives above leave open, and -static keeps libgcc and
+	# winpthreads inside the image.
+	target_link_libraries(comrade ${COMRADE_WIN_LIBS})
+	target_link_options(comrade PRIVATE ${COMRADE_WIN_LINK})
 endif()
 
 install(TARGETS comrade RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
