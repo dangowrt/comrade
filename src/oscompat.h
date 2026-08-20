@@ -4,6 +4,8 @@
 #ifndef COMRADE_OSCOMPAT_H
 #define COMRADE_OSCOMPAT_H
 
+#include <stddef.h>
+
 /*
  * The handful of non-socket, non-terminal OS calls whose Windows spelling
  * differs enough to matter. Small on purpose: everything else in comrade is
@@ -33,5 +35,13 @@ long os_pid(void);
 
 /* Sleep, in milliseconds. */
 void os_msleep(int ms);
+
+/*
+ * memmem(3). A GNU extension: glibc and the BSDs have it, the Windows CRT
+ * does not. The needles here are short literals, so the naive scan costs
+ * nothing worth optimising.
+ */
+const void *os_memmem(const void *hay, size_t haylen,
+		      const void *needle, size_t needlelen);
 
 #endif

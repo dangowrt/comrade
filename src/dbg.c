@@ -6,27 +6,30 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <unistd.h>
 
 #include "dbg.h"
+#include "oscompat.h"
 
 void dbg_logf(const char *fmt, ...)
 {
 	const char *path = getenv("COMRADE_DEBUG");
+	char dflt[512];
 	struct timespec ts;
 	FILE *f;
 	va_list ap;
 
 	if (!path || !path[0])
 		return;
-	if (!strcmp(path, "1"))
-		path = "/tmp/comrade-debug.log";
+	if (!strcmp(path, "1")) {
+		snprintf(dflt, sizeof(dflt), "%s/comrade-debug.log", os_tmpdir());
+		path = dflt;
+	}
 	f = fopen(path, "a");
 	if (!f)
 		return;
 	clock_gettime(CLOCK_REALTIME, &ts);
 	fprintf(f, "[%ld.%03ld pid %ld] ", (long)ts.tv_sec,
-		ts.tv_nsec / 1000000, (long)getpid());
+		ts.tv_nsec / 1000000, os_pid());
 	va_start(ap, fmt);
 	vfprintf(f, fmt, ap);
 	va_end(ap);

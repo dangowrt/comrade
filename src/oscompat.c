@@ -3,6 +3,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "oscompat.h"
 
@@ -96,3 +97,23 @@ void os_msleep(int ms)
 }
 
 #endif /* _WIN32 */
+
+const void *os_memmem(const void *hay, size_t haylen,
+		      const void *needle, size_t needlelen)
+{
+#ifdef _WIN32
+	const unsigned char *h = hay;
+	size_t i;
+
+	if (!needlelen)
+		return hay;
+	if (haylen < needlelen)
+		return NULL;
+	for (i = 0; i + needlelen <= haylen; i++)
+		if (!memcmp(h + i, needle, needlelen))
+			return h + i;
+	return NULL;
+#else
+	return memmem(hay, haylen, needle, needlelen);
+#endif
+}
