@@ -86,6 +86,31 @@ static void changed_gate(void)
 	assert(netmon_changed(&m, 4000) == 0);
 }
 
+/* The sequence the three sig_rebuild sites in session.c depend on, driven from
+ * fingerprints rather than the interfaces this machine happens to have. A
+ * change seen inside the poll window is deferred to the next sample, never
+ * dropped: an SSHC_RECONNECT rejoin lands here right after the link died, and
+ * would otherwise keep signalling bound to the network that has gone. */
+static void changed_transitions(void)
+{
+	uint8_t a[32], b[32];
+	struct netmon m;
+	size_t i;
+
+	for (i = 0; i < 32; i++) {
+		a[i] = (uint8_t)(i + 1);
+		b[i] = (uint8_t)(200 - i);
+	}
+
+	netmon_init(&m);
+	assert(netmon_changed_fp(&m, 0, a) == 0);	/* primes; not a roam */
+	assert(netmon_changed_fp(&m, 1000, a) == 0);	/* inside the window */
+	assert(netmon_changed_fp(&m, 1500, b) == 0);	/* deferred, not lost */
+	assert(netmon_changed_fp(&m, 2500, b) == 1);	/* and reported next */
+	assert(netmon_changed_fp(&m, 5000, b) == 0);	/* adopted, once only */
+	assert(netmon_changed_fp(&m, 8000, a) == 1);	/* moving back is a move */
+}
+
 int main(void)
 {
 	order_independence();
@@ -93,5 +118,6 @@ int main(void)
 	empty_stable();
 	live_snapshot_stable();
 	changed_gate();
+	changed_transitions();
 	return 0;
 }

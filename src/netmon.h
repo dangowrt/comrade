@@ -25,6 +25,12 @@ struct netmon {
 
 void netmon_init(struct netmon *m);
 int netmon_changed(struct netmon *m, uint64_t now_ms);
+/*
+ * The decision half of netmon_changed, over a fingerprint the caller already
+ * holds: the poll interval is enforced here, so a change seen inside the window
+ * is deferred to the next sample rather than lost.
+ */
+int netmon_changed_fp(struct netmon *m, uint64_t now_ms, const uint8_t fp[32]);
 
 size_t netmon_snapshot(struct netmon_addr *out, size_t max);
 void netmon_fingerprint(uint8_t fp[32], struct netmon_addr *addrs, size_t n);

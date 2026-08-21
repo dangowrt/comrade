@@ -188,26 +188,36 @@ void netmon_init(struct netmon *m)
 	m->next_check_ms = 0;
 }
 
+int netmon_changed_fp(struct netmon *m, uint64_t now_ms, const uint8_t fp[32])
+{
+	if (now_ms < m->next_check_ms)
+		return 0;
+	m->next_check_ms = now_ms + NETMON_POLL_MS;
+
+	if (!m->have_fp) {
+		memcpy(m->fp, fp, sizeof(m->fp));
+		m->have_fp = 1;
+		return 0;
+	}
+	if (!memcmp(m->fp, fp, sizeof(m->fp)))
+		return 0;
+	memcpy(m->fp, fp, sizeof(m->fp));
+	return 1;
+}
+
 int netmon_changed(struct netmon *m, uint64_t now_ms)
 {
 	struct netmon_addr addrs[NETMON_MAX_ADDRS];
 	uint8_t fp[32];
 	size_t n;
 
+	/* Sample only when the interval is due; netmon_changed_fp makes the
+	 * same test before it decides anything. */
 	if (now_ms < m->next_check_ms)
 		return 0;
-	m->next_check_ms = now_ms + NETMON_POLL_MS;
 
 	n = netmon_snapshot(addrs, NETMON_MAX_ADDRS);
 	netmon_fingerprint(fp, addrs, n);
 
-	if (!m->have_fp) {
-		memcpy(m->fp, fp, sizeof(fp));
-		m->have_fp = 1;
-		return 0;
-	}
-	if (!memcmp(m->fp, fp, sizeof(fp)))
-		return 0;
-	memcpy(m->fp, fp, sizeof(fp));
-	return 1;
+	return netmon_changed_fp(m, now_ms, fp);
 }
