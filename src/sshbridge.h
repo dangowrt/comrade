@@ -4,7 +4,7 @@
 #ifndef COMRADE_SSHBRIDGE_H
 #define COMRADE_SSHBRIDGE_H
 
-#include <poll.h>
+#include "wsock.h"
 #include <stdint.h>
 
 #include "stream.h"
@@ -30,10 +30,11 @@ struct sshbridge;
  * ends host-first) and a long wait for acks a departed host will never send
  * just stalls the client's exit.
  */
-struct sshbridge *sshbridge_create(int fd, struct stream *s, uint32_t linger_ms);
+struct sshbridge *sshbridge_create(sock_t fd, struct stream *s,
+				   uint32_t linger_ms);
 void sshbridge_destroy(struct sshbridge *b);
 
-int sshbridge_fd(const struct sshbridge *b);
+sock_t sshbridge_fd(const struct sshbridge *b);
 
 /* Events to request on the fd for the next poll(). */
 short sshbridge_events(const struct sshbridge *b);

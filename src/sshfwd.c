@@ -1,18 +1,11 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 /* Copyright (C) 2026 Daniel Golle <daniel@makrotopia.org> */
 
-#include <arpa/inet.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <poll.h>
+#include "wsock.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <unistd.h>
-#include <sys/socket.h>
 
 #include "dbg.h"
 #include "sshfwd.h"
@@ -25,7 +18,7 @@
 /* A live forwarded connection: fd <-> channel via two libssh connectors. */
 struct fwd_bridge {
 	int used;
-	int fd;
+	sock_t fd;
 	ssh_channel chan;
 	ssh_connector in;		/* fd -> channel */
 	ssh_connector out;		/* channel -> fd */
@@ -36,7 +29,7 @@ struct fwd_bridge {
  * with the address string the client asked to bind. */
 struct fwd_listener {
 	int used;
-	int fd;
+	sock_t fd;
 	int is_remote;			/* host side of -R */
 	struct fwdspec sp;		/* client -L: connect target */
 	char req_addr[64];		/* host -R: address to report */
@@ -53,7 +46,7 @@ enum pend_kind {
 struct fwd_pend {
 	int used;
 	enum pend_kind kind;
-	int fd;
+	sock_t fd;
 	ssh_message msg;		/* PEND_SRV_CONNECT: deferred reply */
 	ssh_channel chan;		/* PEND_CLI_CONNECT / PEND_REV_OPEN */
 	uint64_t deadline;
@@ -80,16 +73,8 @@ static uint64_t fwd_now_ms(void)
 	return (uint64_t)t.tv_sec * 1000 + (uint64_t)(t.tv_nsec / 1000000);
 }
 
-static void set_nonblock(int fd)
-{
-	int fl = fcntl(fd, F_GETFL, 0);
-
-	if (fl >= 0)
-		fcntl(fd, F_SETFL, fl | O_NONBLOCK);
-}
-
 /* The peer name of a connected fd, for channel-open originator fields. */
-static void peer_name(int fd, char *addr, size_t alen, uint16_t *port)
+static void peer_name(sock_t fd, char *addr, size_t alen, uint16_t *port)
 {
 	struct sockaddr_storage ss;
 	socklen_t sl = sizeof(ss);
@@ -115,31 +100,39 @@ static void peer_name(int fd, char *addr, size_t alen, uint16_t *port)
  * Returns the fd, or -1. getaddrinfo itself can block on real DNS; targets
  * here are typically loopback, numeric, or local names, and the punched
  * session tolerates a stall of that order (it rides KCP retransmission). */
-static int start_connect(const char *host, uint16_t port)
+static sock_t start_connect(const char *host, uint16_t port)
 {
 	struct addrinfo hints, *res = NULL;
 	char portstr[8];
-	int fd = -1;
+	sock_t fd = INVALID_SOCK;
 
 	memset(&hints, 0, sizeof(hints));
 	hints.ai_socktype = SOCK_STREAM;
 	snprintf(portstr, sizeof(portstr), "%u", port);
 	if (getaddrinfo(host, portstr, &hints, &res) || !res)
-		return -1;
+		return INVALID_SOCK;
 	fd = socket(res->ai_family, SOCK_STREAM, 0);
-	if (fd >= 0)
-		set_nonblock(fd);	/* SOCK_NONBLOCK is Linux-only */
-	if (fd >= 0 && connect(fd, res->ai_addr, res->ai_addrlen) &&
-	    errno != EINPROGRESS) {
-		close(fd);
-		fd = -1;
+	if (sock_valid(fd))
+		sock_set_nonblock(fd);	/* SOCK_NONBLOCK is Linux-only */
+	if (sock_valid(fd) && connect(fd, res->ai_addr, (int)res->ai_addrlen) &&
+	    !sock_err_in_progress(sock_errno())) {
+		sock_close(fd);
+		fd = INVALID_SOCK;
 	}
 	freeaddrinfo(res);
 	return fd;
 }
 
-/* Poll a pending connect: 1 connected, 0 still going, -1 failed. */
-static int finish_connect(int fd)
+/*
+ * Poll a pending connect: 1 connected, 0 still going, -1 failed.
+ *
+ * WSAPoll does not report a *failed* connect at all -- neither POLLOUT nor
+ * POLLERR -- so on Windows a refused target shows up as "still going" until
+ * the caller's FWD_CONNECT_TIMEOUT_MS deadline expires, rather than as an
+ * immediate refusal. The outcome is the same, just slower; SO_ERROR is still
+ * consulted whenever the poll does report something.
+ */
+static int finish_connect(sock_t fd)
 {
 	struct pollfd p;
 	int err = 0;
@@ -148,22 +141,23 @@ static int finish_connect(int fd)
 	p.fd = fd;
 	p.events = POLLOUT;
 	p.revents = 0;
-	if (poll(&p, 1, 0) <= 0)
+	if (sock_poll(&p, 1, 0) <= 0)
 		return 0;
-	if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el) || err)
+	if (getsockopt(fd, SOL_SOCKET, SO_ERROR, (char *)&err, &el) || err)
 		return -1;
 	return 1;
 }
 
 /* Bind a listener for `addr` (fwdspec semantics: "" loopback, "*" any) on
  * `port` (0 = ephemeral). Returns the fd and stores the bound port. */
-static int listen_on(const char *addr, uint16_t port, uint16_t *bound)
+static sock_t listen_on(const char *addr, uint16_t port, uint16_t *bound)
 {
 	struct sockaddr_storage ss;
 	struct sockaddr_in *a4 = (struct sockaddr_in *)&ss;
 	struct sockaddr_in6 *a6 = (struct sockaddr_in6 *)&ss;
 	socklen_t sl;
-	int fd, one = 1;
+	sock_t fd;
+	int one = 1;
 
 	memset(&ss, 0, sizeof(ss));
 	if (!addr[0] || !strcmp(addr, "localhost") ||
@@ -178,7 +172,7 @@ static int listen_on(const char *addr, uint16_t port, uint16_t *bound)
 	} else if (inet_pton(AF_INET6, addr, &a6->sin6_addr) == 1) {
 		a6->sin6_family = AF_INET6;
 	} else {
-		return -1;
+		return INVALID_SOCK;
 	}
 	if (ss.ss_family == AF_INET) {
 		a4->sin_port = htons(port);
@@ -188,13 +182,13 @@ static int listen_on(const char *addr, uint16_t port, uint16_t *bound)
 		sl = sizeof(*a6);
 	}
 	fd = socket(ss.ss_family, SOCK_STREAM, 0);
-	if (fd < 0)
-		return -1;
-	set_nonblock(fd);		/* SOCK_NONBLOCK is Linux-only */
-	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+	if (!sock_valid(fd))
+		return INVALID_SOCK;
+	sock_set_nonblock(fd);		/* SOCK_NONBLOCK is Linux-only */
+	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const char *)&one, sizeof(one));
 	if (bind(fd, (struct sockaddr *)&ss, sl) || listen(fd, 8)) {
-		close(fd);
-		return -1;
+		sock_close(fd);
+		return INVALID_SOCK;
 	}
 	sl = sizeof(ss);
 	if (!getsockname(fd, (struct sockaddr *)&ss, &sl))
@@ -227,7 +221,7 @@ static struct fwd_pend *pend_slot(struct sshfwd *f)
 
 /* Wire fd <-> chan with two connectors on the event. Takes ownership of
  * both; on failure closes and frees them. Returns 0 on success. */
-static int bridge_up(struct sshfwd *f, int fd, ssh_channel chan)
+static int bridge_up(struct sshfwd *f, sock_t fd, ssh_channel chan)
 {
 	struct fwd_bridge *b = bridge_slot(f);
 
@@ -242,13 +236,13 @@ static int bridge_up(struct sshfwd *f, int fd, ssh_channel chan)
 			ssh_connector_free(b->out);
 		if (b)
 			b->in = b->out = NULL;
-		close(fd);
+		sock_close(fd);
 		if (ssh_channel_is_open(chan))
 			ssh_channel_close(chan);
 		ssh_channel_free(chan);
 		return -1;
 	}
-	set_nonblock(fd);
+	sock_set_nonblock(fd);
 	ssh_connector_set_in_fd(b->in, fd);
 	ssh_connector_set_out_channel(b->in, chan, SSH_CONNECTOR_STDOUT);
 	ssh_connector_set_in_channel(b->out, chan, SSH_CONNECTOR_STDOUT);
@@ -267,7 +261,7 @@ static void bridge_down(struct sshfwd *f, struct fwd_bridge *b)
 	ssh_event_remove_connector(f->ev, b->out);
 	ssh_connector_free(b->in);
 	ssh_connector_free(b->out);
-	close(b->fd);
+	sock_close(b->fd);
 	if (ssh_channel_is_open(b->chan))
 		ssh_channel_close(b->chan);
 	ssh_channel_free(b->chan);
@@ -295,15 +289,15 @@ void sshfwd_destroy(struct sshfwd *f)
 		if (f->br[i].used)
 			bridge_down(f, &f->br[i]);
 	for (i = 0; i < FWD_MAX_LISTEN; i++)
-		if (f->ls[i].used)
-			close(f->ls[i].fd);
+		if (f->ls[i].used && sock_valid(f->ls[i].fd))
+			sock_close(f->ls[i].fd);
 	for (i = 0; i < FWD_MAX_PEND; i++) {
 		struct fwd_pend *p = &f->pd[i];
 
 		if (!p->used)
 			continue;
-		if (p->fd >= 0)
-			close(p->fd);
+		if (sock_valid(p->fd))
+			sock_close(p->fd);
 		if (p->msg) {
 			ssh_message_reply_default(p->msg);
 			ssh_message_free(p->msg);
@@ -330,7 +324,7 @@ int sshfwd_cli_local(struct sshfwd *f, const struct fwdspec *sp)
 		return -1;
 	}
 	l->fd = listen_on(sp->bind, sp->bind_port, &l->port);
-	if (l->fd < 0) {
+	if (!sock_valid(l->fd)) {
 		fprintf(stderr, "comrade: -L could not listen on %s port %u\n",
 			sp->bind[0] ? sp->bind : "localhost", sp->bind_port);
 		return -1;
@@ -363,7 +357,7 @@ int sshfwd_cli_remote(struct sshfwd *f, const struct fwdspec *sp)
 	/* Remember the target keyed by the host-side port, for accepts. */
 	for (i = 0; i < FWD_MAX_LISTEN; i++)
 		if (!f->ls[i].used) {
-			f->ls[i].fd = -1;
+			f->ls[i].fd = INVALID_SOCK;
 			f->ls[i].is_remote = 1;
 			f->ls[i].sp = *sp;
 			f->ls[i].port = (uint16_t)(bound ? bound : sp->bind_port);
@@ -385,13 +379,13 @@ static void cli_local_accept(struct sshfwd *f, struct fwd_listener *l)
 	char orig[64];
 	uint16_t oport;
 	ssh_channel chan;
-	int fd = accept(l->fd, NULL, NULL);
+	sock_t fd = accept(l->fd, NULL, NULL);
 
-	if (fd < 0)
+	if (!sock_valid(fd))
 		return;
 	chan = ssh_channel_new(f->s);
 	if (!chan) {
-		close(fd);
+		sock_close(fd);
 		return;
 	}
 	peer_name(fd, orig, sizeof(orig), &oport);
@@ -399,7 +393,7 @@ static void cli_local_accept(struct sshfwd *f, struct fwd_listener *l)
 				     orig, oport) != SSH_OK) {
 		dbg_logf("sshfwd -L: host refused %s:%u",
 			 l->sp.host, l->sp.port);
-		close(fd);
+		sock_close(fd);
 		ssh_channel_free(chan);
 		return;
 	}
@@ -412,21 +406,21 @@ static void cli_local_accept(struct sshfwd *f, struct fwd_listener *l)
 static void srv_remote_accept(struct sshfwd *f, struct fwd_listener *l)
 {
 	struct fwd_pend *p;
-	int fd = accept(l->fd, NULL, NULL);
+	sock_t fd = accept(l->fd, NULL, NULL);
 
-	if (fd < 0)
+	if (!sock_valid(fd))
 		return;
 	p = pend_slot(f);
 	if (!p) {
-		close(fd);
+		sock_close(fd);
 		return;
 	}
 	p->chan = ssh_channel_new(f->s);
 	if (!p->chan) {
-		close(fd);
+		sock_close(fd);
 		return;
 	}
-	set_nonblock(fd);
+	sock_set_nonblock(fd);
 	p->kind = PEND_REV_OPEN;
 	p->fd = fd;
 	p->msg = NULL;
@@ -462,7 +456,7 @@ static int pend_step(struct sshfwd *f, struct fwd_pend *p)
 			ssh_message_free(p->msg);
 			p->msg = NULL;
 		}
-		close(p->fd);
+		sock_close(p->fd);
 		return 1;
 	case PEND_CLI_CONNECT:
 		rc = finish_connect(p->fd);
@@ -473,7 +467,7 @@ static int pend_step(struct sshfwd *f, struct fwd_pend *p)
 			return 1;
 		}
 		dbg_logf("sshfwd -R: local target connect failed");
-		close(p->fd);
+		sock_close(p->fd);
 		if (ssh_channel_is_open(p->chan))
 			ssh_channel_close(p->chan);
 		ssh_channel_free(p->chan);
@@ -487,7 +481,7 @@ static int pend_step(struct sshfwd *f, struct fwd_pend *p)
 			bridge_up(f, p->fd, p->chan);
 			return 1;
 		}
-		close(p->fd);
+		sock_close(p->fd);
 		ssh_channel_free(p->chan);
 		return 1;
 	}
@@ -506,12 +500,13 @@ void sshfwd_tick(struct sshfwd *f)
 		struct fwd_listener *l = &f->ls[i];
 		struct pollfd p;
 
-		if (!l->used || l->fd < 0)
+		if (!l->used || !sock_valid(l->fd))
 			continue;
 		p.fd = l->fd;
 		p.events = POLLIN;
 		p.revents = 0;
-		if (poll(&p, 1, 0) > 0 && (p.revents & POLLIN)) {
+		if (sock_poll(&p, 1, 0) > 0 &&
+		    (p.revents & (POLLIN | POLLHUP | POLLERR))) {
 			if (l->is_remote)
 				srv_remote_accept(f, l);
 			else
@@ -542,7 +537,7 @@ void sshfwd_tick(struct sshfwd *f)
 			p = l ? pend_slot(f) : NULL;
 			if (p) {
 				p->fd = start_connect(l->sp.host, l->sp.port);
-				if (p->fd >= 0) {
+				if (sock_valid(p->fd)) {
 					p->kind = PEND_CLI_CONNECT;
 					p->msg = NULL;
 					p->chan = chan;
@@ -596,7 +591,7 @@ int sshfwd_srv_message(struct sshfwd *f, ssh_message m)
 			return 1;
 		}
 		p->fd = start_connect(dest, (uint16_t)port);
-		if (p->fd < 0) {
+		if (!sock_valid(p->fd)) {
 			ssh_message_reply_default(m);
 			ssh_message_free(m);
 			return 1;
@@ -630,7 +625,7 @@ int sshfwd_srv_message(struct sshfwd *f, ssh_message m)
 		}
 		l->fd = listen_on(strcmp(addr, "localhost") ? addr : "",
 				  (uint16_t)port, &l->port);
-		if (l->fd < 0) {
+		if (!sock_valid(l->fd)) {
 			ssh_message_reply_default(m);
 			ssh_message_free(m);
 			return 1;
@@ -650,8 +645,9 @@ int sshfwd_srv_message(struct sshfwd *f, ssh_message m)
 
 		for (i = 0; i < FWD_MAX_LISTEN; i++)
 			if (f->ls[i].used && f->ls[i].is_remote &&
-			    f->ls[i].port == port && f->ls[i].fd >= 0) {
-				close(f->ls[i].fd);
+			    f->ls[i].port == port &&
+			    sock_valid(f->ls[i].fd)) {
+				sock_close(f->ls[i].fd);
 				memset(&f->ls[i], 0, sizeof(f->ls[i]));
 				ssh_message_global_request_reply_success(m, 0);
 				ssh_message_free(m);

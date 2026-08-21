@@ -1,17 +1,14 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 /* Copyright (C) 2026 Daniel Golle <daniel@makrotopia.org> */
 
-#include <errno.h>
-#include <fcntl.h>
 #include <stdlib.h>
-#include <unistd.h>
 
 #include "sshbridge.h"
 
 #define BRIDGE_BUF 65536
 
 struct sshbridge {
-	int fd;
+	sock_t fd;
 	struct stream *s;
 	int fd_eof;		/* read side saw EOF or the fd is dead */
 	int dead;		/* fatal fd error: stop */
@@ -23,12 +20,12 @@ struct sshbridge {
 	uint8_t out[BRIDGE_BUF];
 };
 
-struct sshbridge *sshbridge_create(int fd, struct stream *s, uint32_t linger_ms)
+struct sshbridge *sshbridge_create(sock_t fd, struct stream *s,
+				   uint32_t linger_ms)
 {
 	struct sshbridge *b;
-	int fl;
 
-	if (fd < 0 || !s)
+	if (!sock_valid(fd) || !s)
 		return NULL;
 	b = calloc(1, sizeof(*b));
 	if (!b)
@@ -36,9 +33,7 @@ struct sshbridge *sshbridge_create(int fd, struct stream *s, uint32_t linger_ms)
 	b->fd = fd;
 	b->s = s;
 	b->linger_ms = linger_ms;
-	fl = fcntl(fd, F_GETFL, 0);
-	if (fl >= 0)
-		fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+	sock_set_nonblock(fd);
 	return b;
 }
 
@@ -47,7 +42,7 @@ void sshbridge_destroy(struct sshbridge *b)
 	free(b);
 }
 
-int sshbridge_fd(const struct sshbridge *b)
+sock_t sshbridge_fd(const struct sshbridge *b)
 {
 	return b->fd;
 }
@@ -69,7 +64,8 @@ static void pump_in(struct sshbridge *b)
 	uint8_t buf[BRIDGE_BUF];
 
 	for (;;) {
-		ssize_t n = read(b->fd, buf, sizeof(buf));
+		ssize_t n = sock_read(b->fd, buf, sizeof(buf));
+		int e;
 
 		if (n > 0) {
 			stream_send(b->s, buf, (size_t)n);
@@ -79,9 +75,10 @@ static void pump_in(struct sshbridge *b)
 			b->fd_eof = 1;
 			return;
 		}
-		if (errno == EAGAIN || errno == EWOULDBLOCK)
+		e = sock_errno();
+		if (sock_err_would_block(e))
 			return;
-		if (errno == EINTR)
+		if (sock_err_intr(e))
 			continue;
 		b->dead = 1;
 		return;
@@ -101,18 +98,20 @@ static void pump_out(struct sshbridge *b)
 			b->out_len = (size_t)n;
 		}
 		while (b->out_pos < b->out_len) {
-			ssize_t n = write(b->fd, b->out + b->out_pos,
-					  b->out_len - b->out_pos);
+			ssize_t n = sock_write(b->fd, b->out + b->out_pos,
+					       b->out_len - b->out_pos);
+			int e;
 
 			if (n > 0) {
 				b->out_pos += (size_t)n;
 				continue;
 			}
-			if (n < 0 && errno == EINTR)
+			e = sock_errno();
+			if (n < 0 && sock_err_intr(e))
 				continue;
-			if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+			if (n < 0 && sock_err_would_block(e))
 				return;
-			/* EPIPE etc: the reader is gone. */
+			/* EPIPE / WSAECONNRESET etc: the reader is gone. */
 			b->dead = 1;
 			return;
 		}
