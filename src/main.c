@@ -148,6 +148,19 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
+#if defined(_WIN32) && defined(COMRADE_HAVE_SESSION)
+	/*
+	 * The host's connection service, re-entered detached. Windows has no
+	 * fork, so the process that outlives the operator's terminal has to be
+	 * a fresh comrade.exe rather than a copy of this one; it is handed the
+	 * session down the inherited socket named here. Deliberately absent
+	 * from usage(): nobody types this. Checked before the option loop so
+	 * it can never be confused with a token.
+	 */
+	if (argc == 3 && !strcmp(argv[1], "--win-service"))
+		return host_win_service(argv[2]);
+#endif
+
 	for (i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help"))
 			return usage(0);

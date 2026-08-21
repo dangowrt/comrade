@@ -8,41 +8,31 @@
 /*
  * Hosting is the half of comrade that is genuinely Unix-shaped: it forks, it
  * runs a command under a pty (forkpty), it detaches a service with setsid, and
- * the command it runs is tmux, which has no native Windows build at all. None
- * of that has a drop-in Windows equivalent -- the replacements are ConPTY
- * (CreatePseudoConsole) plus CreateProcess plus a separately installed
- * tmux.exe, which is a later phase.
- *
- * The join path is untouched by any of it: a client never forks and never
- * opens a pty, which is exactly why the port is client-first. So on Windows
- * this file is the same stub it already is for a build without the session
- * stack, and `comrade` with no token says so.
+ * the command it runs is tmux. Every one of those has a Windows answer --
+ * CreateProcess, CreatePseudoConsole, DETACHED_PROCESS, and a separately
+ * installed tmux.exe -- but they are different enough in shape (no fork means
+ * the service is a *new* process, not a copy of this one) that the Windows
+ * host is its own file: src/host_win.c. This one stays the POSIX host it
+ * always was, with no #ifdefs in it.
  */
-#if !defined(COMRADE_HAVE_SESSION) || defined(_WIN32)
+#if defined(_WIN32) && defined(COMRADE_HAVE_SESSION)
+
+/* host_run/host_show live in host_win.c. */
+
+#elif !defined(COMRADE_HAVE_SESSION)
 
 int host_run(int ui_mode, int no_mcast, int no_fwd)
 {
 	(void)ui_mode;
 	(void)no_mcast;
 	(void)no_fwd;
-#ifdef _WIN32
-	fprintf(stderr, "comrade: hosting a session is not supported on "
-			"Windows yet -- this build can join one:\n"
-			"       comrade <token>\n");
-#else
 	fprintf(stderr, "comrade: built without the session stack\n");
-#endif
 	return 1;
 }
 
 int host_show(void)
 {
-#ifdef _WIN32
-	fprintf(stderr, "comrade: hosting a session is not supported on "
-			"Windows yet, so there is none to show\n");
-#else
 	fprintf(stderr, "comrade: built without the session stack\n");
-#endif
 	return 1;
 }
 

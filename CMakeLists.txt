@@ -32,12 +32,12 @@ find_package(LibJuice CONFIG QUIET)
 find_package(kcp CONFIG QUIET)
 
 #
-# Windows (MinGW-w64/UCRT, x86_64 and aarch64). The command the SSH server
-# serves now runs on a pseudoconsole rather than a forkpty (src/cpty_win.c,
-# src/win_proc.c) and finds a separately installed tmux (src/tmuxpath.c);
-# `comrade` with no token is still fenced off pending the host itself.
-# Everything below is about linking one self-contained comrade.exe that
-# imports nothing but system DLLs.
+# Windows (MinGW-w64/UCRT, x86_64 and aarch64). One comrade.exe that both
+# joins and hosts: hosting's fork/forkpty/setsid are CreateProcess, a
+# pseudoconsole and DETACHED_PROCESS (src/win_proc.c, src/cpty_win.c,
+# src/host_win.c), and the tmux it runs is a separately installed one that is
+# never bundled (src/tmuxpath.c). Everything below is about linking that
+# executable self-contained, importing nothing but system DLLs.
 #
 if(WIN32)
 	# comrade's own crypto is monocypher regardless of what libssh links.
@@ -506,12 +506,22 @@ if(COMRADE_HAVE_SIG AND COMRADE_HAVE_NAT AND COMRADE_HAVE_STREAM AND COMRADE_HAV
 	target_link_libraries(comrade_ui PUBLIC comrade_token comrade_compat)
 endif()
 
-add_library(comrade_host STATIC src/host.c)
+# The host, in two files: the POSIX one and the Windows one. Each is guarded
+# so exactly one of them defines host_run/host_show, which keeps both readable
+# -- the alternative was an #ifdef through every function in host.c, since
+# almost every line of it is a fork, a pty or a signal.
+add_library(comrade_host STATIC src/host.c src/host_win.c)
 target_include_directories(comrade_host PUBLIC src)
 target_link_libraries(comrade_host PUBLIC comrade_token comrade_dbg comrade_termfilter)
 if(COMRADE_HAVE_SESSION)
 	target_link_libraries(comrade_host PUBLIC comrade_session comrade_ui)
 	target_compile_definitions(comrade_host PRIVATE COMRADE_HAVE_SESSION=1)
+	if(WIN32)
+		# host_win.c serialises the ephemeral host key to the detached
+		# service over their socketpair, so it talks to libssh directly.
+		target_link_libraries(comrade_host PUBLIC comrade_cpty
+			comrade_statusbar comrade_conn PkgConfig::LIBSSH)
+	endif()
 endif()
 
 add_executable(comrade src/main.c)
