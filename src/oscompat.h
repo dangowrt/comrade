@@ -5,6 +5,7 @@
 #define COMRADE_OSCOMPAT_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 /*
  * The handful of non-socket, non-terminal OS calls whose Windows spelling
@@ -35,6 +36,14 @@ long os_pid(void);
 
 /* Sleep, in milliseconds. */
 void os_msleep(int ms);
+
+/*
+ * A monotonic millisecond clock, for repaint and timeout arithmetic:
+ * clock_gettime(CLOCK_MONOTONIC) / GetTickCount64. Not wall time -- it never
+ * steps backwards over an NTP correction, which a "has 2 s passed" test
+ * otherwise gets wrong once in a while and for a long time.
+ */
+uint64_t os_mono_ms(void);
 
 /*
  * memmem(3). A GNU extension: glibc and the BSDs have it, the Windows CRT

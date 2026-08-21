@@ -31,10 +31,12 @@ void ui_bind(struct ui *u, struct session_obs *obs);
  * processes. Both halves of that bridge -- the wire framing and the render
  * loop -- stay here in the view layer.
  *
- * ui_emitter: service side. Fills obs to serialise each event to fd (the write
- * end of a pipe to the foreground). ui_emitter_token posts the minted invite.
+ * ui_emitter: service side. Fills obs to serialise each event to fd, the
+ * channel back to the foreground -- a socketpair end, because on Windows the
+ * two halves are separate processes and a socket is the only thing both can
+ * poll. ui_emitter_token posts the minted invite.
  */
-void ui_emitter(struct session_obs *obs, int fd);
+void ui_emitter(struct session_obs *obs, sock_t fd);
 void ui_emitter_token(const struct session_obs *obs, const char *token_str);
 
 /*
@@ -43,6 +45,6 @@ void ui_emitter_token(const struct session_obs *obs, const char *token_str);
  * (ESC / Ctrl-C / SIGTERM -- the caller tears the service down), or 0 if the
  * pipe closed first. The terminal is restored on every path.
  */
-int ui_host_wait(struct ui *u, int fd);
+int ui_host_wait(struct ui *u, sock_t fd);
 
 #endif

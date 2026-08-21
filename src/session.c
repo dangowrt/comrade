@@ -1446,7 +1446,7 @@ static int host_turnstile(struct sess *s)
 	uint64_t ice_start = 0, last_active = now_ms();
 	char filtered[NAT_SDP_MAX];
 	char pending[NAT_SDP_MAX], last_served[NAT_SDP_MAX];
-	int end_fd = cfg->ssh_end_fd;
+	sock_t end_fd = cfg->ssh_end_fd;
 	int served = 0, have_served = 0, dash_seq = 0, i;
 
 	memset(ws, 0, sizeof(ws));
@@ -1643,10 +1643,10 @@ static int host_turnstile(struct sess *s)
 		 * harness passes no end monitor, so there it is bounded by the
 		 * deadline, or exits once idle having served at least one client.
 		 */
-		if (end_fd > 0) {
+		if (sock_isset(end_fd)) {
 			struct pollfd ef;
 
-			ef.fd = (sock_t)end_fd;
+			ef.fd = end_fd;
 			ef.events = POLLIN;
 			ef.revents = 0;
 			if (sock_poll(&ef, 1, 0) > 0 &&

@@ -31,8 +31,10 @@ struct sshd_opts {
 	 * (typically EOF from a liveness monitor that exits with the session)
 	 * means the session is over, so we close the channel toward the client
 	 * at once rather than leave it hanging. 0 disables it (child-exit only).
+	 * A socket, not any fd: it joins the WSAPoll set on Windows, where the
+	 * monitor is a thread watching a process HANDLE rather than a pipe.
 	 */
-	int end_fd;
+	sock_t end_fd;
 	/*
 	 * Optional control-plane fd. When > 0, the server accepts one extra SSH
 	 * channel whose subsystem is "comrade-ctl" and bridges it to this fd, so

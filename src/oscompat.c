@@ -48,6 +48,11 @@ void os_msleep(int ms)
 	Sleep((DWORD)ms);
 }
 
+uint64_t os_mono_ms(void)
+{
+	return (uint64_t)GetTickCount64();
+}
+
 #else /* !_WIN32 */
 
 #include <time.h>
@@ -94,6 +99,14 @@ void os_msleep(int ms)
 	ts.tv_sec = ms / 1000;
 	ts.tv_nsec = (long)(ms % 1000) * 1000000L;
 	nanosleep(&ts, NULL);
+}
+
+uint64_t os_mono_ms(void)
+{
+	struct timespec t;
+
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return (uint64_t)t.tv_sec * 1000 + (uint64_t)(t.tv_nsec / 1000000);
 }
 
 #endif /* _WIN32 */

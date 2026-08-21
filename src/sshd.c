@@ -7,54 +7,20 @@
 
 #include "sshd.h"
 
-#ifdef _WIN32
-
-/*
- * The server side pairs the SSH channel with a forkpty() master and reaps the
- * child with waitpid; on Windows that becomes ConPTY plus CreateProcess, which
- * is the later hosting phase. The
- * client build links these stubs so session.c keeps its one shape on both
- * platforms; nothing on the join path calls them, because cfg->is_host is
- * never set in a Windows build.
- */
-void *sshd_hostkey_new(uint8_t fp[32])
-{
-	(void)fp;
-	return NULL;
-}
-
-void sshd_hostkey_free(void *hostkey)
-{
-	(void)hostkey;
-}
-
-int sshd_serve_fd(sock_t fd, const struct sshd_opts *o)
-{
-	(void)fd;
-	(void)o;
-	return -1;
-}
-
-#else /* !_WIN32 */
-
-#include <fcntl.h>
-#include <poll.h>
-#include <signal.h>			/* kill: implicit via other headers on Linux */
-#ifdef __APPLE__
-#include <util.h>			/* forkpty lives here, not in pty.h */
-#else
-#include <pty.h>
-#endif
-#include <unistd.h>
-#include <sys/ioctl.h>
-#include <sys/wait.h>
-
 #include <libssh/libssh.h>
 #include <libssh/server.h>
 
 #include "base64.h"
+#include "cpty.h"
 #include "dbg.h"
 #include "sshfwd.h"
+
+/*
+ * This file is platform-neutral. Everything Unix-shaped it used to contain --
+ * forkpty, TIOCSWINSZ, waitpid -- lives behind cpty.h, which is forkpty plus
+ * /bin/sh on POSIX and a pseudoconsole plus CreateProcess on Windows, and
+ * hands back the same pair of pollable ends either way (see cpty.h).
+ */
 
 /* Constant-time equality over a fixed-length buffer. */
 static int ct_equal(const void *a, const void *b, size_t len)
@@ -133,83 +99,6 @@ static int safe_term(const char *t)
 	return 1;
 }
 
-/* Spawn /bin/sh -c command; return its pid, plus write- and read-side fds
- * toward the child's stdin and stdout. With a pty both are the master fd.
- *
- * When the client negotiated a terminal type, prepend it as a TERM assignment
- * to the command so the remote command (tmux) renders for the client's actual
- * terminal -- crucially, one whose terminfo has the alternate screen, so tmux
- * does not fall back to scrolling the main screen. Done through the shell
- * rather than setenv() after fork(), which is not safe in a threaded process. */
-static int spawn(const char *command, int use_pty, const struct winsize *ws,
-		 const char *term, pid_t *pid, int *to_child, int *from_child)
-{
-	const char *base = command ? command : "tmux new-session -A -s comrade";
-	char cmd[768];
-	pid_t p;
-
-	if (term && term[0])
-		snprintf(cmd, sizeof(cmd), "TERM=%s %s", term, base);
-	else
-		snprintf(cmd, sizeof(cmd), "%s", base);
-
-	dbg_logf("sshd spawn: use_pty=%d client-requested pty=%dx%d TERM=[%s]",
-		 use_pty, ws ? ws->ws_row : -1, ws ? ws->ws_col : -1,
-		 term ? term : "");
-
-	if (use_pty) {
-		int master;
-
-		/* Size the pty from the client's request so the remote command
-		 * (tmux) uses exactly the rows it asked for. The client reserves
-		 * its own bottom status row by requesting one row fewer; honouring
-		 * that here is what keeps tmux off that row. */
-		p = forkpty(&master, NULL, NULL,
-			    (ws && ws->ws_row) ? (struct winsize *)ws : NULL);
-		if (p < 0)
-			return -1;
-		if (p == 0) {
-			execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
-			_exit(127);
-		}
-		*pid = p;
-		*to_child = master;
-		*from_child = master;
-		return 0;
-	} else {
-		int in[2], out[2];
-
-		if (pipe(in))
-			return -1;
-		if (pipe(out)) {
-			close(in[0]);
-			close(in[1]);
-			return -1;
-		}
-		p = fork();
-		if (p < 0) {
-			close(in[0]); close(in[1]);
-			close(out[0]); close(out[1]);
-			return -1;
-		}
-		if (p == 0) {
-			dup2(in[0], STDIN_FILENO);
-			dup2(out[1], STDOUT_FILENO);
-			dup2(out[1], STDERR_FILENO);
-			close(in[0]); close(in[1]);
-			close(out[0]); close(out[1]);
-			execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
-			_exit(127);
-		}
-		close(in[0]);
-		close(out[1]);
-		*pid = p;
-		*to_child = in[1];
-		*from_child = out[0];
-		return 0;
-	}
-}
-
 /* Authenticate: only password auth, only the token secret, constant-time. */
 static int do_auth(ssh_session s, const char *password)
 {
@@ -263,7 +152,7 @@ static ssh_channel do_channel(ssh_session s)
 /* Wait for a shell/exec request; accept pty requests along the way. Reports
  * whether the client asked for a pty and, if so, the terminal size it asked
  * for so the child's pty can match it (see spawn). */
-static int do_shell_request(ssh_session s, int *want_pty, struct winsize *ws,
+static int do_shell_request(ssh_session s, int *want_pty, int *rows, int *cols,
 			    char *term, size_t termlen)
 {
 	*want_pty = 0;
@@ -281,10 +170,8 @@ static int do_shell_request(ssh_session s, int *want_pty, struct winsize *ws,
 					ssh_message_channel_request_pty_term(m);
 
 				*want_pty = 1;
-				ws->ws_col = (unsigned short)
-					ssh_message_channel_request_pty_width(m);
-				ws->ws_row = (unsigned short)
-					ssh_message_channel_request_pty_height(m);
+				*cols = ssh_message_channel_request_pty_width(m);
+				*rows = ssh_message_channel_request_pty_height(m);
 				if (safe_term(t))
 					snprintf(term, termlen, "%s", t);
 				ssh_message_channel_request_reply_success(m);
@@ -306,16 +193,13 @@ static int do_shell_request(ssh_session s, int *want_pty, struct winsize *ws,
 /* Apply a client window-change to the child pty so tmux reflows. The client
  * has already subtracted its reserved status row, and its terminal-size answer
  * to tmux is corrected on the client side too, so tmux stays one row short. */
-static void apply_winch(int master, ssh_message m)
+static void apply_winch(struct cpty *child, ssh_message m)
 {
-	struct winsize ws;
+	int cols = ssh_message_channel_request_pty_width(m);
+	int rows = ssh_message_channel_request_pty_height(m);
 
-	memset(&ws, 0, sizeof(ws));
-	ws.ws_col = (unsigned short)ssh_message_channel_request_pty_width(m);
-	ws.ws_row = (unsigned short)ssh_message_channel_request_pty_height(m);
-	dbg_logf("sshd window-change -> pty %dx%d", ws.ws_row, ws.ws_col);
-	if (master >= 0 && ws.ws_row)
-		ioctl(master, TIOCSWINSZ, &ws);
+	dbg_logf("sshd window-change -> pty %dx%d", rows, cols);
+	cpty_resize(child, rows, cols);
 }
 
 /*
@@ -327,8 +211,8 @@ static void apply_winch(int master, ssh_message m)
 struct pump_ctx {
 	ssh_session s;
 	ssh_event event;
-	int master;			/* the shell pty, for window-change */
-	int ctl_fd;			/* control-plane fd, <= 0 if none */
+	struct cpty *child;		/* the shell pty, for window-change */
+	sock_t ctl_fd;			/* control-plane socket, 0 if none */
 	ssh_channel ctl_chan;		/* the accepted control channel */
 	ssh_connector ctl_in;		/* ctl_fd -> channel */
 	ssh_connector ctl_out;		/* channel -> ctl_fd */
@@ -371,7 +255,7 @@ static void drain_messages(struct pump_ctx *c)
 		int sub = ssh_message_subtype(m);
 
 		if (type == SSH_REQUEST_CHANNEL_OPEN &&
-		    sub == SSH_CHANNEL_SESSION && c->ctl_fd > 0 &&
+		    sub == SSH_CHANNEL_SESSION && sock_isset(c->ctl_fd) &&
 		    !c->ctl_chan) {
 			c->ctl_chan =
 				ssh_message_channel_request_open_reply_accept(m);
@@ -380,7 +264,7 @@ static void drain_messages(struct pump_ctx *c)
 		}
 		if (type == SSH_REQUEST_CHANNEL &&
 		    sub == SSH_CHANNEL_REQUEST_WINDOW_CHANGE) {
-			apply_winch(c->master, m);
+			apply_winch(c->child, m);
 			ssh_message_reply_default(m);
 			ssh_message_free(m);
 			continue;
@@ -430,17 +314,17 @@ static int on_end_fd(socket_t fd, int revents, void *userdata)
  * ends, not after a poll interval). A few extra polls flush the command's final
  * output first; then we return and the caller closes the channel to the client.
  */
-static void pump(ssh_session s, ssh_channel chan, int to_child, int from_child,
-		 pid_t child, const struct sshd_opts *o)
+static void pump(ssh_session s, ssh_channel chan, struct cpty *child,
+		 const struct sshd_opts *o)
 {
-	int end_fd = o->end_fd;
+	sock_t end_fd = o->end_fd;
 	struct pump_ctx c;
 	ssh_connector c_in, c_out;	/* shell channel <-> child */
 	int ending = 0, drain = 0;
 
 	memset(&c, 0, sizeof(c));
 	c.s = s;
-	c.master = to_child;
+	c.child = child;
 	c.ctl_fd = o->ctl_fd;
 	c.event = ssh_event_new();
 	if (c.event && !o->no_fwd)
@@ -450,14 +334,14 @@ static void pump(ssh_session s, ssh_channel chan, int to_child, int from_child,
 	if (!c.event || !c_in || !c_out)
 		goto out;
 
-	ssh_connector_set_out_fd(c_in, to_child);
+	ssh_connector_set_out_fd(c_in, cpty_in(child));
 	ssh_connector_set_in_channel(c_in, chan, SSH_CONNECTOR_STDOUT);
-	ssh_connector_set_in_fd(c_out, from_child);
+	ssh_connector_set_in_fd(c_out, cpty_out(child));
 	ssh_connector_set_out_channel(c_out, chan, SSH_CONNECTOR_STDOUT);
 
 	ssh_event_add_connector(c.event, c_in);
 	ssh_event_add_connector(c.event, c_out);
-	if (end_fd > 0)
+	if (sock_isset(end_fd))
 		ssh_event_add_fd(c.event, end_fd,
 				 POLLIN | POLLHUP | POLLERR | POLLNVAL,
 				 on_end_fd, &c.end_hit);
@@ -472,7 +356,7 @@ static void pump(ssh_session s, ssh_channel chan, int to_child, int from_child,
 		sshfwd_tick(c.fwd);
 		if (!ending && c.end_hit)
 			ending = 1;
-		if (!ending && waitpid(child, NULL, WNOHANG | WNOWAIT) == child)
+		if (!ending && cpty_exited(child))
 			ending = 1;
 		if (ending && ++drain >= 3)
 			break;
@@ -480,7 +364,7 @@ static void pump(ssh_session s, ssh_channel chan, int to_child, int from_child,
 
 	sshfwd_destroy(c.fwd);
 	c.fwd = NULL;
-	if (end_fd > 0)
+	if (sock_isset(end_fd))
 		ssh_event_remove_fd(c.event, end_fd);
 	ssh_event_remove_connector(c.event, c_in);
 	ssh_event_remove_connector(c.event, c_out);
@@ -511,13 +395,12 @@ int sshd_serve_fd(sock_t fd, const struct sshd_opts *o)
 	ssh_bind bind = NULL;
 	ssh_session s = NULL;
 	ssh_channel chan = NULL;
-	pid_t child = -1;
-	int to_child = -1, from_child = -1;
+	struct cpty *child = NULL;
 	int want_pty = 0;
 	int gave_fd = 0;
 	int rc = -1;
 	int exit_code = 0;
-	struct winsize ws;
+	int rows = 0, cols = 0;
 	char term[64];
 
 	if (!o || !o->hostkey)
@@ -545,31 +428,27 @@ int sshd_serve_fd(sock_t fd, const struct sshd_opts *o)
 	chan = do_channel(s);
 	if (!chan)
 		goto out;
-	memset(&ws, 0, sizeof(ws));
 	term[0] = '\0';
-	if (do_shell_request(s, &want_pty, &ws, term, sizeof(term)))
+	if (do_shell_request(s, &want_pty, &rows, &cols, term, sizeof(term)))
 		goto out;
 
-	if (spawn(o->command, o->use_pty || want_pty, &ws, term, &child,
-		  &to_child, &from_child))
+	/* Size the terminal from the client's request so the remote command
+	 * (tmux) uses exactly the rows it asked for. The client reserves its own
+	 * bottom status row by requesting one row fewer; honouring that here is
+	 * what keeps tmux off that row. */
+	child = cpty_spawn(o->command, o->use_pty || want_pty, rows, cols, term);
+	if (!child)
 		goto out;
 
 	/* Live resizes arrive as window-change requests; the pump applies them
 	 * to the pty. A second channel requesting the comrade-ctl subsystem is
 	 * bridged to o->ctl_fd, and client port forwards are served unless
 	 * o->no_fwd declines them (all in drain_messages). */
-	pump(s, chan, to_child, from_child, child, o);
+	pump(s, chan, child, o);
 	rc = 0;
 out:
-	if (to_child >= 0)
-		close(to_child);
-	if (from_child >= 0 && from_child != to_child)
-		close(from_child);
-	if (child > 0) {
-		kill(child, SIGHUP);
-		waitpid(child, &exit_code, 0);
-		exit_code = WIFEXITED(exit_code) ? WEXITSTATUS(exit_code) : 0;
-	}
+	if (child)
+		exit_code = cpty_close(child);
 	if (chan) {
 		if (ssh_channel_is_open(chan)) {
 			/*
@@ -596,8 +475,6 @@ out:
 	 * up closed, which signals end-of-session to the bridge.
 	 */
 	if (!gave_fd)
-		close(fd);
+		sock_close(fd);
 	return rc;
 }
-
-#endif /* _WIN32 */

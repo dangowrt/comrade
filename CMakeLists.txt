@@ -32,10 +32,12 @@ find_package(LibJuice CONFIG QUIET)
 find_package(kcp CONFIG QUIET)
 
 #
-# Windows (MinGW-w64/UCRT, x86_64 and aarch64). The port is client-only for
-# now: hosting forks, opens a pty and runs tmux, none of which exist here
-# (see src/host.c). Everything below is about linking one self-contained
-# comrade.exe that imports nothing but system DLLs.
+# Windows (MinGW-w64/UCRT, x86_64 and aarch64). The command the SSH server
+# serves now runs on a pseudoconsole rather than a forkpty (src/cpty_win.c,
+# src/win_proc.c) and finds a separately installed tmux (src/tmuxpath.c);
+# `comrade` with no token is still fenced off pending the host itself.
+# Everything below is about linking one self-contained comrade.exe that
+# imports nothing but system DLLs.
 #
 if(WIN32)
 	# comrade's own crypto is monocypher regardless of what libssh links.
@@ -229,6 +231,21 @@ target_link_libraries(comrade_appdir PUBLIC comrade_compat)
 add_library(comrade_dbg STATIC src/dbg.c)
 target_include_directories(comrade_dbg PUBLIC src)
 target_link_libraries(comrade_dbg PUBLIC comrade_compat)
+
+#
+# A command running on its own terminal: forkpty plus /bin/sh, or a
+# pseudoconsole plus CreateProcess. Both the SSH server and the host's local
+# attach drive one, and neither contains a platform #ifdef because of this.
+# The Windows side brings its process helpers and the tmux search with it.
+#
+if(WIN32)
+	add_library(comrade_cpty STATIC
+		src/cpty_win.c src/win_proc.c src/tmuxpath.c)
+else()
+	add_library(comrade_cpty STATIC src/cpty_posix.c)
+endif()
+target_include_directories(comrade_cpty PUBLIC src)
+target_link_libraries(comrade_cpty PUBLIC comrade_compat comrade_dbg)
 
 add_library(comrade_termfilter STATIC src/termfilter.c)
 target_include_directories(comrade_termfilter PUBLIC src)
@@ -466,7 +483,7 @@ if(LIBSSH_FOUND)
 	# The message-based libssh server API is deprecated in favour of the
 	# callback API but is clearer and fully functional; migrate later.
 	target_compile_options(comrade_ssh PRIVATE -Wno-deprecated-declarations)
-	target_link_libraries(comrade_ssh PUBLIC comrade_token comrade_statusbar comrade_dbg comrade_termfilter comrade_fwdspec comrade_compat PkgConfig::LIBSSH Threads::Threads)
+	target_link_libraries(comrade_ssh PUBLIC comrade_token comrade_statusbar comrade_dbg comrade_termfilter comrade_fwdspec comrade_compat comrade_cpty PkgConfig::LIBSSH Threads::Threads)
 	find_library(COMRADE_UTIL util)
 	if(COMRADE_UTIL)
 		target_link_libraries(comrade_ssh PUBLIC ${COMRADE_UTIL})

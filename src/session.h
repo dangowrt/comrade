@@ -111,7 +111,7 @@ struct session_cfg {
 	 * than leaving it hanging -- the `tmux attach` command does not reliably
 	 * exit on its own when the session dies. 0 disables it.
 	 */
-	int ssh_end_fd;
+	sock_t ssh_end_fd;
 	/*
 	 * Where to write the one-line connection status (host only): the operator
 	 * runs in a separate process from this service, so it reads the line from

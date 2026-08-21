@@ -102,6 +102,13 @@ typedef int sock_t;
 #define sock_valid(s) ((s) != INVALID_SOCK)
 
 /*
+ * Optional socket fields (sshd_opts.end_fd, .ctl_fd, ...) are left zero by the
+ * memset that clears their struct, and zero means "none". `fd > 0` used to say
+ * that; on Windows SOCKET is unsigned, so it says almost nothing. This does.
+ */
+#define sock_isset(s) ((s) != 0 && sock_valid(s))
+
+/*
  * Winsock needs an explicit per-process start; the count is kept internally so
  * every entry point can call this without coordinating. No-op on POSIX.
  */

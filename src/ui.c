@@ -21,17 +21,20 @@
 #include "ui.h"
 #include "wsock.h"
 
-#ifndef _WIN32
 #include <signal.h>
+#ifndef _WIN32
 #include <unistd.h>
 #endif
 
-#ifndef _WIN32
-/* Set by SIGINT/SIGTERM while the host foreground waits, so it aborts cleanly
- * (terminal restored, service torn down) instead of dying mid-raw-mode. */
+/*
+ * Set by SIGINT/SIGTERM while the host foreground waits, so it aborts cleanly
+ * (terminal restored, service torn down) instead of dying mid-raw-mode.
+ * Windows has SIGINT too -- the CRT raises it from the console control handler,
+ * on its own thread -- and the wait loop is a 100 ms poll that notices the flag
+ * on its next turn, so one flag serves both. SIGTERM does not exist there.
+ */
 static volatile sig_atomic_t ui_abort_flag;
 static void ui_on_signal(int n) { (void)n; ui_abort_flag = 1; }
-#endif
 
 #define RST "\033[0m"
 #define GRN "\033[32m"
@@ -77,7 +80,7 @@ struct ui {
 	int raw;
 };
 
-struct ui_emit { int fd; };
+struct ui_emit { sock_t fd; };
 
 static uint64_t now_ms(void)
 {
@@ -661,65 +664,72 @@ void ui_bind(struct ui *u, struct session_obs *obs)
 	obs->tick = cb_tick;
 }
 
-/* ---- host service side: serialise events to the foreground pipe ---- */
-
-#ifdef _WIN32
+/* ---- host service side: serialise events to the foreground channel ---- */
 
 /*
- * The emitter feeds the host service's foreground process down a pipe, and
- * the host is not built on Windows yet (see host.c). Nothing else calls it.
+ * One line per event, written to the socket the foreground reads. This was
+ * dprintf() on a pipe; the channel is a socket now (the service is a separate
+ * *process* on Windows, not a fork, and the only handle both ends can poll is
+ * a socket), and Windows has no dprintf and no write() that can see a SOCKET.
+ * Same wire format, same one-line-per-event framing.
  */
-void ui_emitter(struct session_obs *obs, int fd)
+static void emitf(void *a, const char *fmt, ...)
 {
-	(void)fd;
-	memset(obs, 0, sizeof(*obs));
-}
+	struct ui_emit *e = a;
+	char line[512];
+	va_list ap;
+	int n;
 
-#else /* !_WIN32 */
+	va_start(ap, fmt);
+	n = vsnprintf(line, sizeof(line), fmt, ap);
+	va_end(ap);
+	if (n > 0)
+		sock_write(e->fd, line, (size_t)(n < (int)sizeof(line)
+						 ? n : (int)sizeof(line) - 1));
+}
 
 static void em_net(void *a, int f, int sc, int v, const char *ad)
 {
-	dprintf(((struct ui_emit *)a)->fd, "N %d %d %d %s\n", f, sc, v, ad);
+	emitf(a, "N %d %d %d %s\n", f, sc, v, ad);
 }
 static void em_link(void *a, const char *n, int h4, int h6)
 {
-	dprintf(((struct ui_emit *)a)->fd, "I %d %d %s\n", h4, h6, n);
+	emitf(a, "I %d %d %s\n", h4, h6, n);
 }
 static void em_rdv(void *a, int f, const char *ad, int rd)
 {
-	dprintf(((struct ui_emit *)a)->fd, "R %d %d %s\n", f, rd, ad);
+	emitf(a, "R %d %d %s\n", f, rd, ad);
 }
 static void em_rdv_stage(void *a, int f, int st)
 {
-	dprintf(((struct ui_emit *)a)->fd, "G %d %d\n", f, st);
+	emitf(a, "G %d %d\n", f, st);
 }
 static void em_token(void *a, const char *t)
 {
-	dprintf(((struct ui_emit *)a)->fd, "T %s\n", t);
+	emitf(a, "T %s\n", t);
 }
 static void em_peer(void *a, int id, int s, const char *ad)
 {
-	dprintf(((struct ui_emit *)a)->fd, "P %d %d %s\n", id, s,
-		ad && ad[0] ? ad : "-");
+	emitf(a, "P %d %d %s\n", id, s, ad && ad[0] ? ad : "-");
 }
 static void em_reset(void *a)
 {
-	dprintf(((struct ui_emit *)a)->fd, "X\n");
+	emitf(a, "X\n");
 }
 static void em_net_reset(void *a)
 {
-	dprintf(((struct ui_emit *)a)->fd, "Y\n");
+	emitf(a, "Y\n");
 }
 static void em_esc(void *a, const char *w)
 {
-	dprintf(((struct ui_emit *)a)->fd, "E %s\n", w);
+	emitf(a, "E %s\n", w);
 }
 static void em_live(void *a)
 {
-	dprintf(((struct ui_emit *)a)->fd, "L\n");
+	emitf(a, "L\n");
 }
 
-void ui_emitter(struct session_obs *obs, int fd)
+void ui_emitter(struct session_obs *obs, sock_t fd)
 {
 	struct ui_emit *e = malloc(sizeof(*e));	/* lives until the service exits */
 
@@ -741,32 +751,13 @@ void ui_emitter(struct session_obs *obs, int fd)
 	/* tick is local to the view; the foreground animates on its own clock */
 }
 
-#endif /* _WIN32 */
-
 void ui_emitter_token(const struct session_obs *obs, const char *token_str)
 {
 	if (obs && obs->token)
 		obs->token(obs->arg, token_str);
 }
 
-/* ---- host foreground side: render pipe events, wait for the operator ---- */
-
-#ifdef _WIN32
-
-/*
- * Host-only: this half renders the host service's status pipe alongside local
- * keystrokes, and neither the split-process host nor its pipe exists on
- * Windows yet (hosting is a later phase -- see host.c). Nothing on the client
- * path reaches it.
- */
-int ui_host_wait(struct ui *u, int fd)
-{
-	(void)u;
-	(void)fd;
-	return -1;
-}
-
-#else /* !_WIN32 */
+/* ---- host foreground side: render service events, wait for the operator ---- */
 
 static void feed(struct ui *u, char *ln)
 {
@@ -838,30 +829,39 @@ static void raw_off(struct ui *u)
 	}
 }
 
-int ui_host_wait(struct ui *u, int fd)
+int ui_host_wait(struct ui *u, sock_t fd)
 {
 	char buf[1024];
 	int len = 0, result = 0, eof = 0, stdin_ok = 1;
-	struct sigaction sa, oint, oterm;
+	void (*oint)(int);
+#ifdef SIGTERM
+	void (*oterm)(int);
+#endif
+	/* The local keyboard, as something poll can see: a real descriptor on
+	 * POSIX, a socket fed by the console pump thread on Windows (tty.h). */
+	sock_t kbd = tty_sock_in();
 
 	ui_abort_flag = 0;
-	memset(&sa, 0, sizeof(sa));
-	sa.sa_handler = ui_on_signal;		/* no SA_RESTART: poll gets EINTR */
-	sigaction(SIGINT, &sa, &oint);
-	sigaction(SIGTERM, &sa, &oterm);
+	oint = signal(SIGINT, ui_on_signal);
+#ifdef SIGTERM
+	oterm = signal(SIGTERM, ui_on_signal);
+#endif
 
 	raw_on(u);
 	repaint(u);
 	while (!eof) {
 		struct pollfd fds[2];
+		nfds_t nfds = 1;
 
 		fds[0].fd = fd;
 		fds[0].events = POLLIN;
 		fds[0].revents = 0;
-		fds[1].fd = stdin_ok ? STDIN_FILENO : -1;
+		fds[1].fd = kbd;
 		fds[1].events = POLLIN;
 		fds[1].revents = 0;
-		poll(fds, 2, 100);
+		if (stdin_ok && sock_valid(kbd))
+			nfds = 2;
+		sock_poll(fds, nfds, 100);
 
 		if (ui_abort_flag) {		/* Ctrl-C / SIGTERM */
 			result = -1;
@@ -869,7 +869,8 @@ int ui_host_wait(struct ui *u, int fd)
 		}
 		/* POLLHUP without POLLIN signals the service closed the pipe. */
 		if (fds[0].revents & (POLLIN | POLLHUP | POLLERR)) {
-			int got = (int)read(fd, buf + len, sizeof(buf) - 1 - len);
+			int got = (int)sock_read(fd, buf + len,
+						 sizeof(buf) - 1 - len);
 
 			if (got <= 0)
 				eof = 1;
@@ -886,9 +887,9 @@ int ui_host_wait(struct ui *u, int fd)
 				}
 			}
 		}
-		if (fds[1].revents & POLLIN) {
+		if (fds[1].revents & (POLLIN | POLLHUP | POLLERR)) {
 			char c;
-			int got = (int)read(STDIN_FILENO, &c, 1);
+			int got = (int)sock_read(kbd, &c, 1);
 
 			if (got == 0) {
 				stdin_ok = 0;		/* EOF: stop watching it */
@@ -914,8 +915,10 @@ int ui_host_wait(struct ui *u, int fd)
 		}
 	}
 	raw_off(u);
-	sigaction(SIGINT, &oint, NULL);
-	sigaction(SIGTERM, &oterm, NULL);
+	signal(SIGINT, oint);
+#ifdef SIGTERM
+	signal(SIGTERM, oterm);
+#endif
 	if (result == 1) {
 		zap(u, 1);			/* same TX-noise entry as the client */
 	} else if (u->anim) {
@@ -924,8 +927,6 @@ int ui_host_wait(struct ui *u, int fd)
 	}
 	return result;
 }
-
-#endif /* _WIN32 */
 
 /* ---- lifecycle ---- */
 
