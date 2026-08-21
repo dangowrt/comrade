@@ -357,6 +357,123 @@ int main(void)
 		assert(mailbox_client_should_claim(&probe));
 	}
 
+	/* ---- 4. Withdraw, three-way race, reconnect re-claim ---- */
+
+	/* Withdraw: a client that stops advertising declines an otherwise free
+	 * slot, so a slot the host frees is not auto-reclaimed; a later set_mine
+	 * re-arms the claim. */
+	{
+		struct mailbox c;
+
+		mailbox_init(&c, 0);
+		mailbox_set_mine(&c, ANS1, sizeof(ANS1));
+		mailbox_parse(&c, offv, offlen);
+		assert(mailbox_client_should_claim(&c));	/* armed: would claim */
+		mailbox_withdraw(&c);
+		assert(!mailbox_client_should_claim(&c));	/* withdrawn: stands down */
+		assert(mailbox_claim_status(&c) == MAILBOX_CLAIM_FREE);	/* slot free */
+		mailbox_set_mine(&c, ANS1, sizeof(ANS1));	/* re-arm */
+		assert(mailbox_client_should_claim(&c));
+	}
+
+	/* Three claimants, one empty slot: exactly one write lands, the other two
+	 * lose the CAS and, on re-read, see BUSY and back off. The host then
+	 * releases and the two remaining race the freed slot; again exactly one
+	 * lands. Admit-one-per-cycle holds for N > 2. */
+	{
+		struct store st;
+		struct mailbox c1, c2, c3, hst, probe;
+		uint8_t free_v[64], hw[BEP44_MAX_VALUE], snap[BEP44_MAX_VALUE];
+		size_t free_len, hlen, snaplen;
+		int r1, r2, r3, wins, losers;
+		int64_t read_seq;
+
+		mailbox_init(&hst, 1);
+		mailbox_set_mine(&hst, OFFER_E, sizeof(OFFER_E));
+		free_len = offer_only(free_v, sizeof(free_v), OFFER_E,
+				      sizeof(OFFER_E));
+		store_seed(&st, free_v, free_len, 10);
+
+		/* All three GET the same free state at seq 10. */
+		mailbox_init(&c1, 0);
+		mailbox_set_mine(&c1, ANS1, sizeof(ANS1));
+		mailbox_parse(&c1, st.v, st.len);
+		mailbox_init(&c2, 0);
+		mailbox_set_mine(&c2, ANS2, sizeof(ANS2));
+		mailbox_parse(&c2, st.v, st.len);
+		mailbox_init(&c3, 0);
+		mailbox_set_mine(&c3, ANS3, sizeof(ANS3));
+		mailbox_parse(&c3, st.v, st.len);
+		read_seq = st.seq;
+		assert(mailbox_claim_status(&c1) == MAILBOX_CLAIM_FREE);
+		assert(mailbox_claim_status(&c2) == MAILBOX_CLAIM_FREE);
+		assert(mailbox_claim_status(&c3) == MAILBOX_CLAIM_FREE);
+
+		r1 = client_claim(&st, &c1, free_v, free_len, read_seq);
+		r2 = client_claim(&st, &c2, free_v, free_len, read_seq);
+		r3 = client_claim(&st, &c3, free_v, free_len, read_seq);
+		wins = (r1 == 0) + (r2 == 0) + (r3 == 0);
+		losers = (r1 == -1) + (r2 == -1) + (r3 == -1);
+		assert(wins == 1 && losers == 2);	/* exactly one admitted */
+		assert(st.seq == 11);
+
+		/* The two losers re-GET the now-busy state and stand down. */
+		mailbox_parse(&c2, st.v, st.len);
+		mailbox_parse(&c3, st.v, st.len);
+		assert(mailbox_claim_status(&c2) == MAILBOX_CLAIM_BUSY);
+		assert(mailbox_claim_status(&c3) == MAILBOX_CLAIM_BUSY);
+		assert(!mailbox_client_should_claim(&c2));
+		assert(!mailbox_client_should_claim(&c3));
+
+		/* Host picks up the winner and releases: fresh offer, 'a' cleared. */
+		read_seq = st.seq;
+		mailbox_set_mine(&hst, OFFER_E1, sizeof(OFFER_E1));
+		mailbox_arm_release(&hst);
+		assert(mailbox_merge(&hst, st.v, st.len, hw, &hlen, sizeof(hw)) == 0);
+		assert(store_put(&st, hw, hlen, read_seq + 1, read_seq) == 0);
+		mailbox_init(&probe, 1);
+		mailbox_parse(&probe, st.v, st.len);
+		assert(probe.slot_a_len == 0);
+
+		/* The two remaining race the freed slot from one snapshot: one lands. */
+		mailbox_parse(&c2, st.v, st.len);
+		mailbox_parse(&c3, st.v, st.len);
+		assert(mailbox_claim_status(&c2) == MAILBOX_CLAIM_FREE);
+		assert(mailbox_claim_status(&c3) == MAILBOX_CLAIM_FREE);
+		read_seq = st.seq;
+		memcpy(snap, st.v, st.len);
+		snaplen = st.len;
+		r2 = client_claim(&st, &c2, snap, snaplen, read_seq);
+		r3 = client_claim(&st, &c3, snap, snaplen, read_seq);
+		assert((r2 == 0) + (r3 == 0) == 1);
+		assert((r2 == -1) + (r3 == -1) == 1);
+	}
+
+	/* Reconnect: a client whose answer was picked up and cleared re-enters the
+	 * claim loop against the current offer, exactly as a new joiner would
+	 *. */
+	{
+		struct mailbox c;
+		uint8_t held[64], freed[64];
+		size_t heldlen, freedlen;
+
+		/* The client holds the slot (its answer plus the offer it read). */
+		mailbox_init(&c, 0);
+		mailbox_set_mine(&c, ANS1, sizeof(ANS1));
+		mailbox_parse(&c, offv, offlen);
+		heldlen = mailbox_build(&c, held, sizeof(held));
+		mailbox_parse(&c, held, heldlen);
+		assert(mailbox_claim_status(&c) == MAILBOX_CLAIM_HELD);
+		assert(!mailbox_client_should_claim(&c));
+
+		/* Host releases: the offer stands, 'a' is gone. The same client now
+		 * sees FREE and re-claims without any special reconnect path. */
+		freedlen = offer_only(freed, sizeof(freed), OFFER_E, sizeof(OFFER_E));
+		mailbox_parse(&c, freed, freedlen);
+		assert(mailbox_claim_status(&c) == MAILBOX_CLAIM_FREE);
+		assert(mailbox_client_should_claim(&c));
+	}
+
 	printf("mailbox: all container, turnstile and CAS cases pass\n");
 	return 0;
 }

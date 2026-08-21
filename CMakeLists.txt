@@ -632,6 +632,18 @@ if(COMRADE_BUILD_TOOLS)
 		target_link_options(comrade-e2e PRIVATE -static)
 	endif()
 
+	# Concurrent multi-user e2e: one host, N clients racing the turnstile over
+	# the live DHT. Skipped unless COMRADE_E2E_NET=1 (see tests/multiuser.sh),
+	# so the offline suite is unaffected; the turnstile's race-freedom is
+	# proven deterministically by mailbox_test.
+	if(BUILD_TESTING AND UNIX)
+		add_test(NAME multiuser_e2e
+			COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/multiuser.sh
+				$<TARGET_FILE:comrade-e2e> 2)
+		set_tests_properties(multiuser_e2e PROPERTIES
+			SKIP_RETURN_CODE 77 TIMEOUT 300)
+
+	endif()
 endif()
 
 #
