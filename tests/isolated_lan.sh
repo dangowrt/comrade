@@ -1,19 +1,18 @@
 #!/bin/sh
 # Isolated-LAN token mint and connect.
 #
-# A host with no DHT (an isolated LAN) must mint and print a token, marked
-# TOKEN_FLAG_NODHT with the endpoint slots direct (EPx_RDV clear), and a client
-# must honour NODHT -- drop the DHT and find the host over multicast -- and
+# A host with no DHT (an isolated LAN) must mint and print a token with the
+# endpoint slots direct (EPx_RDV clear) and the retired NODHT bit clear, and a
+# client told to decline the DHT itself must find the host over multicast and
 # connect. This runs two same-host processes over real link-local multicast
 # (IP_MULTICAST_LOOP is set), which needs one up, multicast-capable, non-loopback
 # interface; where there is none the whole case SKIPs (exit 77).
 #
 # What this harness does NOT prove, and why: the plan's strict "zero DHT egress"
 # assertion needs a network namespace with no route (root/CAP_NET_ADMIN), which
-# is not available here. The client dropping SIG_DHT on a NODHT token is instead
-# guaranteed by construction (main.c / tools/e2e.c) and covered by the token-flag
-# assertion below; the no-egress guarantee is proven in the netns L2 run, whose
-# command is documented in the plan.
+# is not available here. Both ends here decline the DHT on the command line, the
+# operator's only opt-out; the no-egress guarantee is proven in the netns L2 run,
+# whose command is documented in the plan.
 #
 # Usage: isolated_lan.sh <path-to-comrade-e2e>
 set -u
@@ -51,18 +50,21 @@ while [ "$i" -lt 40 ]; do
 done
 if [ -z "$tok" ]; then echo "no token after ~20s"; cat "$tmp/host.err"; exit 1; fi
 
-# Assert the mint: NODHT set, and the endpoint slots are direct (EPx_RDV clear).
+# Assert the mint: the endpoint slots are direct (EPx_RDV clear), and no token
+# state tells the client to drop a transport (NODHT is retired).
 "$E2E" token "$tok" >"$tmp/flags.out" 2>&1
 cat "$tmp/flags.out"
-if ! grep -q 'nodht=1' "$tmp/flags.out"; then
-	echo "FAIL: token is not NODHT"; exit 1
+if ! grep -q 'nodht=0' "$tmp/flags.out"; then
+	echo "FAIL: token carries the retired NODHT bit"; exit 1
 fi
 if ! grep -q 'ep6_rdv=0 ep4_rdv=0' "$tmp/flags.out"; then
 	echo "FAIL: an endpoint slot is a rendezvous node, not a direct endpoint"; exit 1
 fi
 
-# The client honours NODHT automatically (drops the DHT); --mcast enables the LAN.
-"$E2E" client "$tok" --mcast --stun none --timeout 30 >"$tmp/client.out" 2>"$tmp/client.err" &
+# The client declines the DHT the way its operator would on an isolated LAN;
+# --mcast enables the LAN.
+"$E2E" client "$tok" --mcast --no-dht --stun none --timeout 30 \
+	>"$tmp/client.out" 2>"$tmp/client.err" &
 cpid=$!
 wait "$cpid"; crc=$?
 
@@ -74,5 +76,5 @@ fi
 if [ "$hrc" -ne 0 ]; then
 	echo "host did not exit cleanly:"; cat "$tmp/host.err"; exit 1
 fi
-echo "isolated-LAN e2e: NODHT token minted and an RFC1918 client connected"
+echo "isolated-LAN e2e: endpoint token minted and an RFC1918 client connected"
 exit 0

@@ -732,7 +732,7 @@ CLI surface:
 | `comrade stun-update` | refresh the baked STUN list into the data dir |
 | `-L [bind:]port:host:hostport` / `-R …` | forward a port (repeatable) |
 | `--no-multicast` | DHT/STUN only, skip link-local discovery |
-| `--no-dht` | decline the DHT entirely: link-local discovery only, and both token families settle to `NONE` (§3, §5) |
+| `--no-dht` | decline the DHT entirely: link-local discovery only, and both token families settle to `NONE` (§3, §5); refused with `--no-multicast`, which would leave nothing to meet on |
 | `--no-forwarding` | host declines all client forwards |
 | `-v`, `--verbose` | log lines instead of the dashboard |
 

@@ -30,7 +30,7 @@ typedef void lanlink_recv_cb(void *arg, const struct sockaddr *src,
 
 /*
  * port: the UDP port to bind, or 0 for an ephemeral one. A host that carries a
- * NODHT endpoint token forward across re-serves asks for that token's port so
+ * direct endpoint token forward across re-serves asks for that token's port so
  * the already-printed token stays valid; if it is taken the bind falls back to
  * ephemeral (the caller then re-mints).
  */

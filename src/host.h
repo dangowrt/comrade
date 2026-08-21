@@ -4,8 +4,11 @@
 #ifndef COMRADE_HOST_H
 #define COMRADE_HOST_H
 
-/* ui_mode: UI_AUTO / UI_VERBOSE (see ui.h); no_mcast: drop link-local discovery */
-int host_run(int ui_mode, int no_mcast, int no_fwd);
+/*
+ * ui_mode: UI_AUTO / UI_VERBOSE (see ui.h); no_mcast: drop link-local
+ * discovery; no_dht: drop the DHT, leaving link-local discovery alone.
+ */
+int host_run(int ui_mode, int no_mcast, int no_dht, int no_fwd);
 int host_show(void);
 
 #ifdef _WIN32

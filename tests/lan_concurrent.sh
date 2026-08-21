@@ -49,12 +49,13 @@ if [ -z "$tok" ]; then echo "no token after ~30s"; cat "$tmp/host.err"; exit 1; 
 
 # Assert the isolated mint, then launch N clients at once against the one token.
 "$E2E" token "$tok"
-"$E2E" token "$tok" | grep -q 'nodht=1' || { echo "FAIL: token not NODHT"; exit 1; }
+"$E2E" token "$tok" | grep -q 'ep6_rdv=0 ep4_rdv=0' ||
+	{ echo "FAIL: token is not a direct endpoint mint"; exit 1; }
 
 j=0
 while [ "$j" -lt "$N" ]; do
-	"$E2E" client "$tok" --mcast --stun none --hold-ms 1500 --timeout 40 \
-		>"$tmp/c$j.out" 2>"$tmp/c$j.err" &
+	"$E2E" client "$tok" --mcast --no-dht --stun none --hold-ms 1500 \
+		--timeout 40 >"$tmp/c$j.out" 2>"$tmp/c$j.err" &
 	cpids="$cpids $!"
 	j=$((j + 1))
 done

@@ -70,8 +70,8 @@ static void on_rendezvous(void *arg, const struct sockaddr *sa, socklen_t len)
 	print_token();
 }
 
-/* Isolated-LAN sibling: embed our own direct endpoint (EPx_RDV clear), mark the
- * token NODHT, and print it. Proves the B2 mint path from the harness. */
+/* Isolated-LAN sibling: embed our own direct endpoint (EPx_RDV clear) and print
+ * it. Proves the B2 mint path from the harness. */
 static void on_endpoint(void *arg, const struct sockaddr *sa, socklen_t len)
 {
 	(void)arg;
@@ -91,13 +91,13 @@ static void on_endpoint(void *arg, const struct sockaddr *sa, socklen_t len)
 		host.tok.ep4_port = ntohs(a->sin_port);
 		host.tok.flags &= ~TOKEN_FLAG_EP4_RDV;
 	}
-	host.tok.flags |= TOKEN_FLAG_NODHT;
-	fprintf(stderr, "[e2e] isolated LAN: own endpoint embedded, NODHT set\n");
+	fprintf(stderr, "[e2e] isolated LAN: own endpoint embedded\n");
 	print_token();
 }
 
 /* `comrade-e2e token <TOKEN>`: decode and print the token's flags/endpoints in a
- * greppable form, so the shell harness can assert the mint (NODHT, EPx_RDV). */
+ * greppable form, so the shell harness can assert the mint (EPx_RDV, and that
+ * the retired NODHT bit stays clear). */
 static int inspect_token(const char *s)
 {
 	struct token t;
@@ -239,10 +239,6 @@ int main(int argc, char **argv)
 		cfg.on_rendezvous = on_rendezvous;
 		cfg.on_endpoint = on_endpoint;
 	} else {
-		/* Honour a NODHT token exactly as the product client does: the host
-		 * is not on the DHT, so drop the dead path and find it over mcast. */
-		if (cfg.tok.flags & TOKEN_FLAG_NODHT)
-			cfg.sig_flags &= ~SIG_DHT;
 		for (k = 0; k < SSH_NONCE; k++)
 			tx[k] = (uint8_t)(k * 97 + 13);
 		cfg.interactive = 0;

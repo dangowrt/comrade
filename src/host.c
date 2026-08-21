@@ -552,13 +552,12 @@ static void on_rendezvous(void *arg, const struct sockaddr *sa, socklen_t len)
 		v->tok.ep4_port = ntohs(a->sin_port);
 		v->tok.flags |= TOKEN_FLAG_EP4_RDV;
 	}
-	v->tok.flags &= ~TOKEN_FLAG_NODHT;
 	svc_emit_token(v);
 }
 
 /* The isolated-LAN sibling of on_rendezvous: embed our own direct endpoint for
- * the family (EPx_RDV clear). A token skips the DHT only when no family has a
- * rendezvous node. */
+ * the family (EPx_RDV clear), which the client reaches over the LAN while it
+ * keeps looking for the same host on the DHT. */
 static void on_endpoint(void *arg, const struct sockaddr *sa, socklen_t len)
 {
 	struct svc *v = arg;
@@ -577,16 +576,13 @@ static void on_endpoint(void *arg, const struct sockaddr *sa, socklen_t len)
 		v->tok.ep4_port = ntohs(a->sin_port);
 		v->tok.flags &= ~TOKEN_FLAG_EP4_RDV;
 	}
-	if (v->tok.flags & (TOKEN_FLAG_EP6_RDV | TOKEN_FLAG_EP4_RDV))
-		v->tok.flags &= ~TOKEN_FLAG_NODHT;
-	else
-		v->tok.flags |= TOKEN_FLAG_NODHT;
 	svc_emit_token(v);
 }
 
 /* The backgrounded connection service: serve the shared tmux over the punched
  * link, again after each client, until the tmux server is gone. */
-static void run_service(struct svc *v, void *hostkey, int wfd, int no_mcast)
+static void run_service(struct svc *v, void *hostkey, int wfd, int no_mcast,
+			int no_dht)
 {
 	char cmd[600];
 	char cmd_ro[600];
@@ -615,7 +611,7 @@ static void run_service(struct svc *v, void *hostkey, int wfd, int no_mcast)
 	memset(&cfg, 0, sizeof(cfg));
 	cfg.is_host = 1;
 	cfg.tok = v->tok;
-	cfg.sig_flags = SIG_DHT | (no_mcast ? 0 : SIG_MCAST);
+	cfg.sig_flags = (no_dht ? 0 : SIG_DHT) | (no_mcast ? 0 : SIG_MCAST);
 	cfg.stun_port = 3478;
 	cfg.stun_auto = 1;
 	cfg.log_level = -1;
@@ -661,7 +657,7 @@ static void teardown(pid_t svc, const char *sock, const char *tokfile)
 	unlink(sock);
 }
 
-static int start_new(int ui_mode, int no_mcast, int no_fwd)
+static int start_new(int ui_mode, int no_mcast, int no_dht, int no_fwd)
 {
 	struct svc v;
 	char id[ID_LEN + 1];
@@ -727,7 +723,8 @@ static int start_new(int ui_mode, int no_mcast, int no_fwd)
 	}
 	if (pid == 0) {
 		close(pfd[0]);
-		run_service(&v, hostkey, pfd[1], no_mcast);	/* never returns */
+		/* never returns */
+		run_service(&v, hostkey, pfd[1], no_mcast, no_dht);
 	}
 	close(pfd[1]);
 	sshd_hostkey_free(hostkey);		/* the service has its own copy */
@@ -760,7 +757,7 @@ static int start_new(int ui_mode, int no_mcast, int no_fwd)
 	return 1;
 }
 
-int host_run(int ui_mode, int no_mcast, int no_fwd)
+int host_run(int ui_mode, int no_mcast, int no_dht, int no_fwd)
 {
 	char id[ID_LEN + 1];
 	int rc;
@@ -774,7 +771,7 @@ int host_run(int ui_mode, int no_mcast, int no_fwd)
 		} while (rc == 2);
 		return rc;
 	}
-	return start_new(ui_mode, no_mcast, no_fwd);
+	return start_new(ui_mode, no_mcast, no_dht, no_fwd);
 }
 
 int host_show(void)

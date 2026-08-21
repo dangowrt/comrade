@@ -67,6 +67,7 @@ struct svc {
 	char statusfile[512];
 	int no_fwd;
 	int no_mcast;
+	int no_dht;
 	struct session_obs obs;		/* view-event emitter to the foreground */
 };
 
@@ -457,13 +458,12 @@ static void on_rendezvous(void *arg, const struct sockaddr *sa, socklen_t len)
 		v->tok.ep4_port = ntohs(a->sin_port);
 		v->tok.flags |= TOKEN_FLAG_EP4_RDV;
 	}
-	v->tok.flags &= ~TOKEN_FLAG_NODHT;
 	svc_emit_token(v);
 }
 
 /* The isolated-LAN sibling of on_rendezvous: embed our own direct endpoint for
- * the family (EPx_RDV clear). A token skips the DHT only when no family has a
- * rendezvous node. */
+ * the family (EPx_RDV clear), which the client reaches over the LAN while it
+ * keeps looking for the same host on the DHT. */
 static void on_endpoint(void *arg, const struct sockaddr *sa, socklen_t len)
 {
 	struct svc *v = arg;
@@ -482,10 +482,6 @@ static void on_endpoint(void *arg, const struct sockaddr *sa, socklen_t len)
 		v->tok.ep4_port = ntohs(a->sin_port);
 		v->tok.flags &= ~TOKEN_FLAG_EP4_RDV;
 	}
-	if (v->tok.flags & (TOKEN_FLAG_EP6_RDV | TOKEN_FLAG_EP4_RDV))
-		v->tok.flags &= ~TOKEN_FLAG_NODHT;
-	else
-		v->tok.flags |= TOKEN_FLAG_NODHT;
 	svc_emit_token(v);
 }
 
@@ -507,7 +503,7 @@ static void run_service(struct svc *v, void *hostkey, sock_t wfd)
 	memset(&cfg, 0, sizeof(cfg));
 	cfg.is_host = 1;
 	cfg.tok = v->tok;
-	cfg.sig_flags = SIG_DHT | (v->no_mcast ? 0 : SIG_MCAST);
+	cfg.sig_flags = (v->no_dht ? 0 : SIG_DHT) | (v->no_mcast ? 0 : SIG_MCAST);
 	cfg.stun_port = 3478;
 	cfg.stun_auto = 1;
 	cfg.log_level = -1;
@@ -591,8 +587,9 @@ static int send_state(sock_t s, const struct svc *v, void *hostkey)
 	if (!blob)
 		goto out;
 	n = snprintf(blob, cap, "%s\nsock %s\ntok %s\nstatus %s\n"
-		     "nofwd %d\nnomcast %d\ntoken ", SVC_MAGIC, v->sock,
-		     v->tokfile, v->statusfile, v->no_fwd, v->no_mcast);
+		     "nofwd %d\nnomcast %d\nnodht %d\ntoken ", SVC_MAGIC,
+		     v->sock, v->tokfile, v->statusfile, v->no_fwd,
+		     v->no_mcast, v->no_dht);
 	if (n < 0 || (size_t)n >= cap)
 		goto out;
 	hex_encode(&v->tok, sizeof(v->tok), blob + n);
@@ -662,6 +659,8 @@ static void *recv_state(sock_t s, struct svc *v)
 			v->no_fwd = atoi(line + 6);
 		else if (!strncmp(line, "nomcast ", 8))
 			v->no_mcast = atoi(line + 8);
+		else if (!strncmp(line, "nodht ", 6))
+			v->no_dht = atoi(line + 6);
 		else if (!strncmp(line, "token ", 6)) {
 			if (strlen(line + 6) < sizeof(v->tok) * 2 ||
 			    hex_decode(line + 6, &v->tok, sizeof(v->tok)))
@@ -790,7 +789,7 @@ static int start_tmux(const struct svc *v)
 	return 0;
 }
 
-static int start_new(int ui_mode, int no_mcast, int no_fwd)
+static int start_new(int ui_mode, int no_mcast, int no_dht, int no_fwd)
 {
 	struct svc v;
 	char id[ID_LEN + 1], hnum[32];
@@ -809,6 +808,7 @@ static int start_new(int ui_mode, int no_mcast, int no_fwd)
 	memset(&v, 0, sizeof(v));
 	v.no_fwd = no_fwd;
 	v.no_mcast = no_mcast;
+	v.no_dht = no_dht;
 	if (gen_id(id)) {
 		fprintf(stderr, "comrade: random generation failed\n");
 		return 1;
@@ -901,7 +901,7 @@ static int start_new(int ui_mode, int no_mcast, int no_fwd)
 	return 1;
 }
 
-int host_run(int ui_mode, int no_mcast, int no_fwd)
+int host_run(int ui_mode, int no_mcast, int no_dht, int no_fwd)
 {
 	char id[ID_LEN + 1];
 	int rc;
@@ -915,7 +915,7 @@ int host_run(int ui_mode, int no_mcast, int no_fwd)
 		} while (rc == 2);
 		return rc;
 	}
-	return start_new(ui_mode, no_mcast, no_fwd);
+	return start_new(ui_mode, no_mcast, no_dht, no_fwd);
 }
 
 static void show_one(const char *id, void *arg)

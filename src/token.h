@@ -55,7 +55,7 @@
 #define TOKEN_STR_LEN		(TOKEN_WIRE_LEN * 138 / 100 + 1)
 
 #define TOKEN_FLAG_RO		0x01	/* read-only credential */
-#define TOKEN_FLAG_NODHT	0x02	/* host is not on the DHT; do not query it */
+#define TOKEN_FLAG_NODHT	0x02	/* reserved, never set: no token state tells a peer to drop a transport */
 #define TOKEN_FLAG_EP6_RDV	0x04	/* ep6 slot is a rendezvous DHT node, not a direct endpoint */
 #define TOKEN_FLAG_EP4_RDV	0x08	/* ep4 slot is a rendezvous DHT node, not a direct endpoint */
 

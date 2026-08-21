@@ -34,6 +34,7 @@ static int usage(int ret)
 		"opts:  -v, --verbose      log lines instead of the dashboard\n"
 		"       -V, --version      print the version and exit\n"
 		"       --no-multicast     skip link-local discovery, DHT/STUN only\n"
+		"       --no-dht           skip the DHT, link-local discovery only\n"
 		"client: -L [bind:]port:host:hostport  forward a local port via the host\n"
 		"        -R [bind:]port:host:hostport  forward a host-side port back here\n"
 		"host:  --no-forwarding    decline all client port forwarding\n");
@@ -54,7 +55,7 @@ static int print_version(void)
 #define FWD_SPECS_MAX 8
 
 static int session_connect(const char *arg, int ui_mode, int no_mcast,
-			   const struct fwdspec *fwd_l, int nfwd_l,
+			   int no_dht, const struct fwdspec *fwd_l, int nfwd_l,
 			   const struct fwdspec *fwd_r, int nfwd_r)
 {
 	struct session_cfg cfg;
@@ -73,11 +74,11 @@ static int session_connect(const char *arg, int ui_mode, int no_mcast,
 	cfg.nfwd_r = nfwd_r;
 	/* Race the LAN (multicast) and the DHT: whichever reaches the host wins.
 	 * --no-multicast drops the LAN path, so two hosts on one segment can be
-	 * forced onto the DHT/STUN path for testing. A NODHT token means the host
-	 * is not on the DHT (isolated LAN); drop the dead DHT path and find it over
-	 * multicast. (NODHT with --no-multicast leaves nothing, and cannot connect.) */
-	cfg.sig_flags = ((cfg.tok.flags & TOKEN_FLAG_NODHT) ? 0 : SIG_DHT) |
-			(no_mcast ? 0 : SIG_MCAST);
+	 * forced onto the DHT/STUN path for testing, and --no-dht drops the DHT.
+	 * Only the operator drops a transport: a token saying the host was not on
+	 * the DHT when it was minted is no reason to stop running the one
+	 * rendezvous that survives either end moving off the LAN. */
+	cfg.sig_flags = (no_dht ? 0 : SIG_DHT) | (no_mcast ? 0 : SIG_MCAST);
 	cfg.stun_port = 3478;
 	cfg.stun_auto = 1;
 	cfg.log_level = -1;
@@ -128,7 +129,7 @@ int main(int argc, char **argv)
 	static struct fwdspec fwd_l[FWD_SPECS_MAX], fwd_r[FWD_SPECS_MAX];
 	static char stdout_buf[65536];
 	int nfwd_l = 0, nfwd_r = 0, no_fwd = 0;
-	int ui_mode = UI_AUTO, no_mcast = 0;
+	int ui_mode = UI_AUTO, no_mcast = 0, no_dht = 0;
 	const char *pos = NULL;
 	int i;
 
@@ -178,6 +179,8 @@ int main(int argc, char **argv)
 			ui_mode = UI_VERBOSE;
 		else if (!strcmp(argv[i], "--no-multicast"))
 			no_mcast = 1;
+		else if (!strcmp(argv[i], "--no-dht"))
+			no_dht = 1;
 		else if (!strcmp(argv[i], "--no-forwarding"))
 			no_fwd = 1;
 		else if (!strncmp(argv[i], "-L", 2)) {
@@ -194,13 +197,18 @@ int main(int argc, char **argv)
 			return usage(1);
 	}
 
+	if (no_mcast && no_dht) {
+		fprintf(stderr, "comrade: --no-multicast with --no-dht leaves no "
+			"way to reach a peer\n");
+		return usage(1);
+	}
 	if (!pos) {
 		if (nfwd_l || nfwd_r) {
 			fprintf(stderr, "comrade: -L/-R need a token "
 				"(they are client options)\n");
 			return usage(1);
 		}
-		return host_run(ui_mode, no_mcast, no_fwd);
+		return host_run(ui_mode, no_mcast, no_dht, no_fwd);
 	}
 	if (no_fwd) {
 		fprintf(stderr, "comrade: --no-forwarding is a host option\n");
@@ -217,6 +225,6 @@ int main(int argc, char **argv)
 			count, stunlist_path());
 		return 0;
 	}
-	return session_connect(pos, ui_mode, no_mcast,
+	return session_connect(pos, ui_mode, no_mcast, no_dht,
 			       fwd_l, nfwd_l, fwd_r, nfwd_r);
 }
