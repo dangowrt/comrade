@@ -10,6 +10,7 @@
 #include "stunlist.h"
 #include "token.h"
 #include "ui.h"			/* UI_* enums used by main() in every build */
+#include "wsock.h"		/* WSAStartup before any socket is created */
 
 #ifdef COMRADE_HAVE_SESSION
 #include "sig.h"
@@ -134,8 +135,18 @@ int main(int argc, char **argv)
 	/* Writes race teardown all over this program -- the ssh socketpair, the
 	 * forwarding bridges, the status pipe -- and a peer closing first must
 	 * never kill us outright. The host service already did this for itself;
-	 * do it once here so the client and every other path is covered too. */
+	 * do it once here so the client and every other path is covered too.
+	 * Windows has no SIGPIPE at all: a write to a dead peer just returns
+	 * WSAECONNRESET, which every caller here already handles. */
+#ifdef SIGPIPE
 	signal(SIGPIPE, SIG_IGN);
+#endif
+	/* Winsock needs starting before the first socket() anywhere, including
+	 * inside libjuice and libssh; ref-counted, so the modules may repeat it. */
+	if (wsock_init()) {
+		fprintf(stderr, "comrade: could not initialise networking\n");
+		return 1;
+	}
 
 	for (i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help"))
