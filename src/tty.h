@@ -41,8 +41,8 @@ struct tty_saved {
 int tty_raw_on(struct tty_saved *s, int full);
 void tty_raw_off(struct tty_saved *s);
 
-/* Terminal size in character cells; 0 on success, leaves *rows/*cols alone
- * otherwise. */
+/* Terminal size in character cells; 0 on success, leaving the outputs
+ * untouched otherwise. */
 int tty_size(int *rows, int *cols);
 
 int tty_isatty_in(void);

@@ -1,24 +1,22 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 /* Copyright (C) 2026 Daniel Golle <daniel@makrotopia.org> */
 
-#include <poll.h>
-#include <signal.h>
+#include "wsock.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <termios.h>
 #include <time.h>
-#include <unistd.h>
-#include <sys/ioctl.h>
 
 #include <libssh/libssh.h>
 
 #include "base64.h"
 #include "dbg.h"
+#include "oscompat.h"
 #include "sshc.h"
 #include "sshfwd.h"
 #include "statusbar.h"
 #include "termfilter.h"
+#include "tty.h"
 
 /*
  * stdin -> channel, replacing libssh's plain connector so we can filter the
@@ -44,7 +42,7 @@ static int on_stdin(socket_t fd, int revents, void *userdata)
 
 	if (!(revents & (POLLIN | POLLHUP | POLLERR)))
 		return 0;
-	n = read(fd, buf, sizeof(buf));
+	n = sock_read(fd, buf, sizeof(buf));
 	if (n <= 0) {
 		c->eof = 1;
 		return 0;
@@ -87,7 +85,7 @@ static void scroll_guard(int rows, int reserve, int on)
 		n = snprintf(buf, sizeof(buf), "\033[1;%dr", rows - 1);
 	else
 		n = snprintf(buf, sizeof(buf), "\033[r");
-	if (n > 0 && write(STDOUT_FILENO, buf, (size_t)n)) {
+	if (n > 0 && tty_write(buf, (size_t)n)) {
 		/* best effort */
 	}
 }
@@ -187,9 +185,7 @@ static int run_test(ssh_session s, ssh_channel chan, const struct sshc_opts *o)
 				ssh_event_dopoll(event, 50);
 				sshfwd_tick(fwd);
 			} else {
-				struct timespec ts = { 0, 50 * 1000 * 1000 };
-
-				nanosleep(&ts, NULL);
+				os_msleep(50);
 			}
 		}
 	}
@@ -198,14 +194,6 @@ out:
 	if (event)
 		ssh_event_free(event);
 	return rc;
-}
-
-static volatile sig_atomic_t g_winch;
-
-static void on_winch(int sig)
-{
-	(void)sig;
-	g_winch = 1;
 }
 
 /*
@@ -217,8 +205,7 @@ static void on_winch(int sig)
 static int run_interactive(ssh_session s, ssh_channel chan,
 			   const struct sshc_opts *o)
 {
-	struct termios orig, raw;
-	struct sigaction sa, old_winch;
+	struct tty_saved term;
 	int rows = 0, cols = 0, reserve = 0;
 	volatile int interrupted = 0, quit = 0;
 	int reconnect = 0;
@@ -232,32 +219,29 @@ static int run_interactive(ssh_session s, ssh_channel chan,
 	ssh_channel ctl = NULL;				/* comrade-ctl subsystem */
 	ssh_connector c_ctl_in = NULL, c_ctl_out = NULL;
 	struct sshfwd *fwd = NULL;			/* -L/-R forwarding */
-	int have_tty = isatty(STDIN_FILENO);
+	sock_t s_in = tty_sock_in(), s_out = tty_sock_out();
+	sock_t s_err = tty_sock_err();
+	int have_tty = tty_isatty_in();
 
 	if (!event || !c_out || !c_err)
 		goto out;
+	if (!sock_valid(s_in) || !sock_valid(s_out) || !sock_valid(s_err))
+		goto out;
 
-	if (have_tty && !tcgetattr(STDIN_FILENO, &orig)) {
-		raw = orig;
-		cfmakeraw(&raw);
-		tcsetattr(STDIN_FILENO, TCSANOW, &raw);
-	} else {
+	if (have_tty && tty_raw_on(&term, 1))
 		have_tty = 0;
-	}
-	memset(&sa, 0, sizeof(sa));
-	sa.sa_handler = on_winch;
-	sigaction(SIGWINCH, &sa, &old_winch);
+	tty_resize_watch(1);
 
 	/* Reserve the bottom row for our local status line, if requested and there
 	 * is room: the remote tmux was asked for a pty one row shorter, so it never
 	 * touches this row. */
 	memset(&prev, 0, sizeof(prev));
 	if (have_tty && o && o->status) {
-		struct winsize ws;
+		int r, c;
 
-		if (!ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) && ws.ws_row > 1) {
-			rows = ws.ws_row;
-			cols = ws.ws_col;
+		if (!tty_size(&r, &c) && r > 1) {
+			rows = r;
+			cols = c;
 			reserve = 1;
 		}
 	}
@@ -275,17 +259,17 @@ static int run_interactive(ssh_session s, ssh_channel chan,
 	sctx.interrupted = &interrupted;
 	sctx.quit = &quit;
 	ssh_connector_set_in_channel(c_out, chan, SSH_CONNECTOR_STDOUT);
-	ssh_connector_set_out_fd(c_out, STDOUT_FILENO);
+	ssh_connector_set_out_fd(c_out, s_out);
 	ssh_connector_set_in_channel(c_err, chan, SSH_CONNECTOR_STDERR);
-	ssh_connector_set_out_fd(c_err, STDERR_FILENO);
-	ssh_event_add_fd(event, STDIN_FILENO, POLLIN, on_stdin, &sctx);
+	ssh_connector_set_out_fd(c_err, s_err);
+	ssh_event_add_fd(event, s_in, POLLIN, on_stdin, &sctx);
 	ssh_event_add_connector(event, c_out);
 	ssh_event_add_connector(event, c_err);
 
 	/* Open the authenticated control plane alongside the shell: a second SSH
 	 * channel requesting the comrade-ctl subsystem, bridged to o->ctl_fd. The
 	 * session layer runs its liveness/rendezvous protocol over that fd. */
-	if (o && o->ctl_fd > 0) {
+	if (o && sock_valid(o->ctl_fd)) {
 		ctl = ssh_channel_new(s);
 		if (ctl && ssh_channel_open_session(ctl) == SSH_OK &&
 		    ssh_channel_request_subsystem(ctl, "comrade-ctl") == SSH_OK) {
@@ -323,20 +307,16 @@ static int run_interactive(ssh_session s, ssh_channel chan,
 		 * pause briefly rather than spin, and keep waiting for the channel.
 		 */
 		if (ssh_event_dopoll(event, 200) == SSH_ERROR) {
-			struct timespec ts = { 0, 100 * 1000 * 1000 };
-
-			nanosleep(&ts, NULL);
+			os_msleep(100);
 		}
 		sshfwd_tick(fwd);
-		if (g_winch) {
-			struct winsize ws;
+		if (tty_resized()) {
+			int r, c;
 
-			g_winch = 0;
-			if (have_tty && !ioctl(STDIN_FILENO, TIOCGWINSZ, &ws)) {
-				rows = ws.ws_row;
-				cols = ws.ws_col;
-				ssh_channel_change_pty_size(chan, ws.ws_col,
-							    ws.ws_row - reserve);
+			if (have_tty && !tty_size(&r, &c)) {
+				rows = r;
+				cols = c;
+				ssh_channel_change_pty_size(chan, c, r - reserve);
 				dbg_logf("sshc resize: rows=%d cols=%d "
 					 "(tmux gets %d rows)", rows, cols,
 					 rows - reserve);
@@ -358,7 +338,7 @@ static int run_interactive(ssh_session s, ssh_channel chan,
 				reconnect = 1;
 			if (reserve && (memcmp(&cur, &prev, sizeof(cur)) ||
 			    now - last_status > 2000)) {
-				statusbar_render(STDOUT_FILENO, rows, cols, &cur);
+				statusbar_render(rows, cols, &cur);
 				prev = cur;
 				last_status = now;
 			}
@@ -366,7 +346,7 @@ static int run_interactive(ssh_session s, ssh_channel chan,
 	}
 	sshfwd_destroy(fwd);
 	fwd = NULL;
-	ssh_event_remove_fd(event, STDIN_FILENO);
+	ssh_event_remove_fd(event, s_in);
 	ssh_event_remove_connector(event, c_out);
 	ssh_event_remove_connector(event, c_err);
 	if (c_ctl_in) {
@@ -383,13 +363,13 @@ static int run_interactive(ssh_session s, ssh_channel chan,
 		 * leave its alternate screen and reset attributes so the shell
 		 * comes back clean rather than on tmux's buffer. */
 		const char *cl = "\033[?1049l\033[0m";
-		ssize_t r = write(STDOUT_FILENO, cl, strlen(cl));
+		int r = tty_write(cl, strlen(cl));
 
 		(void)r;
 	}
-	sigaction(SIGWINCH, &old_winch, NULL);
+	tty_resize_watch(0);
 	if (have_tty)
-		tcsetattr(STDIN_FILENO, TCSANOW, &orig);
+		tty_raw_off(&term);
 	if (quit)
 		fprintf(stderr, "comrade: link lost -- disconnected.\n");
 out:
@@ -405,16 +385,19 @@ out:
 		ssh_connector_free(c_err);
 	if (event)
 		ssh_event_free(event);
+	/* Stops the console pump threads and closes their sockets; on POSIX the
+	 * standard descriptors are handed back untouched. */
+	tty_sock_release();
 	return reconnect ? SSHC_RECONNECT : 0;
 }
 
-int sshc_connect_fd(int fd, const struct sshc_opts *o)
+int sshc_connect_fd(sock_t fd, const struct sshc_opts *o)
 {
 	char password[64];
 	const char *host = "comrade";
 	ssh_session s = NULL;
 	ssh_channel chan = NULL;
-	int sock = fd;
+	socket_t sock = fd;
 	int rc = -1;
 
 	if (!o)
@@ -444,25 +427,22 @@ int sshc_connect_fd(int fd, const struct sshc_opts *o)
 	if (!chan || ssh_channel_open_session(chan) != SSH_OK)
 		goto out;
 	if (o->interactive) {
-		struct winsize ws;
 		const char *term = getenv("TERM");
+		int reserve, prows, rows, cols;
 
 		if (!term)
 			term = "xterm-256color";
-		int reserve, prows;
-
-		if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws)) {
-			ws.ws_col = 80;
-			ws.ws_row = 24;
+		if (tty_size(&rows, &cols)) {
+			rows = 24;
+			cols = 80;
 		}
 		/* Match run_interactive: a status line steals the bottom row. */
-		reserve = (o->status && isatty(STDIN_FILENO) &&
-			   ws.ws_row > 1) ? 1 : 0;
-		prows = ws.ws_row - reserve;
+		reserve = (o->status && tty_isatty_in() && rows > 1) ? 1 : 0;
+		prows = rows - reserve;
 		dbg_logf("sshc connect: term=%s rows=%d cols=%d reserve=%d "
-			 "-> request pty %dx%d", term, ws.ws_row, ws.ws_col,
-			 reserve, prows, ws.ws_col);
-		if (ssh_channel_request_pty_size(chan, term, ws.ws_col,
+			 "-> request pty %dx%d", term, rows, cols,
+			 reserve, prows, cols);
+		if (ssh_channel_request_pty_size(chan, term, cols,
 						 prows) != SSH_OK)
 			goto out;
 		if (ssh_channel_request_shell(chan) != SSH_OK)
@@ -490,7 +470,7 @@ out:
 	 * Closing it is also what signals end-of-session to the bridge on the
 	 * other end of the socketpair.
 	 */
-	if (sock >= 0)
-		close(sock);
+	if (sock_valid(sock))
+		sock_close(sock);
 	return rc;
 }

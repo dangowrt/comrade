@@ -17,6 +17,6 @@
  * `rows`) of the terminal on fd, truncated/padded to `cols`. Saves and restores
  * the cursor so the full-screen application above (tmux) is undisturbed.
  */
-void statusbar_render(int fd, int rows, int cols, const struct conn_status *st);
+void statusbar_render(int rows, int cols, const struct conn_status *st);
 
 #endif

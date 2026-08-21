@@ -2,9 +2,9 @@
 /* Copyright (C) 2026 Daniel Golle <daniel@makrotopia.org> */
 
 #include <stdio.h>
-#include <unistd.h>
 
 #include "statusbar.h"
+#include "tty.h"
 
 /* Above this smoothed RTT the bar goes amber to flag a sluggish link. */
 #define RTT_WARN_MS 250
@@ -41,7 +41,7 @@ static const char *state_sgr(const struct conn_status *st)
 	return "\033[44;97m";				/* blue bg: connecting */
 }
 
-void statusbar_render(int fd, int rows, int cols, const struct conn_status *st)
+void statusbar_render(int rows, int cols, const struct conn_status *st)
 {
 	char text[256], bar[256], out[400];
 	int p, w = cols, n;
@@ -75,7 +75,7 @@ void statusbar_render(int fd, int rows, int cols, const struct conn_status *st)
 	n = snprintf(out, sizeof(out), "\0337\033[%d;1H%s%s\033[0m\0338",
 		     rows, state_sgr(st), bar);
 	if (n > 0) {
-		ssize_t r = write(fd, out, (size_t)n);
+		int r = tty_write(out, (size_t)n);
 
 		(void)r;
 	}

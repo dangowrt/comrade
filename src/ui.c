@@ -10,23 +10,28 @@
  * nothing outside this file formats output.
  */
 
-#include <poll.h>
-#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/ioctl.h>
-#include <termios.h>
 #include <time.h>
-#include <unistd.h>
 
+#include "oscompat.h"
+#include "tty.h"
 #include "ui.h"
+#include "wsock.h"
 
+#ifndef _WIN32
+#include <signal.h>
+#include <unistd.h>
+#endif
+
+#ifndef _WIN32
 /* Set by SIGINT/SIGTERM while the host foreground waits, so it aborts cleanly
  * (terminal restored, service torn down) instead of dying mid-raw-mode. */
 static volatile sig_atomic_t ui_abort_flag;
 static void ui_on_signal(int n) { (void)n; ui_abort_flag = 1; }
+#endif
 
 #define RST "\033[0m"
 #define GRN "\033[32m"
@@ -68,7 +73,7 @@ struct ui {
 	int have_escalate;
 	int established;
 
-	struct termios saved;
+	struct tty_saved saved;
 	int raw;
 };
 
@@ -117,13 +122,13 @@ static void show_cursor(struct ui *u)
 
 static void winsize(struct ui *u)
 {
-	struct winsize ws;
+	int rows, cols;
 
 	u->rows = 24;
 	u->cols = 80;
-	if (!ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) && ws.ws_row && ws.ws_col) {
-		u->rows = ws.ws_row;
-		u->cols = ws.ws_col;
+	if (!tty_size(&rows, &cols)) {
+		u->rows = rows;
+		u->cols = cols;
 	}
 }
 
@@ -358,15 +363,6 @@ static void repaint(struct ui *u)
 
 /* ---- the power-on zap: character rows bloom from centre, flare, cut black --- */
 
-static void msleep(int ms)
-{
-	struct timespec ts;
-
-	ts.tv_sec = ms / 1000;
-	ts.tv_nsec = (long)(ms % 1000) * 1000000L;
-	nanosleep(&ts, NULL);
-}
-
 static void bar(int row, int cols, const char *sgr)
 {
 	printf("\033[%d;1H%s%*s" RST, row + 1, sgr, cols, "");
@@ -395,7 +391,7 @@ static void zap(struct ui *u, int snow)
 				fputs(RST, stdout);
 			}
 			fflush(stdout);
-			msleep(28);
+			os_msleep(28);
 		}
 	}
 
@@ -407,15 +403,15 @@ static void zap(struct ui *u, int snow)
 				printf("\033[%d;1H\033[K", y + 1);
 		}
 		fflush(stdout);
-		msleep(20);
+		os_msleep(20);
 	}
 	for (y = 0; y < u->rows; y++)		/* flare */
 		bar(y, u->cols, "\033[107m");
 	fflush(stdout);
-	msleep(70);
+	os_msleep(70);
 	fputs(RST "\033[2J\033[H", stdout);	/* cut to black */
 	fflush(stdout);
-	msleep(130);
+	os_msleep(130);
 }
 
 /* ---- model updates (shared by the inline client and the host foreground) --- */
@@ -667,6 +663,20 @@ void ui_bind(struct ui *u, struct session_obs *obs)
 
 /* ---- host service side: serialise events to the foreground pipe ---- */
 
+#ifdef _WIN32
+
+/*
+ * The emitter feeds the host service's foreground process down a pipe, and
+ * the host is not built on Windows yet (see host.c). Nothing else calls it.
+ */
+void ui_emitter(struct session_obs *obs, int fd)
+{
+	(void)fd;
+	memset(obs, 0, sizeof(*obs));
+}
+
+#else /* !_WIN32 */
+
 static void em_net(void *a, int f, int sc, int v, const char *ad)
 {
 	dprintf(((struct ui_emit *)a)->fd, "N %d %d %d %s\n", f, sc, v, ad);
@@ -731,6 +741,8 @@ void ui_emitter(struct session_obs *obs, int fd)
 	/* tick is local to the view; the foreground animates on its own clock */
 }
 
+#endif /* _WIN32 */
+
 void ui_emitter_token(const struct session_obs *obs, const char *token_str)
 {
 	if (obs && obs->token)
@@ -738,6 +750,23 @@ void ui_emitter_token(const struct session_obs *obs, const char *token_str)
 }
 
 /* ---- host foreground side: render pipe events, wait for the operator ---- */
+
+#ifdef _WIN32
+
+/*
+ * Host-only: this half renders the host service's status pipe alongside local
+ * keystrokes, and neither the split-process host nor its pipe exists on
+ * Windows yet (hosting is a later phase -- see host.c). Nothing on the client
+ * path reaches it.
+ */
+int ui_host_wait(struct ui *u, int fd)
+{
+	(void)u;
+	(void)fd;
+	return -1;
+}
+
+#else /* !_WIN32 */
 
 static void feed(struct ui *u, char *ln)
 {
@@ -795,22 +824,16 @@ static void feed(struct ui *u, char *ln)
 
 static void raw_on(struct ui *u)
 {
-	struct termios t;
-
-	if (!isatty(STDIN_FILENO) || tcgetattr(STDIN_FILENO, &u->saved))
-		return;
-	t = u->saved;
-	t.c_lflag &= ~(unsigned)(ICANON | ECHO);	/* keep ISIG for Ctrl-C */
-	t.c_cc[VMIN] = 1;
-	t.c_cc[VTIME] = 0;
-	if (!tcsetattr(STDIN_FILENO, TCSANOW, &t))
+	/* Not full raw: the host dashboard keeps signal generation so Ctrl-C
+	 * still aborts (see tty_raw_on). */
+	if (!tty_raw_on(&u->saved, 0))
 		u->raw = 1;
 }
 
 static void raw_off(struct ui *u)
 {
 	if (u->raw) {
-		tcsetattr(STDIN_FILENO, TCSANOW, &u->saved);
+		tty_raw_off(&u->saved);
 		u->raw = 0;
 	}
 }
@@ -902,6 +925,8 @@ int ui_host_wait(struct ui *u, int fd)
 	return result;
 }
 
+#endif /* _WIN32 */
+
 /* ---- lifecycle ---- */
 
 struct ui *ui_create(int role, int mode)
@@ -912,7 +937,7 @@ struct ui *ui_create(int role, int mode)
 		return NULL;
 	u->role = role;
 	u->stage4 = u->stage6 = -1;
-	u->anim = (mode != UI_VERBOSE) && isatty(STDOUT_FILENO);
+	u->anim = (mode != UI_VERBOSE) && tty_isatty_out();
 	u->start = now_ms();
 	u->last_spin = u->start;
 	srand((unsigned)u->start);

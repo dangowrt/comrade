@@ -10,6 +10,7 @@
 #include "conn.h"
 #include "fwdspec.h"
 #include "token.h"
+#include "wsock.h"
 
 /*
  * comrade SSH client. Connects over an already-connected byte stream, pins the
@@ -33,7 +34,7 @@ struct sshc_opts {
 	 * bridges it to this fd, carrying the session's control protocol inside
 	 * the authenticated SSH session. 0/-1 leaves the single-channel path.
 	 */
-	int ctl_fd;
+	sock_t ctl_fd;
 
 	/*
 	 * TCP port forwarding, OpenSSH semantics: fwd_l are -L specs (listen
@@ -86,6 +87,6 @@ struct sshc_opts {
  * failure including a host-key fingerprint mismatch (which is treated as a hard
  * error: a mismatch means a MITM, never a prompt).
  */
-int sshc_connect_fd(int fd, const struct sshc_opts *o);
+int sshc_connect_fd(sock_t fd, const struct sshc_opts *o);
 
 #endif

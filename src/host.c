@@ -471,7 +471,7 @@ static int attach(const char *id)
 		memset(&cur, 0, sizeof(cur));
 		conn_read(statuspath, &cur);	/* zeroed = "connecting" if absent */
 		if (memcmp(&cur, &prev, sizeof(cur)) || now - last_paint > 2000) {
-			statusbar_render(STDOUT_FILENO, rows, cols, &cur);
+			statusbar_render(rows, cols, &cur);
 			prev = cur;
 			last_paint = now;
 		}
