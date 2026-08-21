@@ -34,11 +34,15 @@
 # not a cryptographically signed commit -- `git commit --signoff` covers it.
 set -euo pipefail
 
-# Secrets pasted into GitHub's UI routinely pick up a trailing newline, which
-# is invisible in the guard step's -z check (the string is non-empty) but
-# breaks libcurl's URL parser once it lands in the x-access-token@ userinfo
-# below ("URL rejected: Malformed input to a URL function").
-OPENWRT_PACKAGES_TOKEN="$(printf '%s' "$OPENWRT_PACKAGES_TOKEN" | tr -d '\n\r')"
+# Secrets pasted into GitHub's UI routinely pick up stray whitespace -- a
+# trailing newline, a leading or trailing space -- invisible in the guard
+# step's -z check (the string is non-empty either way). gh's own API calls
+# below (PR lookup, release notes, PR create/edit) tolerate it fine, since it
+# just rides along inside an Authorization header; embedding the raw token in
+# a URL's userinfo further down does not, and libcurl rejects any whitespace
+# there outright ("URL rejected: Malformed input to a URL function"), not
+# only an embedded newline. Strip all whitespace, not just \n\r.
+OPENWRT_PACKAGES_TOKEN="$(printf '%s' "$OPENWRT_PACKAGES_TOKEN" | tr -d '[:space:]')"
 
 V="$VERSION"
 NAME="Daniel Golle"
