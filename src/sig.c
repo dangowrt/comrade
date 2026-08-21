@@ -27,6 +27,8 @@
 #define SIG_DHT_RESTORE_MS 8000		/* re-store backoff while a store's
 					 * k-close nodes are being validated */
 #define SIG_MCAST_ANN_MS 1000
+#define SIG_MCAST_OPEN_MS 1000		/* retry the link-local half this often
+					 * while no interface can carry it */
 #define SIG_DHT_GRACE_MS 2000
 #define SIG_LOCATE_BOTH_MS 20000	/* keep re-storing after the first family
 					 * is captured, so the second's DHT (once
@@ -43,7 +45,6 @@ struct sig {
 	struct bep44_engine *engine;
 
 	struct sig_mcast *mc;
-	int mcast_delivered;
 	int mcast_claims;		/* host demultiplexes lanlink itself, so a
 					 * mcast claimant is a direct claim, not an
 					 * ICE offer for the turnstile */
@@ -74,6 +75,7 @@ struct sig {
 	uint64_t next_get_ms;
 	uint64_t next_put_ms;
 	uint64_t next_mcast_ms;
+	uint64_t next_mcast_open_ms;
 };
 
 static uint64_t now_ms(void)
@@ -120,17 +122,19 @@ struct sig *sig_create(const uint8_t rdv[TOKEN_RDV_LEN], unsigned flags,
 	mailbox_init(&s->mb, is_host);
 	s->start_ms = now_ms();
 
-	if (flags & SIG_MCAST) {
+	/*
+	 * A link-local half that will not open now leaves SIG_MCAST set: a moment
+	 * with no multicast-capable interface up -- a laptop between two access
+	 * points, a link being renumbered -- is what signalling exists to survive,
+	 * so sig_dispatch keeps trying until one appears. With none up there is
+	 * nothing on the link to wait for, so the DHT is engaged at once, exactly
+	 * as for a session that asked for no multicast at all; a failure there is
+	 * retried from sig_dispatch too.
+	 */
+	if (flags & SIG_MCAST)
 		s->mc = sig_mcast_open();
-		if (!s->mc)
-			s->flags &= ~SIG_MCAST;
-	}
-	if ((s->flags & SIG_DHT) && !(s->flags & SIG_MCAST)) {
-		if (engage_dht(s)) {
-			sig_destroy(s);
-			return NULL;
-		}
-	}
+	if ((s->flags & SIG_DHT) && !s->mc)
+		engage_dht(s);
 	if (!(s->flags & (SIG_DHT | SIG_MCAST))) {
 		sig_destroy(s);
 		return NULL;
@@ -498,10 +502,8 @@ static void on_mcast_recv(void *arg, const char *salt, const uint8_t *data,
 
 	ps[0] = peer_slot(s);
 	ps[1] = '\0';
-	if (!strcmp(salt, ps)) {
+	if (!strcmp(salt, ps))
 		deliver_peer_mcast(s, data, len, src, srclen);
-		s->mcast_delivered = 1;
-	}
 }
 
 /* Merge our slot into the value just read, preserving the peer's slot. */
@@ -634,6 +636,10 @@ void sig_dispatch(struct sig *s, const struct pollfd *fds, int nfds)
 {
 	uint64_t now = now_ms();
 
+	if ((s->flags & SIG_MCAST) && !s->mc && now >= s->next_mcast_open_ms) {
+		s->mc = sig_mcast_open();
+		s->next_mcast_open_ms = now + SIG_MCAST_OPEN_MS;
+	}
 	if (s->mc) {
 		sig_mcast_dispatch(s->mc, fds, nfds, on_mcast_recv, s);
 		mcast_pump(s, now);
@@ -641,11 +647,13 @@ void sig_dispatch(struct sig *s, const struct pollfd *fds, int nfds)
 
 	/*
 	 * With no multicast in play there is nothing on the link to wait for,
-	 * so engage the DHT at once; only a combined session gives the link a
-	 * brief grace to answer before falling back to the DHT.
+	 * so engage the DHT at once; a combined session gives the link a brief
+	 * grace first and then engages whether or not it answered -- the DHT is
+	 * the only rendezvous that survives a change of network, so it has to be
+	 * running before the change rather than started after it.
 	 */
-	if ((s->flags & SIG_DHT) && !s->dht_engaged && !s->mcast_delivered &&
-	    (!(s->flags & SIG_MCAST) || now - s->start_ms > SIG_DHT_GRACE_MS))
+	if ((s->flags & SIG_DHT) && !s->dht_engaged &&
+	    (!s->mc || now - s->start_ms > SIG_DHT_GRACE_MS))
 		engage_dht(s);
 
 	if (s->dht_engaged) {

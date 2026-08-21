@@ -38,7 +38,10 @@ typedef void sig_recv_cb(void *arg, const uint8_t *data, size_t len);
 /*
  * is_host selects which slot is ours: the host writes the offer and reads the
  * answer, the client the reverse. With both transports, multicast runs first
- * and the DHT is engaged only after a grace elapses without a peer on the link.
+ * and the DHT is engaged once a grace has elapsed, whether or not the link
+ * answered in it. A transport that cannot be brought up now is retried from
+ * sig_dispatch, so NULL means only that the caller asked for no transport at
+ * all.
  */
 struct sig *sig_create(const uint8_t rdv[TOKEN_RDV_LEN], unsigned flags,
 		       int is_host);

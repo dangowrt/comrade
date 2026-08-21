@@ -242,19 +242,17 @@ after the punch completes; see §12. Workers run concurrently.
 Timings (`sig.c`): `SIG_DHT_GET_MS 1000`, `SIG_DHT_PUT_MS 1000`,
 `SIG_DHT_RESTORE_MS 8000`, `SIG_DHT_GRACE_MS 2000`.
 
-**Engagement is unconditional** *(PLANNED, 0.1.x)*. A session engages the DHT
-after `SIG_DHT_GRACE_MS` whatever else has happened, on both roles, and keeps it
-running for the session's whole life. In particular a multicast announcement
-arriving first no longer suppresses it (`sig.c:sig_pump` gates engagement on
-`!mcast_delivered` today, so a pair that meets on the segment never creates a DHT
-node at all). The DHT is the only rendezvous that survives a change of network,
-so it has to be running *before* the change rather than started after it: a host
-and a client that meet on an isolated LAN and later roam apart depend on a
-mailbox published while they were still together, and on the warm rendezvous
-nodes they exchanged over `CTLM_RDV` (§10, §11). A LAN-only session therefore
-pays a socket and periodic bootstrap traffic that will not succeed; that is the
-price of being able to leave the LAN, and the only opt-out is the operator's
-explicit `--no-dht` (§13).
+**Engagement is unconditional**. A session engages the DHT after
+`SIG_DHT_GRACE_MS` whatever else has happened, on both roles, and keeps it
+running for the session's whole life. A multicast announcement arriving first
+does not suppress it. The DHT is the only rendezvous that survives a change of
+network, so it has to be running *before* the change rather than started after
+it: a host and a client that meet on an isolated LAN and later roam apart depend
+on a mailbox published while they were still together, and on the warm
+rendezvous nodes they exchanged over `CTLM_RDV` (§10, §11). A LAN-only session
+therefore pays a socket and periodic bootstrap traffic that will not succeed;
+that is the price of being able to leave the LAN, and the only opt-out is the
+operator's explicit `--no-dht` (§13).
 
 ---
 
