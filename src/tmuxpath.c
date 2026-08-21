@@ -92,6 +92,16 @@ const char *tmux_path(void)
 	env = getenv("COMRADE_TMUX");
 	if (try_path(env))
 		return found;
+	/*
+	 * The portable bundle, first. It has to be laid out as usr\bin +
+	 * usr\share because that is where the msys runtime looks for the
+	 * terminfo database: it infers its root from its own DLL's path, and a
+	 * flat directory of binaries leaves tmux exiting with "can't find
+	 * terminfo database". Measured, and the reason the bundle is shaped
+	 * the way it is rather than as a handful of files in one folder.
+	 */
+	if (try_join(exe_dir(), "\\tmux\\usr\\bin\\tmux.exe"))
+		return found;
 	if (try_join(exe_dir(), "\\tmux\\tmux.exe"))
 		return found;
 	if (try_join(exe_dir(), "\\tmux.exe"))
@@ -156,11 +166,11 @@ void tmux_missing_help(void)
 "  Pick one, no admin needed for either:\n"
 "      winget install MSYS2.MSYS2\n"
 "      C:\\msys64\\usr\\bin\\pacman -S --needed --noconfirm tmux\n"
-"  or, if you would rather not install MSYS2, drop a portable tmux.exe (with\n"
-"  its msys-*.dll runtime and terminfo) in either of:\n"
-"      %s\\tmux\\tmux.exe\n"
-"      %s\\tmux.exe\n"
-"\n", exe_dir(), exe_dir());
+"  or, if you would rather not install MSYS2, unpack a portable tmux next to\n"
+"  comrade.exe -- tmux.exe with its msys-*.dll runtime and a shell in\n"
+"  usr\\bin, and the terminfo database in usr\\share:\n"
+"      %s\\tmux\\usr\\bin\\tmux.exe\n"
+"\n", exe_dir());
 	fprintf(stderr,
 "  comrade looks for tmux in %%COMRADE_TMUX%%, next to comrade.exe, in\n"
 "  %s, and on %%PATH%%.\n", MSYS2_TMUX);
