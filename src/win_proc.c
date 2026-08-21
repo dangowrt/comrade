@@ -305,6 +305,7 @@ HANDLE win_spawn_detached(char *const argv[], HANDLE *inherit, int ninherit)
 	SIZE_T asz = 0;
 	HANDLE nul_in, nul_out, ret = NULL;
 	HANDLE hl[8];
+	DWORD flags;
 	int nhl = 0, i;
 
 	if (ninherit > (int)(sizeof(hl) / sizeof(hl[0])) - 2)
@@ -344,10 +345,26 @@ HANDLE win_spawn_detached(char *const argv[], HANDLE *inherit, int ninherit)
 		goto out_attr;
 
 	memset(&pi, 0, sizeof(pi));
-	if (CreateProcessA(NULL, cmd, NULL, NULL, TRUE,
-			   DETACHED_PROCESS | CREATE_NO_WINDOW |
-			   EXTENDED_STARTUPINFO_PRESENT,
-			   NULL, NULL, &si.StartupInfo, &pi)) {
+	/*
+	 * DETACHED_PROCESS alone is only half of setsid() here. Losing the
+	 * console frees the service from the operator's terminal, but if this
+	 * process was itself started inside a job object with
+	 * JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE -- which is how CI runners, task
+	 * schedulers and Windows OpenSSH all contain their children -- the
+	 * service is still killed the moment the operator's shell goes away,
+	 * which is precisely the thing it exists not to do. CREATE_BREAKAWAY_
+	 * FROM_JOB is the Windows answer, and it *fails the whole call* when
+	 * the job forbids breakaway, so retry without it: no breakaway is a
+	 * worse service lifetime, no service at all is a broken host.
+	 */
+	flags = DETACHED_PROCESS | CREATE_NO_WINDOW |
+		EXTENDED_STARTUPINFO_PRESENT | CREATE_BREAKAWAY_FROM_JOB;
+	if (!CreateProcessA(NULL, cmd, NULL, NULL, TRUE, flags, NULL, NULL,
+			    &si.StartupInfo, &pi))
+		CreateProcessA(NULL, cmd, NULL, NULL, TRUE,
+			       flags & ~(DWORD)CREATE_BREAKAWAY_FROM_JOB,
+			       NULL, NULL, &si.StartupInfo, &pi);
+	if (pi.hProcess) {
 		CloseHandle(pi.hThread);
 		ret = pi.hProcess;
 	}
