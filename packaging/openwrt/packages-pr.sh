@@ -34,6 +34,12 @@
 # not a cryptographically signed commit -- `git commit --signoff` covers it.
 set -euo pipefail
 
+# Secrets pasted into GitHub's UI routinely pick up a trailing newline, which
+# is invisible in the guard step's -z check (the string is non-empty) but
+# breaks libcurl's URL parser once it lands in the x-access-token@ userinfo
+# below ("URL rejected: Malformed input to a URL function").
+OPENWRT_PACKAGES_TOKEN="$(printf '%s' "$OPENWRT_PACKAGES_TOKEN" | tr -d '\n\r')"
+
 V="$VERSION"
 NAME="Daniel Golle"
 EMAIL="daniel@makrotopia.org"
