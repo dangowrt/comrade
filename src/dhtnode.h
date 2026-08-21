@@ -26,7 +26,14 @@ int dhtnode_seed(struct dhtnode *n, const struct sockaddr *sa, socklen_t len);
  * normally-bootstrapping node so a stale hint falls back to the global DHT.
  */
 int dhtnode_pin(struct dhtnode *n, const struct sockaddr *sa, socklen_t len);
+/* Free a node for good: the freshest good set is persisted on the way out. */
 void dhtnode_free(struct dhtnode *n);
+/*
+ * Free a node that is being replaced within this run: another node follows it
+ * immediately, so it is neither the freshest good set nor worth the run's one
+ * teardown write to flash.
+ */
+void dhtnode_discard(struct dhtnode *n);
 struct bep44_engine *dhtnode_engine(struct dhtnode *n);
 int dhtnode_prepare(struct dhtnode *n, struct pollfd *fds, int maxfds,
 		    int *timeout_ms);

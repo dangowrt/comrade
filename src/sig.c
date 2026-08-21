@@ -30,6 +30,8 @@
 #define SIG_MCAST_OPEN_MS 1000		/* retry the link-local half this often
 					 * while no interface can carry it */
 #define SIG_DHT_GRACE_MS 2000
+#define SIG_DHT_OPEN_MS 1000		/* retry the DHT half this often while a
+					 * node cannot be created */
 #define SIG_LOCATE_BOTH_MS 20000	/* keep re-storing after the first family
 					 * is captured, so the second's DHT (once
 					 * converged) also gets the value to serve */
@@ -69,6 +71,8 @@ struct sig {
 	socklen_t rnode4_len;		/* independently as each family's DHT */
 	struct sockaddr_storage rnode6;	/* serves the value back */
 	socklen_t rnode6_len;
+	int acked4, acked6;		/* a validated get had a node of this
+					 * family serve our own value back */
 	uint64_t first_locate_ms;	/* when the first family was captured */
 	int rdv_stage;			/* engine-wide progress: cold/warmup/store/get */
 
@@ -76,6 +80,7 @@ struct sig {
 	uint64_t next_put_ms;
 	uint64_t next_mcast_ms;
 	uint64_t next_mcast_open_ms;
+	uint64_t next_dht_open_ms;
 };
 
 static uint64_t now_ms(void)
@@ -136,21 +141,35 @@ struct sig *sig_create(const uint8_t rdv[TOKEN_RDV_LEN], unsigned flags,
 	if ((s->flags & SIG_DHT) && !s->mc)
 		engage_dht(s);
 	if (!(s->flags & (SIG_DHT | SIG_MCAST))) {
-		sig_destroy(s);
+		sig_discard(s);
 		return NULL;
 	}
 	return s;
 }
 
-void sig_destroy(struct sig *s)
+static void sig_free(struct sig *s, int persist)
 {
 	if (!s)
 		return;
-	if (s->node)
-		dhtnode_free(s->node);
+	if (s->node) {
+		if (persist)
+			dhtnode_free(s->node);
+		else
+			dhtnode_discard(s->node);
+	}
 	if (s->mc)
 		sig_mcast_close(s->mc);
 	free(s);
+}
+
+void sig_destroy(struct sig *s)
+{
+	sig_free(s, 1);
+}
+
+void sig_discard(struct sig *s)
+{
+	sig_free(s, 0);
 }
 
 int sig_prepare(struct sig *s, struct pollfd *fds, int maxfds, int *timeout_ms)
@@ -307,7 +326,18 @@ int sig_located(struct sig *s, int family, struct sockaddr *out,
 
 int sig_dht_acked(struct sig *s, int family)
 {
-	return family == 6 ? s->rnode6_len != 0 : s->rnode4_len != 0;
+	return family == 6 ? s->acked6 : s->acked4;
+}
+
+int sig_locating(struct sig *s, int family)
+{
+	socklen_t rl = family == 6 ? s->rnode6_len : s->rnode4_len;
+
+	if (!(s->flags & SIG_DHT) || !s->is_host || !s->locate || rl)
+		return 0;
+	if (!s->first_locate_ms)
+		return 0;
+	return now_ms() - s->first_locate_ms < SIG_LOCATE_BOTH_MS;
 }
 
 int sig_reinforce(struct sig *s, int family, const struct sockaddr *sa,
@@ -392,23 +422,30 @@ static void on_dht_get(void *arg, const uint8_t *v, size_t v_len, int64_t seq,
 
 	/*
 	 * The value is signature-checked as ours, so the node that served it is
-	 * a validated, responsive, k-close rendezvous point. Keep the first
-	 * (fastest) of EACH family and pin it: a dual-stack client may live
-	 * behind only one family, so both go in the token. The v4 and v6 DHTs
-	 * converge independently, so capturing per family here -- rather than
-	 * the first node of any family -- lets both be found within one session.
+	 * a validated, responsive, k-close rendezvous point, and its family has
+	 * acknowledged our publish. Keep the first (fastest) of EACH family and
+	 * pin it: a dual-stack client may live behind only one family, so both
+	 * go in the token. The v4 and v6 DHTs converge independently, so
+	 * capturing per family here -- rather than the first node of any family
+	 * -- lets both be found within one session.
 	 */
-	if (s->locate && node && node_len && (size_t)node_len <= sizeof(s->rnode4)) {
+	if (node && node_len && (size_t)node_len <= sizeof(s->rnode4)) {
 		int captured = 0;
 
-		if (node->sa_family == AF_INET6 && !s->rnode6_len) {
-			memcpy(&s->rnode6, node, node_len);
-			s->rnode6_len = node_len;
-			captured = 1;
-		} else if (node->sa_family == AF_INET && !s->rnode4_len) {
-			memcpy(&s->rnode4, node, node_len);
-			s->rnode4_len = node_len;
-			captured = 1;
+		if (node->sa_family == AF_INET6) {
+			s->acked6 = 1;
+			if (s->locate && !s->rnode6_len) {
+				memcpy(&s->rnode6, node, node_len);
+				s->rnode6_len = node_len;
+				captured = 1;
+			}
+		} else if (node->sa_family == AF_INET) {
+			s->acked4 = 1;
+			if (s->locate && !s->rnode4_len) {
+				memcpy(&s->rnode4, node, node_len);
+				s->rnode4_len = node_len;
+				captured = 1;
+			}
 		}
 		if (captured) {
 			bep44_pin_add(s->engine, NULL, node, node_len);
@@ -653,8 +690,11 @@ void sig_dispatch(struct sig *s, const struct pollfd *fds, int nfds)
 	 * running before the change rather than started after it.
 	 */
 	if ((s->flags & SIG_DHT) && !s->dht_engaged &&
-	    (!s->mc || now - s->start_ms > SIG_DHT_GRACE_MS))
+	    (!s->mc || now - s->start_ms > SIG_DHT_GRACE_MS) &&
+	    now >= s->next_dht_open_ms) {
 		engage_dht(s);
+		s->next_dht_open_ms = now + SIG_DHT_OPEN_MS;
+	}
 
 	if (s->dht_engaged) {
 		dhtnode_dispatch(s->node, fds, nfds);

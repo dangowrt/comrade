@@ -280,10 +280,10 @@ static void seed_from_dht(struct dhtnode *n)
  *
  * To spare flash on OpenWrt devices the cache is written at most twice per run:
  * once after warm-up, but only if it was empty at start (so a first-ever run
- * leaves something behind), and once on the first teardown that has a set worth
- * writing -- a node torn down so the signalling can be rebuilt on a new network
- * is replaced by another within the same run, and must not cost a write per
- * move.
+ * leaves something behind), and once when a node is freed for good, which is
+ * the freshest good set of the run. A node discarded because it is being
+ * replaced writes nothing, so a move onto a new network costs no write and
+ * cannot spend the run's teardown write on an early set.
  */
 static int cache_flushed;		/* the run's teardown write is done */
 
@@ -467,7 +467,7 @@ static struct dhtnode *dhtnode_create_impl(int do_bootstrap)
 	n->next_seed_ms = 0;
 	return n;
 fail:
-	dhtnode_free(n);
+	dhtnode_discard(n);
 	return NULL;
 }
 
@@ -491,7 +491,7 @@ int dhtnode_pin(struct dhtnode *n, const struct sockaddr *sa, socklen_t len)
 	return bep44_pin_add(n->engine, NULL, sa, len);
 }
 
-void dhtnode_free(struct dhtnode *n)
+static void dhtnode_free_impl(struct dhtnode *n, int persist)
 {
 	if (!n)
 		return;
@@ -499,7 +499,7 @@ void dhtnode_free(struct dhtnode *n)
 		pthread_detach(n->resolver);
 	if (n->boot)
 		resolver_put(n->boot);
-	if (n->cache_enabled && n->dht_ready && !cache_flushed)
+	if (persist && n->cache_enabled && n->dht_ready && !cache_flushed)
 		cache_flushed = dhtcache_save(n);
 	if (n->engine)
 		bep44_free(n->engine);
@@ -510,6 +510,16 @@ void dhtnode_free(struct dhtnode *n)
 	if (sock_valid(n->s6))
 		sock_close(n->s6);
 	free(n);
+}
+
+void dhtnode_free(struct dhtnode *n)
+{
+	dhtnode_free_impl(n, 1);
+}
+
+void dhtnode_discard(struct dhtnode *n)
+{
+	dhtnode_free_impl(n, 0);
 }
 
 struct bep44_engine *dhtnode_engine(struct dhtnode *n)

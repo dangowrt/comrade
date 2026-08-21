@@ -46,6 +46,12 @@ typedef void sig_recv_cb(void *arg, const uint8_t *data, size_t len);
 struct sig *sig_create(const uint8_t rdv[TOKEN_RDV_LEN], unsigned flags,
 		       int is_host);
 void sig_destroy(struct sig *s);
+/*
+ * Destroy a signaller that is being replaced within this session, so its DHT
+ * node is discarded rather than freed for good: another node follows it at once
+ * and is the one worth persisting.
+ */
+void sig_discard(struct sig *s);
 
 int sig_prepare(struct sig *s, struct pollfd *fds, int maxfds, int *timeout_ms);
 void sig_dispatch(struct sig *s, const struct pollfd *fds, int nfds);
@@ -153,6 +159,15 @@ int sig_located(struct sig *s, int family, struct sockaddr *out,
  * so it is the signal that the family is isolated (LAN-only).
  */
 int sig_dht_acked(struct sig *s, int family);
+
+/*
+ * Host: whether `family` is still inside the bounded run of stores that follows
+ * the first family's capture, which is where a slower second DHT is given its
+ * own chance to serve the value back. False for a family already captured, and
+ * false before any capture at all -- there is no window yet, so a caller waiting
+ * on an ack has only its own deadline to settle that family by.
+ */
+int sig_locating(struct sig *s, int family);
 
 /* Rendezvous progress for `family`: 0 cold, 1 warmup, 2 store, 3 get, 4 ready
  * (matches the RDV_* enum). The store/get phases are engine-wide; only ready is

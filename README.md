@@ -68,11 +68,22 @@ The read-write token joins read-write; the read-only token joins the
 same session view-only, unable to type into it. Which one you were handed
 decides it; there is no extra flag.
 
-`-v` swaps the dashboard for plain log lines on either side, and
-`--no-multicast` skips link-local discovery to force the DHT/STUN path.
-Joining an isolated-LAN host, whose token carries no DHT rendezvous, with
-`--no-multicast` cannot connect: the host has no sealed multicast
-announcement to authenticate the client and spawn its worker.
+`-v` swaps the dashboard for plain log lines on either side.
+`--no-multicast` skips link-local discovery to force the DHT/STUN path,
+and `--no-dht` declines the DHT so peers meet over link-local discovery
+alone. Both work on either side, and each is that operator's own choice:
+a token never switches a transport off for the other end. Giving both at
+once is refused, since it would leave nothing to meet on. They are
+properties of the session being started, so `comrade` re-attaching to a
+session you already have keeps whatever that service was started with,
+and says which of them it is ignoring.
+
+A host on an isolated LAN reaches no DHT, so its mailbox is published
+nowhere and its token carries no rendezvous node. Joining such a host
+with `--no-multicast` cannot connect: the client searches a DHT the host
+never reached, and sends none of the sealed multicast announcements the
+host needs to authenticate it and spawn its worker. On a LAN with no
+internet, `--no-dht` at both ends skips that fruitless search.
 
 Already connected? Ordinary SSH `-L` and `-R` tunnel TCP services
 through the same authenticated session, and can be repeated:
