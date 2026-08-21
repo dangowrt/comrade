@@ -683,6 +683,34 @@ static const char *self_path(void)
 	return p;
 }
 
+/*
+ * Make sure the session leaves a directory entry behind.
+ *
+ * The native (winget) tmux does not create a socket *file*: it turns
+ * `-S <path>` into a named pipe, \\.\pipe\<path>, and never touches the
+ * filesystem. Everything that talks to that server still works, because the
+ * path is only a name -- but comrade finds its own sessions by listing
+ * <state_dir>\*.sock, so with no entry `comrade show` reports no session and a
+ * second `comrade` starts a second session instead of re-attaching.
+ *
+ * So create the entry if tmux did not. It must happen *after* tmux has bound,
+ * never before: MSYS2's tmux really does bind an AF_UNIX socket there and a
+ * pre-existing regular file would stop it. Sweeping deletes it as before, and
+ * its mtime is what find_live() orders sessions by.
+ */
+static void mark_sock(const char *sock)
+{
+	HANDLE h;
+
+	if (GetFileAttributesA(sock) != INVALID_FILE_ATTRIBUTES)
+		return;			/* a Cygwin tmux made a real one */
+	h = CreateFileA(sock, GENERIC_WRITE,
+			FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+			NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+	if (h != INVALID_HANDLE_VALUE)
+		CloseHandle(h);
+}
+
 static int start_tmux(const struct svc *v)
 {
 	char *mk[] = { NULL, "-S", NULL, "new-session", "-d", "-s", "comrade",
@@ -701,6 +729,7 @@ static int start_tmux(const struct svc *v)
 				mk[0]);
 		return -1;
 	}
+	mark_sock(v->sock);
 	return 0;
 }
 
