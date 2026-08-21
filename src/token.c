@@ -118,3 +118,48 @@ int token_decode(struct token *tok, const char *src)
 	payload_unpack(tok, wire);
 	return 0;
 }
+
+/*
+ * The per-family state lives in the family's slot plus its two flag bits, and
+ * is read and written here alone so the encoding has exactly one home.
+ */
+int token_family_state(const struct token *tok, int family)
+{
+	const uint8_t *a = family == 6 ? tok->ep6_addr : tok->ep4_addr;
+	size_t n = family == 6 ? TOKEN_EP6_LEN : TOKEN_EP4_LEN;
+	uint8_t rdv = family == 6 ? TOKEN_FLAG_EP6_RDV : TOKEN_FLAG_EP4_RDV;
+	uint8_t set = family == 6 ? TOKEN_FLAG_EP6_SETTLED :
+				    TOKEN_FLAG_EP4_SETTLED;
+	size_t i;
+
+	for (i = 0; i < n; i++)
+		if (a[i])
+			return (tok->flags & rdv) ? TOKEN_STATE_RENDEZVOUS :
+						    TOKEN_STATE_DIRECT;
+	return (tok->flags & set) ? TOKEN_STATE_NONE : TOKEN_STATE_PENDING;
+}
+
+void token_set_family(struct token *tok, int family, int state,
+		      const uint8_t *addr, uint16_t port)
+{
+	uint8_t *a = family == 6 ? tok->ep6_addr : tok->ep4_addr;
+	uint16_t *p = family == 6 ? &tok->ep6_port : &tok->ep4_port;
+	size_t n = family == 6 ? TOKEN_EP6_LEN : TOKEN_EP4_LEN;
+	uint8_t rdv = family == 6 ? TOKEN_FLAG_EP6_RDV : TOKEN_FLAG_EP4_RDV;
+	uint8_t set = family == 6 ? TOKEN_FLAG_EP6_SETTLED :
+				    TOKEN_FLAG_EP4_SETTLED;
+
+	tok->flags &= (uint8_t)~(rdv | set);
+	if (state == TOKEN_STATE_RENDEZVOUS || state == TOKEN_STATE_DIRECT) {
+		memcpy(a, addr, n);
+		*p = port;
+		tok->flags |= set;
+		if (state == TOKEN_STATE_RENDEZVOUS)
+			tok->flags |= rdv;
+	} else {
+		memset(a, 0, n);
+		*p = 0;
+		if (state == TOKEN_STATE_NONE)
+			tok->flags |= set;
+	}
+}

@@ -110,9 +110,9 @@ static void token_typo_check(void)
 }
 
 /* Every kind of token: all flag combinations (ro, nodht, per-family
- * direct/rendezvous) crossed with endpoint presence (none, v6-only, v4-only,
- * dual). Each must round-trip exactly, stay the fixed width, avoid ambiguous
- * glyphs, and keep its checksum live. */
+ * direct/rendezvous and settled) crossed with endpoint presence (none,
+ * v6-only, v4-only, dual). Each must round-trip exactly, stay the fixed width,
+ * avoid ambiguous glyphs, and keep its checksum live. */
 static void token_kinds_check(void)
 {
 	struct token in, out;
@@ -121,7 +121,7 @@ static void token_kinds_check(void)
 	int ep6p, ep4p;
 	size_t i;
 
-	for (flags = 0; flags < 16; flags++)
+	for (flags = 0; flags < 64; flags++)
 		for (ep6p = 0; ep6p <= 1; ep6p++)
 			for (ep4p = 0; ep4p <= 1; ep4p++) {
 				memset(&in, 0, sizeof(in));
@@ -171,6 +171,118 @@ static void token_kinds_check(void)
 			}
 }
 
+/* The four per-family states round-trip through the one encoder/decoder pair,
+ * independently for each family, and the compatibility reading holds: a slot
+ * set by a host that predates the SETTLED bits still reads as the state it
+ * was minted as. */
+static void token_state_check(void)
+{
+	static const int states[4] = {
+		TOKEN_STATE_PENDING, TOKEN_STATE_NONE,
+		TOKEN_STATE_RENDEZVOUS, TOKEN_STATE_DIRECT
+	};
+	uint8_t a6[TOKEN_EP6_LEN], a4[TOKEN_EP4_LEN];
+	char str[TOKEN_STR_LEN + 1];
+	struct token t, w;
+	size_t i;
+	int s6, s4;
+
+	for (i = 0; i < TOKEN_EP6_LEN; i++)
+		a6[i] = (uint8_t)(0x20 + i);
+	for (i = 0; i < TOKEN_EP4_LEN; i++)
+		a4[i] = (uint8_t)(192 - i);
+
+	for (s6 = 0; s6 < 4; s6++)
+		for (s4 = 0; s4 < 4; s4++) {
+			memset(&t, 0, sizeof(t));
+			t.version = TOKEN_VERSION;
+			t.flags = TOKEN_FLAG_RO;
+			token_set_family(&t, 6, states[s6], a6, 45678);
+			token_set_family(&t, 4, states[s4], a4, 51820);
+			assert(token_family_state(&t, 6) == states[s6]);
+			assert(token_family_state(&t, 4) == states[s4]);
+			assert(t.flags & TOKEN_FLAG_RO);
+			/* An address, and only an address, comes back out. */
+			if (states[s6] == TOKEN_STATE_RENDEZVOUS ||
+			    states[s6] == TOKEN_STATE_DIRECT)
+				assert(!memcmp(t.ep6_addr, a6, TOKEN_EP6_LEN) &&
+				       t.ep6_port == 45678);
+			else
+				assert(!t.ep6_port);
+			if (states[s4] == TOKEN_STATE_RENDEZVOUS ||
+			    states[s4] == TOKEN_STATE_DIRECT)
+				assert(!memcmp(t.ep4_addr, a4, TOKEN_EP4_LEN) &&
+				       t.ep4_port == 51820);
+			else
+				assert(!t.ep4_port);
+
+			/* The pair a client reads is the pair the host wrote. */
+			assert(token_encode(&t, str, sizeof(str)) == 0);
+			assert(token_decode(&w, str) == 0);
+			assert(token_family_state(&w, 6) == states[s6]);
+			assert(token_family_state(&w, 4) == states[s4]);
+		}
+
+	/* A 0.1.0 mint: a set slot with no SETTLED bit at all. */
+	memset(&t, 0, sizeof(t));
+	t.version = TOKEN_VERSION;
+	memcpy(t.ep6_addr, a6, TOKEN_EP6_LEN);
+	memcpy(t.ep4_addr, a4, TOKEN_EP4_LEN);
+	t.flags = TOKEN_FLAG_EP4_RDV;
+	assert(token_family_state(&t, 6) == TOKEN_STATE_DIRECT);
+	assert(token_family_state(&t, 4) == TOKEN_STATE_RENDEZVOUS);
+}
+
+/* The host re-emits on every state change, so every state must be writable
+ * over every other: nothing of the state being replaced may survive in the
+ * slot, and the other family must not move. */
+static void token_state_transition_check(void)
+{
+	static const int states[4] = {
+		TOKEN_STATE_PENDING, TOKEN_STATE_NONE,
+		TOKEN_STATE_RENDEZVOUS, TOKEN_STATE_DIRECT
+	};
+	uint8_t a6[TOKEN_EP6_LEN], a4[TOKEN_EP4_LEN], b6[TOKEN_EP6_LEN];
+	struct token t;
+	size_t i;
+	int from, to;
+
+	for (i = 0; i < TOKEN_EP6_LEN; i++) {
+		a6[i] = (uint8_t)(0x20 + i);
+		b6[i] = (uint8_t)(0xfe - i);
+	}
+	for (i = 0; i < TOKEN_EP4_LEN; i++)
+		a4[i] = (uint8_t)(192 - i);
+
+	for (from = 0; from < 4; from++)
+		for (to = 0; to < 4; to++) {
+			memset(&t, 0, sizeof(t));
+			t.version = TOKEN_VERSION;
+			token_set_family(&t, 4, TOKEN_STATE_RENDEZVOUS, a4, 51820);
+			token_set_family(&t, 6, states[from], a6, 45678);
+			token_set_family(&t, 6, states[to], b6, 4001);
+
+			assert(token_family_state(&t, 6) == states[to]);
+			if (states[to] == TOKEN_STATE_RENDEZVOUS ||
+			    states[to] == TOKEN_STATE_DIRECT) {
+				assert(!memcmp(t.ep6_addr, b6, TOKEN_EP6_LEN));
+				assert(t.ep6_port == 4001);
+			} else {
+				for (i = 0; i < TOKEN_EP6_LEN; i++)
+					assert(!t.ep6_addr[i]);
+				assert(!t.ep6_port);
+			}
+
+			/* v4 was settled before either v6 write and stays so. */
+			assert(token_family_state(&t, 4) ==
+			       TOKEN_STATE_RENDEZVOUS);
+			assert(!memcmp(t.ep4_addr, a4, TOKEN_EP4_LEN));
+			assert(t.ep4_port == 51820);
+			/* and no state ever mints the retired bit */
+			assert(!(t.flags & TOKEN_FLAG_NODHT));
+		}
+}
+
 static void token_reject_check(void)
 {
 	struct token in, out;
@@ -191,6 +303,8 @@ int main(void)
 	token_roundtrip_check();
 	token_kinds_check();
 	token_typo_check();
+	token_state_check();
+	token_state_transition_check();
 	token_reject_check();
 	return 0;
 }

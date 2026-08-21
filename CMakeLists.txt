@@ -425,6 +425,10 @@ add_library(comrade_nat STATIC src/nat.c)
 target_include_directories(comrade_nat PUBLIC src)
 target_link_libraries(comrade_nat PUBLIC LibJuice::LibJuice)
 
+add_library(comrade_path STATIC src/path.c)
+target_include_directories(comrade_path PUBLIC src)
+target_link_libraries(comrade_path PUBLIC comrade_crypto comrade_compat)
+
 add_library(comrade_lanlink STATIC src/lanlink.c)
 target_include_directories(comrade_lanlink PUBLIC src)
 target_link_libraries(comrade_lanlink PUBLIC comrade_compat)
@@ -477,7 +481,7 @@ target_include_directories(comrade_session PUBLIC src)
 target_link_libraries(comrade_session PUBLIC
 	comrade_sig comrade_nat comrade_lanlink comrade_stream comrade_ssh
 	comrade_bridge comrade_token comrade_crypto comrade_stunlist comrade_conn
-	comrade_ctlproto comrade_dbg)
+	comrade_path comrade_ctlproto comrade_dbg)
 
 # The view: the only module that draws to the terminal (MVC).
 add_library(comrade_ui STATIC src/ui.c)
@@ -603,6 +607,10 @@ if(BUILD_TESTING)
 	target_link_libraries(netmon_test comrade_crypto)
 	add_test(NAME netmon_test COMMAND netmon_test)
 
+	add_executable(path_test tests/path_test.c)
+	target_link_libraries(path_test comrade_path)
+	add_test(NAME path_test COMMAND path_test)
+
 	add_executable(candpolicy_test tests/candpolicy_test.c)
 	target_link_libraries(candpolicy_test comrade_crypto)
 	add_test(NAME candpolicy_test COMMAND candpolicy_test)
@@ -628,6 +636,17 @@ if(BUILD_TESTING)
 	target_link_libraries(bep44_pin_test comrade_bep44)
 	add_test(NAME bep44_pin_test COMMAND bep44_pin_test)
 	set_tests_properties(bep44_pin_test PROPERTIES TIMEOUT 15)
+
+	# Creates and tears down real DHT nodes (two UDP sockets on the wildcard
+	# address, nothing sent) and stalls their bootstrap resolve, so it needs
+	# no network; SKIPs (77) where no socket can be had. XDG_DATA_HOME keeps
+	# the node cache it persists out of the developer's data dir.
+	add_executable(sig_rebuild_test tests/sig_rebuild_test.c)
+	target_link_libraries(sig_rebuild_test comrade_sig)
+	add_test(NAME sig_rebuild_test COMMAND sig_rebuild_test)
+	set_tests_properties(sig_rebuild_test PROPERTIES
+		SKIP_RETURN_CODE 77 TIMEOUT 30
+		ENVIRONMENT XDG_DATA_HOME=${CMAKE_CURRENT_BINARY_DIR}/test-data)
 
 	add_executable(natstream_test tests/natstream_test.c)
 	target_link_libraries(natstream_test comrade_nat comrade_stream)
@@ -725,6 +744,45 @@ if(COMRADE_BUILD_TOOLS)
 				$<TARGET_FILE:comrade-e2e>)
 		set_tests_properties(turnstile_stuck_e2e PROPERTIES
 			SKIP_RETURN_CODE 77 TIMEOUT 300)
+
+		# The host turnstile rebuilds its signalling on a move while its
+		# workers keep serving, the move manufactured by --roam-ms. No
+		# DHT, so it is offline and deterministic; SKIPs (77) with no
+		# multicast interface.
+		add_test(NAME roam_lan_e2e
+			COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/roam.sh
+				$<TARGET_FILE:comrade-e2e>)
+		set_tests_properties(roam_lan_e2e PROPERTIES
+			SKIP_RETURN_CODE 77 TIMEOUT 180)
+
+		# The client half of the same handler: a client that rebuilds
+		# while still looking must still join over what it rebuilt. Its
+		# rendezvous is the DHT, so SKIPs (77) unless COMRADE_E2E_NET=1.
+		add_test(NAME roam_client_e2e
+			COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/roam_client.sh
+				$<TARGET_FILE:comrade-e2e>)
+		set_tests_properties(roam_client_e2e PROPERTIES
+			SKIP_RETURN_CODE 77 TIMEOUT 300)
+
+		# A roam as a path switch rather than a rejoin: the path
+		# carrying the session is taken away (--blackhole-ms) and the
+		# session must move to another warm one intact. No DHT, so it is
+		# offline; SKIPs (77) with no multicast interface, or where this
+		# host has only one path to offer.
+		add_test(NAME path_switch_e2e
+			COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/path_switch.sh
+				$<TARGET_FILE:comrade-e2e>)
+		set_tests_properties(path_switch_e2e PROPERTIES
+			SKIP_RETURN_CODE 77 TIMEOUT 180)
+
+		# Each of these stands up its own DHT node and multicast
+		# announcer on this host, so under `ctest -j` they contend for
+		# the segment and each other's rendezvous timing. Serialise them
+		# however ctest is invoked.
+		set_tests_properties(multiuser_e2e isolated_lan_e2e
+			lan_concurrent_e2e lan_mixed_e2e turnstile_stuck_e2e
+			roam_lan_e2e roam_client_e2e path_switch_e2e
+			PROPERTIES RESOURCE_LOCK comrade_net)
 	endif()
 endif()
 
@@ -738,9 +796,10 @@ endif()
 if(BUILD_TESTING)
 	foreach(t IN ITEMS
 		token_test tokgen_test termfilter_test ctlproto_test netmon_test
-		candpolicy_test candpack_test mailbox_test roauth_test bep44_test
-		bep44_pin_test natstream_test sshloop_test sshfwd_test
-		sshexit_test sshro_test sshkcp_test sshctl_test)
+		candpolicy_test candpack_test mailbox_test roauth_test
+		path_test bep44_test
+		bep44_pin_test sig_rebuild_test natstream_test sshloop_test
+		sshfwd_test sshexit_test sshro_test sshkcp_test sshctl_test)
 		if(TARGET ${t})
 			target_compile_options(${t} PRIVATE -UNDEBUG)
 		endif()

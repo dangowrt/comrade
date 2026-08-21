@@ -1,7 +1,8 @@
 #!/bin/sh
 # Concurrent isolated-LAN admission.
 #
-# One no-DHT host serves N clients that join at once over real link-local
+# One no-DHT host mints a token whose families both settle to NONE, carrying no
+# address of its own, and serves N clients that join at once over real link-local
 # multicast (IP_MULTICAST_LOOP is set, so same-host multi-process works). Each
 # client gets its own worker over the shared lanlink socket, demultiplexed by
 # source; there is no DHT and no ICE punch (the host suppresses the ICE turnstile
@@ -35,22 +36,27 @@ cpids=""
 	>"$tmp/host.out" 2>"$tmp/host.err" &
 hpid=$!
 
+# The host re-emits its token on every state change, so take the newest line and
+# wait for both families to settle; with the DHT declined that is quick.
 tok=""
 i=0
 while [ "$i" -lt 60 ]; do
-	tok=$(sed -n 's/^COMRADE TOKEN: //p' "$tmp/host.out" 2>/dev/null | head -1)
-	[ -n "$tok" ] && break
+	cand=$(sed -n 's/^COMRADE TOKEN: //p' "$tmp/host.out" 2>/dev/null | tail -1)
+	if [ -n "$cand" ] && "$E2E" token "$cand" 2>/dev/null |
+	   grep -q 'ep6_settled=1 ep4_settled=1'; then
+		tok="$cand"; break
+	fi
 	if ! kill -0 "$hpid" 2>/dev/null; then
 		echo "host exited before minting a token"; cat "$tmp/host.err"; exit 1
 	fi
 	sleep 0.5; i=$((i + 1))
 done
-if [ -z "$tok" ]; then echo "no token after ~30s"; cat "$tmp/host.err"; exit 1; fi
+if [ -z "$tok" ]; then echo "no settled token after ~30s"; cat "$tmp/host.err"; exit 1; fi
 
 # Assert the isolated mint, then launch N clients at once against the one token.
 "$E2E" token "$tok"
-"$E2E" token "$tok" | grep -q 'ep6_rdv=0 ep4_rdv=0' ||
-	{ echo "FAIL: token is not a direct endpoint mint"; exit 1; }
+"$E2E" token "$tok" | grep -q 'state6=NONE state4=NONE' ||
+	{ echo "FAIL: a family did not settle to NONE"; exit 1; }
 
 j=0
 while [ "$j" -lt "$N" ]; do

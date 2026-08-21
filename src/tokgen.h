@@ -13,16 +13,19 @@
  * is done by the caller and handed in as plain facts. This keeps the tree
  * auditable and exhaustively testable in isolation.
  *
- * The result maps onto the token like this:
- *   TOK_ADVERT_ENDPOINT   -> put our own address in the family's endpoint
- *                            slot, TOKEN_FLAG_EPx_RDV clear.
- *   TOK_ADVERT_RENDEZVOUS -> put a DHT node address in the slot, EPx_RDV set.
- *   TOK_ADVERT_NONE       -> leave the family's slot empty; if BOTH families
- *                            are NONE the host has no connectivity and token
- *                            generation aborts.
+ * The result maps onto the token's four per-family states like this:
+ *   TOK_ADVERT_PENDING    -> leave the family's slot empty with EPx_SETTLED
+ *                            clear: nothing is decided for it yet.
+ *   TOK_ADVERT_NONE       -> leave the slot empty with EPx_SETTLED set: this
+ *                            family has no path to the DHT.
+ *   TOK_ADVERT_RENDEZVOUS -> put a DHT node address in the slot, EPx_RDV and
+ *                            EPx_SETTLED set.
+ *   TOK_ADVERT_ENDPOINT   -> put our own PROVEN address in the slot, EPx_RDV
+ *                            clear and EPx_SETTLED set.
  */
 
 enum tok_advert {
+	TOK_ADVERT_PENDING,
 	TOK_ADVERT_ENDPOINT,
 	TOK_ADVERT_RENDEZVOUS,
 	TOK_ADVERT_NONE,
@@ -37,6 +40,9 @@ struct tokgen_facts {
 	int has_usable_addr;	/* some interface has a non-loopback address */
 	int has_default_route;	/* a default route exists for this family */
 	int dht_acked;		/* the DHT acknowledged our publish within time */
+	int dht_attempt_concluded;	/* the DHT attempt has run its course: the
+					 * operator declined it, or it has had
+					 * long enough that an ack is not coming */
 	int public_port_proven;	/* a mapped port was proven open FROM THE OUTSIDE:
 				 * an unsolicited packet from a stranger arrived,
 				 * not merely a UPnP/NAT-PMP/PCP success reply */
@@ -45,10 +51,10 @@ struct tokgen_facts {
 enum tok_advert tokgen_decide(const struct tokgen_facts *f);
 
 /*
- * The two families are decided entirely independently; the host aborts only
- * when NEITHER can be advertised. Every other mix is normal and must be
- * accepted: v4-only, v6-only, global on one family and link-local-only on
- * the other, and so on.
+ * The two families are decided entirely independently, and every mix is normal:
+ * v4-only, v6-only, global on one family and link-local-only on the other, and
+ * so on. Both families NONE is the ordinary state of a LAN-only host, not a
+ * failure.
  */
 struct tokgen_result {
 	enum tok_advert v4;
@@ -56,9 +62,10 @@ struct tokgen_result {
 };
 
 /*
- * Decide both families from their own facts. Returns 0 when at least one
- * family is advertisable, -1 only when both are TOK_ADVERT_NONE (the host has
- * no connectivity of any kind and token generation must abort).
+ * Decide both families from their own facts. Returns 0 normally, and -1 only
+ * when neither family has a usable address -- there is nothing to host over,
+ * which is worth telling the operator but is never a reason to withhold the
+ * token.
  */
 int tokgen_decide_host(const struct tokgen_facts *v4,
 		       const struct tokgen_facts *v6,

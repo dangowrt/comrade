@@ -22,12 +22,17 @@ enum conn_state {
 
 struct conn_status {
 	int state;			/* enum conn_state */
-	char peer[80];			/* the in-use transport's remote addr, "" if none */
+	char peer[80];			/* the in-use path's remote addr, "" if none */
 	char rdv[80];			/* IPv4 rendezvous node, "" if none */
 	char rdv6[80];			/* IPv6 rendezvous node, "" if none */
 	int rtt_ms;			/* smoothed RTT, 0 if unknown */
 	int since_s;			/* seconds in the current state (loss age) */
 	int read_only;			/* this side is a view-only guest */
+	/* The warm paths held besides the one in use: the best-ranked of them,
+	 * and how many there are. What the session would move to were the path
+	 * in use to die. */
+	char alt[80];
+	int warm_alt;
 };
 
 /* Serialise/parse to a tmpfs file. Return 0 on success, -1 on failure. */

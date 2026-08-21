@@ -18,6 +18,7 @@
 #define CTLM_PING 0		/* payload: timestamp(8), big-endian */
 #define CTLM_PONG 1		/* payload: echoed timestamp(8) */
 #define CTLM_RDV 2		/* payload: family(1) port(2) addr(16) */
+#define CTLM_CAND 3		/* payload: family(1) port(2) addr(16) */
 #define CTL_HDR 2
 #define CTL_TS_LEN 8
 #define CTL_RDV_PLEN 19
@@ -46,8 +47,10 @@ void ctl_reframer_feed(struct ctl_reframer *r, const uint8_t *in, size_t n,
 		       void (*cb)(void *, int, const uint8_t *, size_t),
 		       void *arg);
 
-/* A rendezvous node <-> a CTL_RDV payload (CTL_RDV_PLEN bytes). Decode returns
- * the family (4 or 6), or 0 if the payload names neither. */
+/* An endpoint <-> a CTL_RDV_PLEN payload: a rendezvous node for CTLM_RDV, one
+ * of the sender's own local candidate endpoints for CTLM_CAND. The two share
+ * the payload shape and so the codec. Decode returns the family (4 or 6), or 0
+ * if the payload names neither. */
 void ctl_rdv_encode(uint8_t *pl, int family, const struct sockaddr *sa);
 int ctl_rdv_decode(const uint8_t *pl, size_t plen, struct sockaddr_storage *out,
 		   socklen_t *len);

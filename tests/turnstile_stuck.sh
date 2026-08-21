@@ -45,14 +45,17 @@ hpid=$!
 tok=""
 i=0
 while [ "$i" -lt 90 ]; do
-	tok=$(sed -n 's/^COMRADE TOKEN: //p' "$tmp/host.out" 2>/dev/null | head -1)
-	[ -n "$tok" ] && break
+	cand=$(sed -n 's/^COMRADE TOKEN: //p' "$tmp/host.out" 2>/dev/null | tail -1)
+	if [ -n "$cand" ] && "$E2E" token "$cand" 2>/dev/null |
+	   grep -q 'state[46]=RENDEZVOUS'; then
+		tok="$cand"; break
+	fi
 	if ! kill -0 "$hpid" 2>/dev/null; then
 		echo "host exited before minting a token"; cat "$tmp/host.err"; exit 1
 	fi
 	sleep 1; i=$((i + 1))
 done
-if [ -z "$tok" ]; then echo "no token after 90s"; cat "$tmp/host.err"; exit 1; fi
+if [ -z "$tok" ]; then echo "no rendezvous token after 90s"; cat "$tmp/host.err"; exit 1; fi
 
 # The head-start joiner claims first and becomes the wedged one. It never gets
 # served (by design), so we do not wait on it -- it is killed at cleanup.

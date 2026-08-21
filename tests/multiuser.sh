@@ -29,18 +29,22 @@ cpids=""
 "$E2E" host --serve "$N" >"$tmp/host.out" 2>"$tmp/host.err" &
 hpid=$!
 
-# Wait for the minted token (cold DHT convergence can take ~15 s).
+# Wait for a token whose rendezvous node is in it, so the clients skip cold
+# convergence rather than starting from the bootstrap (~15 s either way).
 tok=""
 i=0
 while [ "$i" -lt 120 ]; do
-	tok=$(sed -n 's/^COMRADE TOKEN: //p' "$tmp/host.out" 2>/dev/null | head -1)
-	[ -n "$tok" ] && break
+	cand=$(sed -n 's/^COMRADE TOKEN: //p' "$tmp/host.out" 2>/dev/null | tail -1)
+	if [ -n "$cand" ] && "$E2E" token "$cand" 2>/dev/null |
+	   grep -q 'state[46]=RENDEZVOUS'; then
+		tok="$cand"; break
+	fi
 	if ! kill -0 "$hpid" 2>/dev/null; then
 		echo "host exited before minting a token"; cat "$tmp/host.err"; exit 1
 	fi
 	sleep 1; i=$((i + 1))
 done
-if [ -z "$tok" ]; then echo "no token after 120s"; cat "$tmp/host.err"; exit 1; fi
+if [ -z "$tok" ]; then echo "no rendezvous token after 120s"; cat "$tmp/host.err"; exit 1; fi
 
 # Launch N clients at once against the one token: they race the turnstile.
 j=0

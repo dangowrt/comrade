@@ -126,20 +126,15 @@ struct session_cfg {
 	 */
 	const char *status_path;
 	/*
-	 * Called once the rendezvous is ready to advertise: with the located
-	 * DHT node (embed it in the token), or NULL/0 when there is none to
-	 * embed (multicast-only) so the token can be published immediately.
+	 * Called when a family's token state is first determined and whenever
+	 * it changes: the host writes `state` (TOKEN_STATE_*) into that
+	 * family's slot and re-emits the token. `addr` is the family's address
+	 * bytes (4 or 16), read only for RENDEZVOUS and DIRECT; `port` is in
+	 * host byte order. Both families report once at session start, so a
+	 * host that reaches nothing still has a token to show.
 	 */
-	void (*on_rendezvous)(void *arg, const struct sockaddr *sa, socklen_t len);
-	/*
-	 * Called for an isolated (LAN-only) family instead of on_rendezvous:
-	 * with the host's own direct endpoint (address + lanlink port) for that
-	 * family. The host embeds it in the token with TOKEN_FLAG_EPx_RDV clear.
-	 * The token still says nothing about the DHT: the client races both
-	 * transports whatever the slots hold. Optional; when NULL an isolated
-	 * family is not advertised.
-	 */
-	void (*on_endpoint)(void *arg, const struct sockaddr *sa, socklen_t len);
+	void (*on_token_state)(void *arg, int family, int state,
+			       const uint8_t *addr, uint16_t port);
 	void *arg;
 
 	/* Progress observer (the view); NULL for a headless run. */
@@ -167,6 +162,26 @@ struct session_cfg {
 					 * never connect (a wedged punch), so the
 					 * release-on-pickup turnstile can be shown
 					 * not to head-of-line-block (L1-stuck) */
+	int test_roam_ms;		/* report a network change this often, as
+					 * if netmon had seen the interfaces move
+					 * (0 = never), so the rebuild on a roam
+					 * runs without one. A period, not a
+					 * one-shot: a rebuild has to leave the
+					 * live workers alone every time, not
+					 * once */
+	int test_roam_max;		/* stop after this many of them (0 = keep
+					 * going). A session that has to finish
+					 * connecting needs the moves to end, or
+					 * the period races its own connect
+					 * attempt and nothing ever completes */
+	int test_blackhole_ms;		/* this long into a live session, stop
+					 * sending on the path then carrying it
+					 * (0 = never), as if that path had been
+					 * taken away. A real one cannot be
+					 * without CAP_NET_ADMIN, and dropping
+					 * our own sends is enough to make the
+					 * path die at both ends: the probes
+					 * that keep it warm are ours */
 };
 
 /* Run the session to completion; returns 0 on success, non-zero on failure. */

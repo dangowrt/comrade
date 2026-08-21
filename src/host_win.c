@@ -62,6 +62,7 @@
 
 struct svc {
 	struct token tok;
+	char last_tok[TOKEN_STR_LEN + 1];	/* the token last written out */
 	char sock[512];
 	char tokfile[512];
 	char statusfile[512];
@@ -414,74 +415,55 @@ static int attach(const char *id)
 
 /* Encode the current token (and its read-only twin), write both to the token
  * file so the foreground can print them and `comrade show` can read them, and
- * emit them to the foreground view. Shared by the rendezvous and endpoint mints. */
+ * emit them to the foreground view. Called on every token state change, so an
+ * unchanged token is not rewritten, and the file is replaced by a rename rather
+ * than truncated in place: `comrade show` never reads a half-written one. A
+ * token that did not reach the file is not remembered either, so the next state
+ * change writes it again instead of deduplicating it away. */
 static void svc_emit_token(struct svc *v)
 {
 	char tokbuf[TOKEN_STR_LEN + 1];
 	char tokbuf_ro[TOKEN_STR_LEN + 1];
+	char tmp[520];
 	struct token ro;
 	FILE *f;
+	int wrote = 0;
 
 	if (token_encode(&v->tok, tokbuf, sizeof(tokbuf)))
+		return;
+	if (!strcmp(tokbuf, v->last_tok))
 		return;
 	ro = v->tok;
 	ro.flags |= TOKEN_FLAG_RO;
 	keys_derive_ro_auth(ro.auth, v->tok.auth);
 	if (token_encode(&ro, tokbuf_ro, sizeof(tokbuf_ro)))
 		return;
-	f = fopen(v->tokfile, "wb");
+	snprintf(tmp, sizeof(tmp), "%s.tmp", v->tokfile);
+	f = fopen(tmp, "wb");
 	if (f) {
-		fprintf(f, "%s\n%s\n", tokbuf, tokbuf_ro);
-		fclose(f);
+		int n = fprintf(f, "%s\n%s\n", tokbuf, tokbuf_ro);
+
+		wrote = fclose(f) == 0 &&
+			n == (int)(strlen(tokbuf) + strlen(tokbuf_ro) + 2);
+		if (!wrote || os_rename_replace(tmp, v->tokfile)) {
+			remove(tmp);
+			wrote = 0;
+		}
 	}
+	if (wrote)
+		snprintf(v->last_tok, sizeof(v->last_tok), "%s", tokbuf);
 	ui_emitter_token(&v->obs, tokbuf);	/* show it in the foreground */
 	ui_emitter_token_ro(&v->obs, tokbuf_ro);
 }
 
-/* Called (in the service) once the rendezvous is ready; embed the located DHT
- * node for the family (EPx_RDV set) and write the token. */
-static void on_rendezvous(void *arg, const struct sockaddr *sa, socklen_t len)
+/* Called (in the service) whenever a family's token state changes: write it
+ * into that family's slot and re-emit the token. */
+static void on_token_state(void *arg, int family, int state,
+			   const uint8_t *addr, uint16_t port)
 {
 	struct svc *v = arg;
 
-	(void)len;
-	if (sa && sa->sa_family == AF_INET6) {
-		const struct sockaddr_in6 *a = (const struct sockaddr_in6 *)sa;
-
-		memcpy(v->tok.ep6_addr, &a->sin6_addr, TOKEN_EP6_LEN);
-		v->tok.ep6_port = ntohs(a->sin6_port);
-		v->tok.flags |= TOKEN_FLAG_EP6_RDV;
-	} else if (sa && sa->sa_family == AF_INET) {
-		const struct sockaddr_in *a = (const struct sockaddr_in *)sa;
-
-		memcpy(v->tok.ep4_addr, &a->sin_addr, TOKEN_EP4_LEN);
-		v->tok.ep4_port = ntohs(a->sin_port);
-		v->tok.flags |= TOKEN_FLAG_EP4_RDV;
-	}
-	svc_emit_token(v);
-}
-
-/* The isolated-LAN sibling of on_rendezvous: embed our own direct endpoint for
- * the family (EPx_RDV clear), which the client reaches over the LAN while it
- * keeps looking for the same host on the DHT. */
-static void on_endpoint(void *arg, const struct sockaddr *sa, socklen_t len)
-{
-	struct svc *v = arg;
-
-	(void)len;
-	if (sa && sa->sa_family == AF_INET6) {
-		const struct sockaddr_in6 *a = (const struct sockaddr_in6 *)sa;
-
-		memcpy(v->tok.ep6_addr, &a->sin6_addr, TOKEN_EP6_LEN);
-		v->tok.ep6_port = ntohs(a->sin6_port);
-		v->tok.flags &= ~TOKEN_FLAG_EP6_RDV;
-	} else if (sa && sa->sa_family == AF_INET) {
-		const struct sockaddr_in *a = (const struct sockaddr_in *)sa;
-
-		memcpy(v->tok.ep4_addr, &a->sin_addr, TOKEN_EP4_LEN);
-		v->tok.ep4_port = ntohs(a->sin_port);
-		v->tok.flags &= ~TOKEN_FLAG_EP4_RDV;
-	}
+	token_set_family(&v->tok, family, state, addr, port);
 	svc_emit_token(v);
 }
 
@@ -515,8 +497,7 @@ static void run_service(struct svc *v, void *hostkey, sock_t wfd)
 	cfg.ssh_end_fd = sock_isset(end_fd) ? end_fd : 0;
 	cfg.no_fwd = v->no_fwd;
 	cfg.status_path = v->statusfile;
-	cfg.on_rendezvous = on_rendezvous;
-	cfg.on_endpoint = on_endpoint;
+	cfg.on_token_state = on_token_state;
 	cfg.arg = v;
 	cfg.obs = &v->obs;
 
@@ -910,6 +891,13 @@ int host_run(int ui_mode, int no_mcast, int no_dht, int no_fwd)
 	if (find_live(id)) {
 		fprintf(stderr, "comrade: re-attaching to your running session"
 			" (its token: `comrade show`)\n");
+		if (no_mcast || no_dht || no_fwd)
+			fprintf(stderr, "comrade: ignoring%s%s%s -- the "
+				"running service keeps what it was started "
+				"with\n",
+				no_mcast ? " --no-multicast" : "",
+				no_dht ? " --no-dht" : "",
+				no_fwd ? " --no-forwarding" : "");
 		do {
 			rc = attach(id);
 		} while (rc == 2);

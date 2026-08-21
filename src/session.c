@@ -16,6 +16,7 @@
 #include "lanlink.h"
 #include "nat.h"
 #include "netmon.h"
+#include "path.h"
 #include "session.h"
 #include "sig.h"
 #include "sshbridge.h"
@@ -39,7 +40,9 @@
  * worker reaps itself: with no clean disconnect the SSH bridge never ends on its
  * own (KCP buffers a dead path indefinitely), so the heartbeat is what frees the
  * worker (and its tmux client). Well above HB_LOST_MS so a brief outage, during
- * which the client may still be reconnecting, does not tear a live worker down.
+ * which the client may still be reconnecting, does not tear a live worker down,
+ * and well above PATH_DEAD_MS so a client moving between paths is never
+ * reaped mid-switch.
  */
 #define HOST_REAP_MS 12000
 /*
@@ -52,6 +55,15 @@
 #define RDV_WARM_MS 180000		/* 3 min: re-validate/keep warm */
 #define RDV_POLL_MS 5000		/* until the first node is captured */
 #define RDV_TELL_MS 30000		/* announce our nodes to the peer */
+/*
+ * Candidate advertisement cadence. Each end names its own local endpoints on
+ * the shared lanlink socket over CTLM_CAND, so both explore the full set rather
+ * than only the pair admission produced, and a multi-homed end has its
+ * alternatives warm before anything fails. Repeated on a period rather than
+ * sent once: an interface brought up mid-session is then advertised within one,
+ * and a frame is 21 bytes.
+ */
+#define CAND_TELL_MS 5000
 
 /* Rendezvous node kept for reconnection (ours when we can reach the family, or
  * the peer's for a family we cannot yet reach but might roam to). */
@@ -81,18 +93,14 @@ static int fam_idx(int family)
 #define STUN_WARN_MS 8000
 
 /*
- * A path is qualified when an authenticated probe has round-tripped on it, so
- * these bound the wait rather than the truth: how often to re-probe a path that
- * has not answered, and how long a client keeps probing before it concludes it
- * lost the turnstile round and claims again. See PROTOCOL.md, "Transport probe".
- */
-#define PROBE_EVERY_MS 200
-/*
- * How long a client keeps probing after its claim has left the answer slot
- * before concluding it was not the pickup. Only ever measured from that moment,
- * never from the start of the attempt: a claim still sitting in the slot is
- * queued, however long the queue, and a timeout that cannot tell those two
- * apart livelocks one case or the other (measured, both ways).
+ * A path is qualified when an authenticated probe has round-tripped on it; the
+ * probe cadences, the measurements and the choice between paths are the model
+ * in path.h. This bounds only the wait: how long a client keeps probing after
+ * its claim has left the answer slot before concluding it was not the pickup.
+ * Only ever measured from that moment, never from the start of the attempt: a
+ * claim still sitting in the slot is queued, however long the queue, and a
+ * timeout that cannot tell those two apart livelocks one case or the other
+ * (measured, both ways).
  */
 #define PATH_PROBE_MS 2500
 
@@ -150,24 +158,27 @@ struct conn {
 					 * thread (libjuice) or the host's main
 					 * demux may touch it during teardown */
 
-	/* This connection's direct (lanlink) peer on the shared segment, if any;
-	 * a v4 peer is kept v4-mapped. transport_send prefers it over ICE, and
-	 * the host demultiplexes inbound datagrams to the conn whose lan_peer
-	 * matches the source. */
-	struct sockaddr_in6 lan_peer;
-	int have_lan_peer;
 	/*
-	 * Path qualification. A transport reporting a pair says only that packets
+	 * Every path this connection holds, and the choice between them (the
+	 * model is path.h). A transport reporting a pair says only that packets
 	 * move; it does not say the far end is serving *us* -- a host answers a
-	 * losing claimant's ICE checks with credentials every reader of its offer
-	 * holds. So each path carries the session only once a probe has
-	 * round-tripped on it bearing our own claimant identity, and among
-	 * qualified paths the lowest class wins (see path_class).
+	 * losing claimant's ICE checks with credentials every reader of its
+	 * offer holds. So a path carries the session only once a probe has
+	 * round-tripped on it bearing our own claimant identity.
+	 *
+	 * path_lock covers the table and nothing else: libjuice's receive
+	 * thread, the host's main demux and this connection's own loop all
+	 * reach it. It is never held across a lanlink_send, a nat_send, a seal
+	 * or an agent call, and never nested with stream_lock in either order.
+	 * The computations under it are the ranking, a handful of integer
+	 * compares over at most PATH_MAX entries, and the path id, a keyed
+	 * digest over 36 bytes taken when an endpoint of the pair is learnt or
+	 * changes.
 	 */
-	volatile int lan_qualified;
-	volatile int ice_qualified;
-	volatile int lan_rtt_ms;
-	volatile int ice_rtt_ms;
+	struct path_table paths;
+	pthread_mutex_t path_lock;
+	uint64_t next_ice_ep_ms;	/* when to ask the agent which pair it
+					 * has nominated (see conn_ice_ep) */
 	/*
 	 * The turnstile's answer slot is the mutex, so it -- not a clock -- says
 	 * whether this client is still in the running. held_seen records that our
@@ -177,13 +188,13 @@ struct conn {
 	 */
 	int claim_held_seen;
 	uint64_t claim_released_ms;
-	uint64_t probe_start_ms;	/* first probe of this attempt, for rtt */
-	uint64_t next_probe_ms;
-	uint64_t probe_nonce;
-	char direct_addr[80];		/* the lan_peer, printable (view) */
 	/* The claimant's ICE ufrag, carried for the worker's whole lifetime so the
 	 * host recognises the same client arriving over the other transport. */
 	char claim_ufrag[40];
+	/* The path deliberately made to die (test_blackhole_ms); bh_kind is -1
+	 * while none is. */
+	int bh_kind;
+	struct path_ep bh_ep;
 
 	sock_t ssh_fd;			/* the ssh thread's socketpair end */
 	sock_t ssh_ctl_fd;		/* the ssh thread's comrade-ctl end */
@@ -207,6 +218,7 @@ struct conn {
 	pthread_mutex_t rdv_lock;
 	int rdv_in_dirty;
 	uint64_t next_rdv_tell_ms;
+	uint64_t next_cand_ms;		/* when to advertise our own endpoints */
 
 	/* This connection's status (data only; the view renders it). */
 	pthread_mutex_t status_lock;
@@ -232,6 +244,8 @@ struct sess {
 	struct session_keys keys;	/* sig_key, for sealing transport probes */
 
 	struct netmon netmon;		/* detect a roam while still waiting */
+	uint64_t next_roam_ms;		/* next synthetic change (test_roam_ms) */
+	int roams;			/* synthetic changes reported so far */
 
 	char local_sdp[NAT_SDP_MAX];
 	volatile int have_local_sdp;
@@ -269,9 +283,11 @@ struct sess {
 	uint64_t ice_attempt_start;
 	int ice_attempt;
 	int expect4, expect6;		/* host has DHT reach on this family */
-	int minted4, minted6;		/* family's endpoint/rendezvous is in the token */
+	int tok_state[2];		/* per family [0]=v4 [1]=v6, TOKEN_STATE_* */
+	int tok_told[2];		/* the state has been reported at least once */
 	int noconn_warned;		/* operator told no family can be advertised */
-	uint64_t next_mint_ms;		/* throttle the per-family advert decision */
+	uint64_t next_tok_ms;		/* throttle the per-family advert decision */
+	uint64_t dht_since_ms;		/* this DHT attempt started (armed with sig) */
 
 	uint64_t start_ms;		/* observer: session start, for escalation */
 	int escalated;			/* observer: client warned of DHT warm */
@@ -310,6 +326,16 @@ struct sess {
 		char ufrag[40];
 	} lan_pending[HOST_MAX_WORKERS];
 	int lan_pending_n;
+	/*
+	 * Every connection this host serves, whichever transport admitted it, so
+	 * a probe from a source no path names can be matched to the claimant it
+	 * names -- and the budget that bounds what a stranger can make us open
+	 * (adopt_allow). Both belong to the thread that dispatches the shared
+	 * lanlink socket, which is this one.
+	 */
+	struct conn *conns[HOST_MAX_WORKERS];
+	int adopt_tokens;			/* thousandths of a token */
+	uint64_t adopt_ms;
 	char punch_ufrag[HOST_MAX_WORKERS][40];	/* each punch's claimant id */
 	char last_served_ufrag[40];		/* the most recently served one */
 	int have_served;
@@ -377,6 +403,40 @@ static int cand_addr(const char *cand, char *out, size_t n)
 	return 1;
 }
 
+/*
+ * The endpoint of an ICE candidate line, canonicalised. libjuice reports the
+ * selected pair as two such lines, which is the only source of a remote
+ * endpoint for PATH_ICE -- its receive callback carries no source address at
+ * all. Right except between a re-nomination and the next report. 0 if found.
+ */
+static int cand_ep(const char *cand, struct path_ep *ep)
+{
+	const char *p = strstr(cand, "candidate:");
+	struct sockaddr_in6 a6;
+	struct sockaddr_in a4;
+	char addr[64];
+	unsigned port = 0;
+
+	if (!p || sscanf(p, "candidate:%*s %*d %*s %*u %63s %u",
+			 addr, &port) != 2 || !port)
+		return -1;
+	if (strchr(addr, ':')) {
+		memset(&a6, 0, sizeof(a6));
+		a6.sin6_family = AF_INET6;
+		a6.sin6_port = htons((uint16_t)port);
+		if (inet_pton(AF_INET6, addr, &a6.sin6_addr) != 1)
+			return -1;
+		return path_ep_from_sockaddr(ep, (struct sockaddr *)&a6,
+					     sizeof(a6));
+	}
+	memset(&a4, 0, sizeof(a4));
+	a4.sin_family = AF_INET;
+	a4.sin_port = htons((uint16_t)port);
+	if (inet_pton(AF_INET, addr, &a4.sin_addr) != 1)
+		return -1;
+	return path_ep_from_sockaddr(ep, (struct sockaddr *)&a4, sizeof(a4));
+}
+
 /* Printable "addr:port" ("[v6]:port") for a sockaddr; empty on failure. */
 static void fmt_sockaddr(const struct sockaddr *sa, socklen_t len,
 			 char *out, size_t n)
@@ -391,6 +451,208 @@ static void fmt_sockaddr(const struct sockaddr *sa, socklen_t len,
 		snprintf(out, n, "[%s]:%s", host, serv);
 	else
 		snprintf(out, n, "%s:%s", host, serv);
+}
+
+/* Enter one endpoint on the shared lanlink socket as a path, or find the path
+ * already naming it; its printable form goes to label when one is asked for.
+ * Returns 0 when the connection holds the path afterwards. */
+static int conn_add_lan_path(struct conn *c, enum path_kind kind,
+			     const struct sockaddr_in6 *remote,
+			     char *label, size_t label_len)
+{
+	struct path *p;
+
+	pthread_mutex_lock(&c->path_lock);
+	p = path_table_add(&c->paths, kind, remote, NULL, now_ms());
+	if (p && label)
+		snprintf(label, label_len, "%s", p->label);
+	pthread_mutex_unlock(&c->path_lock);
+	return p ? 0 : -1;
+}
+
+static void conn_add_ice_path(struct conn *c)
+{
+	pthread_mutex_lock(&c->path_lock);
+	path_table_add(&c->paths, PATH_ICE, NULL, c->nat, now_ms());
+	pthread_mutex_unlock(&c->path_lock);
+}
+
+/* Retire the ICE path before its agent goes: the path borrows the agent, it
+ * does not own it. */
+static void conn_drop_ice_path(struct conn *c)
+{
+	pthread_mutex_lock(&c->path_lock);
+	path_table_drop_kind(&c->paths, PATH_ICE);
+	pthread_mutex_unlock(&c->path_lock);
+}
+
+/* How many lanlink paths this connection holds; routable_only leaves out the
+ * link-local endpoints a lanlink send cannot reliably reach. */
+static int conn_lan_paths(struct conn *c, int routable_only)
+{
+	int i, n = 0;
+
+	pthread_mutex_lock(&c->path_lock);
+	for (i = 0; i < PATH_MAX; i++) {
+		struct path *p = &c->paths.p[i];
+
+		if (!p->used || p->kind == PATH_ICE)
+			continue;
+		if (routable_only &&
+		    IN6_IS_ADDR_LINKLOCAL(&p->remote.sin6_addr))
+			continue;
+		n++;
+	}
+	pthread_mutex_unlock(&c->path_lock);
+	return n;
+}
+
+/* Does this connection hold a lanlink path naming this endpoint? exact asks for
+ * the whole endpoint; otherwise the lanlink port alone identifies the peer. */
+static int conn_holds_ep(struct conn *c, const struct path_ep *ep, int exact)
+{
+	int hit;
+
+	pthread_mutex_lock(&c->path_lock);
+	hit = exact ? path_table_find_ep(&c->paths, ep) != NULL :
+		      path_table_find_port(&c->paths, ep->port) != NULL;
+	pthread_mutex_unlock(&c->path_lock);
+	return hit;
+}
+
+/* What a caller needs of the path carrying the session, copied out under the
+ * lock so nothing reaches into the table without it. */
+struct path_pick {
+	int kind;			/* -1 when no path can carry one */
+	int blackholed;			/* the test hook has taken this one away */
+	struct sockaddr_in6 remote;
+	struct nat_agent *agent;
+	char label[PATH_LABEL_MAX];
+};
+
+/*
+ * Is this the path the test hook has taken away (test_blackhole_ms)? A path
+ * cannot be removed for real on a machine without CAP_NET_ADMIN, so the hook
+ * simply stops this end sending on the one that was carrying the session: the
+ * probes that keep a path warm are ours, so it falls silent at both ends.
+ * Called with path_lock held, which is what the hook is written under too.
+ */
+static int path_blackholed(const struct conn *c, int kind,
+			   const struct sockaddr_in6 *to)
+{
+	struct path_ep ep;
+
+	if (c->bh_kind < 0 || kind != c->bh_kind)
+		return 0;
+	if (kind == PATH_ICE)
+		return 1;
+	if (!to || path_ep_from_sockaddr(&ep, (const struct sockaddr *)to,
+					 sizeof(*to)))
+		return 0;
+	return path_ep_eq(&ep, &c->bh_ep);
+}
+
+/* One path's measurements, both ends' views of them, as the selection log
+ * shows them. */
+static void path_desc(const struct path *p, char *out, size_t n)
+{
+	snprintf(out, n, "%s bucket=%d srtt=%d/%d loss=%d/%d",
+		 p->label[0] ? p->label : "ICE", path_bucket(p),
+		 path_srtt_ms(p), p->peer_srtt_ms,
+		 path_loss_ppt(p), p->peer_loss_ppt);
+}
+
+/*
+ * The path carrying the session, chosen purely by measurement (path_select):
+ * the lowest cost in the best occupied warmth tier, ties to the lowest id, both
+ * ends computing that from the same pair of published views. Kind plays no
+ * part -- a segment path wins because it measures lower, and where it does not
+ * measure lower the measurement is right.
+ *
+ * An ICE agent that has nominated no pair carries nothing at all, so it is
+ * marked unusable rather than ranked; the agent is asked before the lock, which
+ * is never held across a call into one.
+ *
+ * Returns 0 when a path was chosen. A change of path is logged with both ends'
+ * numbers, the one triage surface when a switch looks wrong.
+ */
+static int conn_pick(struct conn *c, struct path_pick *out)
+{
+	char from[PATH_LABEL_MAX + 64], to[PATH_LABEL_MAX + 64];
+	int ice_ok = c->nat && nat_connected(c->nat);
+	int i, prev, sel;
+
+	memset(out, 0, sizeof(*out));
+	out->kind = -1;
+	from[0] = '\0';
+	to[0] = '\0';
+	pthread_mutex_lock(&c->path_lock);
+	for (i = 0; i < PATH_MAX; i++)
+		c->paths.p[i].usable = c->paths.p[i].kind != PATH_ICE || ice_ok;
+	prev = c->paths.sel;
+	sel = path_select(&c->paths, now_ms());
+	if (sel >= 0) {
+		struct path *p = &c->paths.p[sel];
+
+		out->kind = (int)p->kind;
+		out->remote = p->remote;
+		out->agent = p->agent;
+		out->blackholed = path_blackholed(c, out->kind, &p->remote);
+		snprintf(out->label, sizeof(out->label), "%s", p->label);
+		if (sel != prev) {
+			path_desc(p, to, sizeof(to));
+			if (prev >= 0 && c->paths.p[prev].used)
+				path_desc(&c->paths.p[prev], from, sizeof(from));
+		}
+	}
+	pthread_mutex_unlock(&c->path_lock);
+	if (to[0])
+		dbg_logf("path: carrying %s (was %s)", to,
+			 from[0] ? from : "none");
+	return out->kind < 0 ? -1 : 0;
+}
+
+/* The endpoint the session is on right now, printable (view). Empty for an ICE
+ * path whose agent has not yet reported the pair it nominated. */
+static void conn_path_label(struct conn *c, char *out, size_t n)
+{
+	struct path_pick pick;
+
+	out[0] = '\0';
+	if (!conn_pick(c, &pick))
+		snprintf(out, n, "%s", pick.label);
+}
+
+/*
+ * The warm paths this connection holds besides the one carrying the session:
+ * how many there are, and the best-ranked of them, printable (view). This is
+ * what the session would move to were the path in use to die, so it is the
+ * evidence for the status row's promise that a roam is a reordering. Call it
+ * after conn_pick, which is what refreshes `usable`.
+ */
+static int conn_warm_alts(struct conn *c, char *best, size_t n)
+{
+	uint64_t now = now_ms();
+	int i, sel, top = -1, cnt = 0;
+
+	best[0] = '\0';
+	pthread_mutex_lock(&c->path_lock);
+	sel = c->paths.sel;
+	for (i = 0; i < PATH_MAX; i++) {
+		struct path *p = &c->paths.p[i];
+
+		if (!p->used || !p->usable || i == sel)
+			continue;
+		if (path_warmth_of(p, now) != PATH_WARM)
+			continue;
+		cnt++;
+		if (top < 0 || path_cmp(p, &c->paths.p[top], now) < 0)
+			top = i;
+	}
+	if (top >= 0)
+		snprintf(best, n, "%s", c->paths.p[top].label);
+	pthread_mutex_unlock(&c->path_lock);
+	return cnt;
 }
 
 /* Classify a bare address string by reachability scope. */
@@ -418,6 +680,61 @@ static int addr_scope(const char *addr)
 	if (b[0] == 100 && b[1] >= 64 && b[1] <= 127)
 		return NET_SCOPE_CGNAT;
 	return NET_SCOPE_GLOBAL;
+}
+
+/* How an endpoint on the shared lanlink socket is come by: one on the local
+ * segment, or any other the same socket can reach. A description of the
+ * endpoint and nothing more -- neither kind ranks above the other. */
+static enum path_kind ep_kind(const struct path_ep *ep)
+{
+	struct in6_addr a6;
+	struct in_addr a4;
+	char host[64];
+
+	if (path_ep_is_v4(ep)) {
+		memcpy(&a4, ep->addr + 12, 4);
+		if (!inet_ntop(AF_INET, &a4, host, sizeof(host)))
+			return PATH_ROUTED;
+	} else {
+		memcpy(&a6, ep->addr, 16);
+		if (!inet_ntop(AF_INET6, &a6, host, sizeof(host)))
+			return PATH_ROUTED;
+	}
+	return addr_scope(host) == NET_SCOPE_LAN ? PATH_SEGMENT : PATH_ROUTED;
+}
+
+/*
+ * An endpoint the peer advertised over CTLM_CAND: one more candidate on the
+ * shared lanlink socket, its kind following the source exactly as an adopted
+ * one's does. It is a claim rather than evidence -- nothing has been seen to
+ * arrive from it -- so it takes a free slot or a dead one and is otherwise
+ * declined, and ranking decides from there whether it ever carries anything.
+ * Runs on the connection's own loop thread.
+ */
+static void conn_offer_path(struct conn *c, const struct sockaddr *sa,
+			    socklen_t len)
+{
+	char added[PATH_LABEL_MAX];
+	struct sockaddr_in6 remote;
+	struct path_ep ep;
+	struct path *p;
+	int fresh;
+
+	if (lanlink_map_peer(sa, len, &remote) ||
+	    path_ep_from_sockaddr(&ep, (struct sockaddr *)&remote,
+				  sizeof(remote)))
+		return;
+	if (path_ep_any(&ep) || !ep.port)
+		return;
+	added[0] = '\0';
+	pthread_mutex_lock(&c->path_lock);
+	fresh = path_table_find_ep(&c->paths, &ep) == NULL;
+	p = path_table_offer(&c->paths, ep_kind(&ep), &remote, now_ms());
+	if (p && fresh)
+		snprintf(added, sizeof(added), "%s", p->label);
+	pthread_mutex_unlock(&c->path_lock);
+	if (added[0])
+		dbg_logf("path advertised: %s", added);
 }
 
 /*
@@ -500,10 +817,12 @@ static void fmt_rdv_fam(struct sess *s, int family, char *out, size_t n)
 	if (s->rdv[i].have)
 		fmt_sockaddr((struct sockaddr *)&s->rdv[i].sa, s->rdv[i].len,
 			     out, n);
-	else if (family == 6 && (t->flags & TOKEN_FLAG_EP6_RDV) &&
+	else if (family == 6 &&
+		 token_family_state(t, 6) == TOKEN_STATE_RENDEZVOUS &&
 		 inet_ntop(AF_INET6, t->ep6_addr, ip, sizeof(ip)))
 		snprintf(out, n, "[%s]:%u", ip, t->ep6_port);
-	else if (family == 4 && (t->flags & TOKEN_FLAG_EP4_RDV) &&
+	else if (family == 4 &&
+		 token_family_state(t, 4) == TOKEN_STATE_RENDEZVOUS &&
 		 inet_ntop(AF_INET, t->ep4_addr, ip, sizeof(ip)))
 		snprintf(out, n, "%s:%u", ip, t->ep4_port);
 }
@@ -525,13 +844,12 @@ static void publish_status(struct conn *c, int state)
 	 * file) leaves it clear and marks read-only guests on the dashboard. */
 	cs.read_only = !s->cfg->is_host &&
 		       (s->cfg->tok.flags & TOKEN_FLAG_RO) != 0;
-	/* Show the endpoint that is actually carrying KCP right now: the
-	 * link-local direct peer when that path is up (it is preferred in
-	 * transport_send), otherwise the selected -- proven -- ICE pair. Never a
-	 * mere gathered candidate. */
-	if (c->have_lan_peer && c->direct_addr[0]) {
-		snprintf(cs.peer, sizeof(cs.peer), "%s", c->direct_addr);
-	} else if (c->nat && nat_connected(c->nat)) {
+	/* Show the endpoint that is actually carrying KCP right now: the path
+	 * in use when it names one, otherwise the selected -- proven -- ICE
+	 * pair. Never a mere gathered candidate. */
+	conn_path_label(c, cs.peer, sizeof(cs.peer));
+	cs.warm_alt = conn_warm_alts(c, cs.alt, sizeof(cs.alt));
+	if (!cs.peer[0] && c->nat && nat_connected(c->nat)) {
 		char loc[192], rem[192];
 
 		if (!nat_selected(c->nat, loc, sizeof(loc), rem, sizeof(rem)))
@@ -609,7 +927,7 @@ static int seed_node_for(struct sess *s, int family, struct sockaddr_storage *sa
 		*len = s->rdv[i].len;
 		return 0;
 	}
-	if (family == 6 && (t->flags & TOKEN_FLAG_EP6_RDV)) {
+	if (family == 6 && token_family_state(t, 6) == TOKEN_STATE_RENDEZVOUS) {
 		struct sockaddr_in6 *a = (struct sockaddr_in6 *)sa;
 
 		memset(a, 0, sizeof(*a));
@@ -619,7 +937,7 @@ static int seed_node_for(struct sess *s, int family, struct sockaddr_storage *sa
 		*len = sizeof(*a);
 		return 0;
 	}
-	if (family == 4 && (t->flags & TOKEN_FLAG_EP4_RDV)) {
+	if (family == 4 && token_family_state(t, 4) == TOKEN_STATE_RENDEZVOUS) {
 		struct sockaddr_in *a = (struct sockaddr_in *)sa;
 
 		memset(a, 0, sizeof(*a));
@@ -664,58 +982,39 @@ static void seed_rendezvous(struct sess *s)
 }
 
 /*
- * Client accelerator (mirror of seed_rendezvous): for each family whose
- * endpoint is direct (EPx_RDV clear) and non-zero, preload the host's endpoint
- * as our lanlink peer at t=0, so KCP starts toward the host immediately instead
+ * Client accelerator (mirror of seed_rendezvous): for each family whose slot is
+ * DIRECT -- which in 0.1.x only an older host mints -- enter the host's
+ * endpoint as a path at t=0, so KCP starts toward the host immediately instead
  * of waiting to hear its multicast announcement. The host still learns us from
  * our own sealed announcement; this only primes the reverse direction. A later
- * multicast on_direct_peer overwrites this with the same endpoint. Only called
- * once s->lan exists (transport_send would otherwise send on a NULL socket).
+ * multicast on_direct_peer names the same endpoint, which is the same path.
+ * Only called once s->lan exists (transport_send would otherwise send on a NULL
+ * socket).
  */
 static void client_direct_connect(struct sess *s)
 {
 	const struct token *t = &s->cfg->tok;
-	int i, any;
+	struct sockaddr_in6 np;
 
-	if (!(t->flags & TOKEN_FLAG_EP6_RDV) && t->ep6_port) {
+	if (token_family_state(t, 6) == TOKEN_STATE_DIRECT) {
 		struct sockaddr_in6 a;
 
-		for (i = 0, any = 0; i < TOKEN_EP6_LEN; i++)
-			if (t->ep6_addr[i])
-				any = 1;
-		if (any) {
-			memset(&a, 0, sizeof(a));
-			a.sin6_family = AF_INET6;
-			memcpy(&a.sin6_addr, t->ep6_addr, TOKEN_EP6_LEN);
-			a.sin6_port = htons(t->ep6_port);
-			if (!lanlink_map_peer((struct sockaddr *)&a, sizeof(a),
-					      &s->c.lan_peer)) {
-				s->c.have_lan_peer = 1;
-				fmt_sockaddr((struct sockaddr *)&a, sizeof(a),
-					     s->c.direct_addr,
-					     sizeof(s->c.direct_addr));
-			}
-		}
+		memset(&a, 0, sizeof(a));
+		a.sin6_family = AF_INET6;
+		memcpy(&a.sin6_addr, t->ep6_addr, TOKEN_EP6_LEN);
+		a.sin6_port = htons(t->ep6_port);
+		if (!lanlink_map_peer((struct sockaddr *)&a, sizeof(a), &np))
+			conn_add_lan_path(&s->c, PATH_SEGMENT, &np, NULL, 0);
 	}
-	if (!(t->flags & TOKEN_FLAG_EP4_RDV) && t->ep4_port) {
+	if (token_family_state(t, 4) == TOKEN_STATE_DIRECT) {
 		struct sockaddr_in a;
 
-		for (i = 0, any = 0; i < TOKEN_EP4_LEN; i++)
-			if (t->ep4_addr[i])
-				any = 1;
-		if (any) {
-			memset(&a, 0, sizeof(a));
-			a.sin_family = AF_INET;
-			memcpy(&a.sin_addr, t->ep4_addr, TOKEN_EP4_LEN);
-			a.sin_port = htons(t->ep4_port);
-			if (!lanlink_map_peer((struct sockaddr *)&a, sizeof(a),
-					      &s->c.lan_peer)) {
-				s->c.have_lan_peer = 1;
-				fmt_sockaddr((struct sockaddr *)&a, sizeof(a),
-					     s->c.direct_addr,
-					     sizeof(s->c.direct_addr));
-			}
-		}
+		memset(&a, 0, sizeof(a));
+		a.sin_family = AF_INET;
+		memcpy(&a.sin_addr, t->ep4_addr, TOKEN_EP4_LEN);
+		a.sin_port = htons(t->ep4_port);
+		if (!lanlink_map_peer((struct sockaddr *)&a, sizeof(a), &np))
+			conn_add_lan_path(&s->c, PATH_SEGMENT, &np, NULL, 0);
 	}
 }
 
@@ -811,25 +1110,20 @@ static void on_ice_candidate(void *arg, const char *cand)
 }
 
 
-/* Send over whichever transport carries the stream right now (see the priority
- * in on_stream_output). Used for the KCP stream and the liveness heartbeat. */
+/* Send over whichever transport carries the stream right now. Used for the KCP
+ * stream and the liveness heartbeat. */
 static int transport_send(struct conn *c, const uint8_t *data, size_t len)
 {
 	struct sess *s = c->sess;
+	struct path_pick pick;
 
-	/*
-	 * Class before anything else: a qualified LAN path stays on the segment,
-	 * needs no NAT binding and no ICE keepalive, and never asks the gateway to
-	 * reflect a packet back at the segment it came from. A host has nothing to
-	 * qualify -- see path_ready -- so it keeps the old preference.
-	 */
-	if (c->lan_qualified || (s->cfg->is_host && c->have_lan_peer))
-		return lanlink_send(s->lan, &c->lan_peer, data, len);
-	if (c->nat && nat_connected(c->nat))
-		return nat_send(c->nat, data, len);
-	if (c->have_lan_peer)
-		return lanlink_send(s->lan, &c->lan_peer, data, len);
-	return -1;
+	if (conn_pick(c, &pick))
+		return -1;
+	if (pick.blackholed)
+		return 0;
+	if (pick.kind == PATH_ICE)
+		return pick.agent ? nat_send(pick.agent, data, len) : -1;
+	return s->lan ? lanlink_send(s->lan, &pick.remote, data, len) : -1;
 }
 
 /*
@@ -873,8 +1167,9 @@ static void ctl_send(struct conn *c, int type, const uint8_t *payload,
 }
 
 /* Act on one decoded control message (a ctl_reframer callback): answer a ping,
- * record a pong's round trip, or stash the peer's announced rendezvous node for
- * rdv_maintain to adopt. */
+ * record a pong's round trip, stash the peer's announced rendezvous node for
+ * rdv_maintain to adopt, or enter an endpoint it advertises as one more path.
+ * Runs on the connection's own loop thread, the same one as path_tick. */
 static void ctl_dispatch(void *arg, int type, const uint8_t *pl, size_t plen)
 {
 	struct conn *c = arg;
@@ -904,6 +1199,12 @@ static void ctl_dispatch(void *arg, int type, const uint8_t *pl, size_t plen)
 			c->rdv_in_dirty = 1;
 			pthread_mutex_unlock(&c->rdv_lock);
 		}
+	} else if (type == CTLM_CAND && plen >= CTL_RDV_PLEN) {
+		struct sockaddr_storage sa;
+		socklen_t sl = 0;
+
+		if (ctl_rdv_decode(pl, plen, &sa, &sl))
+			conn_offer_path(c, (struct sockaddr *)&sa, sl);
 	}
 }
 
@@ -924,119 +1225,239 @@ static void ctl_readable(struct conn *c)
  * libjuice's thread.
  */
 /*
- * The transport probe. Every KCP datagram opens with the conversation id, which
- * ikcp_input rejects on mismatch, and comrade uses one fixed conv -- so a
- * datagram opening with a different 32-bit magic is unambiguously not stream
- * data and can be split off ahead of it for the cost of one compare.
- *
- *   [4 magic][sealed: [1 type][8 nonce][1 ulen][ulen claimant ufrag]]
- *
- * The seal is not defending against the peer, who holds the token and is trusted
- * by construction; it stops a stranger who can guess an endpoint from forging a
- * reply and making us adopt a path that does not work.
- *
- * The ufrag is the claimant identity the turnstile already uses. A host answers
- * only for the claimant its worker was admitted for, and that single test is
- * what separates the winner of a turnstile round from the losers whose checks
- * its agent answered on the way past.
+ * The transport probe (frame and codec in path.h). Every KCP datagram opens
+ * with the conversation id, which ikcp_input rejects on mismatch, and comrade
+ * uses one fixed conv -- so a datagram opening with a different 32-bit magic is
+ * unambiguously not stream data and can be split off ahead of it for the cost
+ * of one compare.
  */
-#define PROBE_MAGIC 0x434d5250U		/* "CMRP"; must differ from SESSION_CONV */
-#define PROBE_PING 1
-#define PROBE_PONG 2
-#define PROBE_PLAIN_MAX (1 + 8 + 1 + 40)
-#define PROBE_MAX (4 + PROBE_PLAIN_MAX + SEAL_OVERHEAD)
 
-static void probe_put32(uint8_t *p, uint32_t v)
+/* Seal one probe for this connection into out (>= PROBE_MAX); 0 on failure.
+ * The claimant ufrag is this connection's, whoever filled the rest in. */
+static size_t conn_probe_seal(struct conn *c, struct path_probe *pr,
+			      uint8_t *out)
 {
-	p[0] = (uint8_t)(v >> 24);
-	p[1] = (uint8_t)(v >> 16);
-	p[2] = (uint8_t)(v >> 8);
-	p[3] = (uint8_t)v;
-}
-
-static uint32_t probe_get32(const uint8_t *p)
-{
-	return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
-	       ((uint32_t)p[2] << 8) | (uint32_t)p[3];
-}
-
-/* Build one probe into out (>= PROBE_MAX); returns its length, or 0. */
-static size_t probe_build(struct conn *c, int type, uint64_t nonce,
-			  uint8_t *out)
-{
-	uint8_t plain[PROBE_PLAIN_MAX];
-	size_t ul = strlen(c->claim_ufrag);
-	int n, i;
-
-	if (ul > 40)
-		return 0;
-	plain[0] = (uint8_t)type;
-	for (i = 0; i < 8; i++)
-		plain[1 + i] = (uint8_t)(nonce >> (8 * (7 - i)));
-	plain[9] = (uint8_t)ul;
-	memcpy(plain + 10, c->claim_ufrag, ul);
-	probe_put32(out, PROBE_MAGIC);
-	n = msg_seal(out + 4, PROBE_MAX - 4, c->sess->keys.sig_key, plain,
-		     10 + ul);
-	return n < 0 ? 0 : (size_t)n + 4;
+	snprintf(pr->ufrag, sizeof(pr->ufrag), "%s", c->claim_ufrag);
+	return path_probe_build(out, PROBE_MAX, c->sess->keys.sig_key, pr);
 }
 
 /*
- * A probe arrived on `lan` (1) or ICE (0). A ping addressed to the claimant we
- * serve is answered on the transport it came in on; a pong qualifies that path
- * and records its round trip. Anything else is dropped in silence.
+ * The path a frame arrived on: the agent for ICE, which reports no source, and
+ * the source endpoint for the lanlink kinds. NULL when this end holds no path
+ * naming it -- not an error, only a source it has nothing to say about yet.
+ * Called with path_lock held.
  */
-static void probe_recv(struct conn *c, const uint8_t *data, size_t len, int lan)
+static struct path *conn_recv_path(struct conn *c, enum path_kind kind,
+				   const struct path_ep *src)
 {
-	uint8_t plain[PROBE_PLAIN_MAX + 1], out[PROBE_MAX];
+	if (kind == PATH_ICE)
+		return path_table_find_agent(&c->paths, c->nat);
+	return path_table_find_ep(&c->paths, src);
+}
+
+/*
+ * The path a pong answers. The nonce names it: one was drawn for one probe on
+ * one path, so it identifies the round trip being measured whatever source the
+ * answer came back from -- which a multi-homed peer's need not match. Called
+ * with path_lock held.
+ */
+static struct path *conn_pong_path(struct conn *c, uint64_t nonce)
+{
+	int i;
+
+	for (i = 0; i < PATH_MAX; i++)
+		if (c->paths.p[i].used && c->paths.p[i].outstanding &&
+		    c->paths.p[i].nonce == nonce)
+			return &c->paths.p[i];
+	return NULL;
+}
+
+/*
+ * An authenticated probe for this connection, arrived on `kind` and from `src`
+ * for the lanlink kinds. A ping is answered to the endpoint it came from, so a
+ * multi-homed peer is answered where it asked, and the answer echoes that
+ * endpoint so the prober learns its own reflexive address for free; a pong is
+ * named by its nonce, records the round trip and qualifies the path. Either
+ * carries this end's view of the path in its tail and takes the peer's from
+ * theirs. Anything else is dropped in silence.
+ *
+ * A ping from a source no path names adds one, whatever source that is: an end
+ * whose address changed keeps the session by probing from the new one. Add,
+ * never replace -- it enters as one more candidate and ranking decides whether
+ * it ever carries anything, so a late datagram from an address that has gone
+ * away cannot flap the binding.
+ */
+static void probe_apply(struct conn *c, const struct path_probe *pr,
+			enum path_kind kind, const struct sockaddr_in6 *src)
+{
 	struct sess *s = c->sess;
-	uint64_t nonce = 0;
-	size_t ul, o;
-	int n, i;
+	struct path_probe rp;
+	struct path_ep from;
+	uint8_t out[PROBE_MAX];
+	struct path *p;
+	char label[PATH_LABEL_MAX], added[PATH_LABEL_MAX];
+	int rtt = -1, drop = 0;
+	size_t o;
 
-	n = msg_open(plain, sizeof(plain), s->keys.sig_key, data + 4, len - 4);
-	if (n < 10)
-		return;
-	for (i = 0; i < 8; i++)
-		nonce = (nonce << 8) | plain[1 + i];
-	ul = plain[9];
-	if ((size_t)n < 10 + ul || ul > 40)
-		return;
-	if (ul != strlen(c->claim_ufrag) ||
-	    memcmp(plain + 10, c->claim_ufrag, ul))
-		return;			/* not the claimant this conn serves */
+	memset(&from, 0, sizeof(from));
+	if (src)
+		path_ep_from_sockaddr(&from, (const struct sockaddr *)src,
+				      sizeof(*src));
+	if (pr->type == PROBE_PING) {
+		enum path_kind srck = kind == PATH_ICE ? kind : ep_kind(&from);
 
-	if (plain[0] == PROBE_PING) {
-		o = probe_build(c, PROBE_PONG, nonce, out);
+		added[0] = '\0';
+		memset(&rp, 0, sizeof(rp));
+		rp.type = PROBE_PONG;
+		rp.nonce = pr->nonce;
+		pthread_mutex_lock(&c->path_lock);
+		p = conn_recv_path(c, kind, &from);
+		if (!p && src && kind != PATH_ICE) {
+			p = path_table_add(&c->paths, srck, src, NULL,
+					   now_ms());
+			if (p)
+				snprintf(added, sizeof(added), "%s", p->label);
+		}
+		drop = path_blackholed(c, (int)(p ? p->kind : srck), src);
+		if (p) {
+			if (path_ep_any(&from))
+				from = p->peer_ep;	/* ICE: no source */
+			path_saw_inbound(p, &from);
+			path_apply_tail(p, pr, s->keys.sig_key);
+			path_fill_tail(p, &rp);
+		} else {
+			rp.have_tail = 1;
+			rp.echo = from;
+		}
+		pthread_mutex_unlock(&c->path_lock);
+		if (added[0])
+			dbg_logf("path adopted: %s", added);
+		if (drop)
+			return;
+		o = conn_probe_seal(c, &rp, out);
 		if (!o)
 			return;
-		if (lan)
-			lanlink_send(s->lan, &c->lan_peer, out, o);
-		else if (c->nat)
-			nat_send(c->nat, out, o);
+		if (kind == PATH_ICE) {
+			if (c->nat)
+				nat_send(c->nat, out, o);
+		} else if (src && s->lan) {
+			lanlink_send(s->lan, src, out, o);
+		}
 		return;
 	}
-	if (plain[0] != PROBE_PONG || nonce != c->probe_nonce)
+	if (pr->type != PROBE_PONG)
 		return;
-	if (lan) {
-		c->lan_rtt_ms = (int)(now_ms() - c->probe_start_ms);
-		c->lan_qualified = 1;
-	} else {
-		c->ice_rtt_ms = (int)(now_ms() - c->probe_start_ms);
-		c->ice_qualified = 1;
+	label[0] = '\0';
+	pthread_mutex_lock(&c->path_lock);
+	p = conn_pong_path(c, pr->nonce);
+	if (p) {
+		int fresh = !p->qualified;
+
+		if (path_ep_any(&from))
+			from = p->peer_ep;
+		path_saw_inbound(p, &from);
+		path_apply_tail(p, pr, s->keys.sig_key);
+		if (path_probe_pong(p, pr->nonce, now_ms()) && fresh) {
+			rtt = path_srtt_ms(p);
+			snprintf(label, sizeof(label), "%s", p->label);
+		}
 	}
-	dbg_logf("path qualified: %s rtt~%dms", lan ? "LAN" : "ICE",
-		 lan ? c->lan_rtt_ms : c->ice_rtt_ms);
+	pthread_mutex_unlock(&c->path_lock);
+	if (rtt >= 0)
+		dbg_logf("path qualified: %s rtt~%dms",
+			 label[0] ? label : "ICE", rtt);
+}
+
+/* Unseal a probe and act on it, if it names the claimant this connection
+ * serves. Anything else is dropped in silence. */
+static void probe_recv(struct conn *c, const uint8_t *data, size_t len,
+		       enum path_kind kind, const struct sockaddr_in6 *src)
+{
+	struct path_probe pr;
+
+	if (path_probe_parse(&pr, c->sess->keys.sig_key, data, len))
+		return;
+	if (strcmp(pr.ufrag, c->claim_ufrag))
+		return;			/* not the claimant this conn serves */
+	probe_apply(c, &pr, kind, src);
+}
+
+/*
+ * The adoption budget: PATH_ADOPT_RATE datagrams a second from sources no path
+ * names, in bursts of PATH_ADOPT_DEPTH. A stranger who can seal nothing must
+ * not be the one setting the rate at which we open seals, so this is consulted
+ * before the AEAD open rather than after. It belongs to the listening socket,
+ * and only the thread dispatching that socket ever touches it.
+ */
+static int adopt_allow(struct sess *s, uint64_t now)
+{
+	const int cap = PATH_ADOPT_DEPTH * 1000;
+	uint64_t gained = (now - s->adopt_ms) * PATH_ADOPT_RATE;
+
+	s->adopt_ms = now;
+	if (gained >= (uint64_t)cap || s->adopt_tokens + (int)gained >= cap)
+		s->adopt_tokens = cap;
+	else
+		s->adopt_tokens += (int)gained;
+	if (s->adopt_tokens < 1000)
+		return 0;
+	s->adopt_tokens -= 1000;
+	return 1;
+}
+
+/*
+ * May this datagram be opened? Only a frame opening with PROBE_MAGIC is a
+ * candidate for adoption at all; anything else is stream data, which
+ * ikcp_input rejects for the cost of one compare. A probe from a source one of
+ * `c`'s paths already names is ordinary traffic, and one from any other source
+ * is admitted to the seal only while the budget has a token. c may be NULL,
+ * which is a source no connection at all is known to hold.
+ */
+static int probe_gate(struct sess *s, struct conn *c, const struct path_ep *ep,
+		      const uint8_t *data, size_t len)
+{
+	if (!path_probe_is(data, len))
+		return 1;
+	if (c && conn_holds_ep(c, ep, 1))
+		return 1;
+	return adopt_allow(s, now_ms());
+}
+
+/*
+ * Host: a probe from a source no worker holds. The seal makes it ours and the
+ * claimant ufrag inside names which connection it belongs to, so the connection
+ * serving that claimant gains a path over the source it arrived from -- which
+ * is how an ICE-admitted client that turns up on the segment, or one whose
+ * address changed, is picked up. Host main thread.
+ */
+static void probe_adopt(struct sess *s, const uint8_t *data, size_t len,
+			const struct sockaddr_in6 *src)
+{
+	struct path_probe pr;
+	int i;
+
+	if (path_probe_parse(&pr, s->keys.sig_key, data, len) ||
+	    pr.type != PROBE_PING || !pr.ufrag[0])
+		return;
+	for (i = 0; i < HOST_MAX_WORKERS; i++)
+		if (s->conns[i] &&
+		    !strcmp(s->conns[i]->claim_ufrag, pr.ufrag)) {
+			probe_apply(s->conns[i], &pr, PATH_SEGMENT, src);
+			return;
+		}
 }
 
 /* Deliver received transport bytes into the conn's KCP stream, under the lock
  * that guards a concurrent teardown clearing c->stream from another thread.
- * A probe is split off first: it is not stream data (see probe_recv). */
+ * A probe is split off first: it is not stream data (see probe_recv). Stream
+ * data is accepted on every path this end holds, not only the one it sends on,
+ * so selection is never a negotiation. */
 static void deliver_stream_from(struct conn *c, const uint8_t *data, size_t len,
-				int lan)
+				enum path_kind kind,
+				const struct sockaddr_in6 *src)
 {
-	if (len >= 4 && probe_get32(data) == PROBE_MAGIC) {
-		probe_recv(c, data, len, lan);
+	if (path_probe_is(data, len)) {
+		probe_recv(c, data, len, kind, src);
 		return;
 	}
 	pthread_mutex_lock(&c->stream_lock);
@@ -1047,46 +1468,118 @@ static void deliver_stream_from(struct conn *c, const uint8_t *data, size_t len,
 
 static void deliver_stream(struct conn *c, const uint8_t *data, size_t len)
 {
-	deliver_stream_from(c, data, len, 0);
+	deliver_stream_from(c, data, len, PATH_ICE, NULL);
 }
 
 /*
- * Send a probe on every path this conn has a candidate for. Cheap enough to
- * repeat: two datagrams of ~70 bytes, and only while nothing has qualified.
+ * The remote endpoint of this connection's ICE path, when its agent has
+ * nominated one. Kept out of path_lock: it reaches into the agent, which
+ * formats the pair under its own lock, so it is asked at the probe cadence
+ * rather than on every pass of a loop that turns a hundred times a second.
  */
-static void probe_pump(struct conn *c)
+static int conn_ice_ep(struct conn *c, uint64_t now, struct path_ep *ep)
+{
+	char loc[192], rem[192];
+
+	if (!c->nat || !nat_connected(c->nat) || now < c->next_ice_ep_ms)
+		return -1;
+	c->next_ice_ep_ms = now + PATH_KEEP_MS;
+	if (nat_selected(c->nat, loc, sizeof(loc), rem, sizeof(rem)))
+		return -1;
+	return cand_ep(rem, ep);
+}
+
+/*
+ * Probe every path whose turn has come, every path being kept warm rather than
+ * only the one in use. One probe is outstanding per path, carrying its own send
+ * timestamp -- so a round trip is measured from the probe that was actually
+ * answered -- and its own nonce, drawn at random because a guessable one is the
+ * only thing between a stranger and a forged pong. Both ends run this: a host
+ * probes as well as answering, or it would never learn its own reflexive
+ * endpoint and could rank nothing.
+ */
+static void path_tick(struct conn *c, uint64_t now)
 {
 	struct sess *s = c->sess;
+	struct sockaddr_in6 to[PATH_MAX];
+	struct path_probe pr[PATH_MAX];
+	uint64_t nonce[PATH_MAX];
+	struct path_ep ice;
 	uint8_t out[PROBE_MAX];
-	size_t n;
+	int kind[PATH_MAX], drop[PATH_MAX], due[PATH_MAX];
+	int i, n = 0, m = 0, have_ice, ice_ok;
+	size_t len;
 
-	if (s->cfg->is_host || !c->claim_ufrag[0])
+	if (!c->claim_ufrag[0])
 		return;
-	if (!c->probe_start_ms)
-		c->probe_start_ms = now_ms();
-	if (now_ms() < c->next_probe_ms)
-		return;
-	c->next_probe_ms = now_ms() + PROBE_EVERY_MS;
-	c->probe_nonce = now_ms();
-	n = probe_build(c, PROBE_PING, c->probe_nonce, out);
+	have_ice = !conn_ice_ep(c, now, &ice);
+	ice_ok = c->nat && nat_connected(c->nat);
+	pthread_mutex_lock(&c->path_lock);
+	for (i = 0; i < PATH_MAX; i++) {
+		struct path *p = &c->paths.p[i];
+
+		if (!p->used)
+			continue;
+		p->usable = p->kind != PATH_ICE || ice_ok;
+		path_probe_expire(p, now);
+		if (p->kind == PATH_ICE && have_ice)
+			path_set_peer_ep(p, &ice, s->keys.sig_key);
+		if (p->usable && path_probe_due(p, now))
+			due[n++] = i;
+	}
+	pthread_mutex_unlock(&c->path_lock);
 	if (!n)
 		return;
-	if (c->have_lan_peer && !c->lan_qualified)
-		lanlink_send(s->lan, &c->lan_peer, out, n);
-	if (c->nat && nat_connected(c->nat) && !c->ice_qualified)
-		nat_send(c->nat, out, n);
+	if (random_bytes(nonce, n * sizeof(nonce[0])))
+		return;			/* a guessable nonce is no probe at all */
+	pthread_mutex_lock(&c->path_lock);
+	for (i = 0; i < n; i++) {
+		struct path *p = &c->paths.p[due[i]];
+
+		if (!p->usable || !path_probe_due(p, now))
+			continue;
+		memset(&pr[m], 0, sizeof(pr[m]));
+		pr[m].type = PROBE_PING;
+		pr[m].nonce = nonce[i];
+		path_fill_tail(p, &pr[m]);
+		path_probe_sent(p, nonce[i], now);
+		kind[m] = (int)p->kind;
+		drop[m] = path_blackholed(c, kind[m], &p->remote);
+		to[m] = p->remote;
+		m++;
+	}
+	pthread_mutex_unlock(&c->path_lock);
+	for (i = 0; i < m; i++) {
+		if (drop[i])
+			continue;
+		len = conn_probe_seal(c, &pr[i], out);
+		if (!len)
+			return;
+		if (kind[i] == PATH_ICE)
+			nat_send(c->nat, out, len);
+		else if (s->lan)
+			lanlink_send(s->lan, &to[i], out, len);
+	}
 }
 
 /*
- * Is any path qualified? A host is exempt: it answers probes rather than sending
- * them, and its worker exists only because the turnstile already decided this
- * client is the one it serves.
+ * Is any path qualified? A host is exempt -- not for want of probing, which it
+ * does too, but because its worker exists only once the turnstile has decided
+ * this client is the one it serves. This answers "may the session start", never
+ * "which path carries it", and it is the whole of the remaining asymmetry: the
+ * host speaks first, and that banner arriving is the client's proof of it.
  */
-static int path_ready(const struct conn *c)
+static int path_ready(struct conn *c)
 {
+	int ready;
+
 	if (c->sess->cfg->is_host)
-		return c->have_lan_peer || (c->nat && nat_connected(c->nat));
-	return c->lan_qualified || c->ice_qualified;
+		return conn_lan_paths(c, 0) > 0 ||
+		       (c->nat && nat_connected(c->nat));
+	pthread_mutex_lock(&c->path_lock);
+	ready = path_table_any_qualified(&c->paths);
+	pthread_mutex_unlock(&c->path_lock);
+	return ready;
 }
 
 /*
@@ -1095,7 +1588,7 @@ static int path_ready(const struct conn *c)
  * an agent serving somebody else -- and only a fresh identity and a fresh claim
  * recover.
  */
-static int path_probe_expired(const struct conn *c)
+static int path_probe_expired(struct conn *c)
 {
 	if (path_ready(c) || !c->claim_released_ms)
 		return 0;
@@ -1109,7 +1602,7 @@ static int path_probe_expired(const struct conn *c)
  * listener a pickup would use. Re-gathering against the current offer is the
  * only way back -- ICE credentials cannot be swapped into a live agent.
  */
-static int offer_moved_on(const struct conn *c)
+static int offer_moved_on(struct conn *c)
 {
 	const struct sess *s = c->sess;
 
@@ -1160,10 +1653,16 @@ static void client_lan_recv(void *arg, const struct sockaddr *src,
 			    socklen_t srclen, const uint8_t *data, size_t len)
 {
 	struct conn *c = arg;
+	struct sockaddr_in6 mapped;
+	struct path_ep ep;
 
-	(void)src;
-	(void)srclen;
-	deliver_stream_from(c, data, len, 1);
+	if (lanlink_map_peer(src, srclen, &mapped) ||
+	    path_ep_from_sockaddr(&ep, (struct sockaddr *)&mapped,
+				  sizeof(mapped)))
+		return;
+	if (!probe_gate(c->sess, c, &ep, data, len))
+		return;
+	deliver_stream_from(c, data, len, PATH_SEGMENT, &mapped);
 }
 
 /*
@@ -1191,41 +1690,53 @@ static void on_direct_peer(void *arg, const struct sockaddr *peer, socklen_t len
 	if (lanlink_map_peer(peer, len, &np))
 		return;
 	/*
-	 * Prefer a non-link-local endpoint. A host on several interfaces announces
-	 * from each, so its link-local IPv6 source can arrive last and overwrite a
-	 * usable v4 or loopback endpoint (such as the one preloaded from the token);
-	 * but a link-local lanlink target needs a zone id that does not reliably
-	 * survive the announcement path, so it often cannot be reached. Never
-	 * downgrade a usable endpoint to a link-local one; a non-link-local wins.
+	 * A link-local lanlink target needs a zone id that does not reliably
+	 * survive the announcement path, so it often cannot be reached: take
+	 * one on only while nothing routable is held.
 	 */
-	if (c->have_lan_peer && IN6_IS_ADDR_LINKLOCAL(&np.sin6_addr) &&
-	    !IN6_IS_ADDR_LINKLOCAL(&c->lan_peer.sin6_addr))
+	if (IN6_IS_ADDR_LINKLOCAL(&np.sin6_addr) && conn_lan_paths(c, 1))
 		return;
 	/*
 	 * The same peer is heard from every address it has, so these announcements
-	 * differ in source but carry the one lanlink port that identifies it. Once
-	 * one of those addresses has answered a probe, keep it -- the others are
-	 * the same peer, and moving to an untried one would discard the proof.
+	 * differ in source but carry the one lanlink port that identifies it.
+	 * Each is one more candidate: the proof a probe leaves on one of them
+	 * ranks it above the untried rest, so arrival order discards nothing.
 	 */
-	if (!c->have_lan_peer || !lan_peer_same(&c->lan_peer, &np))
-		c->lan_qualified = 0;
-	else if (c->lan_qualified)
-		return;
-	c->lan_peer = np;
-	c->have_lan_peer = 1;
-	fmt_sockaddr(peer, len, c->direct_addr, sizeof(c->direct_addr));
+	conn_add_lan_path(c, PATH_SEGMENT, &np, NULL, 0);
+}
+
+/*
+ * Which connection of `tab` holds this endpoint? The whole endpoint first, so
+ * two clients that happen to share a lanlink port are told apart, then the port
+ * alone. Host main thread.
+ */
+static struct conn *ep_owner(struct conn *const *tab, const struct path_ep *ep)
+{
+	int i, exact;
+
+	for (exact = 1; exact >= 0; exact--)
+		for (i = 0; i < HOST_MAX_WORKERS; i++)
+			if (tab[i] && conn_holds_ep(tab[i], ep, exact))
+				return tab[i];
+	return NULL;
+}
+
+/* Which LAN worker holds this endpoint? Admission asks this: an endpoint being
+ * served over the segment is not a fresh claimant. Host main thread. */
+static struct conn *lan_owner(struct sess *s, const struct path_ep *ep)
+{
+	return ep_owner(s->lan_conns, ep);
 }
 
 /* Is this endpoint already an active LAN worker? (host main thread only) */
 static int lan_conn_active(struct sess *s, const struct sockaddr_in6 *peer)
 {
-	int i;
+	struct path_ep ep;
 
-	for (i = 0; i < HOST_MAX_WORKERS; i++)
-		if (s->lan_conns[i] && s->lan_conns[i]->have_lan_peer &&
-		    lan_peer_same(&s->lan_conns[i]->lan_peer, peer))
-			return 1;
-	return 0;
+	if (path_ep_from_sockaddr(&ep, (const struct sockaddr *)peer,
+				  sizeof(*peer)))
+		return 0;
+	return lan_owner(s, &ep) != NULL;
 }
 
 /* The ICE ufrag of an answer (its client's single-use identity), into out
@@ -1323,27 +1834,31 @@ static void on_direct_claim(void *arg, const struct sockaddr *src, socklen_t src
 
 /*
  * Host: an inbound lanlink datagram. Demultiplex it by source into the owning
- * worker's stream. Runs on the host main thread (lanlink_dispatch from
- * pump_once); lan_conns[] is mutated only here on the main thread, so no lock
- * beyond the conn's stream_lock (taken by deliver_stream against a teardown).
+ * connection's stream; a probe from a source no connection holds is offered to
+ * adoption instead, within the budget probe_gate keeps. Runs on the host main
+ * thread (lanlink_dispatch from pump_once); conns[] is mutated only on that
+ * thread, so no lock beyond the conn's stream_lock (taken by deliver_stream
+ * against a teardown).
  */
 static void host_lan_recv(void *arg, const struct sockaddr *src, socklen_t srclen,
 			  const uint8_t *data, size_t len)
 {
 	struct sess *s = arg;
 	struct sockaddr_in6 mapped;
-	int i;
+	struct path_ep ep;
+	struct conn *c;
 
-	if (lanlink_map_peer(src, srclen, &mapped))
+	if (lanlink_map_peer(src, srclen, &mapped) ||
+	    path_ep_from_sockaddr(&ep, (struct sockaddr *)&mapped,
+				  sizeof(mapped)))
 		return;
-	for (i = 0; i < HOST_MAX_WORKERS; i++) {
-		struct conn *c = s->lan_conns[i];
-
-		if (c && c->have_lan_peer && lan_peer_same(&c->lan_peer, &mapped)) {
-			deliver_stream_from(c, data, len, 1);
-			return;
-		}
-	}
+	c = ep_owner(s->conns, &ep);
+	if (!probe_gate(s, c, &ep, data, len))
+		return;
+	if (c)
+		deliver_stream_from(c, data, len, PATH_SEGMENT, &mapped);
+	else if (path_probe_is(data, len))
+		probe_adopt(s, data, len, &mapped);
 }
 
 static void on_peer_offer(void *arg, const uint8_t *data, size_t len)
@@ -1478,14 +1993,16 @@ static void conn_gen_ice(struct conn *c)
 	random_bytes(rb, 2);
 	c->bind_port = (uint16_t)(40000 + (((rb[0] << 8) | rb[1]) % 20000));
 	/* A client probes under its own identity; a host overwrites this with the
-	 * claimant it admitted (lan_drain, and the turnstile at pickup). */
+	 * claimant it admitted (lan_drain, the turnstile at pickup, and the
+	 * single-connection state machine when it takes an answer up). */
 	if (c->sess && !c->sess->cfg->is_host)
 		snprintf(c->claim_ufrag, sizeof(c->claim_ufrag), "%s",
 			 c->ice_ufrag);
-	c->lan_qualified = 0;
-	c->ice_qualified = 0;
-	c->probe_start_ms = 0;
-	c->next_probe_ms = 0;
+	/* What a probe proved was proved for one claimant identity, so a fresh
+	 * one voids every measurement; the endpoints themselves stand. */
+	pthread_mutex_lock(&c->path_lock);
+	path_table_reset_stats(&c->paths);
+	pthread_mutex_unlock(&c->path_lock);
 	c->claim_held_seen = 0;
 	c->claim_released_ms = 0;
 	c->remote_ufrag[0] = '\0';
@@ -1535,6 +2052,7 @@ static int nat_setup(struct conn *c)
 	c->nat = nat_create(&cfg);
 	if (!c->nat || nat_gather(c->nat))
 		return -1;
+	conn_add_ice_path(c);
 	return 0;
 }
 
@@ -1603,6 +2121,70 @@ static void *ssh_cli_thread(void *p)
 	o.hold_ms = s->cfg->test_hold_ms;
 	c->ssh_cli_rc = sshc_connect_fd(c->ssh_fd, &o);
 	return NULL;
+}
+
+/* One interface address of a netmon snapshot as a sockaddr at `port`. Returns
+ * the family (4 or 6), or 0 for a record neither family names. */
+static int addr_sockaddr(const struct netmon_addr *a, uint16_t port,
+			 struct sockaddr_storage *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (a->family == AF_INET && a->addrlen == 4) {
+		struct sockaddr_in *s4 = (struct sockaddr_in *)out;
+
+		s4->sin_family = AF_INET;
+		s4->sin_port = htons(port);
+		memcpy(&s4->sin_addr, a->addr, 4);
+		return 4;
+	}
+	if (a->family == AF_INET6 && a->addrlen == 16) {
+		struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)out;
+
+		s6->sin6_family = AF_INET6;
+		s6->sin6_port = htons(port);
+		memcpy(&s6->sin6_addr, a->addr, 16);
+		return 6;
+	}
+	return 0;
+}
+
+/*
+ * Advertise our own local endpoints to the peer over CTLM_CAND, so it probes
+ * and holds them rather than exploring only the pair admission produced. The
+ * port is the shared lanlink socket's: that is the one transport able to send
+ * to an arbitrary endpoint, so an advertised endpoint always becomes a SEGMENT
+ * or ROUTED path and never an ICE one. The addresses come from the interface
+ * snapshot, which already leaves out loopback (which names this machine to
+ * nobody else) and IPv6 link-local (which travels without the zone id it cannot
+ * be reached without). A session with no lanlink socket advertises nothing.
+ * Self-throttled; runs from the connection's own loop.
+ */
+static void cand_tell(struct conn *c, uint64_t now)
+{
+	struct netmon_addr addrs[NETMON_MAX_ADDRS];
+	struct sess *s = c->sess;
+	size_t naddrs, i;
+	uint16_t port;
+
+	if (now < c->next_cand_ms)
+		return;
+	c->next_cand_ms = now + CAND_TELL_MS;
+	if (!s->lan)
+		return;
+	port = lanlink_port(s->lan);
+	if (!port)
+		return;
+	naddrs = netmon_snapshot(addrs, NETMON_MAX_ADDRS);
+	for (i = 0; i < naddrs; i++) {
+		struct sockaddr_storage sa;
+		uint8_t pl[CTL_RDV_PLEN];
+		int fam = addr_sockaddr(&addrs[i], port, &sa);
+
+		if (!fam)
+			continue;
+		ctl_rdv_encode(pl, fam, (struct sockaddr *)&sa);
+		ctl_send(c, CTLM_CAND, pl, sizeof(pl));
+	}
 }
 
 /*
@@ -1703,7 +2285,7 @@ static int conn_run(struct conn *c, int drive_sig)
 	struct stream *st;
 	pthread_t th;
 	sock_t sp[2], cp[2];
-	int done = 0;
+	int done = 0, link_lost = 0;
 	uint64_t next_hb, conn_start;
 
 	/* Both pairs must be sockets, not pipes: they are polled in the same
@@ -1755,6 +2337,7 @@ static int conn_run(struct conn *c, int drive_sig)
 	pthread_mutex_unlock(&c->hb_lock);
 	next_hb = now_ms();
 	conn_start = now_ms();
+	c->next_cand_ms = conn_start;
 
 	if (drive_sig) {
 		/* Capture a rendezvous node per family for reconnection (the host
@@ -1805,6 +2388,29 @@ static int conn_run(struct conn *c, int drive_sig)
 		if (fds[cidx].revents & (POLLIN | POLLHUP | POLLERR))
 			ctl_readable(c);
 
+		/* Every path is kept warm for the whole session, not merely the
+		 * one carrying it, so a switch is an immediate reordering rather
+		 * than a rediscovery. */
+		path_tick(c, now_ms());
+		cand_tell(c, now_ms());
+		if (s->cfg->test_blackhole_ms > 0 && c->bh_kind < 0 &&
+		    now_ms() - conn_start >
+		    (uint64_t)s->cfg->test_blackhole_ms) {
+			struct path_pick pick;
+
+			if (!conn_pick(c, &pick)) {
+				pthread_mutex_lock(&c->path_lock);
+				memset(&c->bh_ep, 0, sizeof(c->bh_ep));
+				path_ep_from_sockaddr(&c->bh_ep,
+					(struct sockaddr *)&pick.remote,
+					sizeof(pick.remote));
+				c->bh_kind = pick.kind;
+				pthread_mutex_unlock(&c->path_lock);
+				dbg_logf("path blackholed: %s",
+					 pick.label[0] ? pick.label : "ICE");
+			}
+		}
+
 		if (now_ms() >= next_hb) {
 			uint8_t ts[CTL_TS_LEN];
 
@@ -1832,6 +2438,19 @@ static int conn_run(struct conn *c, int drive_sig)
 			state = c->lost_since_ms ? CONN_LOST : CONN_LIVE;
 			pthread_mutex_unlock(&c->hb_lock);
 			publish_status(c, state);
+			/* The heartbeat is end to end, so this says the
+			 * session stopped getting through -- not that any one
+			 * path did. A path dying is a reordering the heartbeat
+			 * never sees; this is what it looks like when there is
+			 * nothing left to reorder to. */
+			if (state == CONN_LOST && !link_lost) {
+				link_lost = 1;
+				dbg_logf("link lost: no pong for %ums",
+					 (unsigned)(now - lp));
+			} else if (state == CONN_LIVE && link_lost) {
+				link_lost = 0;
+				dbg_logf("link back");
+			}
 			c->next_status_ms = now + 500;
 			/* A host reaps a client that has been silent too long --
 			 * the bridge would otherwise never end for one that
@@ -1914,6 +2533,7 @@ static int client_regather(struct sess *s)
 	if (o && o->reset)
 		o->reset(o->arg);
 	s->established_fired = 0;
+	conn_drop_ice_path(&s->c);
 	if (s->c.nat)
 		nat_destroy(s->c.nat);
 	s->c.nat = NULL;
@@ -1928,12 +2548,6 @@ static int client_regather(struct sess *s)
 	s->trickle_dirty = 0;
 	pthread_mutex_unlock(&s->trickle_lock);
 	s->peer_state = SESSION_PEER_SEEN;
-	s->c.lan_qualified = 0;
-	s->c.ice_qualified = 0;
-	s->c.probe_start_ms = 0;
-	s->c.next_probe_ms = 0;
-	s->c.claim_held_seen = 0;
-	s->c.claim_released_ms = 0;
 	sig_redeliver(s->sig);		/* we discarded the offer we were given */
 	return nat_setup(&s->c) ? -1 : 0;
 }
@@ -1965,146 +2579,79 @@ static void update_expect(struct sess *s)
 }
 
 /*
- * Route-up but the DHT never acked (captive portal / UDP-blocked): mint the LAN
- * endpoint only after this grace, well beyond DHT convergence, so a merely-slow
- * global host is not mislabelled isolated.
+ * How long a DHT attempt is given before it has run its course, so a family
+ * with a route but no ack settles at NONE rather than staying PENDING (a
+ * captive portal, or UDP blocked outbound). It bounds a family sig has stopped
+ * working on; one still inside sig's own locate window waits for that to close
+ * first, so the second family gets its full run before the verdict.
  */
-#define ISOLATED_ROUTE_GRACE_MS 25000
+#define DHT_CONCLUDE_MS 25000
 
 /*
- * First usable direct-endpoint address of `family` in the sdp: a "host" ICE
- * candidate that is neither loopback nor -- for v6 -- link-local (a fe80
- * address cannot be embedded in the 16-byte slot without a zone id). The bare
- * address goes into out (out may be NULL to only test presence); 1 if found.
+ * Is there a usable address of `family` on an interface: netmon's snapshot
+ * already drops loopback interfaces and v6 link-local, which reach nothing off
+ * the segment they are on. The interfaces rather than our ICE candidates,
+ * because the candidate policy answers who we can punch with and says nothing
+ * about the family's reach to the DHT, which binds its own sockets.
  */
-static int fam_usable_addr(const char *sdp, int family, char *out, size_t n)
+static int fam_usable_addr(const struct netmon_addr *addrs, size_t naddrs,
+			   int family)
 {
-	const char *p = sdp;
-	char addr[64], typ[16];
-	unsigned char b[16];
+	int af = family == 6 ? AF_INET6 : AF_INET;
+	size_t i;
 
-	while ((p = strstr(p, "candidate:")) != NULL) {
-		if (sscanf(p, "candidate:%*s %*d %*s %*u %63s %*d typ %15s",
-			   addr, typ) == 2 && !strcmp(typ, "host")) {
-			if (family == 6 && strchr(addr, ':') &&
-			    inet_pton(AF_INET6, addr, b) == 1) {
-				int ll = b[0] == 0xfe && (b[1] & 0xc0) == 0x80;
-				int lo = b[15] == 1, i;
-
-				for (i = 0; i < 15; i++)
-					if (b[i])
-						lo = 0;
-				if (!ll && !lo) {
-					if (out)
-						snprintf(out, n, "%s", addr);
-					return 1;
-				}
-			} else if (family == 4 && !strchr(addr, ':') &&
-				   inet_pton(AF_INET, addr, b) == 1) {
-				if (b[0] != 127) {
-					if (out)
-						snprintf(out, n, "%s", addr);
-					return 1;
-				}
-			}
-		}
-		p += 10;
-	}
+	for (i = 0; i < naddrs; i++)
+		if (addrs[i].family == af)
+			return 1;
 	return 0;
 }
 
-/* Build the host's own direct endpoint for `family`: its first usable host
- * address at the shared lanlink port (0 if lanlink is not up yet). 1 if built. */
-static int fam_endpoint(struct sess *s, int family,
-			struct sockaddr_storage *ss, socklen_t *slen)
+/*
+ * This family's DHT attempt can no longer produce an ack worth waiting for:
+ * the operator declined the DHT outright, or the attempt armed with the
+ * current sig has had its grace and sig is no longer storing to locate this
+ * family. A rebuild on a roam re-arms it, so a move onto a network that does
+ * reach the DHT is given a fresh run.
+ */
+static int dht_attempt_concluded(struct sess *s, int family)
 {
-	char addr[64];
-	uint16_t port = s->lan ? lanlink_port(s->lan) : 0;
-
-	if (!fam_usable_addr(s->local_sdp, family, addr, sizeof(addr)))
+	if (!(s->cfg->sig_flags & SIG_DHT))
+		return 1;
+	if (now_ms() - s->dht_since_ms <= DHT_CONCLUDE_MS)
 		return 0;
-	memset(ss, 0, sizeof(*ss));
-	if (family == 6) {
-		struct sockaddr_in6 *a = (struct sockaddr_in6 *)ss;
-
-		a->sin6_family = AF_INET6;
-		if (inet_pton(AF_INET6, addr, &a->sin6_addr) != 1)
-			return 0;
-		a->sin6_port = htons(port);
-		*slen = sizeof(*a);
-	} else {
-		struct sockaddr_in *a = (struct sockaddr_in *)ss;
-
-		a->sin_family = AF_INET;
-		if (inet_pton(AF_INET, addr, &a->sin_addr) != 1)
-			return 0;
-		a->sin_port = htons(port);
-		*slen = sizeof(*a);
-	}
-	return 1;
+	return !sig_locating(s->sig, family);
 }
 
-/* Gather the four tokgen facts for `family`. */
-static void gather_facts(struct sess *s, int family, struct tokgen_facts *f)
+/* Gather the tokgen facts for `family`, over an interface snapshot the caller
+ * already holds. */
+static void gather_facts(struct sess *s, int family,
+			 const struct netmon_addr *addrs, size_t naddrs,
+			 struct tokgen_facts *f)
 {
 	int af = family == 6 ? AF_INET6 : AF_INET;
 	char buf[64];
 
 	memset(f, 0, sizeof(*f));
-	f->has_usable_addr = fam_usable_addr(s->local_sdp, family, NULL, 0);
+	f->has_usable_addr = fam_usable_addr(addrs, naddrs, family);
 	f->has_default_route = source_addr(af, buf, sizeof(buf)) == 0;
 	f->dht_acked = sig_dht_acked(s->sig, family);
+	f->dht_attempt_concluded = dht_attempt_concluded(s, family);
 	f->public_port_proven = 0;	/* no UPnP/NAT-PMP/PCP in the tree */
 }
 
 /*
- * An ENDPOINT family is "settled" -- safe to mint -- when it can no longer turn
- * out to be global: at once when the host is not on the DHT by policy or has no
- * default route (the DHT can never ack), otherwise only after a grace so a
- * genuinely global family that is merely slow to ack still mints RENDEZVOUS.
- */
-static int endpoint_settled(struct sess *s, const struct tokgen_facts *f)
-{
-	if (!(s->cfg->sig_flags & SIG_DHT))
-		return 1;
-	if (!f->has_default_route)
-		return 1;
-	return now_ms() - s->start_ms > ISOLATED_ROUTE_GRACE_MS;
-}
-
-/* Mint the host's own LAN endpoint for `family` (EPx_RDV clear). */
-static void mint_endpoint(struct sess *s, int family)
-{
-	struct sockaddr_storage ss;
-	socklen_t slen = 0;
-
-	if (!fam_endpoint(s, family, &ss, &slen))
-		return;
-	s->cfg->on_endpoint(s->cfg->arg, (struct sockaddr *)&ss, slen);
-	if (family == 6)
-		s->minted6 = 1;
-	else
-		s->minted4 = 1;
-}
-
-/*
- * Host token minting. A globally reachable family is located on the DHT and
- * embedded as a RENDEZVOUS node the moment it is ready (upgraded in place when
- * the second family converges). An isolated (LAN-only) family instead mints the
- * host's own direct ENDPOINT once it is settled -- decided per family by the
- * pure tokgen tree from four observed facts. If neither family can be
- * advertised the operator is told, rather than the host hanging silently.
+ * Report the host's rendezvous progress to the view: which family has a node,
+ * how far each is through locating one, and the endpoint the local status line
+ * shows. What goes into the token is token_pump's.
  */
 static void maybe_announce_rendezvous(struct sess *s)
 {
 	const struct session_obs *o = s->cfg->obs;
 	struct sockaddr_storage a4, a6;
 	socklen_t l4 = sizeof(a4), l6 = sizeof(a6);
-	struct tokgen_facts f4, f6;
-	struct tokgen_result verdict;
 	int have4, have6;
 
-	if (!s->cfg->is_host || !s->cfg->on_rendezvous)
+	if (!s->cfg->is_host)
 		return;
 	if (!s->have_local_sdp)		/* no candidates yet: cannot decide */
 		return;
@@ -2147,46 +2694,142 @@ static void maybe_announce_rendezvous(struct sess *s)
 			o->rendezvous(o->arg, 6, "", 0);
 		}
 	}
+}
 
-	/* Mint a RENDEZVOUS family as soon as it is located, upgrading the token
-	 * in place when the other arrives: a single-family host publishes at once,
-	 * and a dual-stack host gains the second family when its DHT converges. */
-	if (have4 && !s->minted4) {
-		s->cfg->on_rendezvous(s->cfg->arg, (struct sockaddr *)&a4, l4);
-		s->minted4 = 1;
-	}
-	if (have6 && !s->minted6) {
-		s->cfg->on_rendezvous(s->cfg->arg, (struct sockaddr *)&a6, l6);
-		s->minted6 = 1;
-	}
+/*
+ * The token's view of a sockaddr: the bare address bytes, and the port in host
+ * order. NULL for a family the token cannot carry.
+ */
+static const uint8_t *ep_bytes(const struct sockaddr *sa, uint16_t *port)
+{
+	if (sa->sa_family == AF_INET6) {
+		const struct sockaddr_in6 *a = (const struct sockaddr_in6 *)sa;
 
-	/* Decide the isolated (ENDPOINT) families and the no-connectivity case
-	 * from the tokgen tree, throttled (its route probe is cheap but not free).
-	 * A family the DHT acked is never minted as an endpoint -- it took the
-	 * RENDEZVOUS path above. */
-	if ((s->minted4 && s->minted6) || now_ms() < s->next_mint_ms)
+		*port = ntohs(a->sin6_port);
+		return (const uint8_t *)&a->sin6_addr;
+	}
+	if (sa->sa_family == AF_INET) {
+		const struct sockaddr_in *a = (const struct sockaddr_in *)sa;
+
+		*port = ntohs(a->sin_port);
+		return (const uint8_t *)&a->sin_addr;
+	}
+	return NULL;
+}
+
+/*
+ * The address bytes and host-order port a carried token already holds for
+ * `family`, so a state seeded from it is re-reported with the endpoint it
+ * names rather than a fresh one.
+ */
+static void carried_ep(const struct token *t, int family, uint8_t *addr,
+		       uint16_t *port)
+{
+	memset(addr, 0, TOKEN_EP6_LEN);
+	if (family == 6) {
+		memcpy(addr, t->ep6_addr, TOKEN_EP6_LEN);
+		*port = t->ep6_port;
+	} else {
+		memcpy(addr, t->ep4_addr, TOKEN_EP4_LEN);
+		*port = t->ep4_port;
+	}
+}
+
+/*
+ * Resolve one family's tokgen verdict into the state its slot carries; `addr`
+ * (TOKEN_EP6_LEN bytes) and `port` receive what a RENDEZVOUS or DIRECT slot
+ * embeds. A verdict whose address is not to hand yet stays PENDING.
+ */
+static int advert_state(struct sess *s, int fam, enum tok_advert adv,
+			uint8_t *addr, uint16_t *port)
+{
+	struct sockaddr_storage ss;
+	socklen_t sl = sizeof(ss);
+	const uint8_t *b;
+
+	memset(addr, 0, TOKEN_EP6_LEN);
+	*port = 0;
+	switch (adv) {
+	case TOK_ADVERT_RENDEZVOUS:
+		if (!sig_located(s->sig, fam, (struct sockaddr *)&ss, &sl))
+			break;
+		b = ep_bytes((struct sockaddr *)&ss, port);
+		if (!b)
+			break;
+		memcpy(addr, b, fam == 6 ? TOKEN_EP6_LEN : TOKEN_EP4_LEN);
+		return TOKEN_STATE_RENDEZVOUS;
+	case TOK_ADVERT_NONE:
+		return TOKEN_STATE_NONE;
+	case TOK_ADVERT_ENDPOINT:	/* a proven endpoint; the prover that
+					 * fills this arm is the RFC 5780 probe */
+	case TOK_ADVERT_PENDING:
+		break;
+	}
+	return TOKEN_STATE_PENDING;
+}
+
+/*
+ * Host token minting: decide each family from the pure tokgen tree over the
+ * facts observed now, and report the ones that changed, so the token follows
+ * the host's situation in both directions -- a family that settled at NONE is
+ * upgraded when a late DHT convergence gives it a node, and one that had a
+ * node drops back when a move takes it away. Both families report once per
+ * session, so a host that reaches nothing still has a token to show at t=0. If
+ * neither family has an address the operator is told, rather than the host
+ * hanging silently.
+ */
+static void token_pump(struct sess *s)
+{
+	static const int famv[2] = { 4, 6 };
+	const struct session_obs *o = s->cfg->obs;
+	enum tok_advert adv[2] = { TOK_ADVERT_PENDING, TOK_ADVERT_PENDING };
+	struct netmon_addr addrs[NETMON_MAX_ADDRS];
+	struct tokgen_facts f4, f6;
+	struct tokgen_result verdict;
+	size_t naddrs;
+	int i;
+
+	if (!s->cfg->is_host || !s->cfg->on_token_state)
 		return;
-	s->next_mint_ms = now_ms() + 1000;
-
-	gather_facts(s, 4, &f4);
-	gather_facts(s, 6, &f6);
-	if (tokgen_decide_host(&f4, &f6, &verdict) < 0) {
-		if (o && o->escalate && !s->noconn_warned &&
+	if (now_ms() < s->next_tok_ms)
+		return;
+	s->next_tok_ms = now_ms() + 1000;	/* the route probe is cheap,
+						 * not free */
+	/* Before the local candidates exist there are no facts to decide on, so
+	 * each family holds the state it was seeded with -- which is how the
+	 * t=0 report happens with no special case, and how a re-gather holds
+	 * the token steady instead of flapping it back to PENDING. */
+	if (s->have_local_sdp) {
+		naddrs = netmon_snapshot(addrs, NETMON_MAX_ADDRS);
+		gather_facts(s, 4, addrs, naddrs, &f4);
+		gather_facts(s, 6, addrs, naddrs, &f6);
+		if (tokgen_decide_host(&f4, &f6, &verdict) < 0 && o &&
+		    o->escalate && !s->noconn_warned &&
 		    now_ms() - s->start_ms > 3000) {
 			o->escalate(o->arg, "no usable address on any family -- "
 				    "nothing to host over; check the network");
 			s->noconn_warned = 1;
 		}
-		return;
+		adv[0] = verdict.v4;
+		adv[1] = verdict.v6;
 	}
-	if (!s->cfg->on_endpoint)
-		return;
-	if (verdict.v4 == TOK_ADVERT_ENDPOINT && !s->minted4 &&
-	    !f4.dht_acked && endpoint_settled(s, &f4))
-		mint_endpoint(s, 4);
-	if (verdict.v6 == TOK_ADVERT_ENDPOINT && !s->minted6 &&
-	    !f6.dht_acked && endpoint_settled(s, &f6))
-		mint_endpoint(s, 6);
+	for (i = 0; i < 2; i++) {
+		uint8_t a[TOKEN_EP6_LEN];
+		uint16_t port = 0;
+		int st;
+
+		if (s->have_local_sdp) {
+			st = advert_state(s, famv[i], adv[i], a, &port);
+		} else {
+			st = s->tok_state[i];
+			carried_ep(&s->cfg->tok, famv[i], a, &port);
+		}
+		if (s->tok_told[i] && st == s->tok_state[i])
+			continue;
+		s->tok_state[i] = st;
+		s->tok_told[i] = 1;
+		s->cfg->on_token_state(s->cfg->arg, famv[i], st, a, port);
+	}
 }
 
 /* Keep the located rendezvous nodes warm (host, main thread only -- sig is
@@ -2217,6 +2860,33 @@ static void rdv_keep_warm(struct sess *s)
 	s->next_rdv_warm_ms = now + (captured ? RDV_WARM_MS : RDV_POLL_MS);
 }
 
+/*
+ * The host's registry of the connections it serves, which is what lets an
+ * authenticated probe from an unknown source find the connection it belongs to
+ * (probe_adopt). Registered at admission and cleared in conn_free, so nothing
+ * can reach a connection through it after it has gone; host main thread only,
+ * which is where admission and reaping both happen.
+ */
+static void conn_register(struct sess *s, struct conn *c)
+{
+	int i;
+
+	for (i = 0; i < HOST_MAX_WORKERS; i++)
+		if (!s->conns[i]) {
+			s->conns[i] = c;
+			return;
+		}
+}
+
+static void conn_unregister(struct sess *s, struct conn *c)
+{
+	int i;
+
+	for (i = 0; i < HOST_MAX_WORKERS; i++)
+		if (s->conns[i] == c)
+			s->conns[i] = NULL;
+}
+
 static struct conn *conn_alloc(struct sess *s)
 {
 	struct conn *c = calloc(1, sizeof(*c));
@@ -2225,10 +2895,13 @@ static struct conn *conn_alloc(struct sess *s)
 		return NULL;
 	c->sess = s;
 	c->ctl_fd = INVALID_SOCK;
+	c->bh_kind = -1;
 	pthread_mutex_init(&c->hb_lock, NULL);
 	pthread_mutex_init(&c->rdv_lock, NULL);
 	pthread_mutex_init(&c->status_lock, NULL);
 	pthread_mutex_init(&c->stream_lock, NULL);
+	pthread_mutex_init(&c->path_lock, NULL);
+	path_table_init(&c->paths);
 	conn_gen_ice(c);
 	return c;
 }
@@ -2237,12 +2910,15 @@ static void conn_free(struct conn *c)
 {
 	if (!c)
 		return;
+	conn_unregister(c->sess, c);
+	conn_drop_ice_path(c);
 	if (c->nat)
 		nat_destroy(c->nat);
 	pthread_mutex_destroy(&c->hb_lock);
 	pthread_mutex_destroy(&c->rdv_lock);
 	pthread_mutex_destroy(&c->status_lock);
 	pthread_mutex_destroy(&c->stream_lock);
+	pthread_mutex_destroy(&c->path_lock);
 	free(c);
 }
 
@@ -2300,6 +2976,7 @@ static void lan_drain(struct sess *s, struct worker *ws, int *dash_seq)
 
 	for (p = 0; p < s->lan_pending_n; p++) {
 		struct sockaddr_in6 mapped;
+		char addr[PATH_LABEL_MAX];
 		struct conn *c;
 		int slot = -1;
 
@@ -2318,8 +2995,12 @@ static void lan_drain(struct sess *s, struct worker *ws, int *dash_seq)
 		c = conn_alloc(s);
 		if (!c)
 			break;
-		c->lan_peer = mapped;
-		c->have_lan_peer = 1;		/* c->nat stays NULL: lanlink only */
+		/* c->nat stays NULL: this worker is lanlink only. */
+		if (conn_add_lan_path(c, PATH_SEGMENT, &mapped, addr,
+				      sizeof(addr))) {
+			conn_free(c);
+			break;
+		}
 		snprintf(c->claim_ufrag, sizeof(c->claim_ufrag), "%s",
 			 s->lan_pending[p].ufrag);
 		if (c->claim_ufrag[0]) {
@@ -2328,23 +3009,18 @@ static void lan_drain(struct sess *s, struct worker *ws, int *dash_seq)
 				 c->claim_ufrag);
 			s->have_served = 1;
 		}
-		fmt_sockaddr((struct sockaddr *)&s->lan_pending[p].sa,
-			     s->lan_pending[p].len, c->direct_addr,
-			     sizeof(c->direct_addr));
 		c->dash_id = ++*dash_seq;
-		snprintf(c->status_peer, sizeof(c->status_peer), "%s",
-			 c->direct_addr);
+		snprintf(c->status_peer, sizeof(c->status_peer), "%s", addr);
 		s->lan_conns[slot] = c;
+		conn_register(s, c);
 		if (o && o->peer) {
-			o->peer(o->arg, c->dash_id, SESSION_PEER_SEEN,
-				c->direct_addr);
-			o->peer(o->arg, c->dash_id, SESSION_PEER_LIVE,
-				c->direct_addr);
+			o->peer(o->arg, c->dash_id, SESSION_PEER_SEEN, addr);
+			o->peer(o->arg, c->dash_id, SESSION_PEER_LIVE, addr);
 		}
 		if (worker_spawn(ws, c)) {	/* worker table full */
 			if (o && o->peer)
 				o->peer(o->arg, c->dash_id, SESSION_PEER_GONE,
-					c->direct_addr);
+					addr);
 			s->lan_conns[slot] = NULL;
 			conn_free(c);
 		}
@@ -2399,6 +3075,7 @@ static void punch_scan(struct sess *s, struct worker *ws, struct conn **punching
 					addr);
 			}
 			punching[i] = NULL;
+			conn_register(s, c);
 			if (worker_spawn(ws, c)) {
 				s->punch_ufrag[i][0] = '\0';
 				conn_free(c);		/* table full */
@@ -2429,6 +3106,25 @@ static int host_is_multiuser(const struct session_cfg *cfg)
 }
 
 /*
+ * Has the local network moved? The interfaces are the answer; test_roam_ms
+ * manufactures one on a period instead, so the rebuild below can be exercised
+ * without a second network to walk between.
+ */
+static int net_changed(struct sess *s)
+{
+	const struct session_cfg *cfg = s->cfg;
+	uint64_t now = now_ms();
+
+	if (cfg->test_roam_ms > 0 && now >= s->next_roam_ms &&
+	    (cfg->test_roam_max <= 0 || s->roams < cfg->test_roam_max)) {
+		s->next_roam_ms = now + (uint64_t)cfg->test_roam_ms;
+		s->roams++;
+		return 1;
+	}
+	return netmon_changed(&s->netmon, now);
+}
+
+/*
  * Create the signalling and arm it: subscribe the callbacks, advertise the
  * direct transport's port and seed the rendezvous. The lanlink socket itself is
  * not touched here -- it belongs to the session rather than to sig, and worker
@@ -2441,6 +3137,8 @@ static int sig_arm(struct sess *s)
 	s->sig = sig_create(cfg->tok.rdv, cfg->sig_flags, cfg->is_host);
 	if (!s->sig)
 		return -1;
+	s->dht_since_ms = now_ms();	/* a rebuild is a fresh attempt, and a
+					 * fresh grace, on the new network */
 	sig_subscribe(s->sig, on_peer_offer, s);
 	if (s->lan) {
 		sig_set_direct_port(s->sig, lanlink_port(s->lan));
@@ -2459,13 +3157,14 @@ static int sig_arm(struct sess *s)
  * Rebuild the signalling on a move. A fresh sig binds a new DHT socket and
  * joins the multicast groups on the interfaces that exist now, where the old
  * one stays bound to the one that vanished -- which is why a manual restart
- * reconnects instantly and a reused socket does not. The old sig is destroyed
- * first: jech/dht is a process-global singleton, so two nodes cannot overlap.
- * The lanlink socket is deliberately left as it is, since worker threads and
- * libjuice's receive thread send on it unlocked and a host's direct endpoint
- * names its port. The new sig is seeded from the rendezvous nodes this session
- * kept warm and exchanged over CTLM_RDV, so it starts from a node the peer
- * holds too.
+ * reconnects instantly and a reused socket does not. The old sig is discarded
+ * first: jech/dht is a process-global singleton, so two nodes cannot overlap,
+ * and its node set is not persisted because the fresh one is what the run
+ * should leave behind. The lanlink socket is deliberately left as it is, since
+ * worker threads and libjuice's receive thread send on it unlocked and a host's
+ * direct endpoint names its port. The new sig is seeded from the rendezvous
+ * nodes this session kept warm and exchanged over CTLM_RDV, so it starts from a
+ * node the peer holds too.
  *
  * Callers must run this on the thread that owns sig, with no sig callback in
  * flight: at the top of the owning loop, between one sig_dispatch and the next
@@ -2474,7 +3173,7 @@ static int sig_arm(struct sess *s)
  */
 static int sig_rebuild(struct sess *s)
 {
-	sig_destroy(s->sig);
+	sig_discard(s->sig);
 	s->sig = NULL;
 	if (sig_arm(s)) {
 		dbg_logf("sig: rebuild failed -- giving up the session");
@@ -2525,7 +3224,8 @@ static int host_turnstile(struct sess *s)
 		int active = 0;
 
 		pump_once(s, 100);		/* the main thread owns sig + lan */
-		maybe_announce_rendezvous(s);	/* mint and advertise the token */
+		maybe_announce_rendezvous(s);	/* report the rendezvous */
+		token_pump(s);			/* mint and advertise the token */
 		rdv_keep_warm(s);
 		lan_drain(s, ws, &dash_seq);	/* admit same-segment claimants */
 
@@ -2539,7 +3239,7 @@ static int host_turnstile(struct sess *s)
 		 * pump_once has finished dispatching, so no sig callback is in
 		 * flight and the rebuild is safe here.
 		 */
-		if (netmon_changed(&s->netmon, now_ms())) {
+		if (net_changed(s)) {
 			if (listen) {
 				conn_free(listen);
 				listen = NULL;
@@ -2782,28 +3482,11 @@ static int host_turnstile(struct sess *s)
 }
 
 /*
- * The lanlink port a host should re-bind: the shared port already printed in a
- * carried-forward direct endpoint token, so it stays valid across the re-serve
- * loop. Either family's endpoint carries the one shared port. 0 (ephemeral) for
- * a client, or a host with no direct endpoint.
- */
-static uint16_t carried_lanlink_port(const struct session_cfg *cfg)
-{
-	const struct token *t = &cfg->tok;
-
-	if (!cfg->is_host)
-		return 0;
-	if (!(t->flags & TOKEN_FLAG_EP6_RDV) && t->ep6_port)
-		return t->ep6_port;
-	if (!(t->flags & TOKEN_FLAG_EP4_RDV) && t->ep4_port)
-		return t->ep4_port;
-	return 0;
-}
-
-/*
- * Bring the signalling up at session start: the link-local transport first,
- * then the signalling armed over it. A roam rebuilds only the sig half
- * (sig_rebuild); the lanlink socket outlives it.
+ * Bring the signalling up at session start: the link-local transport first, on
+ * an ephemeral port -- no token names it, since a proven public endpoint would
+ * name the external mapping rather than this local port -- then the signalling
+ * armed over it. A roam rebuilds only the sig half (sig_rebuild); the lanlink
+ * socket outlives it.
  *
  * The direct transport comes up for host and client alike whenever multicast is
  * on (the old !host_is_multiuser gate is gone): a multi-user host demultiplexes
@@ -2820,8 +3503,7 @@ static int sig_setup(struct sess *s)
 		int mu = host_is_multiuser(cfg);
 
 		s->lan = lanlink_create(mu ? host_lan_recv : client_lan_recv,
-					mu ? (void *)s : (void *)&s->c,
-					carried_lanlink_port(cfg));
+					mu ? (void *)s : (void *)&s->c, 0);
 	}
 	s->offer_conn = &s->c;
 	if (sig_arm(s))
@@ -2852,13 +3534,21 @@ int session_run(const struct session_cfg *cfg)
 	s.cfg = cfg;
 	s.c.sess = &s;
 	s.c.ctl_fd = INVALID_SOCK;		/* no control channel until run_ssh */
+	s.c.bh_kind = -1;
 	memcpy(s.auth, cfg->tok.auth, TOKEN_AUTH_LEN);
+	/* Seed each family from the token handed in, so a re-serve carries the
+	 * anchor it already published forward instead of wiping the slot. */
+	s.tok_state[0] = token_family_state(&cfg->tok, 4);
+	s.tok_state[1] = token_family_state(&cfg->tok, 6);
 	pthread_mutex_init(&s.trickle_lock, NULL);
 	pthread_mutex_init(&s.c.status_lock, NULL);	/* s.c.status zeroed = connecting */
 	pthread_mutex_init(&s.c.hb_lock, NULL);
 	pthread_mutex_init(&s.c.rdv_lock, NULL);
 	pthread_mutex_init(&s.c.stream_lock, NULL);
+	pthread_mutex_init(&s.c.path_lock, NULL);
+	path_table_init(&s.c.paths);
 	netmon_init(&s.netmon);
+	s.next_roam_ms = now_ms() + (uint64_t)cfg->test_roam_ms;
 	if (keys_derive(&s.keys, cfg->tok.rdv))
 		return 1;
 	if (cfg->stun_auto)
@@ -2892,6 +3582,7 @@ int session_run(const struct session_cfg *cfg)
 
 		pump_once(&s, 100);
 		maybe_announce_rendezvous(&s);
+		token_pump(&s);
 		/*
 		 * Roamed before the link came up: rebuild the signalling on the
 		 * interfaces that exist now, re-gather there and flush the
@@ -2900,12 +3591,13 @@ int session_run(const struct session_cfg *cfg)
 		 * from there. pump_once above has finished dispatching, so no sig
 		 * callback is in flight.
 		 */
-		if (st != ST_RUN && netmon_changed(&s.netmon, now_ms())) {
+		if (st != ST_RUN && net_changed(&s)) {
 			if (sig_rebuild(&s)) {
 				st = ST_FAIL;
 				break;
 			}
 			if (s.c.nat) {
+				conn_drop_ice_path(&s.c);
 				nat_destroy(s.c.nat);
 				s.c.nat = NULL;
 			}
@@ -3006,6 +3698,13 @@ int session_run(const struct session_cfg *cfg)
 				sdp_ufrag(s.peer_sdp, ufrag);
 				snprintf(s.c.remote_ufrag, sizeof(s.c.remote_ufrag),
 					 "%s", ufrag);
+				/* The claimant a single-connection host serves is
+				 * the identity in the answer it takes up, as
+				 * lan_drain and the turnstile record theirs. */
+				if (cfg->is_host)
+					snprintf(s.c.claim_ufrag,
+						 sizeof(s.c.claim_ufrag), "%s",
+						 ufrag);
 				sig_post(s.sig, (const uint8_t *)s.local_sdp,
 					 strlen(s.local_sdp));
 				s.remote_set = 1;
@@ -3030,7 +3729,7 @@ int session_run(const struct session_cfg *cfg)
 			 * that lost back into the running.
 			 */
 			claim_watch(&s.c);
-			probe_pump(&s.c);
+			path_tick(&s.c, now_ms());
 			if (offer_moved_on(&s.c)) {
 				snprintf(s.regathered_for,
 					 sizeof(s.regathered_for), "%s",
@@ -3067,10 +3766,10 @@ int session_run(const struct session_cfg *cfg)
 						cand_addr(rem, s.c.status_peer,
 							  sizeof(s.c.status_peer));
 					}
-					else if (s.c.direct_addr[0])
-						snprintf(s.c.status_peer,
-							 sizeof(s.c.status_peer),
-							 "%s", s.c.direct_addr);
+					else
+						conn_path_label(&s.c,
+						  s.c.status_peer,
+						  sizeof(s.c.status_peer));
 					if (o && o->peer)
 						o->peer(o->arg, 0,
 							SESSION_PEER_LIVE,
@@ -3083,6 +3782,7 @@ int session_run(const struct session_cfg *cfg)
 			if (nat_failed(s.c.nat) ||
 			    now_ms() - s.ice_attempt_start > ICE_ATTEMPT_MS) {
 				s.ice_attempt++;
+				conn_drop_ice_path(&s.c);
 				nat_destroy(s.c.nat);
 				s.c.nat = NULL;
 				if (nat_setup(&s.c))
@@ -3130,8 +3830,7 @@ int session_run(const struct session_cfg *cfg)
 				dbg_logf("session: rejoin (roam)");
 				deadline = now_ms() +
 					(uint64_t)cfg->connect_timeout_s * 1000;
-				if (netmon_changed(&s.netmon, now_ms()) &&
-				    sig_rebuild(&s))
+				if (net_changed(&s) && sig_rebuild(&s))
 					st = ST_FAIL;
 				else
 					st = client_regather(&s) ? ST_FAIL :
@@ -3166,6 +3865,7 @@ int session_run(const struct session_cfg *cfg)
 done:
 	if (s.c.stream)
 		stream_destroy(s.c.stream);
+	conn_drop_ice_path(&s.c);
 	if (s.c.nat)
 		nat_destroy(s.c.nat);
 	if (s.lan)
@@ -3177,5 +3877,6 @@ done:
 	pthread_mutex_destroy(&s.c.hb_lock);
 	pthread_mutex_destroy(&s.c.rdv_lock);
 	pthread_mutex_destroy(&s.c.stream_lock);
+	pthread_mutex_destroy(&s.c.path_lock);
 	return rc;
 }

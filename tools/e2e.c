@@ -11,6 +11,7 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,8 +28,14 @@
 
 static struct {
 	struct token tok;
-	int printed;
 } host;
+
+static const char *state_name(int state)
+{
+	static const char *n[4] = { "PENDING", "NONE", "RENDEZVOUS", "DIRECT" };
+
+	return n[state & 3];
+}
 
 /* Encode host.tok and print it for the operator to carry to the client. */
 static void print_token(void)
@@ -41,63 +48,22 @@ static void print_token(void)
 	}
 	printf("COMRADE TOKEN: %s\n", tokbuf);
 	fflush(stdout);
-	host.printed = 1;
 }
 
-/* Embed a located rendezvous node in the token and print it for the operator to
- * carry to the client; called with NULL when there is no node (multicast). */
-static void on_rendezvous(void *arg, const struct sockaddr *sa, socklen_t len)
+/* Write a family's new state into the token and print the token afresh, so the
+ * shell harness sees every re-emission the host makes. */
+static void on_token_state(void *arg, int family, int state,
+			   const uint8_t *addr, uint16_t port)
 {
 	(void)arg;
-	(void)len;
-	if (host.printed)
-		return;
-	if (sa && sa->sa_family == AF_INET6) {
-		const struct sockaddr_in6 *a = (const struct sockaddr_in6 *)sa;
-
-		memcpy(host.tok.ep6_addr, &a->sin6_addr, TOKEN_EP6_LEN);
-		host.tok.ep6_port = ntohs(a->sin6_port);
-		host.tok.flags |= TOKEN_FLAG_EP6_RDV;
-		fprintf(stderr, "[e2e] rendezvous node located, embedded in token\n");
-	} else if (sa && sa->sa_family == AF_INET) {
-		const struct sockaddr_in *a = (const struct sockaddr_in *)sa;
-
-		memcpy(host.tok.ep4_addr, &a->sin_addr, TOKEN_EP4_LEN);
-		host.tok.ep4_port = ntohs(a->sin_port);
-		host.tok.flags |= TOKEN_FLAG_EP4_RDV;
-		fprintf(stderr, "[e2e] rendezvous node located, embedded in token\n");
-	}
+	token_set_family(&host.tok, family, state, addr, port);
+	fprintf(stderr, "[e2e] token: v%d %s\n", family, state_name(state));
 	print_token();
 }
 
-/* Isolated-LAN sibling: embed our own direct endpoint (EPx_RDV clear) and print
- * it. Proves the B2 mint path from the harness. */
-static void on_endpoint(void *arg, const struct sockaddr *sa, socklen_t len)
-{
-	(void)arg;
-	(void)len;
-	if (host.printed)
-		return;
-	if (sa && sa->sa_family == AF_INET6) {
-		const struct sockaddr_in6 *a = (const struct sockaddr_in6 *)sa;
-
-		memcpy(host.tok.ep6_addr, &a->sin6_addr, TOKEN_EP6_LEN);
-		host.tok.ep6_port = ntohs(a->sin6_port);
-		host.tok.flags &= ~TOKEN_FLAG_EP6_RDV;
-	} else if (sa && sa->sa_family == AF_INET) {
-		const struct sockaddr_in *a = (const struct sockaddr_in *)sa;
-
-		memcpy(host.tok.ep4_addr, &a->sin_addr, TOKEN_EP4_LEN);
-		host.tok.ep4_port = ntohs(a->sin_port);
-		host.tok.flags &= ~TOKEN_FLAG_EP4_RDV;
-	}
-	fprintf(stderr, "[e2e] isolated LAN: own endpoint embedded\n");
-	print_token();
-}
-
-/* `comrade-e2e token <TOKEN>`: decode and print the token's flags/endpoints in a
- * greppable form, so the shell harness can assert the mint (EPx_RDV, and that
- * the retired NODHT bit stays clear). */
+/* `comrade-e2e token <TOKEN>`: decode and print the token's flags, per-family
+ * states and endpoints in a greppable form, so the shell harness can assert the
+ * mint (the four states, and that the retired NODHT bit stays clear). */
 static int inspect_token(const char *s)
 {
 	struct token t;
@@ -107,9 +73,14 @@ static int inspect_token(const char *s)
 		fprintf(stderr, "error: invalid token\n");
 		return 2;
 	}
-	printf("flags=0x%02x nodht=%d ro=%d ep6_rdv=%d ep4_rdv=%d\n",
+	printf("flags=0x%02x nodht=%d ro=%d ep6_rdv=%d ep4_rdv=%d "
+	       "ep6_settled=%d ep4_settled=%d\n",
 	       t.flags, !!(t.flags & TOKEN_FLAG_NODHT), !!(t.flags & TOKEN_FLAG_RO),
-	       !!(t.flags & TOKEN_FLAG_EP6_RDV), !!(t.flags & TOKEN_FLAG_EP4_RDV));
+	       !!(t.flags & TOKEN_FLAG_EP6_RDV), !!(t.flags & TOKEN_FLAG_EP4_RDV),
+	       !!(t.flags & TOKEN_FLAG_EP6_SETTLED),
+	       !!(t.flags & TOKEN_FLAG_EP4_SETTLED));
+	printf("state6=%s state4=%s\n", state_name(token_family_state(&t, 6)),
+	       state_name(token_family_state(&t, 4)));
 	if (inet_ntop(AF_INET6, t.ep6_addr, ip, sizeof(ip)))
 		printf("ep6=[%s]:%u\n", ip, t.ep6_port);
 	if (inet_ntop(AF_INET, t.ep4_addr, ip, sizeof(ip)))
@@ -134,6 +105,14 @@ int main(int argc, char **argv)
 	size_t rx_got = 0, k;
 	const char *stun_arg = NULL;
 	int is_host, i, rc;
+
+	/* A peer closing first must not kill the harness outright, the same way
+	 * the product binary arranges for itself (main.c). Without this a client
+	 * that has finished and gone can take the host down mid-write, which the
+	 * concurrent LAN case reaches whenever its clients exit close together. */
+#ifdef SIGPIPE
+	signal(SIGPIPE, SIG_IGN);
+#endif
 
 	if (argc >= 3 && !strcmp(argv[1], "token"))
 		return inspect_token(argv[2]);
@@ -186,7 +165,9 @@ int main(int argc, char **argv)
 			"usage: %s host    [--stun host|none] [--family 4|6] [opts]\n"
 			"       %s client <TOKEN>          [--stun ...]      [opts]\n"
 			"  opts: [--stun-port p] [--timeout s] [--log N]\n"
-			"        [--mcast] [--no-dht]\n", argv[0], argv[0]);
+			"        [--mcast] [--no-dht] [--roam-ms N] [--roams N]\n"
+			"        [--blackhole-ms N]\n",
+			argv[0], argv[0]);
 		return 2;
 	}
 	cfg.is_host = is_host;
@@ -208,6 +189,12 @@ int main(int argc, char **argv)
 			cfg.test_single_conn = 1;
 		else if (!strcmp(argv[i], "--stuck") && i + 1 < argc)
 			cfg.test_stuck_punches = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--roam-ms") && i + 1 < argc)
+			cfg.test_roam_ms = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--roams") && i + 1 < argc)
+			cfg.test_roam_max = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--blackhole-ms") && i + 1 < argc)
+			cfg.test_blackhole_ms = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--log") && i + 1 < argc)
 			cfg.log_level = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--mcast"))
@@ -236,8 +223,7 @@ int main(int argc, char **argv)
 		host.tok = cfg.tok;
 		cfg.ssh_command = "cat";	/* echo oracle, not tmux */
 		cfg.use_pty = 0;
-		cfg.on_rendezvous = on_rendezvous;
-		cfg.on_endpoint = on_endpoint;
+		cfg.on_token_state = on_token_state;
 	} else {
 		for (k = 0; k < SSH_NONCE; k++)
 			tx[k] = (uint8_t)(k * 97 + 13);
@@ -256,8 +242,11 @@ int main(int argc, char **argv)
 		int n;
 
 		rc = 0;
-		for (n = 0; n < cfg.host_serve_max && !rc; n++)
+		for (n = 0; n < cfg.host_serve_max && !rc; n++) {
+			cfg.tok = host.tok;	/* carry the anchor forward, as
+						 * run_service does */
 			rc = session_run(&cfg);
+		}
 	} else {
 		rc = session_run(&cfg);
 	}

@@ -176,20 +176,54 @@ static struct sshfwd *fwd_up(ssh_session s, ssh_event ev,
 	return f;
 }
 
+/*
+ * Open the authenticated control plane alongside the session channel: a second
+ * SSH channel requesting the comrade-ctl subsystem, bridged both ways to
+ * o->ctl_fd. The session layer runs its liveness heartbeat, rendezvous exchange
+ * and candidate advertisement over that fd. The caller owns everything handed
+ * back and pumps `event`; a control plane that could not be opened leaves the
+ * session running without one.
+ */
+static void ctl_open(ssh_session s, ssh_event event, const struct sshc_opts *o,
+		     ssh_channel *chan, ssh_connector *in, ssh_connector *out)
+{
+	*chan = NULL;
+	*in = NULL;
+	*out = NULL;
+	if (!event || !o || !sock_valid(o->ctl_fd))
+		return;
+	*chan = ssh_channel_new(s);
+	if (!*chan)
+		return;
+	if (ssh_channel_open_session(*chan) != SSH_OK ||
+	    ssh_channel_request_subsystem(*chan, "comrade-ctl") != SSH_OK)
+		return;
+	*in = ssh_connector_new(s);
+	*out = ssh_connector_new(s);
+	if (!*in || !*out)
+		return;
+	ssh_connector_set_in_fd(*in, o->ctl_fd);
+	ssh_connector_set_out_channel(*in, *chan, SSH_CONNECTOR_STDOUT);
+	ssh_connector_set_in_channel(*out, *chan, SSH_CONNECTOR_STDOUT);
+	ssh_connector_set_out_fd(*out, o->ctl_fd);
+	ssh_event_add_connector(event, *in);
+	ssh_event_add_connector(event, *out);
+}
+
 /* Test mode: write the whole request, then read echoed bytes until we have
  * as many as we sent (or the channel ends). */
 static int run_test(ssh_session s, ssh_channel chan, const struct sshc_opts *o)
 {
-	size_t got = 0;
-	ssh_event event = NULL;
+	ssh_channel ctl = NULL;				/* comrade-ctl subsystem */
+	ssh_connector c_ctl_in = NULL, c_ctl_out = NULL;
+	ssh_event event = ssh_event_new();
 	struct sshfwd *fwd = NULL;
+	size_t got = 0;
 	int rc = -1;
 
-	if (o->nfwd_l || o->nfwd_r) {
-		event = ssh_event_new();
-		if (event)
-			fwd = fwd_up(s, event, o);
-	}
+	if (event && (o->nfwd_l || o->nfwd_r))
+		fwd = fwd_up(s, event, o);
+	ctl_open(s, event, o, &ctl, &c_ctl_in, &c_ctl_out);
 
 	if (o->send_len &&
 	    ssh_channel_write(chan, o->send, (uint32_t)o->send_len) !=
@@ -209,16 +243,16 @@ static int run_test(ssh_session s, ssh_channel chan, const struct sshc_opts *o)
 	if (o->recv_len)
 		*o->recv_len = got;
 	rc = 0;
-	/* Hold the session open (the session layer keeps the heartbeat alive on
-	 * its own thread), so a test can keep one client connected while another
-	 * joins -- the case that reveals slot hogging -- or exercise forwarding
-	 * (the engine is pumped from this loop). */
+	/* Hold the session open so a test can keep one client connected while
+	 * another joins -- the case that reveals slot hogging -- and so the
+	 * control plane, forwarding and path upkeep are all exercised over a
+	 * live session rather than only over a bring-up. */
 	if (o->hold_ms > 0) {
 		uint64_t end = mono_ms() + (uint64_t)o->hold_ms;
 
 		while (mono_ms() < end && ssh_channel_is_open(chan) &&
 		       !ssh_channel_is_eof(chan)) {
-			if (fwd) {
+			if (event) {
 				ssh_event_dopoll(event, 50);
 				sshfwd_tick(fwd);
 			} else {
@@ -228,6 +262,20 @@ static int run_test(ssh_session s, ssh_channel chan, const struct sshc_opts *o)
 	}
 out:
 	sshfwd_destroy(fwd);
+	if (c_ctl_in) {
+		ssh_event_remove_connector(event, c_ctl_in);
+		ssh_event_remove_connector(event, c_ctl_out);
+	}
+	if (ctl && ssh_channel_is_open(ctl)) {
+		ssh_channel_send_eof(ctl);
+		ssh_channel_close(ctl);
+	}
+	if (c_ctl_in)
+		ssh_connector_free(c_ctl_in);
+	if (c_ctl_out)
+		ssh_connector_free(c_ctl_out);
+	if (ctl)
+		ssh_channel_free(ctl);
 	if (event)
 		ssh_event_free(event);
 	return rc;
@@ -306,27 +354,7 @@ static int run_interactive(ssh_session s, ssh_channel chan,
 	ssh_event_add_connector(event, c_out);
 	ssh_event_add_connector(event, c_err);
 
-	/* Open the authenticated control plane alongside the shell: a second SSH
-	 * channel requesting the comrade-ctl subsystem, bridged to o->ctl_fd. The
-	 * session layer runs its liveness/rendezvous protocol over that fd. */
-	if (o && sock_valid(o->ctl_fd)) {
-		ctl = ssh_channel_new(s);
-		if (ctl && ssh_channel_open_session(ctl) == SSH_OK &&
-		    ssh_channel_request_subsystem(ctl, "comrade-ctl") == SSH_OK) {
-			c_ctl_in = ssh_connector_new(s);
-			c_ctl_out = ssh_connector_new(s);
-			if (c_ctl_in && c_ctl_out) {
-				ssh_connector_set_in_fd(c_ctl_in, o->ctl_fd);
-				ssh_connector_set_out_channel(c_ctl_in, ctl,
-							SSH_CONNECTOR_STDOUT);
-				ssh_connector_set_in_channel(c_ctl_out, ctl,
-							SSH_CONNECTOR_STDOUT);
-				ssh_connector_set_out_fd(c_ctl_out, o->ctl_fd);
-				ssh_event_add_connector(event, c_ctl_in);
-				ssh_event_add_connector(event, c_ctl_out);
-			}
-		}
-	}
+	ctl_open(s, event, o, &ctl, &c_ctl_in, &c_ctl_out);
 
 	/* -L/-R port forwarding rides the same session; served from this loop. */
 	fwd = fwd_up(s, event, o);

@@ -16,9 +16,10 @@ Layering, outermost to innermost:
                     -> tmux  +  comrade-ctl in-band control channel
 ```
 
-Sections and paragraphs marked **PLANNED (0.1.x)** or **PLANNED (0.2.0)** specify
-behaviour this tree does not implement yet; everything unmarked is implemented as
-described. Each mark is removed when its change lands.
+Sections and paragraphs marked **PLANNED**, with the release the change is
+expected in, specify behaviour this tree does not implement yet; everything
+unmarked is implemented as described. Each mark is removed when its change
+lands.
 
 ---
 
@@ -113,15 +114,13 @@ Fixed **90-byte** payload (`TOKEN_RAW_LEN`), packed in order:
 | 1 `0x02` | `NODHT` | **reserved, never set.** Retired: it told the client to drop `SIG_DHT`, which is exactly the wrong thing to do (§5, §11) |
 | 2 `0x04` | `EP6_RDV` | the ep6 slot holds a **rendezvous DHT node** rather than a host endpoint |
 | 3 `0x08` | `EP4_RDV` | likewise for ep4 |
-| 4 `0x10` | `EP6_SETTLED` | the v6 family's state is determined, not still being worked out *(PLANNED, 0.1.x)* |
-| 5 `0x20` | `EP4_SETTLED` | likewise for v4 *(PLANNED, 0.1.x)* |
+| 4 `0x10` | `EP6_SETTLED` | the v6 family's state is determined, not still being worked out |
+| 5 `0x20` | `EP4_SETTLED` | likewise for v4 |
 | 6-7 | | reserved, must be zero |
 
-**Per-family state** *(PLANNED, 0.1.x, for the `PENDING`/`NONE` split; the
-`RENDEZVOUS` and `DIRECT` encodings are unchanged from 0.1.0)*. A family's slot
-and its two bits encode one of four states.
-The families are wholly independent: every mix is legal, and a host that reaches
-the DHT over one family only is normal rather than degraded.
+**Per-family state**. A family's slot and its two bits encode one of four
+states. The families are wholly independent: every mix is legal, and a host that
+reaches the DHT over one family only is normal rather than degraded.
 
 | slot | `RDV` | `SETTLED` | state | meaning |
 |------|-------|-----------|-------|---------|
@@ -150,19 +149,26 @@ does not encode:
   once the DHT attempt has run its course.
 
 An operator may also decline the DHT outright with `--no-dht` (§13), which
-settles both families to `NONE` at t=0.
+settles both families to `NONE` as soon as the local addresses are known.
 
 **`DIRECT` requires proof** *(PLANNED, 0.2.0)*. The slot is specified and its
 encoding fixed, but nothing in 0.1.x may mint it: a host cannot tell whether one
 of its own ports is reachable from a stranger's address without an external
 prober, and a UPnP/NAT-PMP/PCP mapping reporting success is not that proof,
 because a CGNAT gateway will happily report a mapping on an address nothing can
-reach. The intended prover is an RFC 5780 `OTHER-SERVER` STUN probe. Until it
-exists every globally connected family mints `RENDEZVOUS` and no address of the
-host's own ever enters a token. When `DIRECT` does become mintable it takes the
-family's slot ahead of `RENDEZVOUS`, because it removes the signalling round trip
-altogether; the cold DHT lookup remains the fallback should the host's firewall
-later change.
+reach. The intended prover is the RFC 5780 filtering test, which uses the
+`OTHER-ADDRESS` attribute (there is no `OTHER-SERVER`). Until it exists every
+globally connected family mints `RENDEZVOUS` and no address of the host's own
+ever enters a token.
+
+Note what that test can and cannot establish. It shows that *one* third party --
+an address and port chosen by the STUN operator, not by us -- can reach the
+mapped port unsolicited. That is real evidence, and it is strictly weaker than
+"reachable from an arbitrary stranger", which is the claim a `DIRECT` slot makes
+to every holder of the token. `DIRECT` must therefore not displace `RENDEZVOUS`
+wherever `RENDEZVOUS` also works: the rendezvous is the path that survives a
+firewall changing its mind, and the token has only one slot per family to say it
+with.
 
 Wire form: payload(90) `||` **CRC-32/IEEE** over the payload (4 bytes, stored as
 two BE `put16` halves `sum>>16`, `sum&0xffff`) = `TOKEN_WIRE_LEN = 94`.
@@ -240,7 +246,7 @@ rotates the offer and releases `a` **on pickup** (when it adopts the claim), not
 after the punch completes; see §12. Workers run concurrently.
 
 Timings (`sig.c`): `SIG_DHT_GET_MS 1000`, `SIG_DHT_PUT_MS 1000`,
-`SIG_DHT_RESTORE_MS 8000`, `SIG_DHT_GRACE_MS 2000`.
+`SIG_DHT_RESTORE_MS 8000`, `SIG_DHT_GRACE_MS 2000`, `SIG_DHT_OPEN_MS 1000`.
 
 **Engagement is unconditional**. A session engages the DHT after
 `SIG_DHT_GRACE_MS` whatever else has happened, on both roles, and keeps it
@@ -291,13 +297,19 @@ carrying KCP directly with no ICE; v4 peers kept v4-mapped. It is no longer
 session-global 1:1. The **host binds one shared lanlink socket on one advertised
 port** (`sig_set_direct_port` from `lanlink_port`), the single `direct_port` in
 every offer. The **peer is a property of the connection, not the socket**: each
-`struct conn` holds its own `lan_peer`/`have_lan_peer`, and `transport_send`
-sends a lanlink worker's KCP over the shared socket to that conn's `lan_peer`
-while an ICE worker uses its own agent, so the two coexist. The host
-demultiplexes inbound datagrams by source on its main thread (`lanlink_dispatch`
-uses `recvfrom`; `host_lan_recv` matches the source against the active
-`lan_conns[]` and delivers into the owning worker's stream under a per-conn
-lock). A client keeps its single `lan_peer`.
+`struct conn` holds its own path table (§9), and `transport_send` sends its KCP
+over the shared socket to the endpoint of the path in use while a connection
+carried by ICE uses its own agent, so the two coexist -- and one connection may
+hold both kinds at once. The host demultiplexes inbound datagrams by source on
+its main thread (`lanlink_dispatch` uses `recvfrom`; `host_lan_recv` matches the
+source against the paths of the connections it serves, `sess.conns[]`, and
+delivers into the owning worker's stream under a per-conn lock); a source no
+connection holds is offered to adoption (§9). A client accepts on the one
+socket whatever the source, since it holds one peer.
+
+The socket is created with the multicast transport (`session.c:sig_setup`), so a
+session that declines multicast has no direct transport, and therefore no
+`SEGMENT` or `ROUTED` path, at all.
 
 ---
 
@@ -358,7 +370,7 @@ finished receiver LINGERS on `ikcp_waitsnd` until its own sent tail is acked.
 
 ---
 
-### Path model and transport probe (`session.c`, `PROBE_MAGIC`)
+### Path model and transport probe (`src/path.c`, `src/session.c`)
 
 A **path** is a pair (local transport instance, remote endpoint) over which
 sealed datagrams for one connection can be sent. Three kinds exist:
@@ -366,7 +378,7 @@ sealed datagrams for one connection can be sent. Three kinds exist:
 | kind | local transport | remote endpoint |
 |---|---|---|
 | `SEGMENT` | the shared lanlink socket (§6) | a peer endpoint on the link, learnt from a sealed multicast announcement |
-| `ROUTED` | the shared lanlink socket | any other peer endpoint, learnt in band or from a probe that arrived from it *(PLANNED, 0.1.x)* |
+| `ROUTED` | the shared lanlink socket | any other peer endpoint, learnt from a probe that arrived from it |
 | `ICE` | a libjuice agent (§8) | its nominated pair |
 
 The kind is a description, not a rank: it names how a path was come by and
@@ -383,19 +395,23 @@ deciding for the other.
 
 1. A path carries the session only once a probe has round-tripped on it. Nothing
    else qualifies a path: a transport reporting a pair says that packets move,
-   not that the far end is serving *us* (§12).
+   not that the far end is serving *us* (§12). This governs **adoption**, which
+   is every send after the first exchange.
 2. Every end accepts stream data on **every** path it holds, not only the one it
    sends on. Selection is therefore never a negotiation, and a transient
    disagreement costs nothing but a moment of asymmetric routing.
 3. All obtainable paths are kept **warm**, not merely the one in use, so a switch
    is an immediate reordering rather than a rediscovery.
-4. A host **speaks first**, on its lowest-cost path whatever its qualification
-   state, because its banner is what supplies the client's proof. Qualification
-   reorders paths; it never gates the first send.
-
-*(PLANNED, 0.1.x: everything below beyond invariant 1. 0.1.0 keeps one flag and
-one RTT per transport kind, probes only until something qualifies, never probes
-from the host, and prefers by a fixed class order.)*
+4. A host **speaks first**, on its best path whatever its qualification state.
+   This is the single exemption to invariant 1 and is bounded to it: the opening
+   send is not the session being carried, it is the stimulus that creates the
+   round trip, and the client's proof of the path is that banner arriving.
+   Qualification reorders paths; it never gates the first send.
+5. **Ordering is total, so both ends always agree**, even before any measurement
+   exists: qualified paths before unqualified, then by cost, then by the lowest
+   `id(P)`. At t=0 nothing is qualified and no cost is known, so the order falls
+   through to the id -- deterministic, role-free and identical on both ends.
+   "Purely by measurement" governs from the first measurement onward.
 
 #### Probe frame
 
@@ -420,15 +436,18 @@ costs accuracy and never correctness.
   arriving from, v4 carried v4-mapped, all-zero when nothing has arrived yet. On
   a PONG it is the source of the PING being answered, so a prober learns its own
   reflexive endpoint on that path for free. That echo is also the groundwork the
-  RFC 5780 work in §3 builds on.
+  RFC 5780 work in §3 builds on. An `ICE` path has no observed source to give:
+  libjuice's receive callback carries none, so the remote of the pair it
+  nominated stands in (`session.c:conn_ice_ep`), which is right except between a
+  re-nomination and the next report -- and a wrong echo costs a tie-break, never
+  a delivery.
 - **srtt_ms** is the sender's current smoothed round trip for this path, 0 when
   unmeasured; **loss_ppt** its probe loss in parts per thousand.
 
 The seal is not defending against the peer, who holds the token and is trusted by
 construction (§12); it stops a stranger who can guess an endpoint from forging a
 reply. The **nonce must be unpredictable**, being the only thing that stops a
-forged PONG. *(PLANNED, 0.1.x: `session.c:probe_pump` derives it from `now_ms()`,
-which any token holder can guess; it has to be `random_bytes`.)*
+forged PONG.
 
 The **claimant ufrag** ties a frame to one connection: a host worker answers only
 for the claimant it was admitted for, and that single test separates the winner
@@ -444,18 +463,21 @@ echo, so both hold the same unordered pair:
 
 ```
   E     = addr(16) || port(2)                                 18 bytes each
-  id(P) = cc_blake2b_keyed(sig_key, min(Ea,Eb) || max(Ea,Eb))[0..8]
+  id(P) = cc_blake2b_keyed(sig_key, min(Ea,Eb) || max(Ea,Eb))  -> 32 bytes,
+          of which the first 8 are the id
 ```
 
 `min`/`max` are plain byte comparisons, so the value is order-free and no role
-appears in it. Keyed BLAKE2b is the primitive from §1; nothing new is introduced.
+appears in it. Keyed BLAKE2b is the primitive from §1; nothing new is
+introduced. Take the natural 32-byte digest and truncate -- do **not** ask for an
+8-byte digest, which the libgcrypt backend cannot produce.
 
 #### Qualification, warmth and measurement
 
 One probe is outstanding per path, carrying its own nonce and send timestamp, so
-a round trip is measured from the probe that was actually answered. *(PLANNED,
-0.1.x: `probe_start_ms` is set once per attempt today, so a reported RTT includes
-every retry that preceded the answer.)*
+a round trip is measured from the probe that was actually answered, and the next
+probe on a path waits for the outstanding one to be answered or to pass its loss
+deadline.
 
 | state | condition |
 |---|---|
@@ -465,7 +487,11 @@ every retry that preceded the answer.)*
 | `DEAD` | silent for longer than `PATH_DEAD_MS` |
 
 Per path each end keeps a smoothed round trip (EWMA, alpha 1/8), a loss ratio
-over the last 16 probe outcomes, and the time of the last PONG. It probes an
+over the last 16 probe outcomes, and the time of the last PONG. A probe becomes
+a **loss** outcome only once it has been outstanding longer than
+`max(3 * srtt, 1000 ms)`: scoring a superseded probe as lost the moment the next
+one is sent would score 100% loss on any path whose round trip exceeds the probe
+period, condemning a working path for being slow. It probes an
 unqualified path every `PROBE_EVERY_MS` and a qualified one every `PATH_KEEP_MS`,
 the path in use included: the ctl heartbeat (§10) measures the session end to
 end, not any individual path.
@@ -487,6 +513,12 @@ same number from the same data:
   bucket(P) = ceil(cost(P) / PATH_COST_QUANTUM_MS)
 ```
 
+A path whose local transport cannot carry a datagram at that moment -- an `ICE`
+path whose agent has nominated no pair -- is not a candidate at all rather than
+a poor one, and an incumbent that becomes one is left immediately, exactly as a
+`DEAD` one is. That is a fact about the transport, not a rank, and it is the
+only thing besides measurement that keeps a path out of the running.
+
 Selection takes the lowest `bucket` among the paths in the best occupied warmth
 tier (`WARM`, else `COLD`), ties broken by the lowest `id(P)`. That is the whole
 of the agreement: **consensus by deterministic function over shared observations,
@@ -498,8 +530,12 @@ harmless by invariant 2.
 
 **Switching** is immediate when the path in use goes `DEAD`. Otherwise a
 candidate must win by `PATH_SWITCH_MARGIN` buckets for `PATH_SWITCH_HOLD`
-consecutive evaluations, so near-equal paths cannot flap. Both ends apply the
-identical rule to the identical numbers and so flip together.
+consecutive evaluations, so near-equal paths cannot flap. Selection is evaluated
+once per `PATH_KEEP_MS`, which is what gives `PATH_SWITCH_HOLD` its unit. The
+margin-and-hold applies only **between paths in the same warmth tier**: a
+demotion of the incumbent is immediate and ungated, so a dying path never holds
+the session for extra evaluations at exactly the wrong moment. Both ends apply
+the identical rule to the identical numbers and so flip together.
 
 | constant | value | meaning |
 |---|---|---|
@@ -511,21 +547,27 @@ identical rule to the identical numbers and so flip together.
 | `PATH_LOSS_PENALTY_MS` | 200 | cost added by total loss |
 | `PATH_COST_QUANTUM_MS` | 5 | ranking bucket width |
 | `PATH_SWITCH_MARGIN` | 1 | buckets a candidate must win by |
-| `PATH_SWITCH_HOLD` | 2 | consecutive evaluations it must hold |
+| `PATH_SWITCH_HOLD` | 2 | consecutive evaluations it must hold (one per `PATH_KEEP_MS`) |
+| `PATH_ADOPT_RATE` | 8/s, depth 8 | token bucket for unknown-source probes, per listening socket |
 
 #### Adding a path mid-session
 
-*(PLANNED, 0.1.x.)* A sealed PING naming a connection's claimant ufrag **adds a
-path** for that connection, whatever source it arrives from. This is what lets an
-end whose address changed keep the session: it simply probes from the new source,
-and the peer picks the new path up.
+A sealed PING naming a connection's claimant ufrag **adds a path** for that
+connection, whatever source it arrives from (`session.c:probe_apply`). This is
+what lets an end whose address changed keep the session: it simply probes from
+the new source, and the peer picks the new path up. The new path's kind follows
+the source -- `SEGMENT` for a LAN-scope one, `ROUTED` otherwise -- which names
+how it was come by and changes nothing about how it ranks.
 
 The rule is **add, never replace**. A new endpoint enters the path table as one
 more candidate and ranking decides whether it carries anything (§9 "Ranking and
 symmetric selection"); it never displaces the endpoint in use. A late datagram
 from an address that has gone away therefore cannot flap the binding: the stale
-path simply cools and is evicted, oldest `DEAD` first, when the table is full at
-`PATH_MAX`.
+path simply cools, and is evicted when the table is full at `PATH_MAX`. What
+goes then is the worst-ranked path that is not carrying the session, oldest
+`DEAD` first and oldest first between equals -- never the path in use, and never
+the newcomer, since a probe that arrived is evidence its source works where a
+path that has stopped answering is evidence of the opposite.
 
 **Why the ufrag suffices.** It is not a secret between token holders -- it
 travels in the mailbox slot every holder of `R` can read and unseal (§4, §12) --
@@ -536,12 +578,22 @@ already common to both grades. Disruption between token holders is out of scope;
 the boundary the seal defends is the **stranger**, who holds no `R`, can seal
 nothing, and cannot attach to anything.
 
-**Bounding the cost.** A datagram from an unknown source can only be matched to
-a connection by trying its seal against each candidate, so an implementation must
-bound that work: only a frame opening with `PROBE_MAGIC` is a candidate at all,
-and unknown-source attempts are rate-limited (`PATH_ADOPT_RATE`, per second, per
-listening socket). Without the bound a stranger who can seal nothing still costs
-one AEAD open per live connection per junk datagram.
+A host has many connections and the source names none of them, so it is the
+claimant ufrag inside the seal that says which one the path belongs to: the host
+keeps the connections it serves in `sess.conns[]`, registered at admission and
+cleared before the connection is freed, and matches the ufrag against them
+(`session.c:probe_adopt`). A client has one connection and needs no such lookup.
+
+**Bounding the cost.** Only a frame opening with `PROBE_MAGIC` is a candidate at
+all, and unknown-source attempts are rate-limited by a `PATH_ADOPT_RATE` token
+bucket, consulted **before** the AEAD open rather than after
+(`session.c:adopt_allow`, `probe_gate`); the bucket belongs to the listening
+socket and is touched only by the thread that dispatches it. The cost being
+bounded is one open per junk datagram, not one per live connection: every conn
+of a session shares `sig_key`, derived once from `R` (§2), so a single open
+either authenticates the frame or does not, however many connections are live.
+The bound is still worth having -- it is what stops a stranger who can seal
+nothing from setting the rate of that work.
 
 **What this does and does not recover.** It recovers an address change that
 leaves the peer's endpoint reachable: a DHCP renewal, a move between interfaces
@@ -553,9 +605,31 @@ all; that still needs fresh signalling, which is what the always-engaged DHT of
 Paths are not only discovered by accident, either. Each end advertises its own
 local candidate endpoints over comrade-ctl (`CTLM_CAND`, §10) and probes every
 endpoint the peer advertises, so both ends explore the full set rather than only
-the pair admission happened to produce. A multi-homed end therefore has its
-alternatives already `WARM` before anything fails, which is invariant 3 applied
-to discovery rather than only to upkeep.
+the pair admission happened to produce (`session.c:cand_tell`,
+`session.c:conn_offer_path`). A multi-homed end therefore has its alternatives
+already `WARM` before anything fails, which is invariant 3 applied to discovery
+rather than only to upkeep.
+
+The port an advertised endpoint names is the **shared lanlink socket's**: that
+is the one transport able to send to an arbitrary endpoint, so an advertisement
+always yields a `SEGMENT` or `ROUTED` path and never an `ICE` one. The addresses
+are the local interfaces', less loopback (which names this machine to nobody
+else) and IPv6 link-local (which travels without the zone id it cannot be
+reached without). A session with no lanlink socket advertises nothing.
+
+An advertisement is a **claim, not evidence**: nothing has been seen to arrive
+from the endpoint it names. It is therefore admitted only into a free slot, or
+one a `DEAD` path is holding, and is otherwise declined
+(`path.c:path_table_offer`) -- where a probe that *arrived* displaces the
+worst-ranked path above. A peer with more addresses than `PATH_MAX` can then
+name them all without churning the paths that are answering, and can never
+touch the one in use.
+
+A declined endpoint is not lost, and that is what makes the conservative rule
+safe. If it works at all, the peer's own probe reaches this end from the source
+that reaches it, and adoption -- which is evidence -- takes the slot the claim
+could not. The advertisement is an accelerator: it is how an endpoint gets
+warmed *before* it is needed, not the only way one is ever found.
 
 ---
 
@@ -599,9 +673,11 @@ per-message checksum; the SSH channel provides integrity):
 Message types (`ctlproto.h`): `CTLM_PING 0` payload `timestamp(8, BE)`;
 `CTLM_PONG 1` payload echoed timestamp(8); `CTLM_RDV 2` payload
 `family(1) | port(2,BE) | addr(16)` = `CTL_RDV_PLEN 19` (a warm rendezvous node
-for the peer to reuse on a roam); `CTLM_CAND 3` *(PLANNED, 0.1.x)*, same 19-byte
-payload shape, one local candidate endpoint the peer should probe and hold as a
-path (§9). `CTL_HDR = 2`, `CTL_FRAME_MAX = 21`.
+for the peer to reuse on a roam); `CTLM_CAND 3`, the same 19-byte payload shape
+and so the same codec, one local endpoint at the sender's lanlink port for the
+peer to probe and hold as a path (§9), re-sent every `CAND_TELL_MS 5000` so an
+interface brought up mid-session is advertised within one period. `CTL_HDR = 2`,
+`CTL_FRAME_MAX = 21`.
 
 ---
 
@@ -614,13 +690,26 @@ path (§9). `CTL_HDR = 2`, `CTL_FRAME_MAX = 21`.
   over `CTLM_RDV`, so either side can re-signal quickly after a move. This is
   what the unconditional DHT engagement of §5 exists to feed: a node can only be
   exchanged if one was ever located.
-- **Roaming is a path switch, not a rejoin** *(PLANNED, 0.1.x)*. When the path
-  carrying the session dies, the session moves to the best warm path (§9) with
-  the connection, the worker, the tmux attach and the KCP stream all intact. The
-  peer needs no notice, since it accepts on every path it holds.
+- **Roaming is a path switch, not a rejoin**. When the path carrying the session
+  dies, the session moves to the best warm path (§9) with the connection, the
+  worker, the tmux attach and the KCP stream all intact. The peer needs no
+  notice, since it accepts on every path it holds. Nothing signals the switch
+  and nothing waits for it: ranking reorders, and the next datagram leaves by
+  the new path.
+- The heartbeat is **end to end and knows nothing about paths**, so it is not
+  what decides a switch and is not suppressed for one either. Depending on where
+  in its round the path died it may report the link lost for a moment while the
+  switch lands; that is the outage the switch is repairing, and it is far inside
+  the rejoin grace below. `HOST_REAP_MS 12000` likewise sits well above
+  `PATH_DEAD_MS 8000`, so a host never reaps a client that is mid-switch.
 - **Reconnect == new join** (tmux redraws) is the fallback for when *no* path is
   warm, with a grace window `SSHC_REJOIN_GRACE_S 6` so a transient blip resumes
-  without a re-punch.
+  without a re-punch. The grace is what keeps the two apart rather than any
+  interlock: the incumbent leaves `WARM` `PATH_WARM_MS 3000` after the last
+  answer it gave and a warm alternative takes over at once (sooner, where the
+  incumbent's loss has already cost it the margin), while the rejoin cannot fire
+  until `HB_LOST_MS 2500` and then the grace have both passed. The rejoin
+  therefore only ever fires where there was nothing to switch to.
 - **Signalling is rebuilt on a move**. A fresh `sig` binds a new DHT socket on
   the new network, where the old one stays stuck on the interface that vanished;
   that is why a manual restart reconnects instantly where a reused socket does
@@ -629,7 +718,10 @@ path (§9). `CTL_HDR = 2`, `CTL_FRAME_MAX = 21`.
   gives the session up: a network that is still coming up has no
   multicast-capable interface for the link-local half to bind, so the flag stays
   set and `sig_dispatch` retries the open every `SIG_MCAST_OPEN_MS 1000` while
-  the DHT half, which binds the wildcard address, runs meanwhile.
+  the DHT half, which binds the wildcard address, runs meanwhile. The DHT half
+  is symmetrical: a node that cannot be created now is retried every
+  `SIG_DHT_OPEN_MS 1000` rather than on every pump tick, and is never given up
+  either.
 - A change of **local address** is survivable without re-signalling wherever the
   peer's endpoints stay reachable, because a sealed probe from the new source
   adds a path; see "Adding a path mid-session" in §9. A move to a network from
@@ -738,7 +830,10 @@ CLI surface:
 
 `--no-dht` names the mechanism it declines rather than the medium it assumes. A
 future non-IP transport (BLE, LoRaWAN, AX.25) would make a `--lan-only` spelling
-meaningless, while "no DHT" still says exactly what it does.
+meaningless, while "no DHT" still says exactly what it does. These options
+configure the session being started: `comrade` re-attaching to a session that is
+already running keeps whatever its service was given, and names on stderr which
+of them it is ignoring.
 
 MVC seam (`src/session.h:session_obs`): the controller emits semantic events
 (`net`, `link`, `rendezvous`, `rdv_stage`, `token`, `peer`, `reset`, `escalate`,

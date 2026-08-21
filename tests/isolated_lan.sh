@@ -1,10 +1,11 @@
 #!/bin/sh
 # Isolated-LAN token mint and connect.
 #
-# A host with no DHT (an isolated LAN) must mint and print a token with the
-# endpoint slots direct (EPx_RDV clear) and the retired NODHT bit clear, and a
-# client told to decline the DHT itself must find the host over multicast and
-# connect. This runs two same-host processes over real link-local multicast
+# A host with no DHT (an isolated LAN) must mint and print a token whose two
+# families settle to NONE -- carrying no address of the host's own, and with the
+# retired NODHT bit clear -- and a client told to decline the DHT itself must
+# still find the host over multicast and connect on the rendezvous secret alone.
+# This runs two same-host processes over real link-local multicast
 # (IP_MULTICAST_LOOP is set), which needs one up, multicast-capable, non-loopback
 # interface; where there is none the whole case SKIPs (exit 77).
 #
@@ -38,27 +39,40 @@ cpid=""
 	>"$tmp/host.out" 2>"$tmp/host.err" &
 hpid=$!
 
+# The host re-emits its token on every state change, so take the newest line and
+# wait for both families to settle. With the DHT declined that takes only as long
+# as ICE gathering. A truncated last line simply fails to decode and we retry.
 tok=""
 i=0
 while [ "$i" -lt 40 ]; do
-	tok=$(sed -n 's/^COMRADE TOKEN: //p' "$tmp/host.out" 2>/dev/null | head -1)
-	[ -n "$tok" ] && break
+	cand=$(sed -n 's/^COMRADE TOKEN: //p' "$tmp/host.out" 2>/dev/null | tail -1)
+	if [ -n "$cand" ] && "$E2E" token "$cand" 2>/dev/null |
+	   grep -q 'ep6_settled=1 ep4_settled=1'; then
+		tok="$cand"; break
+	fi
 	if ! kill -0 "$hpid" 2>/dev/null; then
 		echo "host exited before minting a token"; cat "$tmp/host.err"; exit 1
 	fi
 	sleep 0.5; i=$((i + 1))
 done
-if [ -z "$tok" ]; then echo "no token after ~20s"; cat "$tmp/host.err"; exit 1; fi
+if [ -z "$tok" ]; then echo "no settled token after ~20s"; cat "$tmp/host.err"; exit 1; fi
 
-# Assert the mint: the endpoint slots are direct (EPx_RDV clear), and no token
-# state tells the client to drop a transport (NODHT is retired).
+# Assert the mint: both families settled to NONE, no address of the host's own
+# in either slot, and no token state telling the client to drop a transport
+# (NODHT is retired).
 "$E2E" token "$tok" >"$tmp/flags.out" 2>&1
 cat "$tmp/flags.out"
 if ! grep -q 'nodht=0' "$tmp/flags.out"; then
 	echo "FAIL: token carries the retired NODHT bit"; exit 1
 fi
-if ! grep -q 'ep6_rdv=0 ep4_rdv=0' "$tmp/flags.out"; then
-	echo "FAIL: an endpoint slot is a rendezvous node, not a direct endpoint"; exit 1
+if ! grep -q 'state6=NONE state4=NONE' "$tmp/flags.out"; then
+	echo "FAIL: a family did not settle to NONE"; exit 1
+fi
+if ! grep -q 'ep6=\[::\]:0' "$tmp/flags.out"; then
+	echo "FAIL: the v6 slot carries a host address"; exit 1
+fi
+if ! grep -q 'ep4=0.0.0.0:0' "$tmp/flags.out"; then
+	echo "FAIL: the v4 slot carries a host address"; exit 1
 fi
 
 # The client declines the DHT the way its operator would on an isolated LAN;
@@ -76,5 +90,5 @@ fi
 if [ "$hrc" -ne 0 ]; then
 	echo "host did not exit cleanly:"; cat "$tmp/host.err"; exit 1
 fi
-echo "isolated-LAN e2e: endpoint token minted and an RFC1918 client connected"
+echo "isolated-LAN e2e: both families settled to NONE and an RFC1918 client connected"
 exit 0

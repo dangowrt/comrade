@@ -162,6 +162,38 @@ int main(void)
 		assert(ctl_rdv_decode(rdv, CTL_RDV_PLEN, &out, &ol) == 0);
 	}
 
-	printf("ctlproto: all framing and rendezvous cases pass\n");
+	/*
+	 * A candidate advertisement is one endpoint in the same 19-byte shape,
+	 * so it frames to exactly CTL_FRAME_MAX and needs no more room than the
+	 * rendezvous message the framing was sized for.
+	 */
+	{
+		struct sockaddr_in a;
+		struct sockaddr_storage out;
+		socklen_t ol = 0;
+		uint8_t f[CTL_FRAME_MAX];
+		size_t n;
+
+		memset(&a, 0, sizeof(a));
+		a.sin_family = AF_INET;
+		a.sin_port = htons(51820);
+		assert(inet_pton(AF_INET, "198.51.100.9", &a.sin_addr) == 1);
+		ctl_rdv_encode(rdv, 4, (struct sockaddr *)&a);
+		n = ctl_frame(f, CTLM_CAND, rdv, CTL_RDV_PLEN);
+		assert(n == CTL_FRAME_MAX);
+		reset(&r);
+		ctl_reframer_feed(&r, f, n, collect, NULL);
+		assert(nseen == 1 && seen[0].type == CTLM_CAND);
+		assert(seen[0].plen == CTL_RDV_PLEN);
+		assert(ctl_rdv_decode(seen[0].pl, seen[0].plen, &out, &ol) == 4);
+		{
+			struct sockaddr_in *b = (struct sockaddr_in *)&out;
+
+			assert(ntohs(b->sin_port) == 51820);
+			assert(memcmp(&b->sin_addr, &a.sin_addr, 4) == 0);
+		}
+	}
+
+	printf("ctlproto: all framing, rendezvous and candidate cases pass\n");
 	return 0;
 }

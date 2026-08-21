@@ -25,20 +25,25 @@
  * fingerprint of the host's ephemeral SSH key (the client pins it, so there
  * is no trust-on-first-use).
  *
- * The two endpoint slots (v6, v4) are per-family hints whose meaning is set
- * independently by the flags:
- *   - all-zero address: absent, nothing known for that family.
- *   - direct (EPx_RDV clear): the host's own reachable endpoint. A directly
- *     reachable host (public IP, permissive-firewall v6, or LAN) lets the
- *     client connect server-model with no punch and the DHT untouched.
- *   - rendezvous (EPx_RDV set): a DHT node holding the host's mailbox for
- *     that family, like a tracker address in a magnet URI. The client
+ * The two endpoint slots (v6, v4) are per-family, and a slot together with
+ * that family's EPx_RDV and EPx_SETTLED bits carries one of four states:
+ *   - PENDING (slot all-zero, SETTLED clear): the host has not finished
+ *     working this family out.
+ *   - NONE (slot all-zero, SETTLED set): this family has no path to the DHT,
+ *     so it is reachable over link-local discovery alone.
+ *   - RENDEZVOUS (slot set, RDV set): a DHT node holding the host's mailbox
+ *     for that family, like a tracker address in a magnet URI. The client
  *     queries it directly for a fast lookup-free rendezvous while the host's
  *     own address stays out of the token, which is the right posture for a
  *     NATed host (it cannot be reached directly from a one-way token; the
  *     client's address must reach it through the two-way DHT/mcast mailbox).
- * The direct/rendezvous choice is one bit per family because a host is
- * commonly v6-direct and v4-rendezvous (or v4-absent) at the same time.
+ *   - DIRECT (slot set, RDV clear): the host's own endpoint, proven reachable
+ *     from outside, which lets the client connect server-model with no punch
+ *     and the DHT untouched.
+ * The families are wholly independent, because a host is commonly reachable
+ * over one and not the other. The state is advisory: R alone always suffices,
+ * so the host re-mints as its situation changes and an already-copied token
+ * is a snapshot that is never wrong, only sometimes slower.
  *
  * A CRC-32 over the payload is appended (wire form) so any transcription
  * typo is caught instantly on decode, before any network use. The wire form
@@ -58,6 +63,15 @@
 #define TOKEN_FLAG_NODHT	0x02	/* reserved, never set: no token state tells a peer to drop a transport */
 #define TOKEN_FLAG_EP6_RDV	0x04	/* ep6 slot is a rendezvous DHT node, not a direct endpoint */
 #define TOKEN_FLAG_EP4_RDV	0x08	/* ep4 slot is a rendezvous DHT node, not a direct endpoint */
+#define TOKEN_FLAG_EP6_SETTLED	0x10	/* the v6 family's state is determined, not still being worked out */
+#define TOKEN_FLAG_EP4_SETTLED	0x20	/* likewise for v4 */
+
+enum token_state {
+	TOKEN_STATE_PENDING,
+	TOKEN_STATE_NONE,
+	TOKEN_STATE_RENDEZVOUS,
+	TOKEN_STATE_DIRECT
+};
 
 struct token {
 	uint8_t version;
@@ -73,5 +87,21 @@ struct token {
 
 int token_encode(const struct token *tok, char *dest, size_t dest_len);
 int token_decode(struct token *tok, const char *src);
+
+/*
+ * The TOKEN_STATE_* one family (4 or 6) carries. A set slot with SETTLED clear
+ * does not occur, and is read as settled, so a token minted before the SETTLED
+ * bits existed still reads as the DIRECT or RENDEZVOUS it was.
+ */
+int token_family_state(const struct token *tok, int family);
+
+/*
+ * Write one family's state into its slot. `addr` is that family's address
+ * bytes (TOKEN_EP4_LEN or TOKEN_EP6_LEN) and `port` is in host byte order;
+ * both are read only for the two states that carry an address, so a caller
+ * with none to give may pass anything.
+ */
+void token_set_family(struct token *tok, int family, int state,
+		      const uint8_t *addr, uint16_t port);
 
 #endif

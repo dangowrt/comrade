@@ -48,7 +48,7 @@ static const char *state_sgr(const struct conn_status *st)
 
 void statusbar_render(int rows, int cols, const struct conn_status *st)
 {
-	char text[256], bar[BAR_MAX_COLS + 1], out[BAR_MAX_COLS + 64];
+	char text[384], bar[BAR_MAX_COLS + 1], out[BAR_MAX_COLS + 64];
 	int p, w = cols, n;
 
 	if (rows < 1 || w < 1)
@@ -64,6 +64,15 @@ void statusbar_render(int rows, int cols, const struct conn_status *st)
 		p += snprintf(text + p, sizeof(text) - p, " %ds", st->since_s);
 	if (p > 0 && p < (int)sizeof(text) && st->peer[0])
 		p += snprintf(text + p, sizeof(text) - p, "  peer %s", st->peer);
+	/* The path in use, and what it would move to: a roam is a reordering of
+	 * paths already warm, so the alternative is worth seeing before it is
+	 * needed. Only the best one is named; the count carries the rest. */
+	if (p > 0 && p < (int)sizeof(text) && st->alt[0]) {
+		p += snprintf(text + p, sizeof(text) - p, "  alt %s", st->alt);
+		if (p > 0 && p < (int)sizeof(text) && st->warm_alt > 1)
+			p += snprintf(text + p, sizeof(text) - p, " +%d",
+				      st->warm_alt - 1);
+	}
 	if (p > 0 && p < (int)sizeof(text) && st->rdv[0])
 		p += snprintf(text + p, sizeof(text) - p, "  rdv4 %s", st->rdv);
 	if (p > 0 && p < (int)sizeof(text) && st->rdv6[0])
