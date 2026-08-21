@@ -269,9 +269,9 @@ static void table_check(void)
 	assert(!path_table_find_port(&t, 5001));
 	assert(path_index(&t, p) == 0);
 
-	for (i = 1; i < PATH_MAX; i++)
+	for (i = 1; i < PATH_TABLE_MAX; i++)
 		add(&t, "2001:db8::1", (uint16_t)(5000 + i), 100 + i);
-	assert(path_table_count(&t) == PATH_MAX);
+	assert(path_table_count(&t) == PATH_TABLE_MAX);
 
 	/* Full: the oldest DEAD goes first, and never the path in use. */
 	round_trip(p, 200, 1);
@@ -282,7 +282,7 @@ static void table_check(void)
 	assert(path_warmth_of(q, 200 + PATH_DEAD_MS + 1) == PATH_DEAD);
 	p = add(&t, "2001:db8::9", 9999, 200 + PATH_DEAD_MS + 1);
 	assert(p == q);
-	assert(path_table_count(&t) == PATH_MAX);
+	assert(path_table_count(&t) == PATH_TABLE_MAX);
 	assert(t.sel == 0);
 
 	path_table_drop_kind(&t, PATH_SEGMENT);
@@ -831,7 +831,7 @@ static void adopt_check(void)
 	/* Full, and nothing DEAD: the worst-ranked path that is not carrying the
 	 * session goes, oldest first between equals. */
 	path_table_init(&t);
-	for (i = 0; i < PATH_MAX; i++) {
+	for (i = 0; i < PATH_TABLE_MAX; i++) {
 		p = add(&t, "2001:db8::1", (uint16_t)(5000 + i), now + i);
 		warm(p, now);
 		bucketed(p, 10 * (i + 1));
@@ -839,7 +839,7 @@ static void adopt_check(void)
 	assert(path_select(&t, now) == 0);
 	p = add(&t, "2001:db8::9", 9999, now);
 	assert(p && path_index(&t, p) == 1);
-	assert(path_table_count(&t) == PATH_MAX);
+	assert(path_table_count(&t) == PATH_TABLE_MAX);
 	assert(t.sel == 0);
 }
 
@@ -847,7 +847,7 @@ static void adopt_check(void)
  * An endpoint the peer advertises over CTLM_CAND is a claim, not evidence:
  * nothing has been seen to arrive from it. It therefore takes a free slot or
  * one a DEAD path is holding, and where there is neither it is declined --
- * a multi-homed peer naming more endpoints than PATH_MAX must not be able to
+ * a multi-homed peer naming more endpoints than PATH_TABLE_MAX must not be able to
  * churn the paths that are answering, and must never touch the one in use.
  */
 static void offer_check(void)
@@ -868,7 +868,7 @@ static void offer_check(void)
 	assert(path_table_count(&t) == 1);
 
 	/* Full and everything answering: declined outright. */
-	for (i = 1; i < PATH_MAX; i++) {
+	for (i = 1; i < PATH_TABLE_MAX; i++) {
 		p = add(&t, "2001:db8::1", (uint16_t)(5000 + i), now);
 		warm(p, now);
 	}
@@ -876,7 +876,7 @@ static void offer_check(void)
 	assert(path_select(&t, now) == 0);
 	sa = sa6("2001:db8::9", 9999);
 	assert(path_table_offer(&t, PATH_ROUTED, &sa, now) == NULL);
-	assert(path_table_count(&t) == PATH_MAX);
+	assert(path_table_count(&t) == PATH_TABLE_MAX);
 
 	/* A path that has gone DEAD is holding a slot nothing is using, and an
 	 * advertised endpoint may have it. */
@@ -891,12 +891,12 @@ static void offer_check(void)
 
 	/* Never the path in use, even when it is the only DEAD one. */
 	path_table_init(&t);
-	for (i = 0; i < PATH_MAX; i++)
+	for (i = 0; i < PATH_TABLE_MAX; i++)
 		add(&t, "2001:db8::2", (uint16_t)(6000 + i), now);
 	warm(&t.p[0], now);
 	assert(path_select(&t, now) == 0);
 	now += PATH_DEAD_MS + 1;
-	for (i = 1; i < PATH_MAX; i++)
+	for (i = 1; i < PATH_TABLE_MAX; i++)
 		warm(&t.p[i], now);
 	assert(path_warmth_of(&t.p[0], now) == PATH_DEAD);
 	assert(t.sel == 0);

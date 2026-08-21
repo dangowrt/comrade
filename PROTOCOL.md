@@ -383,7 +383,7 @@ sealed datagrams for one connection can be sent. Three kinds exist:
 
 The kind is a description, not a rank: it names how a path was come by and
 nothing else, and plays no part in choosing between paths. A connection tracks up
-to `PATH_MAX` of them and carries KCP over exactly one at a time.
+to `PATH_TABLE_MAX` of them and carries KCP over exactly one at a time.
 
 Path management is **symmetric and role-free**. comrade's application model has a
 host and a client -- one owns the tmux, one claims the turnstile (§12) -- but
@@ -539,7 +539,7 @@ the identical rule to the identical numbers and so flip together.
 
 | constant | value | meaning |
 |---|---|---|
-| `PATH_MAX` | 4 | paths tracked per connection |
+| `PATH_TABLE_MAX` | 4 | paths tracked per connection |
 | `PROBE_EVERY_MS` | 200 | probe period while unqualified |
 | `PATH_KEEP_MS` | 1000 | probe period once qualified, every path |
 | `PATH_WARM_MS` | 3000 | silence beyond this: `WARM` becomes `COLD` |
@@ -563,7 +563,7 @@ The rule is **add, never replace**. A new endpoint enters the path table as one
 more candidate and ranking decides whether it carries anything (§9 "Ranking and
 symmetric selection"); it never displaces the endpoint in use. A late datagram
 from an address that has gone away therefore cannot flap the binding: the stale
-path simply cools, and is evicted when the table is full at `PATH_MAX`. What
+path simply cools, and is evicted when the table is full at `PATH_TABLE_MAX`. What
 goes then is the worst-ranked path that is not carrying the session, oldest
 `DEAD` first and oldest first between equals -- never the path in use, and never
 the newcomer, since a probe that arrived is evidence its source works where a
@@ -621,7 +621,7 @@ An advertisement is a **claim, not evidence**: nothing has been seen to arrive
 from the endpoint it names. It is therefore admitted only into a free slot, or
 one a `DEAD` path is holding, and is otherwise declined
 (`path.c:path_table_offer`) -- where a probe that *arrived* displaces the
-worst-ranked path above. A peer with more addresses than `PATH_MAX` can then
+worst-ranked path above. A peer with more addresses than `PATH_TABLE_MAX` can then
 name them all without churning the paths that are answering, and can never
 touch the one in use.
 

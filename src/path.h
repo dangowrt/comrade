@@ -14,7 +14,7 @@
  * The path model: everything about a path that is decidable without touching a
  * socket or a clock. A path is a pair (local transport instance, remote
  * endpoint) over which sealed datagrams for one connection can be sent; a
- * connection tracks up to PATH_MAX of them and carries KCP over exactly one at
+ * connection tracks up to PATH_TABLE_MAX of them and carries KCP over exactly one at
  * a time. See PROTOCOL.md, "Path model and transport probe".
  *
  * Everything here is pure: every entry point that needs the time takes it as an
@@ -52,7 +52,7 @@ enum path_warmth {
 	PATH_DEAD		/* silent beyond PATH_DEAD_MS */
 };
 
-#define PATH_MAX 4			/* paths tracked per connection */
+#define PATH_TABLE_MAX 4			/* paths tracked per connection */
 #define PROBE_EVERY_MS 200		/* probe period while unqualified */
 #define PATH_KEEP_MS 1000		/* probe period once qualified */
 #define PATH_WARM_MS 3000		/* WARM becomes COLD past this */
@@ -222,7 +222,7 @@ struct path {
  * unit. Slot indices are stable across an eviction, so `sel` stays meaningful.
  */
 struct path_table {
-	struct path p[PATH_MAX];
+	struct path p[PATH_TABLE_MAX];
 	int sel;			/* the path in use, -1 if none */
 	int cand;			/* the challenger, -1 if none */
 	int hold;			/* evaluations it has won the margin */
@@ -249,7 +249,7 @@ struct path *path_table_add(struct path_table *t, enum path_kind kind,
  * seen to arrive from. It is a guess, so it takes a free slot or one a DEAD
  * path is holding and is otherwise declined: a probe that arrived is evidence
  * its source works, where an advertisement is only a claim, and a multi-homed
- * peer naming more endpoints than PATH_MAX must not be able to churn the ones
+ * peer naming more endpoints than PATH_TABLE_MAX must not be able to churn the ones
  * that are answering. Returns the path, the existing one when an endpoint is
  * already named, or NULL when there is no room to spare for a guess.
  */

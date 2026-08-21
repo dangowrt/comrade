@@ -171,7 +171,7 @@ struct conn {
 	 * reach it. It is never held across a lanlink_send, a nat_send, a seal
 	 * or an agent call, and never nested with stream_lock in either order.
 	 * The computations under it are the ranking, a handful of integer
-	 * compares over at most PATH_MAX entries, and the path id, a keyed
+	 * compares over at most PATH_TABLE_MAX entries, and the path id, a keyed
 	 * digest over 36 bytes taken when an endpoint of the pair is learnt or
 	 * changes.
 	 */
@@ -493,7 +493,7 @@ static int conn_lan_paths(struct conn *c, int routable_only)
 	int i, n = 0;
 
 	pthread_mutex_lock(&c->path_lock);
-	for (i = 0; i < PATH_MAX; i++) {
+	for (i = 0; i < PATH_TABLE_MAX; i++) {
 		struct path *p = &c->paths.p[i];
 
 		if (!p->used || p->kind == PATH_ICE)
@@ -587,7 +587,7 @@ static int conn_pick(struct conn *c, struct path_pick *out)
 	from[0] = '\0';
 	to[0] = '\0';
 	pthread_mutex_lock(&c->path_lock);
-	for (i = 0; i < PATH_MAX; i++)
+	for (i = 0; i < PATH_TABLE_MAX; i++)
 		c->paths.p[i].usable = c->paths.p[i].kind != PATH_ICE || ice_ok;
 	prev = c->paths.sel;
 	sel = path_select(&c->paths, now_ms());
@@ -638,7 +638,7 @@ static int conn_warm_alts(struct conn *c, char *best, size_t n)
 	best[0] = '\0';
 	pthread_mutex_lock(&c->path_lock);
 	sel = c->paths.sel;
-	for (i = 0; i < PATH_MAX; i++) {
+	for (i = 0; i < PATH_TABLE_MAX; i++) {
 		struct path *p = &c->paths.p[i];
 
 		if (!p->used || !p->usable || i == sel)
@@ -1265,7 +1265,7 @@ static struct path *conn_pong_path(struct conn *c, uint64_t nonce)
 {
 	int i;
 
-	for (i = 0; i < PATH_MAX; i++)
+	for (i = 0; i < PATH_TABLE_MAX; i++)
 		if (c->paths.p[i].used && c->paths.p[i].outstanding &&
 		    c->paths.p[i].nonce == nonce)
 			return &c->paths.p[i];
@@ -1501,12 +1501,12 @@ static int conn_ice_ep(struct conn *c, uint64_t now, struct path_ep *ep)
 static void path_tick(struct conn *c, uint64_t now)
 {
 	struct sess *s = c->sess;
-	struct sockaddr_in6 to[PATH_MAX];
-	struct path_probe pr[PATH_MAX];
-	uint64_t nonce[PATH_MAX];
+	struct sockaddr_in6 to[PATH_TABLE_MAX];
+	struct path_probe pr[PATH_TABLE_MAX];
+	uint64_t nonce[PATH_TABLE_MAX];
 	struct path_ep ice;
 	uint8_t out[PROBE_MAX];
-	int kind[PATH_MAX], drop[PATH_MAX], due[PATH_MAX];
+	int kind[PATH_TABLE_MAX], drop[PATH_TABLE_MAX], due[PATH_TABLE_MAX];
 	int i, n = 0, m = 0, have_ice, ice_ok;
 	size_t len;
 
@@ -1515,7 +1515,7 @@ static void path_tick(struct conn *c, uint64_t now)
 	have_ice = !conn_ice_ep(c, now, &ice);
 	ice_ok = c->nat && nat_connected(c->nat);
 	pthread_mutex_lock(&c->path_lock);
-	for (i = 0; i < PATH_MAX; i++) {
+	for (i = 0; i < PATH_TABLE_MAX; i++) {
 		struct path *p = &c->paths.p[i];
 
 		if (!p->used)

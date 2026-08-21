@@ -264,7 +264,7 @@ int path_table_count(const struct path_table *t)
 {
 	int i, n = 0;
 
-	for (i = 0; i < PATH_MAX; i++)
+	for (i = 0; i < PATH_TABLE_MAX; i++)
 		if (t->p[i].used)
 			n++;
 	return n;
@@ -272,7 +272,7 @@ int path_table_count(const struct path_table *t)
 
 int path_index(const struct path_table *t, const struct path *p)
 {
-	if (!p || p < t->p || p >= t->p + PATH_MAX)
+	if (!p || p < t->p || p >= t->p + PATH_TABLE_MAX)
 		return -1;
 	return (int)(p - t->p);
 }
@@ -287,7 +287,7 @@ struct path *path_table_find(struct path_table *t, enum path_kind kind,
 {
 	int i;
 
-	for (i = 0; i < PATH_MAX; i++)
+	for (i = 0; i < PATH_TABLE_MAX; i++)
 		if (t->p[i].used && t->p[i].kind == kind &&
 		    path_ep_eq(&t->p[i].peer_ep, ep))
 			return &t->p[i];
@@ -298,7 +298,7 @@ struct path *path_table_find_ep(struct path_table *t, const struct path_ep *ep)
 {
 	int i;
 
-	for (i = 0; i < PATH_MAX; i++)
+	for (i = 0; i < PATH_TABLE_MAX; i++)
 		if (t->p[i].used && kind_is_lanlink(t->p[i].kind) &&
 		    path_ep_eq(&t->p[i].peer_ep, ep))
 			return &t->p[i];
@@ -309,7 +309,7 @@ struct path *path_table_find_port(struct path_table *t, uint16_t port)
 {
 	int i;
 
-	for (i = 0; i < PATH_MAX; i++)
+	for (i = 0; i < PATH_TABLE_MAX; i++)
 		if (t->p[i].used && kind_is_lanlink(t->p[i].kind) &&
 		    t->p[i].peer_ep.port == port)
 			return &t->p[i];
@@ -323,7 +323,7 @@ struct path *path_table_find_agent(struct path_table *t,
 
 	if (!agent)
 		return NULL;
-	for (i = 0; i < PATH_MAX; i++)
+	for (i = 0; i < PATH_TABLE_MAX; i++)
 		if (t->p[i].used && t->p[i].agent == agent)
 			return &t->p[i];
 	return NULL;
@@ -345,10 +345,10 @@ static int path_table_evict(struct path_table *t, uint64_t now)
 {
 	int i, worst = -1;
 
-	for (i = 0; i < PATH_MAX; i++)
+	for (i = 0; i < PATH_TABLE_MAX; i++)
 		if (!t->p[i].used)
 			return i;
-	for (i = 0; i < PATH_MAX; i++) {
+	for (i = 0; i < PATH_TABLE_MAX; i++) {
 		enum path_warmth w, ww;
 
 		if (i == t->sel)
@@ -421,10 +421,10 @@ static int path_table_spare(const struct path_table *t, uint64_t now)
 {
 	int i;
 
-	for (i = 0; i < PATH_MAX; i++)
+	for (i = 0; i < PATH_TABLE_MAX; i++)
 		if (!t->p[i].used)
 			return 1;
-	for (i = 0; i < PATH_MAX; i++)
+	for (i = 0; i < PATH_TABLE_MAX; i++)
 		if (i != t->sel && path_warmth_of(&t->p[i], now) == PATH_DEAD)
 			return 1;
 	return 0;
@@ -457,7 +457,7 @@ void path_table_drop_kind(struct path_table *t, enum path_kind kind)
 {
 	int i;
 
-	for (i = 0; i < PATH_MAX; i++) {
+	for (i = 0; i < PATH_TABLE_MAX; i++) {
 		if (!t->p[i].used || t->p[i].kind != kind)
 			continue;
 		memset(&t->p[i], 0, sizeof(t->p[i]));
@@ -474,7 +474,7 @@ void path_table_reset_stats(struct path_table *t)
 {
 	int i;
 
-	for (i = 0; i < PATH_MAX; i++) {
+	for (i = 0; i < PATH_TABLE_MAX; i++) {
 		struct path *p = &t->p[i];
 
 		if (!p->used)
@@ -500,7 +500,7 @@ int path_table_any_qualified(const struct path_table *t)
 {
 	int i;
 
-	for (i = 0; i < PATH_MAX; i++)
+	for (i = 0; i < PATH_TABLE_MAX; i++)
 		if (t->p[i].used && t->p[i].qualified)
 			return 1;
 	return 0;
@@ -645,7 +645,7 @@ int path_best(const struct path_table *t, uint64_t now)
 {
 	int i, best = -1;
 
-	for (i = 0; i < PATH_MAX; i++) {
+	for (i = 0; i < PATH_TABLE_MAX; i++) {
 		if (!t->p[i].used || !t->p[i].usable)
 			continue;
 		if (best < 0 || path_cmp(&t->p[i], &t->p[best], now) < 0)
