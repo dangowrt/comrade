@@ -16,11 +16,14 @@
  *
  * Search order, most specific first:
  *   1. %COMRADE_TMUX%                     -- explicit override, always wins
- *   2. <dir of comrade.exe>\tmux\tmux.exe -- the portable bundle, dropped
- *   3. <dir of comrade.exe>\tmux.exe         next to the executable
- *   4. C:\msys64\usr\bin\tmux.exe         -- the default MSYS2 install
+ *   2. <dir of comrade.exe>\tmux.exe      -- dropped next to the executable
+ *      (also \tmux\tmux.exe and the MSYS2 \tmux\usr\bin\tmux.exe layout)
+ *   3. the winget package dir            -- arndawg.tmux-windows, the native
+ *      MSVC/ConPTY tmux 3.6a: the primary path, and the one comrade offers
+ *      to install. User scope, then machine scope, then the winget Links alias
+ *   4. C:\msys64\usr\bin\tmux.exe         -- MSYS2, a silent fallback
  *   5. tmux.exe on %PATH%
- *   6. the usual scoop / winget / Cygwin / relocated-MSYS2 locations
+ *   6. Cygwin / relocated-MSYS2 / scoop shims
  */
 
 /* Absolute path to a usable tmux.exe, or NULL. Cached after the first call. */
@@ -33,11 +36,11 @@ const char *tmux_path(void);
 void tmux_missing_help(void);
 
 /*
- * Offer to install tmux and do it if the operator agrees: one keypress when a
- * package manager comrade recognises is already present (MSYS2's pacman,
- * scoop), or a fetch of the portable bundle when one is configured. Returns 1
- * if tmux is available afterwards, 0 otherwise. Never prompts when stdin is
- * not a terminal (the detached service, a pipe): it just returns 0.
+ * Offer to install tmux and do it if the operator agrees: one keypress runs
+ * `winget install --id arndawg.tmux-windows`, and MSYS2's pacman is offered
+ * after it on a machine that has one. Returns 1 if tmux is available
+ * afterwards, 0 otherwise. Never prompts when stdin is not a terminal (the
+ * detached service, a pipe): it just returns 0.
  */
 int tmux_offer_install(void);
 

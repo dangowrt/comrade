@@ -13,15 +13,27 @@
 #include "win_proc.h"
 
 /*
- * Where a prebuilt portable tmux would be fetched from. Empty in this tree:
- * nothing is hosted yet, so comrade prints the exact one-command install for
- * whatever the machine already has instead of offering a download. Setting it
- * (a .zip laid out as tmux.exe plus its runtime, extracted next to
- * comrade.exe) is the only change needed to turn the offer on.
+ * tmux on Windows comes from winget. `arndawg.tmux-windows` is a native
+ * MSVC/ConPTY build of tmux 3.6a (ISC): one 1.3 MB tmux.exe importing
+ * KERNEL32, WS2_32, ADVAPI32 and bcrypt and nothing else -- no msys-2.0.dll,
+ * no terminfo database to lay out, no bundled shell (its default-shell is
+ * cmd.exe). It installs per-user, needs no admin, and drives every command
+ * comrade sends it. That is why it is looked for first and is the only thing
+ * offered.
+ *
+ * MSYS2's tmux keeps working and is still found, silently, for the many
+ * developers who already have MSYS2 -- it is a Cygwin program with a DLL
+ * closure and a terminfo database, but comrade only CreateProcess()es tmux,
+ * so either is fine.
+ *
+ * winget lays a portable package down as
+ *   %LOCALAPPDATA%\Microsoft\WinGet\Packages\<id>_<source-hash>\tmux.exe
+ * (machine scope: %ProgramFiles%\WinGet\Packages\...). The trailing hash names
+ * the source the package came from, so the directory is matched with a
+ * wildcard rather than spelled out; the version appears nowhere in the path.
  */
-#ifndef COMRADE_TMUX_BUNDLE_URL
-#define COMRADE_TMUX_BUNDLE_URL ""
-#endif
+#define WINGET_TMUX_ID "arndawg.tmux-windows"
+#define WINGET_PKG_GLOB WINGET_TMUX_ID "_*"
 
 #define MSYS2_TMUX "C:\\msys64\\usr\\bin\\tmux.exe"
 #define MSYS2_PACMAN "C:\\msys64\\usr\\bin\\pacman.exe"
@@ -72,9 +84,84 @@ static int try_join(const char *dir, const char *tail)
 	return try_path(p);
 }
 
+/*
+ * Look for tmux.exe under one winget Packages root. The zip this package
+ * ships is flat -- <pkgdir>\tmux.exe -- but one level of subdirectory is
+ * searched too, so a future layout with a top-level folder still resolves
+ * without a code change.
+ */
+static int try_winget_packages(const char *pkgroot)
+{
+	WIN32_FIND_DATAA fd, sd;
+	HANDLE h, h2;
+	char pat[MAX_PATH], dir[MAX_PATH], sub[MAX_PATH];
+
+	if (!pkgroot || !*pkgroot)
+		return 0;
+	snprintf(pat, sizeof(pat), "%s\\%s", pkgroot, WINGET_PKG_GLOB);
+	h = FindFirstFileA(pat, &fd);
+	if (h == INVALID_HANDLE_VALUE)
+		return 0;
+	do {
+		if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+			continue;
+		snprintf(dir, sizeof(dir), "%s\\%s", pkgroot, fd.cFileName);
+		if (try_join(dir, "\\tmux.exe")) {
+			FindClose(h);
+			return 1;
+		}
+		snprintf(sub, sizeof(sub), "%s\\*", dir);
+		h2 = FindFirstFileA(sub, &sd);
+		if (h2 == INVALID_HANDLE_VALUE)
+			continue;
+		do {
+			if (!(sd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ||
+			    sd.cFileName[0] == '.')
+				continue;
+			snprintf(sub, sizeof(sub), "%s\\%s", dir, sd.cFileName);
+			if (try_join(sub, "\\tmux.exe")) {
+				FindClose(h2);
+				FindClose(h);
+				return 1;
+			}
+		} while (FindNextFileA(h2, &sd));
+		FindClose(h2);
+	} while (FindNextFileA(h, &fd));
+	FindClose(h);
+	return 0;
+}
+
+/* The native winget tmux, user scope then machine scope. */
+static int try_winget_tmux(void)
+{
+	const char *lad = getenv("LOCALAPPDATA");
+	const char *pf = getenv("ProgramFiles");
+	char root[MAX_PATH];
+
+	if (lad && *lad) {
+		snprintf(root, sizeof(root), "%s\\Microsoft\\WinGet\\Packages",
+			 lad);
+		if (try_winget_packages(root))
+			return 1;
+	}
+	if (pf && *pf) {
+		snprintf(root, sizeof(root), "%s\\WinGet\\Packages", pf);
+		if (try_winget_packages(root))
+			return 1;
+	}
+	/* The command alias winget drops on PATH: a symlink to the real exe.
+	 * Only consulted if the package scan found nothing, because any
+	 * package providing a `tmux` alias lands here. */
+	if (try_join(lad, "\\Microsoft\\WinGet\\Links\\tmux.exe"))
+		return 1;
+	if (try_join(pf, "\\WinGet\\Links\\tmux.exe"))
+		return 1;
+	return 0;
+}
+
 const char *tmux_path(void)
 {
-	static const char *fixed[] = {
+	static const char *msys[] = {
 		MSYS2_TMUX,
 		"C:\\msys32\\usr\\bin\\tmux.exe",
 		"C:\\tools\\msys64\\usr\\bin\\tmux.exe",
@@ -93,28 +180,28 @@ const char *tmux_path(void)
 	if (try_path(env))
 		return found;
 	/*
-	 * The portable bundle, first. It has to be laid out as usr\bin +
-	 * usr\share because that is where the msys runtime looks for the
-	 * terminfo database: it infers its root from its own DLL's path, and a
-	 * flat directory of binaries leaves tmux exiting with "can't find
-	 * terminfo database". Measured, and the reason the bundle is shaped
-	 * the way it is rather than as a handful of files in one folder.
+	 * A tmux.exe placed next to comrade.exe by hand outranks anything
+	 * installed, for the same reason %COMRADE_TMUX% does: it is a
+	 * deliberate act. The usr\bin form is the MSYS2 layout, kept because
+	 * that runtime finds its terminfo database relative to its own DLL and
+	 * will not start from a flat directory; a native tmux.exe needs
+	 * neither and can simply sit there.
 	 */
-	if (try_join(exe_dir(), "\\tmux\\usr\\bin\\tmux.exe"))
+	if (try_join(exe_dir(), "\\tmux.exe"))
 		return found;
 	if (try_join(exe_dir(), "\\tmux\\tmux.exe"))
 		return found;
-	if (try_join(exe_dir(), "\\tmux.exe"))
+	if (try_join(exe_dir(), "\\tmux\\usr\\bin\\tmux.exe"))
 		return found;
-	for (i = 0; fixed[i]; i++)
-		if (try_path(fixed[i]))
+	if (try_winget_tmux())
+		return found;
+	for (i = 0; msys[i]; i++)
+		if (try_path(msys[i]))
 			return found;
 	if (SearchPathA(NULL, "tmux.exe", NULL, sizeof(buf), buf, NULL) &&
 	    try_path(buf))
 		return found;
 	if (try_join(getenv("USERPROFILE"), "\\scoop\\shims\\tmux.exe"))
-		return found;
-	if (try_join(getenv("LOCALAPPDATA"), "\\Microsoft\\WinGet\\Links\\tmux.exe"))
 		return found;
 	return NULL;
 }
@@ -126,20 +213,33 @@ static void tmux_rescan(void)
 	found[0] = '\0';
 }
 
+/* winget.exe, or NULL on a Windows without App Installer. */
+static const char *winget_exe(void)
+{
+	static char p[MAX_PATH];
+	static int done;
+	const char *lad;
+
+	if (done)
+		return p[0] ? p : NULL;
+	done = 1;
+	lad = getenv("LOCALAPPDATA");
+	if (lad && *lad) {
+		snprintf(p, sizeof(p),
+			 "%s\\Microsoft\\WindowsApps\\winget.exe", lad);
+		if (is_file(p))
+			return p;
+	}
+	if (SearchPathA(NULL, "winget.exe", NULL, sizeof(p), p, NULL) &&
+	    is_file(p))
+		return p;
+	p[0] = '\0';
+	return NULL;
+}
+
 static int have_pacman(void)
 {
 	return is_file(MSYS2_PACMAN);
-}
-
-static int have_scoop(void)
-{
-	char p[MAX_PATH];
-	const char *home = getenv("USERPROFILE");
-
-	if (!home)
-		return 0;
-	snprintf(p, sizeof(p), "%s\\scoop\\shims\\scoop.cmd", home);
-	return is_file(p);
 }
 
 void tmux_missing_help(void)
@@ -149,31 +249,26 @@ void tmux_missing_help(void)
 "\n"
 "  Only hosting needs it -- joining a session (`comrade <token>`) never does,\n"
 "  and comrade itself stays one portable .exe. tmux is the one separate piece.\n"
+"\n"
+"  One command, no admin needed:\n"
+"      winget install --id " WINGET_TMUX_ID "\n"
+"\n"
+"  That is a native build of tmux 3.6a: a single tmux.exe, no Cygwin runtime,\n"
+"  no terminfo database, and it runs cmd.exe as its shell.\n"
 "\n");
 	if (have_pacman())
 		fprintf(stderr,
-"  You already have MSYS2. One command installs it, no admin needed:\n"
+"  You also have MSYS2, whose tmux works just as well if you prefer it:\n"
 "      %s -S --needed --noconfirm tmux\n"
 "\n", MSYS2_PACMAN);
-	else if (have_scoop())
-		fprintf(stderr,
-"  You already have scoop. One command installs MSYS2 (which carries tmux):\n"
-"      scoop install msys2\n"
-"      C:\\Users\\...\\scoop\\apps\\msys2\\current\\usr\\bin\\pacman -S tmux\n"
-"\n");
 	else
 		fprintf(stderr,
-"  Pick one, no admin needed for either:\n"
-"      winget install MSYS2.MSYS2\n"
-"      C:\\msys64\\usr\\bin\\pacman -S --needed --noconfirm tmux\n"
-"  or, if you would rather not install MSYS2, unpack a portable tmux next to\n"
-"  comrade.exe -- tmux.exe with its msys-*.dll runtime and a shell in\n"
-"  usr\\bin, and the terminfo database in usr\\share:\n"
-"      %s\\tmux\\usr\\bin\\tmux.exe\n"
-"\n", exe_dir());
+"  MSYS2 users can use theirs instead:\n"
+"      %s -S --needed --noconfirm tmux\n"
+"\n", MSYS2_PACMAN);
 	fprintf(stderr,
-"  comrade looks for tmux in %%COMRADE_TMUX%%, next to comrade.exe, in\n"
-"  %s, and on %%PATH%%.\n", MSYS2_TMUX);
+"  comrade looks for tmux in %%COMRADE_TMUX%%, next to comrade.exe, in the\n"
+"  winget package directory, in %s, and on %%PATH%%.\n", MSYS2_TMUX);
 }
 
 /* One y/n question on the operator's terminal. Returns 1 for yes. */
@@ -191,44 +286,34 @@ static int confirm(const char *question)
 	       line[0] == 'Y' || line[0] == '\r';
 }
 
-/* Fetch and unpack the portable bundle with PowerShell, which every Windows
- * has -- so the download costs comrade neither a new DLL import nor a zip
- * reader. Only reachable when a bundle URL is configured at build time. */
-static int fetch_bundle(void)
+/*
+ * Both installers are judged by whether a tmux appears, not by the exit code:
+ * winget in particular reports failure for "already installed" and for a
+ * source-update hiccup that did not stop the package landing.
+ */
+static int run_winget(void)
 {
-	const char *url = COMRADE_TMUX_BUNDLE_URL;
-	char script[1024], dest[MAX_PATH], zip[MAX_PATH];
-	char *argv[6];
-	const char *tmp = getenv("TEMP");
+	char *argv[] = { NULL, "install", "--id", WINGET_TMUX_ID,
+			 "--accept-package-agreements",
+			 "--accept-source-agreements",
+			 "--disable-interactivity", NULL };
+	char err[256];
+	int rc;
 
-	if (!*url)
+	argv[0] = (char *)winget_exe();
+	if (!argv[0])
 		return 0;
-	snprintf(dest, sizeof(dest), "%s\\tmux", exe_dir());
-	snprintf(zip, sizeof(zip), "%s\\comrade-tmux.zip", tmp ? tmp : ".");
-	snprintf(script, sizeof(script),
-		 "$ErrorActionPreference='Stop';"
-		 "Invoke-WebRequest -UseBasicParsing -Uri '%s' -OutFile '%s';"
-		 "Expand-Archive -Force -Path '%s' -DestinationPath '%s';"
-		 "Remove-Item -Force '%s'", url, zip, zip, dest, zip);
-	argv[0] = "powershell.exe";
-	argv[1] = "-NoProfile";
-	argv[2] = "-ExecutionPolicy";
-	argv[3] = "Bypass";
-	argv[4] = "-Command";
-	argv[5] = script;
-	fprintf(stderr, "comrade: fetching a portable tmux into %s ...\n", dest);
-	{
-		char *a[7];
-		int i;
-
-		for (i = 0; i < 6; i++)
-			a[i] = argv[i];
-		a[6] = NULL;
-		if (win_run(a))
-			return 0;
-	}
+	fprintf(stderr, "comrade: installing tmux with winget (%s) ...\n",
+		WINGET_TMUX_ID);
+	rc = win_run_capture(argv, err, sizeof(err));
 	tmux_rescan();
-	return tmux_path() != NULL;
+	if (tmux_path())
+		return 1;
+	if (err[0])
+		fprintf(stderr, "comrade: winget failed: %s\n", err);
+	else
+		fprintf(stderr, "comrade: winget install failed (%d)\n", rc);
+	return 0;
 }
 
 static int run_pacman(void)
@@ -251,12 +336,12 @@ int tmux_offer_install(void)
 {
 	if (tmux_path())
 		return 1;
-	if (*COMRADE_TMUX_BUNDLE_URL &&
-	    confirm("comrade: download a portable tmux next to comrade.exe?") &&
-	    fetch_bundle())
+	if (winget_exe() &&
+	    confirm("comrade: install tmux with winget now?") &&
+	    run_winget())
 		return 1;
 	if (have_pacman() &&
-	    confirm("comrade: install tmux with MSYS2 pacman now?") &&
+	    confirm("comrade: install tmux with MSYS2 pacman instead?") &&
 	    run_pacman())
 		return 1;
 	return 0;
