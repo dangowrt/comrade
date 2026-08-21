@@ -591,52 +591,80 @@ static void sdp_filter_peer(const char *in, int family, char *out, size_t outlen
 		dbg_logf("sdp_filter_peer: dropped self-address host candidate(s)");
 }
 
-/* Plant the token's rendezvous node(s) as sticky DHT hints (client). */
-static int client_seed_rendezvous(struct sess *s)
+/*
+ * The rendezvous node a fresh sig should be seeded with for `family`: the one
+ * this session located and keeps warm, or the peer's adopted over the control
+ * channel (s->rdv[]); the token's slot only where we hold neither, since a
+ * token minted long ago can name a node that has since gone. Returns 0 and
+ * fills sa/len, -1 when neither has one for this family.
+ */
+static int seed_node_for(struct sess *s, int family, struct sockaddr_storage *sa,
+			 socklen_t *len)
 {
-	const struct session_obs *o = s->cfg->obs;
 	const struct token *t = &s->cfg->tok;
-	int n = 0;
+	int i = fam_idx(family);
 
-	if (t->flags & TOKEN_FLAG_EP6_RDV) {
-		struct sockaddr_in6 a;
-
-		memset(&a, 0, sizeof(a));
-		a.sin6_family = AF_INET6;
-		memcpy(&a.sin6_addr, t->ep6_addr, TOKEN_EP6_LEN);
-		a.sin6_port = htons(t->ep6_port);
-		if (!sig_seed_node(s->sig, (struct sockaddr *)&a, sizeof(a))) {
-			n++;
-			if (o && o->rendezvous) {
-				char b[80];
-
-				addr_str((struct sockaddr *)&a, b, sizeof(b));
-				o->rendezvous(o->arg, 6, b, 0);
-			}
-		}
+	if (s->rdv[i].have) {
+		*sa = s->rdv[i].sa;
+		*len = s->rdv[i].len;
+		return 0;
 	}
-	if (t->flags & TOKEN_FLAG_EP4_RDV) {
-		struct sockaddr_in a;
+	if (family == 6 && (t->flags & TOKEN_FLAG_EP6_RDV)) {
+		struct sockaddr_in6 *a = (struct sockaddr_in6 *)sa;
 
-		memset(&a, 0, sizeof(a));
-		a.sin_family = AF_INET;
-		memcpy(&a.sin_addr, t->ep4_addr, TOKEN_EP4_LEN);
-		a.sin_port = htons(t->ep4_port);
-		if (!sig_seed_node(s->sig, (struct sockaddr *)&a, sizeof(a))) {
-			n++;
-			if (o && o->rendezvous) {
-				char b[80];
-
-				addr_str((struct sockaddr *)&a, b, sizeof(b));
-				o->rendezvous(o->arg, 4, b, 0);
-			}
-		}
+		memset(a, 0, sizeof(*a));
+		a->sin6_family = AF_INET6;
+		memcpy(&a->sin6_addr, t->ep6_addr, TOKEN_EP6_LEN);
+		a->sin6_port = htons(t->ep6_port);
+		*len = sizeof(*a);
+		return 0;
 	}
-	return n;
+	if (family == 4 && (t->flags & TOKEN_FLAG_EP4_RDV)) {
+		struct sockaddr_in *a = (struct sockaddr_in *)sa;
+
+		memset(a, 0, sizeof(*a));
+		a->sin_family = AF_INET;
+		memcpy(&a->sin_addr, t->ep4_addr, TOKEN_EP4_LEN);
+		a->sin_port = htons(t->ep4_port);
+		*len = sizeof(*a);
+		return 0;
+	}
+	return -1;
 }
 
 /*
- * Client accelerator (mirror of client_seed_rendezvous): for each family whose
+ * Plant a rendezvous node per family into a newly created sig: a client seeds
+ * it as a sticky DHT hint, queried before the global DHT has converged, while a
+ * host adopts and reinforces it as its anchor, so a token already in somebody's
+ * clipboard keeps naming a node that serves this mailbox.
+ */
+static void seed_rendezvous(struct sess *s)
+{
+	static const int famv[2] = { 4, 6 };
+	const struct session_obs *o = s->cfg->obs;
+	int i;
+
+	for (i = 0; i < 2; i++) {
+		struct sockaddr_storage sa;
+		socklen_t sl = 0;
+
+		if (seed_node_for(s, famv[i], &sa, &sl))
+			continue;
+		if (s->cfg->is_host) {
+			sig_reinforce(s->sig, famv[i], (struct sockaddr *)&sa,
+				      sl);
+		} else if (!sig_seed_node(s->sig, (struct sockaddr *)&sa, sl) &&
+			   o && o->rendezvous) {
+			char b[80];
+
+			addr_str((struct sockaddr *)&sa, b, sizeof(b));
+			o->rendezvous(o->arg, famv[i], b, 0);
+		}
+	}
+}
+
+/*
+ * Client accelerator (mirror of seed_rendezvous): for each family whose
  * endpoint is direct (EPx_RDV clear) and non-zero, preload the host's endpoint
  * as our lanlink peer at t=0, so KCP starts toward the host immediately instead
  * of waiting to hear its multicast announcement. The host still learns us from
@@ -688,33 +716,6 @@ static void client_direct_connect(struct sess *s)
 					     sizeof(s->c.direct_addr));
 			}
 		}
-	}
-}
-
-/* Host: if the token already carries rendezvous nodes -- a persisted anchor
- * from a previous idle attempt -- adopt and reinforce them instead of locating
- * fresh ones, so the shared token stays valid and the node does not churn. */
-static void host_seed_anchor(struct sess *s)
-{
-	const struct token *t = &s->cfg->tok;
-
-	if (t->flags & TOKEN_FLAG_EP6_RDV) {
-		struct sockaddr_in6 a;
-
-		memset(&a, 0, sizeof(a));
-		a.sin6_family = AF_INET6;
-		memcpy(&a.sin6_addr, t->ep6_addr, TOKEN_EP6_LEN);
-		a.sin6_port = htons(t->ep6_port);
-		sig_reinforce(s->sig, 6, (struct sockaddr *)&a, sizeof(a));
-	}
-	if (t->flags & TOKEN_FLAG_EP4_RDV) {
-		struct sockaddr_in a;
-
-		memset(&a, 0, sizeof(a));
-		a.sin_family = AF_INET;
-		memcpy(&a.sin_addr, t->ep4_addr, TOKEN_EP4_LEN);
-		a.sin_port = htons(t->ep4_port);
-		sig_reinforce(s->sig, 4, (struct sockaddr *)&a, sizeof(a));
 	}
 }
 
@@ -2071,7 +2072,7 @@ static int endpoint_settled(struct sess *s, const struct tokgen_facts *f)
 	return now_ms() - s->start_ms > ISOLATED_ROUTE_GRACE_MS;
 }
 
-/* Mint the host's own LAN endpoint for `family` (EPx_RDV clear, NODHT set). */
+/* Mint the host's own LAN endpoint for `family` (EPx_RDV clear). */
 static void mint_endpoint(struct sess *s, int family)
 {
 	struct sockaddr_storage ss;
@@ -2414,6 +2415,77 @@ static void punch_scan(struct sess *s, struct worker *ws, struct conn **punching
 }
 
 /*
+ * A host with any signalling backend serves many clients through the turnstile:
+ * DHT/ICE joins arrive over the mailbox, and same-segment multicast claimants
+ * are admitted over the one shared lanlink socket (demultiplexed by source),
+ * both concurrently on the shared tmux. An isolated LAN with no DHT is no longer
+ * capped at one client. Only the test-only single-connection flag forces the
+ * sequential re-serve state machine instead.
+ */
+static int host_is_multiuser(const struct session_cfg *cfg)
+{
+	return cfg->is_host && (cfg->sig_flags & (SIG_DHT | SIG_MCAST)) &&
+	       !cfg->test_single_conn;
+}
+
+/*
+ * Create the signalling and arm it: subscribe the callbacks, advertise the
+ * direct transport's port and seed the rendezvous. The lanlink socket itself is
+ * not touched here -- it belongs to the session rather than to sig, and worker
+ * threads send on it without a lock. Returns 0 on success.
+ */
+static int sig_arm(struct sess *s)
+{
+	const struct session_cfg *cfg = s->cfg;
+
+	s->sig = sig_create(cfg->tok.rdv, cfg->sig_flags, cfg->is_host);
+	if (!s->sig)
+		return -1;
+	sig_subscribe(s->sig, on_peer_offer, s);
+	if (s->lan) {
+		sig_set_direct_port(s->sig, lanlink_port(s->lan));
+		if (host_is_multiuser(cfg)) {
+			sig_subscribe_direct(s->sig, on_direct_claim, s);
+			sig_set_mcast_claims(s->sig, 1);
+		} else {
+			sig_subscribe_direct(s->sig, on_direct_peer, &s->c);
+		}
+	}
+	seed_rendezvous(s);
+	return 0;
+}
+
+/*
+ * Rebuild the signalling on a move. A fresh sig binds a new DHT socket and
+ * joins the multicast groups on the interfaces that exist now, where the old
+ * one stays bound to the one that vanished -- which is why a manual restart
+ * reconnects instantly and a reused socket does not. The old sig is destroyed
+ * first: jech/dht is a process-global singleton, so two nodes cannot overlap.
+ * The lanlink socket is deliberately left as it is, since worker threads and
+ * libjuice's receive thread send on it unlocked and a host's direct endpoint
+ * names its port. The new sig is seeded from the rendezvous nodes this session
+ * kept warm and exchanged over CTLM_RDV, so it starts from a node the peer
+ * holds too.
+ *
+ * Callers must run this on the thread that owns sig, with no sig callback in
+ * flight: at the top of the owning loop, between one sig_dispatch and the next
+ * sig_prepare, never from a callback sig_dispatch is still unwinding. Returns 0,
+ * or -1 when there is no signalling left to run the session on.
+ */
+static int sig_rebuild(struct sess *s)
+{
+	sig_destroy(s->sig);
+	s->sig = NULL;
+	if (sig_arm(s)) {
+		dbg_logf("sig: rebuild failed -- giving up the session");
+		return -1;
+	}
+	s->next_rdv_warm_ms = now_ms();
+	dbg_logf("sig: rebuilt on the new network");
+	return 0;
+}
+
+/*
  * Host turnstile: advertise one offer at a time (a fresh ICE identity per
  * offer) and accept a client's claimed answer. On pickup the listener hands the
  * punch to an in-flight set (punching[]) and rotates a fresh offer at once, so
@@ -2458,16 +2530,23 @@ static int host_turnstile(struct sess *s)
 		lan_drain(s, ws, &dash_seq);	/* admit same-segment claimants */
 
 		/*
-		 * Roamed while waiting for the next client: the current offer
-		 * advertises the old network's candidates, so drop the listening
-		 * agent and re-gather on the new interfaces, and flush the stale
-		 * local addresses from the dashboard (the live client rows stay).
+		 * Roamed while waiting for the next client: the signalling is
+		 * bound to the network that just vanished and the current offer
+		 * advertises its candidates, so rebuild sig on the interfaces that
+		 * exist now, drop the listening agent and re-gather, and flush the
+		 * stale local addresses from the dashboard (the live client rows,
+		 * and the workers behind them, stay). This is the top of the loop:
+		 * pump_once has finished dispatching, so no sig callback is in
+		 * flight and the rebuild is safe here.
 		 */
 		if (netmon_changed(&s->netmon, now_ms())) {
 			if (listen) {
 				conn_free(listen);
 				listen = NULL;
+				s->offer_conn = NULL;
 			}
+			if (sig_rebuild(s))
+				break;
 			s->have_local_sdp = 0;
 			s->have_peer_sdp = 0;
 			s->remote_set = 0;
@@ -2703,28 +2782,6 @@ static int host_turnstile(struct sess *s)
 }
 
 /*
- * A host with any signalling backend serves many clients through the turnstile:
- * DHT/ICE joins arrive over the mailbox, and same-segment multicast claimants
- * are admitted over the one shared lanlink socket (demultiplexed by source),
- * both concurrently on the shared tmux. An isolated LAN with no DHT is no longer
- * capped at one client. Only the test-only single-connection flag forces the
- * sequential re-serve state machine instead.
- */
-static int host_is_multiuser(const struct session_cfg *cfg)
-{
-	return cfg->is_host && (cfg->sig_flags & (SIG_DHT | SIG_MCAST)) &&
-	       !cfg->test_single_conn;
-}
-
-/*
- * Create the signalling (and, for multicast, the link-local transport),
- * subscribe the callbacks and seed the rendezvous. Used at start and, for a
- * client, again on a roam: a fresh sig binds a new DHT socket on the new
- * network, whereas the old one stays stuck on the interface that just vanished
- * (which is why a manual restart reconnects instantly but a reused socket does
- * not). Returns 0 on success.
- */
-/*
  * The lanlink port a host should re-bind: the shared port already printed in a
  * carried-forward direct endpoint token, so it stays valid across the re-serve
  * loop. Either family's endpoint carries the one shared port. 0 (ephemeral) for
@@ -2743,54 +2800,44 @@ static uint16_t carried_lanlink_port(const struct session_cfg *cfg)
 	return 0;
 }
 
+/*
+ * Bring the signalling up at session start: the link-local transport first,
+ * then the signalling armed over it. A roam rebuilds only the sig half
+ * (sig_rebuild); the lanlink socket outlives it.
+ *
+ * The direct transport comes up for host and client alike whenever multicast is
+ * on (the old !host_is_multiuser gate is gone): a multi-user host demultiplexes
+ * the one shared socket by source into per-worker streams and admits claimants
+ * (host_lan_recv / on_direct_claim), while a client or single-connection host
+ * carries its one peer (client_lan_recv / on_direct_peer). The host advertises
+ * the shared port in its offer. Returns 0 on success.
+ */
 static int sig_setup(struct sess *s)
 {
 	const struct session_cfg *cfg = s->cfg;
 
-	s->sig = sig_create(cfg->tok.rdv, cfg->sig_flags, cfg->is_host);
-	if (!s->sig)
-		return -1;
-	s->offer_conn = &s->c;
-	sig_subscribe(s->sig, on_peer_offer, s);
-	/*
-	 * The direct transport comes up for host and client alike whenever
-	 * multicast is on (the old !host_is_multiuser gate is gone): a multi-user
-	 * host demultiplexes the one shared socket by source into per-worker
-	 * streams and admits claimants (host_lan_recv / on_direct_claim), while a
-	 * client or single-connection host carries its one peer (client_lan_recv /
-	 * on_direct_peer). The host advertises the shared port in its offer.
-	 */
 	if (cfg->sig_flags & SIG_MCAST) {
 		int mu = host_is_multiuser(cfg);
 
 		s->lan = lanlink_create(mu ? host_lan_recv : client_lan_recv,
 					mu ? (void *)s : (void *)&s->c,
 					carried_lanlink_port(cfg));
-		if (s->lan) {
-			sig_set_direct_port(s->sig, lanlink_port(s->lan));
-			if (mu) {
-				sig_subscribe_direct(s->sig, on_direct_claim, s);
-				sig_set_mcast_claims(s->sig, 1);
-			} else {
-				sig_subscribe_direct(s->sig, on_direct_peer,
-						     &s->c);
-			}
-			if (cfg->obs && cfg->obs->link) {
-				struct sig_mcast_if ifs[16];
-				int ni = sig_link_ifaces(s->sig, ifs, 16), k;
-
-				for (k = 0; k < ni; k++)
-					cfg->obs->link(cfg->obs->arg, ifs[k].name,
-						       ifs[k].has4, ifs[k].has6);
-			}
-			if (!cfg->is_host)
-				client_direct_connect(s);
-		}
 	}
-	if (!cfg->is_host)
-		client_seed_rendezvous(s);
-	else
-		host_seed_anchor(s);
+	s->offer_conn = &s->c;
+	if (sig_arm(s))
+		return -1;
+	if (s->lan) {
+		if (cfg->obs && cfg->obs->link) {
+			struct sig_mcast_if ifs[16];
+			int ni = sig_link_ifaces(s->sig, ifs, 16), k;
+
+			for (k = 0; k < ni; k++)
+				cfg->obs->link(cfg->obs->arg, ifs[k].name,
+					       ifs[k].has4, ifs[k].has6);
+		}
+		if (!cfg->is_host)
+			client_direct_connect(s);
+	}
 	return 0;
 }
 
@@ -2820,8 +2867,10 @@ int session_run(const struct session_cfg *cfg)
 
 	conn_gen_ice(&s.c);
 
-	if (sig_setup(&s))
-		return 1;
+	if (sig_setup(&s)) {
+		rc = 1;
+		goto done;
+	}
 
 	s.start_ms = now_ms();
 	deadline = s.start_ms + (uint64_t)cfg->connect_timeout_s * 1000;
@@ -2844,11 +2893,18 @@ int session_run(const struct session_cfg *cfg)
 		pump_once(&s, 100);
 		maybe_announce_rendezvous(&s);
 		/*
-		 * Roamed before the link came up: re-gather on the new interfaces
-		 * and flush the dashboard's stale local addresses. Once running, a
-		 * roam instead drops the link and returns through SSHC_RECONNECT.
+		 * Roamed before the link came up: rebuild the signalling on the
+		 * interfaces that exist now, re-gather there and flush the
+		 * dashboard's stale local addresses. Once running, a roam instead
+		 * drops the link and returns through SSHC_RECONNECT, which rebuilds
+		 * from there. pump_once above has finished dispatching, so no sig
+		 * callback is in flight.
 		 */
 		if (st != ST_RUN && netmon_changed(&s.netmon, now_ms())) {
+			if (sig_rebuild(&s)) {
+				st = ST_FAIL;
+				break;
+			}
 			if (s.c.nat) {
 				nat_destroy(s.c.nat);
 				s.c.nat = NULL;
@@ -3061,14 +3117,25 @@ int session_run(const struct session_cfg *cfg)
 				 * The link stayed down past the grace window: rejoin
 				 * as a fresh client -- a new ICE identity, a new
 				 * punch and a new claim -- re-attaching to the session
-				 * that lives on the host. Reuse the signalling; reset
-				 * the deadline so the reconnect is not bounded by the
-				 * original connect budget.
+				 * that lives on the host. netmon is not polled while
+				 * the link is up, so this is where a move is first
+				 * seen: rebuild the signalling on the new network
+				 * before re-claiming, and keep the signalling as it is
+				 * for a rejoin that is not a move (a host that went
+				 * away and came back). Reset the deadline so the
+				 * reconnect is not bounded by the original connect
+				 * budget. conn_run has returned, so nothing is
+				 * dispatching sig.
 				 */
 				dbg_logf("session: rejoin (roam)");
 				deadline = now_ms() +
 					(uint64_t)cfg->connect_timeout_s * 1000;
-				st = client_regather(&s) ? ST_FAIL : ST_GATHER;
+				if (netmon_changed(&s.netmon, now_ms()) &&
+				    sig_rebuild(&s))
+					st = ST_FAIL;
+				else
+					st = client_regather(&s) ? ST_FAIL :
+								   ST_GATHER;
 			} else if (!cfg->is_host && now_ms() + 10000 < deadline) {
 				/*
 				 * The nominated pair never carried a session. It is

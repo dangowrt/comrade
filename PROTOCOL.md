@@ -621,12 +621,15 @@ path (§9). `CTL_HDR = 2`, `CTL_FRAME_MAX = 21`.
 - **Reconnect == new join** (tmux redraws) is the fallback for when *no* path is
   warm, with a grace window `SSHC_REJOIN_GRACE_S 6` so a transient blip resumes
   without a re-punch.
-- **Signalling is rebuilt on a move** *(PLANNED, 0.1.x)*. A fresh `sig` binds a
-  new DHT socket on the new network, where the old one stays stuck on the
-  interface that vanished; that is why a manual restart reconnects instantly
-  where a reused socket does not. It is re-seeded from the rendezvous nodes
-  learnt over `CTLM_RDV` rather than from the token, whose slots may long since
-  be stale. (`sig_setup` runs exactly once today, at session start.)
+- **Signalling is rebuilt on a move**. A fresh `sig` binds a new DHT socket on
+  the new network, where the old one stays stuck on the interface that vanished;
+  that is why a manual restart reconnects instantly where a reused socket does
+  not. It is re-seeded from the rendezvous nodes learnt over `CTLM_RDV` rather
+  than from the token, whose slots may long since be stale. The rebuild never
+  gives the session up: a network that is still coming up has no
+  multicast-capable interface for the link-local half to bind, so the flag stays
+  set and `sig_dispatch` retries the open every `SIG_MCAST_OPEN_MS 1000` while
+  the DHT half, which binds the wildcard address, runs meanwhile.
 - A change of **local address** is survivable without re-signalling wherever the
   peer's endpoints stay reachable, because a sealed probe from the new source
   adds a path; see "Adding a path mid-session" in §9. A move to a network from
