@@ -45,6 +45,25 @@ static const struct {
 	{ "dht.libtorrent.org", "25401" },
 };
 
+/*
+ * The bootstrap routers are resolved on a side thread: getaddrinfo can block
+ * for many seconds on a slow uplink, and doing it inline would freeze the whole
+ * client (a black screen) before anything is drawn. The thread only resolves;
+ * the main loop does the DHT pings, since jech/dht is not thread-safe. The
+ * results are held in their own reference-counted allocation, so a node freed
+ * while a resolve is still running detaches the thread and drops its reference
+ * rather than waiting: getaddrinfo cannot be cancelled, and the loop that frees
+ * the node is the one pumping every live connection.
+ */
+struct resolver {
+	pthread_mutex_t lock;
+	int refs;
+	struct sockaddr_storage addr[16];
+	socklen_t len[16];
+	int n;
+	int ready;
+};
+
 struct dhtnode {
 	sock_t s4;
 	sock_t s6;
@@ -56,20 +75,9 @@ struct dhtnode {
 	uint64_t next_bootstrap_ms;
 	uint64_t next_cache_ms;		/* next warm-up cache-write check */
 	int bootstrap_done;
-	/*
-	 * The bootstrap routers are resolved on a side thread: getaddrinfo can
-	 * block for many seconds on a slow uplink, and doing it inline would freeze
-	 * the whole client (a black screen) before anything is drawn. The thread
-	 * only resolves; the main loop does the DHT pings, since jech/dht is not
-	 * thread-safe.
-	 */
 	pthread_t resolver;
 	int resolver_on;
-	pthread_mutex_t boot_lock;
-	struct sockaddr_storage boot_addr[16];
-	socklen_t boot_len[16];
-	int boot_n;
-	int boot_ready;
+	struct resolver *boot;
 	int cache_enabled;		/* persist/restore good nodes across runs */
 	int cache_was_empty;		/* no on-disk cache at start */
 	int cache_primed;		/* the one warm-up write has been done */
@@ -126,10 +134,37 @@ fail:
 	return INVALID_SOCK;
 }
 
-/* Side thread: resolve the routers (blocking getaddrinfo) into boot_addr. */
+static struct resolver *resolver_new(void)
+{
+	struct resolver *r = calloc(1, sizeof(*r));
+
+	if (!r)
+		return NULL;
+	if (pthread_mutex_init(&r->lock, NULL)) {
+		free(r);
+		return NULL;
+	}
+	r->refs = 1;
+	return r;
+}
+
+static void resolver_put(struct resolver *r)
+{
+	int last;
+
+	pthread_mutex_lock(&r->lock);
+	last = !--r->refs;
+	pthread_mutex_unlock(&r->lock);
+	if (!last)
+		return;
+	pthread_mutex_destroy(&r->lock);
+	free(r);
+}
+
+/* Side thread: resolve the routers (blocking getaddrinfo) into r->addr. */
 static void *resolver_fn(void *arg)
 {
-	struct dhtnode *n = arg;
+	struct resolver *r = arg;
 	size_t i;
 
 	for (i = 0; i < sizeof(bootstrap_hosts) / sizeof(bootstrap_hosts[0]); i++) {
@@ -154,21 +189,21 @@ static void *resolver_fn(void *arg)
 			} else if (ai->ai_family != AF_INET) {
 				continue;
 			}
-			pthread_mutex_lock(&n->boot_lock);
-			if (n->boot_n < (int)(sizeof(n->boot_addr) /
-					      sizeof(n->boot_addr[0]))) {
-				memcpy(&n->boot_addr[n->boot_n], ai->ai_addr,
+			pthread_mutex_lock(&r->lock);
+			if (r->n < (int)(sizeof(r->addr) / sizeof(r->addr[0]))) {
+				memcpy(&r->addr[r->n], ai->ai_addr,
 				       ai->ai_addrlen);
-				n->boot_len[n->boot_n] = ai->ai_addrlen;
-				n->boot_n++;
+				r->len[r->n] = ai->ai_addrlen;
+				r->n++;
 			}
-			pthread_mutex_unlock(&n->boot_lock);
+			pthread_mutex_unlock(&r->lock);
 		}
 		freeaddrinfo(res);
 	}
-	pthread_mutex_lock(&n->boot_lock);
-	n->boot_ready = 1;
-	pthread_mutex_unlock(&n->boot_lock);
+	pthread_mutex_lock(&r->lock);
+	r->ready = 1;
+	pthread_mutex_unlock(&r->lock);
+	resolver_put(r);
 	return NULL;
 }
 
@@ -184,15 +219,17 @@ static void bootstrap_ping(struct dhtnode *n)
 	socklen_t len[16];
 	int cnt, i;
 
-	pthread_mutex_lock(&n->boot_lock);
-	if (!n->boot_ready) {
-		pthread_mutex_unlock(&n->boot_lock);
+	if (!n->boot)
+		return;
+	pthread_mutex_lock(&n->boot->lock);
+	if (!n->boot->ready) {
+		pthread_mutex_unlock(&n->boot->lock);
 		return;
 	}
-	cnt = n->boot_n;
-	memcpy(addr, n->boot_addr, sizeof(addr));
-	memcpy(len, n->boot_len, sizeof(len));
-	pthread_mutex_unlock(&n->boot_lock);
+	cnt = n->boot->n;
+	memcpy(addr, n->boot->addr, sizeof(addr));
+	memcpy(len, n->boot->len, sizeof(len));
+	pthread_mutex_unlock(&n->boot->lock);
 
 	for (i = 0; i < cnt; i++) {
 		int fam = addr[i].ss_family;
@@ -243,8 +280,13 @@ static void seed_from_dht(struct dhtnode *n)
  *
  * To spare flash on OpenWrt devices the cache is written at most twice per run:
  * once after warm-up, but only if it was empty at start (so a first-ever run
- * leaves something behind), and once when the session ends.
+ * leaves something behind), and once on the first teardown that has a set worth
+ * writing -- a node torn down so the signalling can be rebuilt on a new network
+ * is replaced by another within the same run, and must not cost a write per
+ * move.
  */
+static int cache_flushed;		/* the run's teardown write is done */
+
 static void cache_path(int af, char *out, size_t n)
 {
 	snprintf(out, n, "%s/dht_nodes_v%d", appdir_data(), af == AF_INET6 ? 6 : 4);
@@ -403,11 +445,15 @@ static struct dhtnode *dhtnode_create_impl(int do_bootstrap)
 	if (do_bootstrap) {
 		/* Resolve the routers off-thread so getaddrinfo cannot stall the
 		 * client's startup; the main loop pings them once they are ready. */
-		if (!pthread_mutex_init(&n->boot_lock, NULL) &&
-		    !pthread_create(&n->resolver, NULL, resolver_fn, n))
-			n->resolver_on = 1;
-		else
-			pthread_mutex_destroy(&n->boot_lock);
+		n->boot = resolver_new();
+		if (n->boot) {
+			n->boot->refs++;	/* the thread's own reference */
+			if (pthread_create(&n->resolver, NULL, resolver_fn,
+					   n->boot))
+				n->boot->refs--;
+			else
+				n->resolver_on = 1;
+		}
 		/* Cached nodes seed alongside the curated routers, not instead. */
 		n->cache_enabled = 1;
 		dhtcache_load(n);
@@ -449,12 +495,12 @@ void dhtnode_free(struct dhtnode *n)
 {
 	if (!n)
 		return;
-	if (n->resolver_on) {
-		pthread_join(n->resolver, NULL);
-		pthread_mutex_destroy(&n->boot_lock);
-	}
-	if (n->cache_enabled && n->dht_ready)
-		dhtcache_save(n);	/* flush the freshest good set on the way out */
+	if (n->resolver_on)
+		pthread_detach(n->resolver);
+	if (n->boot)
+		resolver_put(n->boot);
+	if (n->cache_enabled && n->dht_ready && !cache_flushed)
+		cache_flushed = dhtcache_save(n);
 	if (n->engine)
 		bep44_free(n->engine);
 	if (n->dht_ready)
