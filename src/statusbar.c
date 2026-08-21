@@ -9,6 +9,11 @@
 /* Above this smoothed RTT the bar goes amber to flag a sluggish link. */
 #define RTT_WARN_MS 250
 
+/* ws_col is an unsigned short (up to 65535); cap the paint width at a
+ * generous but bounded column count rather than sizing off the message
+ * buffer, so wide terminals don't get truncated status bars. */
+#define BAR_MAX_COLS 1024
+
 static const char *state_word(int s)
 {
 	switch (s) {
@@ -43,7 +48,7 @@ static const char *state_sgr(const struct conn_status *st)
 
 void statusbar_render(int rows, int cols, const struct conn_status *st)
 {
-	char text[256], bar[256], out[400];
+	char text[256], bar[BAR_MAX_COLS + 1], out[BAR_MAX_COLS + 64];
 	int p, w = cols, n;
 
 	if (rows < 1 || w < 1)
