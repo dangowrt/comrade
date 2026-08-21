@@ -381,6 +381,37 @@ jobs:
         if: steps.guard.outputs.skip != 'true'
         run: bash packaging/homebrew/bottle-publish.sh
 
+  # Bumps net/comrade/Makefile in the dangowrt fork of openwrt/packages and
+  # opens the version-bump PR against openwrt/packages -- or, if an earlier
+  # release's bump PR is still open, adopts it in place (branch force-pushed,
+  # title and description replaced) rather than opening a second one. Only
+  # needs the tag to exist -- PKG_HASH comes from GitHub's own codeload
+  # tarball for the tag, not from anything the other jobs build -- so this
+  # runs independently of build/release rather than behind them.
+  # See packaging/openwrt/README.md for the secret this needs.
+  openwrt-packages-pr:
+    needs: prepare
+    if: ${{ github.ref_type == 'tag' }}
+    runs-on: ${{ vars.RUNNER_LINUX && fromJSON(vars.RUNNER_LINUX) || 'ubuntu-latest' }}
+    timeout-minutes: 15
+    env:
+      OPENWRT_PACKAGES_TOKEN: ${{ secrets.OPENWRT_PACKAGES_TOKEN }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Guard on the packages token
+        id: guard
+        run: |
+          if [ -z "$OPENWRT_PACKAGES_TOKEN" ]; then
+            echo "OPENWRT_PACKAGES_TOKEN is not set; skipping the openwrt/packages PR." >&2
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Bump net/comrade and open/update the PR
+        if: steps.guard.outputs.skip != 'true'
+        run: bash packaging/openwrt/packages-pr.sh
+
   # Windows release binaries: one static comrade-<arch>.exe per architecture,
   # built with llvm-mingw (clang, UCRT). Both x64 and arm64 cross-build from a
   # single Windows runner; arm64 is compile/link/import-verified only, since an
