@@ -1,6 +1,42 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 /* Copyright (C) 2026 Daniel Golle <daniel@makrotopia.org> */
 
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "sshd.h"
+
+#ifdef _WIN32
+
+/*
+ * The server side pairs the SSH channel with a forkpty() master and reaps the
+ * child with waitpid; on Windows that becomes ConPTY plus CreateProcess, which
+ * is the later hosting phase. The
+ * client build links these stubs so session.c keeps its one shape on both
+ * platforms; nothing on the join path calls them, because cfg->is_host is
+ * never set in a Windows build.
+ */
+void *sshd_hostkey_new(uint8_t fp[32])
+{
+	(void)fp;
+	return NULL;
+}
+
+void sshd_hostkey_free(void *hostkey)
+{
+	(void)hostkey;
+}
+
+int sshd_serve_fd(sock_t fd, const struct sshd_opts *o)
+{
+	(void)fd;
+	(void)o;
+	return -1;
+}
+
+#else /* !_WIN32 */
+
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>			/* kill: implicit via other headers on Linux */
@@ -9,9 +45,6 @@
 #else
 #include <pty.h>
 #endif
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <sys/wait.h>
@@ -21,7 +54,6 @@
 
 #include "base64.h"
 #include "dbg.h"
-#include "sshd.h"
 #include "sshfwd.h"
 
 /* Constant-time equality over a fixed-length buffer. */
@@ -473,7 +505,7 @@ out:
 		ssh_event_free(c.event);
 }
 
-int sshd_serve_fd(int fd, const struct sshd_opts *o)
+int sshd_serve_fd(sock_t fd, const struct sshd_opts *o)
 {
 	char password[64];
 	ssh_bind bind = NULL;
@@ -567,3 +599,5 @@ out:
 		close(fd);
 	return rc;
 }
+
+#endif /* _WIN32 */

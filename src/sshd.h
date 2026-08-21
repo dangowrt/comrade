@@ -7,6 +7,7 @@
 #include <stdint.h>
 
 #include "token.h"
+#include "wsock.h"
 
 /*
  * comrade SSH server. Runs a single session over an already-connected byte
@@ -41,7 +42,7 @@ struct sshd_opts {
 	 * name, leaving room for future services (comrade-transfer, ...). 0/-1
 	 * disables it, in which case behaviour is exactly the single-channel one.
 	 */
-	int ctl_fd;
+	sock_t ctl_fd;
 	/*
 	 * Decline all TCP port forwarding (client -L/-R): direct-tcpip channel
 	 * opens and tcpip-forward global requests are refused. The zero value
@@ -64,6 +65,6 @@ void sshd_hostkey_free(void *hostkey);
  * Returns 0 on a clean session, -1 on error. Does not take ownership of
  * o->hostkey (imports a copy).
  */
-int sshd_serve_fd(int fd, const struct sshd_opts *o);
+int sshd_serve_fd(sock_t fd, const struct sshd_opts *o);
 
 #endif
