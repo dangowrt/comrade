@@ -19,6 +19,7 @@
 
 #include "dbg.h"
 #include "oscompat.h"
+#include "token.h"
 #include "tty.h"
 #include "ui.h"
 #include "wsock.h"
@@ -72,6 +73,7 @@ struct ui {
 	int stage4, stage6;		/* per-family rendezvous stage, -1 unknown */
 	char token[256];
 	int have_token;
+	int tok_st4, tok_st6;		/* TOKEN_STATE_* decoded from token */
 	char token_ro[256];
 	int have_token_ro;
 	struct peerrow peer[8];
@@ -305,22 +307,11 @@ static void draw(struct ui *u)
 	line("");
 
 	if (u->role == UI_ROLE_HOST) {
-		int r4 = 0, r6 = 0, p4 = 0, p6 = 0, j;
+		int r4 = u->tok_st4 == TOKEN_STATE_RENDEZVOUS ||
+			 u->tok_st4 == TOKEN_STATE_DIRECT;
+		int r6 = u->tok_st6 == TOKEN_STATE_RENDEZVOUS ||
+			 u->tok_st6 == TOKEN_STATE_DIRECT;
 
-		for (j = 0; j < 2; j++) {
-			struct rdvrow *rr = &u->rdv[j];
-
-			if (!rr->family)
-				continue;
-			if (rr->ready && rr->family == 4)
-				r4 = 1;
-			else if (rr->ready)
-				r6 = 1;
-			else if (rr->family == 4)
-				p4 = 1;
-			else
-				p6 = 1;
-		}
 		line(CYN "INVITE" RST);
 		if (u->have_token) {
 			line("  " WHT "$ comrade %s" RST DIM "   (read-write)" RST,
@@ -330,10 +321,10 @@ static void draw(struct ui *u)
 				     "   (read-only)" RST, u->token_ro);
 			if (r4 && r6)
 				line("  " BGR "reachable over IPv4 and IPv6" RST);
-			else if (r4 && p6)
+			else if (r4 && u->tok_st6 == TOKEN_STATE_PENDING)
 				line("  " BGR "IPv4 ready" RST DIM
 				     " -- locating IPv6 ..." RST);
-			else if (r6 && p4)
+			else if (r6 && u->tok_st4 == TOKEN_STATE_PENDING)
 				line("  " BGR "IPv6 ready" RST DIM
 				     " -- locating IPv4 ..." RST);
 			else if (r4)
@@ -341,6 +332,15 @@ static void draw(struct ui *u)
 			else if (r6)
 				line("  " RED "! IPv6 only" RST DIM
 				     " -- IPv4-only peers cannot connect" RST);
+			else if (u->tok_st4 == TOKEN_STATE_PENDING ||
+				 u->tok_st6 == TOKEN_STATE_PENDING)
+				line("  " YEL "locating rendezvous nodes ..." RST
+				     DIM " -- joining works now, via a full DHT "
+				     "warm-up" RST);
+			else
+				line("  " YEL "! no rendezvous nodes" RST DIM
+				     " -- joining needs a full DHT warm-up "
+				     "(slower, less reliable)" RST);
 		} else {
 			line(DIM "  locating a rendezvous node ..." RST);
 		}
@@ -541,10 +541,19 @@ static void um_rdv_stage(struct ui *u, int family, int stage)
 	}
 }
 
+/* The invite classification is read out of the token itself -- the states are
+ * in the string the view is already handed, so decoding it here keeps the
+ * lines consistent with what the token actually says. */
 static void um_token(struct ui *u, const char *tok)
 {
+	struct token t;
+
 	snprintf(u->token, sizeof(u->token), "%s", tok);
 	u->have_token = 1;
+	if (!token_decode(&t, u->token)) {
+		u->tok_st4 = token_family_state(&t, 4);
+		u->tok_st6 = token_family_state(&t, 6);
+	}
 	if (!u->anim)
 		vlog(u, "token  %s", tok);
 	else
