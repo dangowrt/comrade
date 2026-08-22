@@ -19,6 +19,7 @@
 #include "keys.h"
 #include "session.h"
 #include "sig.h"
+#include "sig_mcast.h"
 #include "sshd.h"
 #include "token.h"
 
@@ -29,12 +30,24 @@ static struct {
 	int printed;
 } host;
 
+/* Encode host.tok and print it for the operator to carry to the client. */
+static void print_token(void)
+{
+	char tokbuf[TOKEN_STR_LEN + 1];
+
+	if (token_encode(&host.tok, tokbuf, sizeof(tokbuf))) {
+		fprintf(stderr, "error: token_encode failed\n");
+		return;
+	}
+	printf("COMRADE TOKEN: %s\n", tokbuf);
+	fflush(stdout);
+	host.printed = 1;
+}
+
 /* Embed a located rendezvous node in the token and print it for the operator to
  * carry to the client; called with NULL when there is no node (multicast). */
 static void on_rendezvous(void *arg, const struct sockaddr *sa, socklen_t len)
 {
-	char tokbuf[TOKEN_STR_LEN + 1];
-
 	(void)arg;
 	(void)len;
 	if (host.printed)
@@ -54,13 +67,54 @@ static void on_rendezvous(void *arg, const struct sockaddr *sa, socklen_t len)
 		host.tok.flags |= TOKEN_FLAG_EP4_RDV;
 		fprintf(stderr, "[e2e] rendezvous node located, embedded in token\n");
 	}
-	if (token_encode(&host.tok, tokbuf, sizeof(tokbuf))) {
-		fprintf(stderr, "error: token_encode failed\n");
+	print_token();
+}
+
+/* Isolated-LAN sibling: embed our own direct endpoint (EPx_RDV clear), mark the
+ * token NODHT, and print it. Proves the B2 mint path from the harness. */
+static void on_endpoint(void *arg, const struct sockaddr *sa, socklen_t len)
+{
+	(void)arg;
+	(void)len;
+	if (host.printed)
 		return;
+	if (sa && sa->sa_family == AF_INET6) {
+		const struct sockaddr_in6 *a = (const struct sockaddr_in6 *)sa;
+
+		memcpy(host.tok.ep6_addr, &a->sin6_addr, TOKEN_EP6_LEN);
+		host.tok.ep6_port = ntohs(a->sin6_port);
+		host.tok.flags &= ~TOKEN_FLAG_EP6_RDV;
+	} else if (sa && sa->sa_family == AF_INET) {
+		const struct sockaddr_in *a = (const struct sockaddr_in *)sa;
+
+		memcpy(host.tok.ep4_addr, &a->sin_addr, TOKEN_EP4_LEN);
+		host.tok.ep4_port = ntohs(a->sin_port);
+		host.tok.flags &= ~TOKEN_FLAG_EP4_RDV;
 	}
-	printf("COMRADE TOKEN: %s\n", tokbuf);
-	fflush(stdout);
-	host.printed = 1;
+	host.tok.flags |= TOKEN_FLAG_NODHT;
+	fprintf(stderr, "[e2e] isolated LAN: own endpoint embedded, NODHT set\n");
+	print_token();
+}
+
+/* `comrade-e2e token <TOKEN>`: decode and print the token's flags/endpoints in a
+ * greppable form, so the shell harness can assert the mint (NODHT, EPx_RDV). */
+static int inspect_token(const char *s)
+{
+	struct token t;
+	char ip[64];
+
+	if (token_decode(&t, s)) {
+		fprintf(stderr, "error: invalid token\n");
+		return 2;
+	}
+	printf("flags=0x%02x nodht=%d ro=%d ep6_rdv=%d ep4_rdv=%d\n",
+	       t.flags, !!(t.flags & TOKEN_FLAG_NODHT), !!(t.flags & TOKEN_FLAG_RO),
+	       !!(t.flags & TOKEN_FLAG_EP6_RDV), !!(t.flags & TOKEN_FLAG_EP4_RDV));
+	if (inet_ntop(AF_INET6, t.ep6_addr, ip, sizeof(ip)))
+		printf("ep6=[%s]:%u\n", ip, t.ep6_port);
+	if (inet_ntop(AF_INET, t.ep4_addr, ip, sizeof(ip)))
+		printf("ep4=%s:%u\n", ip, t.ep4_port);
+	return 0;
 }
 
 int main(int argc, char **argv)
@@ -70,6 +124,20 @@ int main(int argc, char **argv)
 	size_t rx_got = 0, k;
 	const char *stun_arg = NULL;
 	int is_host, i, rc;
+
+	if (argc >= 3 && !strcmp(argv[1], "token"))
+		return inspect_token(argv[2]);
+
+	/* Deterministic skip signal for the LAN harnesses: 0 if a usable
+	 * multicast interface exists, 77 (ctest SKIP) if not. */
+	if (argc >= 2 && !strcmp(argv[1], "mcast-probe")) {
+		struct sig_mcast *m = sig_mcast_open();
+
+		if (!m)
+			return 77;
+		sig_mcast_close(m);
+		return 0;
+	}
 
 	memset(&cfg, 0, sizeof(cfg));
 	cfg.family = 0;
@@ -142,7 +210,12 @@ int main(int argc, char **argv)
 		cfg.ssh_command = "cat";	/* echo oracle, not tmux */
 		cfg.use_pty = 0;
 		cfg.on_rendezvous = on_rendezvous;
+		cfg.on_endpoint = on_endpoint;
 	} else {
+		/* Honour a NODHT token exactly as the product client does: the host
+		 * is not on the DHT, so drop the dead path and find it over mcast. */
+		if (cfg.tok.flags & TOKEN_FLAG_NODHT)
+			cfg.sig_flags &= ~SIG_DHT;
 		for (k = 0; k < SSH_NONCE; k++)
 			tx[k] = (uint8_t)(k * 97 + 13);
 		cfg.interactive = 0;
