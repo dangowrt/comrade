@@ -100,6 +100,16 @@ ADOPT_PR="$(gh pr list --repo "$UPSTREAM_REPO" --author dangowrt --state open \
 log "Compute the tarball hash codeload will serve for v$V"
 HASH="$(curl -fsSL "https://codeload.github.com/dangowrt/comrade/tar.gz/v$V" | sha256sum | cut -d' ' -f1)"
 
+# The codeload tarball carries the STUN submodule as an empty directory, so
+# net/comrade downloads the pinned list separately (Download/stunlist) and
+# installs it before configure. Keep that pin in step with the submodule
+# commit the tag actually references -- readable straight off the tag's tree,
+# no submodule checkout needed -- and hash the very file OpenWrt will fetch.
+log "Read the STUN list pin the v$V tag references and hash that list"
+STUN_REV="$(git -C "$COMRADE_DIR" ls-tree "v$V" deps/always-online-stun | awk '{print $3}')"
+[ -n "$STUN_REV" ]
+STUN_SHA="$(curl -fsSL "https://raw.githubusercontent.com/pradt2/always-online-stun/$STUN_REV/valid_nat_testing_hosts.txt" | sha256sum | cut -d' ' -f1)"
+
 log "Clone the fork and rebuild $BRANCH fresh off upstream's current master"
 WORK="$(mktemp -d)"
 git clone --quiet "https://x-access-token:${OPENWRT_PACKAGES_TOKEN}@github.com/${FORK_REPO}.git" "$WORK"
@@ -117,14 +127,18 @@ git checkout --quiet -B "$BRANCH" upstream/master
 log "Read the version net/comrade currently references upstream"
 OLD_V="$(sed -n 's/^PKG_VERSION:=//p' "$PKG_DIR/Makefile")"
 
-log "Bump PKG_VERSION, reset PKG_RELEASE, refresh PKG_HASH"
+log "Bump PKG_VERSION, reset PKG_RELEASE, refresh PKG_HASH and the STUN pin"
 sed -i \
   -e "s/^PKG_VERSION:=.*/PKG_VERSION:=$V/" \
   -e "s/^PKG_RELEASE:=.*/PKG_RELEASE:=1/" \
   -e "s/^PKG_HASH:=.*/PKG_HASH:=$HASH/" \
+  -e "s/^STUN_LIST_VERSION:=.*/STUN_LIST_VERSION:=$STUN_REV/" \
+  -e "s/^  HASH:=.*/  HASH:=$STUN_SHA/" \
   "$PKG_DIR/Makefile"
 grep -q "^PKG_VERSION:=$V$" "$PKG_DIR/Makefile"
 grep -q "^PKG_HASH:=$HASH$" "$PKG_DIR/Makefile"
+grep -q "^STUN_LIST_VERSION:=$STUN_REV$" "$PKG_DIR/Makefile"
+grep -q "^  HASH:=$STUN_SHA$" "$PKG_DIR/Makefile"
 
 git config user.name "$NAME"
 git config user.email "$EMAIL"
