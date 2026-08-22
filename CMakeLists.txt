@@ -9,6 +9,17 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 add_compile_options(-Wall -Wextra)
 
+# CI holds comrade's own code to a warning-free bar. Scoped to this directory's
+# compile options, so it covers comrade's sources but not imported libraries;
+# the vendored jech/dht is compiled with -w below, which keeps it exempt, and
+# on Windows libssh is built by a separate CMake run that never sees this. Off
+# by default so distribution and hand builds are not broken by a newer
+# compiler's new warnings.
+option(COMRADE_WERROR "Treat comrade's own warnings as errors (used by CI)" OFF)
+if(COMRADE_WERROR)
+	add_compile_options(-Werror)
+endif()
+
 include(CheckCCompilerFlag)
 
 function(comrade_add_flag flag)
