@@ -17,19 +17,24 @@
 # anything this repo builds, so this only needs the tag to exist -- it does
 # not wait on the release job.
 #
-# The commit and the PR description both quote a changelog built from this
-# repo's own `git log`, not from GitHub Release notes: the release notes
-# turned out to be boilerplate repeated almost verbatim release after
-# release, not an actual changelog, and are not even a reliable source --
-# several comrade releases have shipped a real tag with no Release object
-# at all (a release job that failed after tagging). Tags are the ground
-# truth instead. The changelog covers every commit since whatever version
+# The PR description quotes a changelog built from this repo's own
+# `git log`, not from GitHub Release notes: the release notes turned out
+# to be boilerplate repeated almost verbatim release after release, not
+# an actual changelog, and are not even a reliable source -- several
+# comrade releases have shipped a real tag with no Release object at all
+# (a release job that failed after tagging). Tags are the ground truth
+# instead. The changelog covers every commit since whatever version
 # openwrt/packages currently has, not just v$VERSION: a bump PR sitting
 # open across several comrade releases -- or a reviewer taking a while to
 # get to it -- means that can be several releases behind v$VERSION, and
 # nothing in between should go missing. That "currently has" version is
 # read straight out of upstream's own net/comrade/Makefile, not tracked
 # separately here.
+#
+# The commit itself carries only a terse compare-URL reference, not the
+# changelog: openwrt/packages' own commit convention is short, and a
+# multi-release changelog bloats the commit body for no reader who isn't
+# already looking at the PR description right above it.
 #
 # Environment: VERSION, OPENWRT_PACKAGES_TOKEN.
 #
@@ -175,7 +180,7 @@ wrap_bullets() {
   '
 }
 
-log "Build the changelog for the commit and the PR description"
+log "Build the changelog for the PR description"
 # --reverse so commits within a step read oldest first, same direction as
 # the steps themselves (v$OLD_V's successor first, v$V last): one
 # consistent chronological read top to bottom, not steps going forward in
@@ -196,9 +201,21 @@ $step"
   prev="$t"
 done
 
+# A compare link needs a real v$OLD_V tag on the near end; when there is
+# none (same fallback as the changelog above), point at the release
+# itself instead of a compare URL GitHub would 404 on.
+if git -C "$COMRADE_DIR" rev-parse -q --verify "refs/tags/v$OLD_V" >/dev/null \
+   && [ "$OLD_V" != "$V" ]; then
+  COMMIT_REF="Upstream changes:
+https://github.com/dangowrt/comrade/compare/v$OLD_V...v$V"
+else
+  COMMIT_REF="Upstream changes:
+https://github.com/dangowrt/comrade/releases/tag/v$V"
+fi
+
 log "Commit and force-push over whatever was on $BRANCH before"
 git add "$PKG_DIR/Makefile"
-git commit --quiet --signoff -m "$TITLE" -m "$CHANGELOG"
+git commit --quiet --signoff -m "$TITLE" -m "$COMMIT_REF"
 git push --quiet --force-with-lease origin "$BRANCH:$BRANCH"
 
 log "Write the PR title and description, openwrt/packages' own template"
