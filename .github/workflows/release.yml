@@ -402,7 +402,12 @@ jobs:
       OPENWRT_PACKAGES_TOKEN: ${{ secrets.OPENWRT_PACKAGES_TOKEN }}
       VERSION: ${{ needs.prepare.outputs.version }}
     steps:
+      # packages-pr.sh's changelog walks this repo's own tags and git log,
+      # so it needs full history, not the single-commit shallow checkout
+      # every other job in this workflow is content with.
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
       - name: Guard on the packages token
         id: guard

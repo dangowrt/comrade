@@ -17,13 +17,19 @@
 # anything this repo builds, so this only needs the tag to exist -- it does
 # not wait on the release job.
 #
-# The PR description quotes release notes, but not just this release's: a
-# bump PR sitting open across several comrade releases -- or a reviewer
-# taking a while to get to it -- means the version openwrt/packages
-# currently has can be several releases behind v$VERSION, so the notes for
-# everything in between belong in the description too, not just the last
-# one. That "currently has" version is read straight out of upstream's own
-# net/comrade/Makefile, not tracked separately here.
+# The commit and the PR description both quote a changelog built from this
+# repo's own `git log`, not from GitHub Release notes: the release notes
+# turned out to be boilerplate repeated almost verbatim release after
+# release, not an actual changelog, and are not even a reliable source --
+# several comrade releases have shipped a real tag with no Release object
+# at all (a release job that failed after tagging). Tags are the ground
+# truth instead. The changelog covers every commit since whatever version
+# openwrt/packages currently has, not just v$VERSION: a bump PR sitting
+# open across several comrade releases -- or a reviewer taking a while to
+# get to it -- means that can be several releases behind v$VERSION, and
+# nothing in between should go missing. That "currently has" version is
+# read straight out of upstream's own net/comrade/Makefile, not tracked
+# separately here.
 #
 # Environment: VERSION, OPENWRT_PACKAGES_TOKEN.
 #
@@ -45,11 +51,11 @@ set -euo pipefail
 # Secrets pasted into GitHub's UI routinely pick up stray whitespace -- a
 # trailing newline, a leading or trailing space -- invisible in the guard
 # step's -z check (the string is non-empty either way). gh's own API calls
-# below (PR lookup, release notes, PR create/edit) tolerate it fine, since it
-# just rides along inside an Authorization header; embedding the raw token in
-# a URL's userinfo further down does not, and libcurl rejects any whitespace
-# there outright ("URL rejected: Malformed input to a URL function"), not
-# only an embedded newline. Strip all whitespace, not just \n\r.
+# below (PR lookup, PR create/edit) tolerate it fine, since it just rides
+# along inside an Authorization header; embedding the raw token in a URL's
+# userinfo further down does not, and libcurl rejects any whitespace there
+# outright ("URL rejected: Malformed input to a URL function"), not only an
+# embedded newline. Strip all whitespace, not just \n\r.
 OPENWRT_PACKAGES_TOKEN="$(printf '%s' "$OPENWRT_PACKAGES_TOKEN" | tr -d '[:space:]')"
 
 V="$VERSION"
@@ -59,6 +65,10 @@ UPSTREAM_REPO="openwrt/packages"
 FORK_REPO="dangowrt/packages"
 PKG_DIR="net/comrade"
 BRANCH="comrade-update"
+# This checkout of comrade itself, captured before the fork clone below cds
+# elsewhere -- the changelog is built from this repo's own tags and log, not
+# from anything fetched over the network.
+COMRADE_DIR="$PWD"
 # The title stays version-specific even though the branch name is fixed:
 # openwrt/packages' formalities bot flags generic subjects
 # (warn_generic_subjects), and "comrade-update" with no version in it reads
@@ -114,40 +124,49 @@ grep -q "^PKG_HASH:=$HASH$" "$PKG_DIR/Makefile"
 git config user.name "$NAME"
 git config user.email "$EMAIL"
 
-log "Pull this release's notes for the commit"
-# Left unwrapped: the GitHub release body is a markdown bullet list, and
-# blindly re-wrapping it (fmt et al.) merges the bullets into one paragraph.
-NOTES="$(gh release view "v$V" --repo dangowrt/comrade --json body --jq .body)"
+log "Walk this repo's own tags from v$OLD_V (exclusive) to v$V (inclusive)"
+# version:refname is git's numeric tag sort (vN.N.N in numeric rather than
+# lexical order), so this list is oldest first regardless of what order the
+# tags were actually pushed in.
+mapfile -t ALL_TAGS < <(git -C "$COMRADE_DIR" tag --sort=version:refname)
+STEP_TAGS=()
+collecting=0
+for t in "${ALL_TAGS[@]}"; do
+  [ "$collecting" -eq 1 ] && STEP_TAGS+=("$t")
+  [ "$t" = "v$OLD_V" ] && collecting=1
+  [ "$t" = "v$V" ] && break
+done
+# v$OLD_V is not a tag this repo has (Makefile carries a version this repo
+# never released, or the tag was deleted) -- fall back to the single release
+# being bumped to, same as when there is nothing to catch up on at all.
+[ "${#STEP_TAGS[@]}" -eq 0 ] && STEP_TAGS=("v$V")
 
-log "Pull every release's notes since v$OLD_V for the PR description"
-# openwrt/packages may be several comrade releases behind v$V by the time
-# this runs (a bump PR left open a while, or several releases in a row with
-# nothing to adopt), so the description should not silently drop what
-# changed in between. Fall back to just this release's notes if v$OLD_V
-# does not resolve to a real release (deleted, or the Makefile did not
-# actually carry a version) or if there is nothing to catch up on.
-ALL_RELEASES="$(gh release list --repo dangowrt/comrade --json tagName,createdAt --limit 1000)"
-OLD_DATE="$(jq -r --arg t "v$OLD_V" '[.[] | select(.tagName == $t)][0].createdAt // empty' <<<"$ALL_RELEASES")"
-NEW_DATE="$(jq -r --arg t "v$V" '[.[] | select(.tagName == $t)][0].createdAt // empty' <<<"$ALL_RELEASES")"
-if [ -n "$OLD_DATE" ] && [ -n "$NEW_DATE" ] && [ "$OLD_V" != "$V" ]; then
-  NOTE_TAGS="$(jq -r --arg lo "$OLD_DATE" --arg hi "$NEW_DATE" \
-    '[.[] | select(.createdAt > $lo and .createdAt <= $hi)] | sort_by(.createdAt) | .[].tagName' \
-    <<<"$ALL_RELEASES")"
-else
-  NOTE_TAGS="v$V"
-fi
-ALL_NOTES=""
-while IFS= read -r tag; do
-  [ -n "$tag" ] || continue
-  tag_notes="$(gh release view "$tag" --repo dangowrt/comrade --json body --jq .body)"
-  ALL_NOTES="${ALL_NOTES:+$ALL_NOTES$'\n\n'}### $tag
+log "Build the changelog for the commit and the PR description"
+# Each step's commits become a bullet list of `owner/repo@hash` references,
+# GitHub's own autolink syntax for a commit in another repository -- left
+# unfenced (no code block) so GitHub actually renders the links instead of
+# showing literal text.
+CHANGELOG=""
+prev="v$OLD_V"
+for t in "${STEP_TAGS[@]}"; do
+  if git -C "$COMRADE_DIR" rev-parse -q --verify "refs/tags/$prev" >/dev/null; then
+    step="$(git -C "$COMRADE_DIR" log --oneline "$prev..$t" \
+      | sed -E 's#^([0-9a-f]+) (.*)$#- dangowrt/comrade@\1 \2#')"
+  else
+    step="(v$OLD_V is not a tag here; showing the last 20 commits up to $t)
 
-$tag_notes"
-done <<<"$NOTE_TAGS"
+$(git -C "$COMRADE_DIR" log --oneline -n 20 "$t" \
+      | sed -E 's#^([0-9a-f]+) (.*)$#- dangowrt/comrade@\1 \2#')"
+  fi
+  CHANGELOG="${CHANGELOG:+$CHANGELOG$'\n\n'}### $t
+
+$step"
+  prev="$t"
+done
 
 log "Commit and force-push over whatever was on $BRANCH before"
 git add "$PKG_DIR/Makefile"
-git commit --quiet --signoff -m "$TITLE" -m "$NOTES"
+git commit --quiet --signoff -m "$TITLE" -m "$CHANGELOG"
 git push --quiet --force-with-lease origin "$BRANCH:$BRANCH"
 
 log "Write the PR title and description, openwrt/packages' own template"
@@ -160,7 +179,7 @@ cat > "$BODY" <<EOF
 **Description:**
 Update net/comrade to $V.
 
-$ALL_NOTES
+$CHANGELOG
 
 ---
 
