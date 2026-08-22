@@ -750,9 +750,13 @@ static void mark_sock(const char *sock)
 
 static int start_tmux(const struct svc *v)
 {
+	/* The lifecycle options are pinned for the same reason host.c pins
+	 * them: the operator's tmux.conf must not make guest attaches fatal. */
 	char *mk[] = { NULL, "-S", NULL, "new-session", "-d", "-s", "comrade",
 		       ";", "set", "-g", "status-position", "top",
-		       ";", "set", "-g", "window-size", "smallest", NULL };
+		       ";", "set", "-g", "window-size", "smallest",
+		       ";", "set", "-g", "destroy-unattached", "off",
+		       ";", "set", "-s", "exit-unattached", "off", NULL };
 	char err[256];
 
 	mk[0] = (char *)tmux_path();

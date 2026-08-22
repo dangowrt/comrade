@@ -668,10 +668,21 @@ static int start_new(int ui_mode, int no_mcast, int no_dht, int no_fwd)
 	}
 
 	{
+		/*
+		 * The lifecycle options are pinned against whatever the
+		 * operator's own tmux.conf says: guests' attaches are
+		 * disposable and the operator owns the session's lifetime, so
+		 * a destroy-unattached/exit-unattached carried over from their
+		 * personal config must not let the first guest's departure
+		 * take the whole service down (it did: one join-and-leave
+		 * before the operator entered ended the session).
+		 */
 		char *mk[] = { "tmux", "-S", v.sock, "new-session", "-d",
 			       "-s", "comrade",
 			       ";", "set", "-g", "status-position", "top",
 			       ";", "set", "-g", "window-size", "smallest",
+			       ";", "set", "-g", "destroy-unattached", "off",
+			       ";", "set", "-s", "exit-unattached", "off",
 			       NULL };
 		char err[256];
 
