@@ -40,6 +40,7 @@ struct nat_config {
 
 struct nat_agent *nat_create(const struct nat_config *cfg);
 void nat_destroy(struct nat_agent *a);
+void nat_rebind(struct nat_agent *a, void *arg);
 
 int nat_gather(struct nat_agent *a);
 int nat_local_description(struct nat_agent *a, char *sdp, size_t len);

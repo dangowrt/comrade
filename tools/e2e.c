@@ -195,6 +195,10 @@ int main(int argc, char **argv)
 			cfg.test_roam_max = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--blackhole-ms") && i + 1 < argc)
 			cfg.test_blackhole_ms = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--blackhole-lift-ms") && i + 1 < argc)
+			cfg.test_blackhole_lift_ms = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--blackhole-all"))
+			cfg.test_blackhole_all = 1;
 		else if (!strcmp(argv[i], "--log") && i + 1 < argc)
 			cfg.log_level = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--mcast"))

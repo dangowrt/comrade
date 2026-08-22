@@ -797,13 +797,22 @@ if(COMRADE_BUILD_TOOLS)
 		set_tests_properties(path_switch_e2e PROPERTIES
 			SKIP_RETURN_CODE 77 TIMEOUT 180)
 
+		# A total outage mid-session resumes in place: same worker,
+		# same SSH session, the punch grafted. Its rendezvous is the
+		# DHT, so SKIPs (77) unless COMRADE_E2E_NET=1.
+		add_test(NAME resume_e2e
+			COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/resume.sh
+				$<TARGET_FILE:comrade-e2e>)
+		set_tests_properties(resume_e2e PROPERTIES
+			SKIP_RETURN_CODE 77 TIMEOUT 300)
+
 		# Each of these stands up its own DHT node and multicast
 		# announcer on this host, so under `ctest -j` they contend for
 		# the segment and each other's rendezvous timing. Serialise them
 		# however ctest is invoked.
 		set_tests_properties(multiuser_e2e isolated_lan_e2e
 			lan_concurrent_e2e lan_mixed_e2e turnstile_stuck_e2e
-			roam_lan_e2e roam_client_e2e path_switch_e2e
+			roam_lan_e2e roam_client_e2e path_switch_e2e resume_e2e
 			PROPERTIES RESOURCE_LOCK comrade_net)
 	endif()
 endif()

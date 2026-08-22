@@ -239,12 +239,36 @@ struct conn {
 	int claim_lost;
 	uint64_t claim_released_ms;
 	int pongs_sent;			/* answered pings (test_drop_pong's count) */
+
+	/*
+	 * In-place transport resume. On the client, a lost link re-claims
+	 * through the turnstile under this connection's own session-stable ICE
+	 * identity, so the host recognises the claimant and grafts the fresh
+	 * punch into the worker it already runs -- the SSH session, the
+	 * forwards and their carried TCP streams ride through on KCP
+	 * retransmission (rs_state: 0 idle, 1 gathering, 2 claimed). On the
+	 * host, the turnstile parks the punched agent in resume_agent for the
+	 * worker's own thread to adopt -- c->nat belongs to that thread -- and
+	 * resume_pending holds the reap off while the punch is in flight.
+	 */
+	int rs_state;
+	uint64_t rs_deadline;
+	struct nat_agent *volatile resume_agent;
+	volatile int resume_pending;
+	uint64_t resume_last_ms;	/* host: when a resume punch last began,
+					 * so a redelivered claim in the window
+					 * between graft and first probe does
+					 * not punch the same worker twice */
 	/* The claimant's ICE ufrag, carried for the worker's whole lifetime so the
 	 * host recognises the same client arriving over the other transport. */
 	char claim_ufrag[40];
 	/* The path deliberately made to die (test_blackhole_ms); bh_kind is -1
-	 * while none is. */
+	 * while none is, bh_done once one has been (so a lift does not re-arm
+	 * it). */
 	int bh_kind;
+	int bh_done;
+	volatile int bh_mute;		/* test_blackhole_all: drop receives too,
+					 * read on the receive threads */
 	struct path_ep bh_ep;
 
 	sock_t ssh_fd;			/* the ssh thread's socketpair end */
@@ -613,6 +637,8 @@ static int path_blackholed(const struct conn *c, int kind,
 {
 	struct path_ep ep;
 
+	if (c->bh_mute)
+		return 1;
 	if (c->bh_kind < 0 || kind != c->bh_kind)
 		return 0;
 	if (kind == PATH_ICE)
@@ -1662,6 +1688,8 @@ static void deliver_stream_from(struct conn *c, const uint8_t *data, size_t len,
 {
 	uint64_t now = now_ms();
 
+	if (c->bh_mute)		/* a staged total outage swallows receives */
+		return;
 	/* The unlocked read only coarsens the update to ~100ms; the store is
 	 * what the liveness verdict reads, and it is taken under the lock. */
 	if (now - c->hb_last_heard >= 100) {
@@ -2495,6 +2523,128 @@ static void rdv_maintain(struct conn *c)
 	}
 }
 
+static int net_changed(struct sess *s);
+static int sig_rebuild(struct sess *s);
+
+/*
+ * A fresh ICE password under the same ufrag: the identity naming this
+ * connection stays, the claim's bytes do not -- an unchanged claim would be
+ * deduplicated away by the peer's redelivery guard and never seen at all.
+ */
+static void conn_fresh_pwd(struct conn *c)
+{
+	static const char hx[] = "0123456789abcdef";
+	uint8_t rb[16];
+	int j;
+
+	random_bytes(rb, 16);
+	for (j = 0; j < 16; j++) {
+		c->ice_pwd[j * 2] = hx[rb[j] >> 4];
+		c->ice_pwd[j * 2 + 1] = hx[rb[j] & 0xf];
+	}
+	c->ice_pwd[32] = '\0';
+}
+
+/*
+ * How long a link stays lost before the client re-claims in place, and how
+ * long each such attempt runs before regathering. Short on purpose: the
+ * attempt is non-destructive -- every warm path stays in the table, the SSH
+ * session above never pauses more than the outage itself -- so trying early
+ * costs nothing and beats the host's reap comfortably.
+ */
+#define RESUME_AFTER_MS 3000
+#define RESUME_ATTEMPT_MS 10000
+
+/*
+ * Client-side in-place resume: while the link is lost, run the claim half of
+ * the join machinery from inside the live connection -- gather a fresh agent
+ * under this connection's own session-stable ICE identity, post the claim,
+ * prime the current offer -- so the host recognises the claimant and grafts
+ * the punch into the worker it already runs for us. Nothing above the
+ * transport is touched: the SSH session, the forwards and their carried TCP
+ * streams ride out the gap on KCP retransmission. The caller has just
+ * dispatched sig, so no callback is in flight when the signalling is rebuilt
+ * for a roam.
+ */
+static void resume_tick(struct conn *c)
+{
+	struct sess *s = c->sess;
+	uint64_t now = now_ms();
+	int lost;
+
+	pthread_mutex_lock(&c->hb_lock);
+	lost = c->lost_since_ms != 0 &&
+	       now - c->lost_since_ms >= RESUME_AFTER_MS;
+	pthread_mutex_unlock(&c->hb_lock);
+	if (!lost) {
+		if (c->rs_state) {
+			c->rs_state = 0;
+			sig_withdraw(s->sig);
+			dbg_logf("resume: link back");
+		}
+		return;
+	}
+	switch (c->rs_state) {
+	case 0:
+		if (net_changed(s) && sig_rebuild(s))
+			return;
+		conn_drop_ice_path(c);
+		if (c->nat) {
+			nat_destroy(c->nat);
+			c->nat = NULL;
+		}
+		conn_fresh_pwd(c);
+		s->have_local_sdp = 0;
+		s->have_peer_sdp = 0;
+		s->remote_set = 0;
+		c->remote_ufrag[0] = '\0';
+		pthread_mutex_lock(&s->trickle_lock);
+		s->trickle_sdp[0] = '\0';
+		s->trickle_dirty = 0;
+		pthread_mutex_unlock(&s->trickle_lock);
+		if (nat_setup(c))
+			return;
+		c->rs_state = 1;
+		c->rs_deadline = now + RESUME_ATTEMPT_MS;
+		dbg_logf("resume: re-claiming under the session identity");
+		return;
+	case 1:
+		if (s->have_local_sdp) {
+			char filtered[NAT_SDP_MAX];
+
+			sdp_filter(s->local_sdp, s->cfg->family, filtered,
+				   sizeof(filtered));
+			snprintf(s->local_sdp, sizeof(s->local_sdp), "%s",
+				 filtered);
+			s->pool_posted = fan_local_sdp(s);
+			sig_post(s->sig, (const uint8_t *)s->local_sdp,
+				 strlen(s->local_sdp));
+			sig_redeliver(s->sig);
+			c->rs_state = 2;
+		} else if (now >= c->rs_deadline) {
+			c->rs_state = 0;
+		}
+		return;
+	default:
+		if (s->have_peer_sdp && !s->remote_set) {
+			char filtered[NAT_SDP_MAX];
+			char ufrag[40];
+
+			sdp_filter_peer(s->peer_sdp, s->cfg->family, filtered,
+					sizeof(filtered));
+			if (!nat_set_remote_description(c->nat, filtered)) {
+				sdp_ufrag(s->peer_sdp, ufrag);
+				snprintf(c->remote_ufrag,
+					 sizeof(c->remote_ufrag), "%s", ufrag);
+				s->remote_set = 1;
+			}
+		}
+		if (now >= c->rs_deadline)
+			c->rs_state = 0;
+		return;
+	}
+}
+
 /*
  * Run one connection's SSH session over its connected stream until it ends.
  * Sets up the KCP stream, the ssh thread (sshd on a host, sshc on a client) and
@@ -2591,6 +2741,22 @@ static int conn_run(struct conn *c, int drive_sig)
 		struct pollfd fds[9];
 		int timeout = 10, nfds = 0, lnf = 0, bidx, cidx;
 
+		/* A re-punched agent the turnstile grafted for us: adopt it
+		 * here, on the one thread that owns c->nat. Its callbacks were
+		 * re-pointed at this connection before it was parked, so its
+		 * packets have been landing in the stream all along; this
+		 * makes it the sending agent too. */
+		if (c->resume_agent) {
+			struct nat_agent *old = c->nat;
+
+			conn_drop_ice_path(c);
+			c->nat = c->resume_agent;
+			c->resume_agent = NULL;
+			conn_add_ice_path(c);
+			if (old)
+				nat_destroy(old);
+			dbg_logf("resume: adopted the re-punched agent");
+		}
 		if (drive_sig) {
 			nfds = sig_prepare(s->sig, fds, 5, &timeout);
 			if (s->lan)
@@ -2624,21 +2790,37 @@ static int conn_run(struct conn *c, int drive_sig)
 		path_tick(c, now_ms());
 		cand_tell(c, now_ms());
 		if (s->cfg->test_blackhole_ms > 0 && c->bh_kind < 0 &&
+		    !c->bh_done &&
 		    now_ms() - conn_start >
 		    (uint64_t)s->cfg->test_blackhole_ms) {
 			struct path_pick pick;
 
-			if (!conn_pick(c, &pick)) {
+			if (s->cfg->test_blackhole_all) {
+				c->bh_mute = 1;
+				c->bh_done = 1;
+				dbg_logf("path blackholed: all");
+			} else if (!conn_pick(c, &pick)) {
 				pthread_mutex_lock(&c->path_lock);
 				memset(&c->bh_ep, 0, sizeof(c->bh_ep));
 				path_ep_from_sockaddr(&c->bh_ep,
 					(struct sockaddr *)&pick.remote,
 					sizeof(pick.remote));
 				c->bh_kind = pick.kind;
+				c->bh_done = 1;
 				pthread_mutex_unlock(&c->path_lock);
 				dbg_logf("path blackholed: %s",
 					 pick.label[0] ? pick.label : "ICE");
 			}
+		}
+		if ((c->bh_kind >= 0 || c->bh_mute) &&
+		    s->cfg->test_blackhole_lift_ms > 0 &&
+		    now_ms() - conn_start >
+		    (uint64_t)s->cfg->test_blackhole_lift_ms) {
+			pthread_mutex_lock(&c->path_lock);
+			c->bh_kind = -1;
+			pthread_mutex_unlock(&c->path_lock);
+			c->bh_mute = 0;
+			dbg_logf("path blackhole lifted");
 		}
 
 		if (now_ms() >= next_hb) {
@@ -2650,6 +2832,8 @@ static int conn_run(struct conn *c, int drive_sig)
 		}
 		if (drive_sig)
 			rdv_maintain(c);
+		if (drive_sig && !s->cfg->is_host)
+			resume_tick(c);
 		if (now_ms() >= c->next_status_ms) {
 			uint64_t now = now_ms(), lp;
 			int state, pong_seen;
@@ -2697,6 +2881,7 @@ static int conn_run(struct conn *c, int drive_sig)
 			 * tighter heartbeat-loss window. */
 			if (s->cfg->is_host) {
 				if (pong_seen && c->lost_since_ms &&
+				    !c->resume_pending &&
 				    now - c->lost_since_ms > HOST_REAP_MS)
 					done = 1;
 				else if (!pong_seen && now - conn_start >
@@ -3210,6 +3395,56 @@ static int worker_spawn(struct worker *ws, struct conn *c)
 	return -1;			/* worker table full */
 }
 
+/* The running worker serving this claimant, if any: a client's ICE identity
+ * is session-stable, so the ufrag names the same client across its claims. */
+static struct conn *worker_by_ufrag(struct worker *ws, const char *ufrag)
+{
+	int i;
+
+	if (!ufrag[0])
+		return NULL;
+	for (i = 0; i < HOST_MAX_WORKERS; i++)
+		if (ws[i].used && !ws[i].done &&
+		    !strcmp(ws[i].c->claim_ufrag, ufrag))
+			return ws[i].c;
+	return NULL;
+}
+
+static int conn_is_lost(struct conn *c)
+{
+	int lost;
+
+	pthread_mutex_lock(&c->hb_lock);
+	lost = c->lost_since_ms != 0;
+	pthread_mutex_unlock(&c->hb_lock);
+	return lost;
+}
+
+/* Is this claimant queued for LAN admission (not yet a worker)? */
+static int lan_pending_ufrag(const struct sess *s, const char *ufrag)
+{
+	int i;
+
+	for (i = 0; i < s->lan_pending_n; i++)
+		if (!strcmp(s->lan_pending[i].ufrag, ufrag))
+			return 1;
+	return 0;
+}
+
+/* Is a punch for this claimant running right now? Narrower than
+ * ufrag_admitted, whose slots keep naming a claimant for the worker's whole
+ * life -- residue that must not veto that same claimant's resumption. */
+static int punch_in_flight(const struct sess *s, struct conn *const *punching,
+			   const char *ufrag)
+{
+	int i;
+
+	for (i = 0; i < HOST_MAX_WORKERS; i++)
+		if (punching[i] && !strcmp(s->punch_ufrag[i], ufrag))
+			return 1;
+	return 0;
+}
+
 /*
  * Admit each newly-claimed LAN endpoint: allocate a conn bound to that peer over
  * the shared lanlink socket (no ICE, no punch -- a multicast claimant is already
@@ -3288,8 +3523,8 @@ static void lan_drain(struct sess *s, struct worker *ws, int *dash_seq)
  * Host main thread.
  */
 static void punch_scan(struct sess *s, struct worker *ws, struct conn **punching,
-		       uint64_t *punch_start, int *punch_stuck,
-		       int *dash_seq)
+		       struct conn **punch_resume, uint64_t *punch_start,
+		       int *punch_stuck, int *dash_seq)
 {
 	const struct session_obs *o = s->cfg->obs;
 	int i;
@@ -3305,6 +3540,30 @@ static void punch_scan(struct sess *s, struct worker *ws, struct conn **punching
 			snprintf(s->last_served_ufrag, sizeof(s->last_served_ufrag),
 				 "%.39s", s->punch_ufrag[i]);
 			s->have_served = 1;
+			/*
+			 * A resumption: hand the punched agent to the worker
+			 * already serving this claimant. Its callbacks are
+			 * re-pointed first, so packets land in the worker's
+			 * stream from this instant; the worker's own thread
+			 * adopts it as the sending agent on its next pass
+			 * (c->nat belongs to that thread). The punch shell is
+			 * dissolved without a worker, a dashboard row, or a
+			 * registration of its own.
+			 */
+			if (punch_resume[i]) {
+				struct conn *t = punch_resume[i];
+
+				dbg_logf("host: punch connected -> resume "
+					 "worker");
+				nat_rebind(c->nat, t);
+				t->resume_agent = c->nat;
+				c->nat = NULL;
+				t->resume_pending = 0;
+				punching[i] = NULL;
+				punch_resume[i] = NULL;
+				conn_free(c);
+				continue;
+			}
 			addr[0] = '\0';
 			if (!nat_selected(c->nat, loc, sizeof(loc), rem,
 					  sizeof(rem))) {
@@ -3333,6 +3592,10 @@ static void punch_scan(struct sess *s, struct worker *ws, struct conn **punching
 			   (!punch_stuck[i] && nat_failed(c->nat))) {
 			dbg_logf("host: punch %s -> drop",
 				 punch_stuck[i] ? "wedged (test)" : "failed");
+			if (punch_resume[i]) {
+				punch_resume[i]->resume_pending = 0;
+				punch_resume[i] = NULL;
+			}
 			punching[i] = NULL;
 			s->punch_ufrag[i][0] = '\0';
 			conn_free(c);
@@ -3452,6 +3715,8 @@ static int host_turnstile(struct sess *s)
 	struct worker ws[HOST_MAX_WORKERS];
 	struct conn *listen = NULL;
 	struct conn *punching[HOST_MAX_WORKERS];	/* in-flight ICE punches */
+	struct conn *punch_resume[HOST_MAX_WORKERS];	/* worker each punch
+							 * resumes, if any */
 	uint64_t punch_start[HOST_MAX_WORKERS];
 	int punch_stuck[HOST_MAX_WORKERS];		/* test: never connect */
 	enum { TS_GATHER, TS_WAIT_CLAIM } ts = TS_GATHER;
@@ -3464,6 +3729,7 @@ static int host_turnstile(struct sess *s)
 
 	memset(ws, 0, sizeof(ws));
 	memset(punching, 0, sizeof(punching));
+	memset(punch_resume, 0, sizeof(punch_resume));
 	memset(punch_stuck, 0, sizeof(punch_stuck));
 	s->last_served_ufrag[0] = '\0';
 	s->have_served = 0;
@@ -3546,6 +3812,13 @@ static int host_turnstile(struct sess *s)
 				for (j = 0; j < HOST_MAX_WORKERS; j++)
 					if (s->lan_conns[j] == ws[i].c)
 						s->lan_conns[j] = NULL;
+				/* A punch that was resuming this worker loses
+				 * its target and proceeds as a fresh admission
+				 * -- the client wanted its session back, but a
+				 * new one beats none. */
+				for (j = 0; j < HOST_MAX_WORKERS; j++)
+					if (punch_resume[j] == ws[i].c)
+						punch_resume[j] = NULL;
 				if (ws[i].c->claim_ufrag[0])
 					for (j = 0; j < HOST_MAX_WORKERS; j++)
 						if (!strcmp(s->punch_ufrag[j],
@@ -3591,7 +3864,8 @@ static int host_turnstile(struct sess *s)
 		/* Advance in-flight punches (connect -> worker, wedged -> freed),
 		 * concurrently with the listener below. An in-flight punch keeps the
 		 * host non-idle. */
-		punch_scan(s, ws, punching, punch_start, punch_stuck, &dash_seq);
+		punch_scan(s, ws, punching, punch_resume, punch_start,
+			   punch_stuck, &dash_seq);
 		for (i = 0; i < HOST_MAX_WORKERS; i++)
 			if (punching[i])
 				active = 1;
@@ -3652,27 +3926,39 @@ static int host_turnstile(struct sess *s)
 			break;
 		case TS_WAIT_CLAIM:
 			if (s->have_peer_sdp && !s->remote_set) {
+				struct conn *resume = NULL;
 				char cu[40];
 				int pslot = -1, inflight = 0;
 
 				/*
-				 * Ignore an answer that is already being served or
-				 * punched: the DHT is eventually consistent, so a
-				 * lagging node re-serves a just-picked-up answer, and
-				 * a still-punching client keeps re-claiming the slot
-				 * the rotate cleared; either would be punched again
-				 * (double-serve). The claimant is its ICE ufrag. This
-				 * is the stale-claim guard (have_served/last_served),
-				 * keyed by ufrag so it covers concurrent punches.
+				 * A claim naming a claimant already on the books is
+				 * one of two things. From a worker that has lost its
+				 * client, it is that client returning -- the ICE
+				 * identity is session-stable -- and the punch it asks
+				 * for is a resumption of the worker's connection, not
+				 * a duplicate join. From anywhere else -- a healthy
+				 * worker, a punch in flight, a queued LAN admission,
+				 * the claimant just served -- it is the eventually-
+				 * consistent DHT re-serving a stale value, ignored as
+				 * before (either would be punched again: double-serve).
 				 */
 				sdp_ufrag(s->peer_sdp, cu);
-				if (cu[0] && ((s->have_served &&
-					       !strcmp(cu, s->last_served_ufrag)) ||
-					      ufrag_admitted(s, cu) ||
-					      lan_ufrag_claimed(s, cu))) {
-					dbg_logf("host: ignore stale/in-flight claim");
-					s->have_peer_sdp = 0;
-					break;
+				if (cu[0]) {
+					struct conn *w = worker_by_ufrag(ws, cu);
+
+					if (w && conn_is_lost(w) &&
+					    !punch_in_flight(s, punching, cu) &&
+					    now_ms() - w->resume_last_ms >
+					    RESUME_ATTEMPT_MS) {
+						resume = w;
+					} else if (w || ufrag_admitted(s, cu) ||
+						   lan_pending_ufrag(s, cu) ||
+						   (s->have_served &&
+						    !strcmp(cu, s->last_served_ufrag))) {
+						dbg_logf("host: ignore stale/in-flight claim");
+						s->have_peer_sdp = 0;
+						break;
+					}
 				}
 				/* Room to punch? (a free in-flight slot within the
 				 * combined worker + punch budget). If not, keep the
@@ -3689,7 +3975,9 @@ static int host_turnstile(struct sess *s)
 				}
 				if (pslot < 0 || inflight >= HOST_MAX_WORKERS)
 					break;
-				dbg_logf("host: claim received -> punch (release)");
+				dbg_logf(resume ?
+					 "host: resume claim -> punch (release)" :
+					 "host: claim received -> punch (release)");
 				sdp_filter_peer(s->peer_sdp, cfg->family, filtered,
 					   sizeof(filtered));
 				if (nat_set_remote_description(listen->nat,
@@ -3706,6 +3994,11 @@ static int host_turnstile(struct sess *s)
 				 * set and rotate a fresh offer at once, so the next
 				 * client is admitted without waiting for this punch. */
 				punching[pslot] = listen;
+				punch_resume[pslot] = resume;
+				if (resume) {
+					resume->resume_pending = 1;
+					resume->resume_last_ms = now_ms();
+				}
 				snprintf(listen->claim_ufrag,
 					 sizeof(listen->claim_ufrag), "%s", cu);
 				punch_start[pslot] = now_ms();

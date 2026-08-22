@@ -86,10 +86,13 @@ struct sshc_opts {
  */
 #define SSHC_RECONNECT 2
 
-/* How long the link may stay down before the interactive client stops waiting
- * and asks to rejoin. Short enough to recover quickly from a roam, long enough
- * that a brief blip (which KCP rides out) does not trigger a needless re-punch. */
-#define SSHC_REJOIN_GRACE_S 6
+/* How long the link may stay down before the interactive client gives up on
+ * it and asks to rejoin as a fresh session. The last resort, not the first:
+ * the connection resumes itself in place (resume_tick re-claims under the
+ * session identity within seconds, and the host grafts the punch into the
+ * worker it already runs), so this only fires when that keeps failing --
+ * the worker reaped, the host gone, the network refusing every punch. */
+#define SSHC_REJOIN_GRACE_S 45
 
 /*
  * Run one SSH session on fd; blocks until it ends. Returns 0 on a clean end,

@@ -101,6 +101,18 @@ struct nat_agent *nat_create(const struct nat_config *cfg)
 	return a;
 }
 
+/*
+ * Re-point the callbacks' argument at another owner, for an agent whose punch
+ * is adopted by an existing connection. A single pointer store: a callback
+ * already past the load delivers to the old owner one last time, which the
+ * owners in question (a punch shell being dissolved, the connection adopting
+ * it) both tolerate.
+ */
+void nat_rebind(struct nat_agent *a, void *arg)
+{
+	a->arg = arg;
+}
+
 void nat_destroy(struct nat_agent *a)
 {
 	if (!a)

@@ -683,8 +683,14 @@ interface brought up mid-session is advertised within one period. `CTL_HDR = 2`,
 
 ## 11. Roaming, reconnect, keep-alive (`src/session.c`)
 
-- Heartbeat over comrade-ctl: `HB_INTERVAL_MS 700`, link lost after
-  `HB_LOST_MS 2500`, a vanished host worker reaped after `HOST_REAP_MS 12000`.
+- Heartbeat over comrade-ctl: `HB_INTERVAL_MS 700`, and the link is lost when
+  **nothing at all** -- pong or any other datagram from the peer -- has arrived
+  for `HB_LOST_MS 2500`. The pong alone must not carry the verdict: it rides
+  the same stream and queues as bulk data, so on a saturated slow link it
+  arrives seconds late while the transfer demonstrably moves; the pong's own
+  job is the round-trip figure. A vanished host worker is reaped after
+  `HOST_REAP_MS 12000`, deferred while a resumption punch for it is in flight
+  (§12).
 - Network changes are polled (`netmon`, `NETMON_POLL_MS 2000`).
 - Each end keeps a **warm rendezvous node per address family** and exchanges it
   over `CTLM_RDV`, so either side can re-signal quickly after a move. This is
@@ -702,14 +708,20 @@ interface brought up mid-session is advertised within one period. `CTL_HDR = 2`,
   switch lands; that is the outage the switch is repairing, and it is far inside
   the rejoin grace below. `HOST_REAP_MS 12000` likewise sits well above
   `PATH_DEAD_MS 8000`, so a host never reaps a client that is mid-switch.
-- **Reconnect == new join** (tmux redraws) is the fallback for when *no* path is
-  warm, with a grace window `SSHC_REJOIN_GRACE_S 6` so a transient blip resumes
-  without a re-punch. The grace is what keeps the two apart rather than any
-  interlock: the incumbent leaves `WARM` `PATH_WARM_MS 3000` after the last
-  answer it gave and a warm alternative takes over at once (sooner, where the
-  incumbent's loss has already cost it the margin), while the rejoin cannot fire
-  until `HB_LOST_MS 2500` and then the grace have both passed. The rejoin
-  therefore only ever fires where there was nothing to switch to.
+- **Total loss resumes in place; a new join is the last resort.** Where no
+  path is warm and nothing has been heard for `RESUME_AFTER_MS 3000`, the
+  client re-runs the claim half of the join from inside the live connection
+  (`resume_tick`): the signalling is rebuilt if the network moved, a fresh
+  agent gathers under the connection's **session-stable ufrag** with a fresh
+  password (an unchanged claim would be deduplicated away by the peer's
+  redelivery guard), and the claim is posted again. The host recognises the
+  claimant and grafts the punch into the worker it already runs (§12), so the
+  SSH session, the port forwards and their carried TCP streams ride out the
+  outage on KCP retransmission; each attempt runs `RESUME_ATTEMPT_MS 10000`
+  before regathering. Only when that keeps failing does the interactive client
+  tear down and rejoin as a fresh identity (tmux redraws), after
+  `SSHC_REJOIN_GRACE_S 45`: the worker was reaped, the host is gone, or the
+  network refuses every punch.
 - **Signalling is rebuilt on a move**. A fresh `sig` binds a new DHT socket on
   the new network, where the old one stays stuck on the interface that vanished;
   that is why a manual restart reconnects instantly where a reused socket does
@@ -784,6 +796,24 @@ release-on-pickup: rejecting stalls exactly the joiners that arrive while a punc
 is wedged (measured, and what `turnstile_stuck.sh` exists to catch). A claimant
 paired with an agent it never primed against simply never qualifies, and the
 rules above recover it.
+
+**A claim naming a claimant the host already serves is a resumption.** The
+ufrag is session-stable, so it names the same client across its claims. If the
+worker serving it has lost its client, the claim is that client returning, and
+its punch ends in a graft rather than a worker: the punched agent's callbacks
+are re-pointed at the worker's connection -- packets land in its stream from
+that instant -- and the agent is parked for the worker's own thread to adopt
+as the sending one, since `c->nat` belongs to that thread. The punch shell is
+dissolved with no worker, no dashboard row and no registration of its own, and
+the worker's reap is held off while the punch runs. From a *healthy* worker
+the same claim is the eventually-consistent DHT re-serving a stale value and
+is ignored, as are claims whose punch is already in flight, and resumptions
+inside `RESUME_ATTEMPT_MS` of the last -- the window between a graft and its
+first probe, where the worker still reads as lost. Anyone holding the token
+can claim any ufrag, but a resumption moves packets, not trust: the SSH
+session inside the stream authenticates end to end, so a forged resumption
+redirects the transport at worst -- a denial no cheaper than the claim spam
+the shared-secret model already admits (see the slot limit below).
 
 Concurrent DHT admission is partial beyond two clients: the turnstile is serial
 by construction, so N clients cost N rotations and each rotation strands the

@@ -160,6 +160,11 @@ struct session_cfg {
 	int test_drop_pong;		/* answer only the first pings, then never
 					 * again: a link whose pongs starve
 					 * mid-session, staged */
+	int test_blackhole_lift_ms;	/* restore the blackholed path this long
+					 * after the connection starts, so what
+					 * follows an outage can be staged too */
+	int test_blackhole_all;		/* blackhole every path and mute receive:
+					 * a total outage, not a path failure */
 	int test_single_conn;		/* host: force the single-connection path even
 					 * on DHT (exercise the sequential re-serve
 					 * loop that the product host uses) */
