@@ -32,7 +32,13 @@
 /*
  * Liveness heartbeat cadence over the comrade-ctl control channel (framing in
  * ctlproto.h): a ping every HB_INTERVAL_MS, and the link is declared lost when
- * no pong has come back for HB_LOST_MS.
+ * nothing at all -- no pong, and no other traffic -- has arrived from the peer
+ * for HB_LOST_MS. The pong alone must not carry the verdict: it rides the
+ * same stream as bulk data through several queues, so on a saturated slow
+ * link it arrives seconds late while the transfer is demonstrably moving
+ * (measured at carrier fair-use rates: the link declared lost, and the worker
+ * reaped, mid-download). Arriving datagrams are the liveness; the pong's own
+ * job is the round-trip figure.
  */
 #define HB_INTERVAL_MS 700
 #define HB_LOST_MS 2500
@@ -232,6 +238,7 @@ struct conn {
 	int claim_held_seen;
 	int claim_lost;
 	uint64_t claim_released_ms;
+	int pongs_sent;			/* answered pings (test_drop_pong's count) */
 	/* The claimant's ICE ufrag, carried for the worker's whole lifetime so the
 	 * host recognises the same client arriving over the other transport. */
 	char claim_ufrag[40];
@@ -252,6 +259,8 @@ struct conn {
 	 * once the link has truly stalled, which is exactly the signal we want. */
 	pthread_mutex_t hb_lock;
 	uint64_t hb_last_pong;		/* when a pong last came back */
+	uint64_t hb_last_heard;		/* when anything last arrived from the
+					 * peer (fed by the receive threads) */
 	int hb_rtt;			/* round trip from the last pong, ms */
 	int hb_pong_seen;		/* a pong has ever come back on this conn */
 	uint64_t lost_since_ms;		/* when the link was first seen lost, 0 if live */
@@ -1367,7 +1376,10 @@ static void ctl_dispatch(void *arg, int type, const uint8_t *pl, size_t plen)
 	struct conn *c = arg;
 
 	if (type == CTLM_PING && plen >= CTL_TS_LEN) {
-		ctl_send(c, CTLM_PONG, pl, CTL_TS_LEN);
+		if (!c->sess->cfg->test_drop_pong || c->pongs_sent < 2) {
+			c->pongs_sent++;
+			ctl_send(c, CTLM_PONG, pl, CTL_TS_LEN);
+		}
 	} else if (type == CTLM_PONG && plen >= CTL_TS_LEN) {
 		uint64_t now = now_ms();
 
@@ -1648,6 +1660,15 @@ static void deliver_stream_from(struct conn *c, const uint8_t *data, size_t len,
 				enum path_kind kind,
 				const struct sockaddr_in6 *src)
 {
+	uint64_t now = now_ms();
+
+	/* The unlocked read only coarsens the update to ~100ms; the store is
+	 * what the liveness verdict reads, and it is taken under the lock. */
+	if (now - c->hb_last_heard >= 100) {
+		pthread_mutex_lock(&c->hb_lock);
+		c->hb_last_heard = now;
+		pthread_mutex_unlock(&c->hb_lock);
+	}
 	if (path_probe_is(data, len)) {
 		probe_recv(c, data, len, kind, src);
 		return;
@@ -2540,6 +2561,7 @@ static int conn_run(struct conn *c, int drive_sig)
 	/* The path is up on entry, so start the liveness clock as alive. */
 	pthread_mutex_lock(&c->hb_lock);
 	c->hb_last_pong = now_ms();
+	c->hb_last_heard = c->hb_last_pong;
 	c->hb_pong_seen = 0;
 	c->lost_since_ms = 0;
 	pthread_mutex_unlock(&c->hb_lock);
@@ -2634,6 +2656,8 @@ static int conn_run(struct conn *c, int drive_sig)
 
 			pthread_mutex_lock(&c->hb_lock);
 			lp = c->hb_last_pong;
+			if (c->hb_last_heard > lp)
+				lp = c->hb_last_heard;
 			pong_seen = c->hb_pong_seen;
 			if (pong_seen) {
 				if (now - lp > HB_LOST_MS) {
@@ -2653,7 +2677,7 @@ static int conn_run(struct conn *c, int drive_sig)
 			 * nothing left to reorder to. */
 			if (state == CONN_LOST && !link_lost) {
 				link_lost = 1;
-				dbg_logf("link lost: no pong for %ums",
+				dbg_logf("link lost: nothing heard for %ums",
 					 (unsigned)(now - lp));
 			} else if (state == CONN_LIVE && link_lost) {
 				link_lost = 0;

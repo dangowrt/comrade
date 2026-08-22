@@ -157,6 +157,9 @@ struct session_cfg {
 	size_t test_recv_cap;
 	size_t *test_recv_len;
 	int test_hold_ms;		/* keep the session open this long after echo */
+	int test_drop_pong;		/* answer only the first pings, then never
+					 * again: a link whose pongs starve
+					 * mid-session, staged */
 	int test_single_conn;		/* host: force the single-connection path even
 					 * on DHT (exercise the sequential re-serve
 					 * loop that the product host uses) */

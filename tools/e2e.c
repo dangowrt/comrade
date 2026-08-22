@@ -104,7 +104,7 @@ int main(int argc, char **argv)
 	uint8_t tx[SSH_NONCE], rx[SSH_NONCE];
 	size_t rx_got = 0, k;
 	const char *stun_arg = NULL;
-	int is_host, i, rc;
+	int is_host, i, rc, flood = 0;
 
 	/* A peer closing first must not kill the harness outright, the same way
 	 * the product binary arranges for itself (main.c). Without this a client
@@ -201,6 +201,10 @@ int main(int argc, char **argv)
 			cfg.sig_flags |= SIG_MCAST;
 		else if (!strcmp(argv[i], "--no-dht"))
 			cfg.sig_flags &= ~SIG_DHT;
+		else if (!strcmp(argv[i], "--drop-pong"))
+			cfg.test_drop_pong = 1;
+		else if (!strcmp(argv[i], "--flood"))
+			flood = 1;
 		else {
 			fprintf(stderr, "unknown option: %s\n", argv[i]);
 			return 2;
@@ -221,7 +225,11 @@ int main(int argc, char **argv)
 		random_bytes(cfg.tok.rdv, TOKEN_RDV_LEN);
 		random_bytes(cfg.tok.auth, TOKEN_AUTH_LEN);
 		host.tok = cfg.tok;
-		cfg.ssh_command = "cat";	/* echo oracle, not tmux */
+		/* The echo oracle, not tmux; --flood keeps producing after the
+		 * echo so a held session carries continuous peer data. */
+		cfg.ssh_command = flood ?
+			"sh -c 'head -c 4096; while :; do head -c 1024 /dev/zero;"
+			" sleep 0.05; done'" : "cat";
 		cfg.use_pty = 0;
 		cfg.on_token_state = on_token_state;
 	} else {

@@ -252,6 +252,16 @@ static int run_test(ssh_session s, ssh_channel chan, const struct sshc_opts *o)
 
 		while (mono_ms() < end && ssh_channel_is_open(chan) &&
 		       !ssh_channel_is_eof(chan)) {
+			char sink[4096];
+
+			/* Drain what the command keeps producing, or the
+			 * channel window would idle the very link the hold is
+			 * meant to keep carrying. */
+			while (ssh_channel_poll(chan, 0) > 0 &&
+			       ssh_channel_read_nonblocking(chan, sink,
+							    sizeof(sink),
+							    0) > 0)
+				;
 			if (event) {
 				ssh_event_dopoll(event, 50);
 				sshfwd_tick(fwd);
