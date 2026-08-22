@@ -579,6 +579,10 @@ if(BUILD_TESTING)
 	target_link_libraries(mailbox_test comrade_mailbox)
 	add_test(NAME mailbox_test COMMAND mailbox_test)
 
+	add_executable(roauth_test tests/roauth_test.c)
+	target_link_libraries(roauth_test comrade_crypto comrade_token)
+	add_test(NAME roauth_test COMMAND roauth_test)
+
 	# Both exercise the BEP 44 engine alone, which needs no DHT library.
 	add_executable(bep44_test tests/bep44_test.c)
 	target_link_libraries(bep44_test comrade_bep44)
@@ -608,6 +612,12 @@ if(BUILD_TESTING)
 	target_link_libraries(sshexit_test comrade_ssh comrade_token Threads::Threads)
 	add_test(NAME sshexit_test COMMAND sshexit_test)
 	set_tests_properties(sshexit_test PROPERTIES TIMEOUT 30)
+
+	add_executable(sshro_test tests/sshro_test.c)
+	target_link_libraries(sshro_test
+		comrade_ssh comrade_crypto comrade_token Threads::Threads)
+	add_test(NAME sshro_test COMMAND sshro_test)
+	set_tests_properties(sshro_test PROPERTIES TIMEOUT 30)
 
 	add_executable(sshkcp_test tests/sshkcp_test.c)
 	target_link_libraries(sshkcp_test
@@ -656,9 +666,9 @@ endif()
 if(BUILD_TESTING)
 	foreach(t IN ITEMS
 		token_test tokgen_test termfilter_test ctlproto_test netmon_test
-		candpolicy_test candpack_test mailbox_test bep44_test
+		candpolicy_test candpack_test mailbox_test roauth_test bep44_test
 		bep44_pin_test natstream_test sshloop_test sshfwd_test
-		sshexit_test sshkcp_test sshctl_test)
+		sshexit_test sshro_test sshkcp_test sshctl_test)
 		if(TARGET ${t})
 			target_compile_options(${t} PRIVATE -UNDEBUG)
 		endif()
