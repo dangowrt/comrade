@@ -20,7 +20,13 @@
 
 struct lanlink;
 
-typedef void lanlink_recv_cb(void *arg, const uint8_t *data, size_t len);
+/*
+ * One shared socket carries several peers on a host. A received datagram is
+ * handed up with its source, so the host can demultiplex it into the owning
+ * connection's stream; a send names its peer explicitly.
+ */
+typedef void lanlink_recv_cb(void *arg, const struct sockaddr *src,
+			     socklen_t srclen, const uint8_t *data, size_t len);
 
 /*
  * port: the UDP port to bind, or 0 for an ephemeral one. A host that carries a
@@ -35,15 +41,22 @@ void lanlink_destroy(struct lanlink *l);
 /* The bound UDP port, to announce so the peer can reach us. */
 uint16_t lanlink_port(struct lanlink *l);
 
-/* The peer's endpoint, learned from the announcement (its source address and
- * announced port); a v4 peer is kept v4-mapped for the dual-stack socket. */
-int lanlink_set_peer(struct lanlink *l, const struct sockaddr *peer,
-		     socklen_t len);
-int lanlink_have_peer(struct lanlink *l);
+/*
+ * Map a peer endpoint (its source address and announced port) into a v4-mapped
+ * sockaddr_in6 for the dual-stack socket, so both client and host fill a
+ * connection's lan_peer identically. Returns 0 on success.
+ */
+int lanlink_map_peer(const struct sockaddr *sa, socklen_t len,
+		     struct sockaddr_in6 *out);
 
 int lanlink_prepare(struct lanlink *l, struct pollfd *fds, int maxfds,
 		    int *timeout_ms);
 void lanlink_dispatch(struct lanlink *l, const struct pollfd *fds, int nfds);
-int lanlink_send(struct lanlink *l, const uint8_t *data, size_t len);
+
+/* Send to a specific peer over the shared socket. Safe to call from several
+ * worker threads at once: each datagram is independent, no shared socket state
+ * is mutated. */
+int lanlink_send(struct lanlink *l, const struct sockaddr_in6 *peer,
+		 const uint8_t *data, size_t len);
 
 #endif

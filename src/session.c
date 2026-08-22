@@ -123,6 +123,17 @@ struct conn {
 
 	struct nat_agent *nat;
 	struct stream *stream;
+	pthread_mutex_t stream_lock;	/* guards c->stream: a transport receive
+					 * thread (libjuice) or the host's main
+					 * demux may touch it during teardown */
+
+	/* This connection's direct (lanlink) peer on the shared segment, if any;
+	 * a v4 peer is kept v4-mapped. transport_send prefers it over ICE, and
+	 * the host demultiplexes inbound datagrams to the conn whose lan_peer
+	 * matches the source. */
+	struct sockaddr_in6 lan_peer;
+	int have_lan_peer;
+	char direct_addr[80];		/* the lan_peer, printable (view) */
 
 	sock_t ssh_fd;			/* the ssh thread's socketpair end */
 	sock_t ssh_ctl_fd;		/* the ssh thread's comrade-ctl end */
@@ -191,7 +202,6 @@ struct sess {
 	int escalated;			/* observer: client warned of DHT warm */
 	int peer_state;			/* observer: highest SESSION_PEER_* sent */
 	int established_fired;		/* observer: established sent once */
-	char direct_addr[80];		/* observer: link-local peer, printable */
 	int have_priv4;			/* a private/CGNAT v4 host candidate (needs STUN) */
 	int have_srflx4;		/* STUN gave us a public v4 (reflexive) */
 	int stun_warned;		/* warned once that STUN produced nothing */
@@ -420,8 +430,8 @@ static void publish_status(struct conn *c, int state)
 	 * link-local direct peer when that path is up (it is preferred in
 	 * transport_send), otherwise the selected -- proven -- ICE pair. Never a
 	 * mere gathered candidate. */
-	if (s->lan && lanlink_have_peer(s->lan) && s->direct_addr[0]) {
-		snprintf(cs.peer, sizeof(cs.peer), "%s", s->direct_addr);
+	if (c->have_lan_peer && c->direct_addr[0]) {
+		snprintf(cs.peer, sizeof(cs.peer), "%s", c->direct_addr);
 	} else if (c->nat && nat_connected(c->nat)) {
 		char loc[192], rem[192];
 
@@ -636,8 +646,8 @@ static int transport_send(struct conn *c, const uint8_t *data, size_t len)
 {
 	struct sess *s = c->sess;
 
-	if (s->lan && lanlink_have_peer(s->lan))
-		return lanlink_send(s->lan, data, len);
+	if (c->have_lan_peer)
+		return lanlink_send(s->lan, &c->lan_peer, data, len);
 	if (c->nat && nat_connected(c->nat))
 		return nat_send(c->nat, data, len);
 	return -1;
@@ -733,21 +743,39 @@ static void ctl_readable(struct conn *c)
  * everything arriving on the raw path is KCP stream data. May run on
  * libjuice's thread.
  */
-static void on_transport_recv(void *arg, const uint8_t *data, size_t len)
+/* Deliver received transport bytes into the conn's KCP stream, under the lock
+ * that guards a concurrent teardown clearing c->stream from another thread. */
+static void deliver_stream(struct conn *c, const uint8_t *data, size_t len)
 {
-	struct conn *c = arg;
-
+	pthread_mutex_lock(&c->stream_lock);
 	if (c->stream)
 		stream_input(c->stream, data, len);
+	pthread_mutex_unlock(&c->stream_lock);
+}
+
+static void on_transport_recv(void *arg, const uint8_t *data, size_t len)
+{
+	deliver_stream((struct conn *)arg, data, len);
+}
+
+/* Single-connection lanlink receive (client, or a single-connection host): its
+ * one conn, source ignored -- it only ever talks to the one peer. */
+static void client_lan_recv(void *arg, const struct sockaddr *src,
+			    socklen_t srclen, const uint8_t *data, size_t len)
+{
+	(void)src;
+	(void)srclen;
+	deliver_stream((struct conn *)arg, data, len);
 }
 
 static void on_direct_peer(void *arg, const struct sockaddr *peer, socklen_t len)
 {
-	struct sess *s = arg;
+	struct conn *c = arg;
 
-	if (s->lan)
-		lanlink_set_peer(s->lan, peer, len);
-	fmt_sockaddr(peer, len, s->direct_addr, sizeof(s->direct_addr));
+	if (lanlink_map_peer(peer, len, &c->lan_peer))
+		return;
+	c->have_lan_peer = 1;
+	fmt_sockaddr(peer, len, c->direct_addr, sizeof(c->direct_addr));
 }
 
 static void on_peer_offer(void *arg, const uint8_t *data, size_t len)
@@ -1066,6 +1094,7 @@ static int conn_run(struct conn *c, int drive_sig)
 {
 	struct sess *s = c->sess;
 	struct sshbridge *br;
+	struct stream *st;
 	pthread_t th;
 	sock_t sp[2], cp[2];
 	int done = 0;
@@ -1225,8 +1254,14 @@ static int conn_run(struct conn *c, int drive_sig)
 	c->ctl_fd = INVALID_SOCK;
 	sock_close(cp[0]);
 	sock_close(cp[1]);
-	stream_destroy(c->stream);
+	/* Clear the stream under the lock before destroying it: a transport
+	 * receive thread (or the host's main-thread demux) may be about to call
+	 * stream_input on it. After this, deliver_stream sees NULL and no-ops. */
+	pthread_mutex_lock(&c->stream_lock);
+	st = c->stream;
 	c->stream = NULL;
+	pthread_mutex_unlock(&c->stream_lock);
+	stream_destroy(st);
 
 	if (s->cfg->is_host)
 		return 0;
@@ -1523,6 +1558,7 @@ static struct conn *conn_alloc(struct sess *s)
 	pthread_mutex_init(&c->hb_lock, NULL);
 	pthread_mutex_init(&c->rdv_lock, NULL);
 	pthread_mutex_init(&c->status_lock, NULL);
+	pthread_mutex_init(&c->stream_lock, NULL);
 	conn_gen_ice(c);
 	return c;
 }
@@ -1536,6 +1572,7 @@ static void conn_free(struct conn *c)
 	pthread_mutex_destroy(&c->hb_lock);
 	pthread_mutex_destroy(&c->rdv_lock);
 	pthread_mutex_destroy(&c->status_lock);
+	pthread_mutex_destroy(&c->stream_lock);
 	free(c);
 }
 
@@ -1871,11 +1908,11 @@ static int sig_setup(struct sess *s)
 		return -1;
 	sig_subscribe(s->sig, on_peer_offer, &s->c);
 	if ((cfg->sig_flags & SIG_MCAST) && !host_is_multiuser(cfg)) {
-		s->lan = lanlink_create(on_transport_recv, &s->c,
+		s->lan = lanlink_create(client_lan_recv, &s->c,
 					carried_lanlink_port(cfg));
 		if (s->lan) {
 			sig_set_direct_port(s->sig, lanlink_port(s->lan));
-			sig_subscribe_direct(s->sig, on_direct_peer, s);
+			sig_subscribe_direct(s->sig, on_direct_peer, &s->c);
 			if (cfg->obs && cfg->obs->link) {
 				struct sig_mcast_if ifs[16];
 				int ni = sig_link_ifaces(s->sig, ifs, 16), k;
@@ -1909,6 +1946,7 @@ int session_run(const struct session_cfg *cfg)
 	pthread_mutex_init(&s.c.status_lock, NULL);	/* s.c.status zeroed = connecting */
 	pthread_mutex_init(&s.c.hb_lock, NULL);
 	pthread_mutex_init(&s.c.rdv_lock, NULL);
+	pthread_mutex_init(&s.c.stream_lock, NULL);
 	netmon_init(&s.netmon);
 	if (cfg->stun_auto)
 		s.stun_servers = stunlist_load(&s.stun_count);
@@ -2052,8 +2090,7 @@ int session_run(const struct session_cfg *cfg)
 			}
 			break;
 		case ST_WAIT_ICE:
-			if (nat_connected(s.c.nat) ||
-			    (s.lan && lanlink_have_peer(s.lan))) {
+			if (nat_connected(s.c.nat) || s.c.have_lan_peer) {
 				if (s.peer_state < SESSION_PEER_LIVE) {
 					char loc[192], rem[192];
 
@@ -2063,10 +2100,10 @@ int session_run(const struct session_cfg *cfg)
 							  rem, sizeof(rem)))
 						cand_addr(rem, s.c.status_peer,
 							  sizeof(s.c.status_peer));
-					else if (s.direct_addr[0])
+					else if (s.c.direct_addr[0])
 						snprintf(s.c.status_peer,
 							 sizeof(s.c.status_peer),
-							 "%s", s.direct_addr);
+							 "%s", s.c.direct_addr);
 					if (o && o->peer)
 						o->peer(o->arg, 0,
 							SESSION_PEER_LIVE,
@@ -2172,5 +2209,6 @@ done:
 	pthread_mutex_destroy(&s.c.status_lock);
 	pthread_mutex_destroy(&s.c.hb_lock);
 	pthread_mutex_destroy(&s.c.rdv_lock);
+	pthread_mutex_destroy(&s.c.stream_lock);
 	return rc;
 }

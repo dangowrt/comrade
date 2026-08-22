@@ -9,10 +9,8 @@
 #include "lanlink.h"
 
 struct lanlink {
-	sock_t fd;			/* dual-stack v6 UDP socket */
+	sock_t fd;			/* dual-stack v6 UDP socket, shared */
 	uint16_t port;
-	struct sockaddr_in6 peer;	/* v4 peers kept v4-mapped */
-	int have_peer;
 	lanlink_recv_cb *on_recv;
 	void *arg;
 };
@@ -78,35 +76,29 @@ uint16_t lanlink_port(struct lanlink *l)
 	return l->port;
 }
 
-int lanlink_set_peer(struct lanlink *l, const struct sockaddr *peer,
-		     socklen_t len)
+int lanlink_map_peer(const struct sockaddr *sa, socklen_t len,
+		     struct sockaddr_in6 *out)
 {
-	memset(&l->peer, 0, sizeof(l->peer));
-	l->peer.sin6_family = AF_INET6;
-	if (peer->sa_family == AF_INET6) {
+	memset(out, 0, sizeof(*out));
+	out->sin6_family = AF_INET6;
+	if (sa->sa_family == AF_INET6) {
 		if (len < (socklen_t)sizeof(struct sockaddr_in6))
 			return -1;
-		l->peer = *(const struct sockaddr_in6 *)peer;
-	} else if (peer->sa_family == AF_INET) {
+		*out = *(const struct sockaddr_in6 *)sa;
+	} else if (sa->sa_family == AF_INET) {
 		/* Map a v4 peer into the dual-stack socket: ::ffff:a.b.c.d */
-		const struct sockaddr_in *s4 = (const struct sockaddr_in *)peer;
+		const struct sockaddr_in *s4 = (const struct sockaddr_in *)sa;
 
 		if (len < (socklen_t)sizeof(struct sockaddr_in))
 			return -1;
-		l->peer.sin6_port = s4->sin_port;
-		l->peer.sin6_addr.s6_addr[10] = 0xff;
-		l->peer.sin6_addr.s6_addr[11] = 0xff;
-		memcpy(&l->peer.sin6_addr.s6_addr[12], &s4->sin_addr, 4);
+		out->sin6_port = s4->sin_port;
+		out->sin6_addr.s6_addr[10] = 0xff;
+		out->sin6_addr.s6_addr[11] = 0xff;
+		memcpy(&out->sin6_addr.s6_addr[12], &s4->sin_addr, 4);
 	} else {
 		return -1;
 	}
-	l->have_peer = 1;
 	return 0;
-}
-
-int lanlink_have_peer(struct lanlink *l)
-{
-	return l->have_peer;
 }
 
 int lanlink_prepare(struct lanlink *l, struct pollfd *fds, int maxfds,
@@ -133,22 +125,25 @@ void lanlink_dispatch(struct lanlink *l, const struct pollfd *fds, int nfds)
 		    !(fds[i].revents & (POLLIN | POLLHUP | POLLERR)))
 			continue;
 		for (;;) {
-			int rc = recv(l->fd, (char *)buf, (int)sizeof(buf), 0);
+			struct sockaddr_storage src;
+			socklen_t srclen = sizeof(src);
+			int rc = recvfrom(l->fd, (char *)buf, (int)sizeof(buf), 0,
+					  (struct sockaddr *)&src, &srclen);
 
 			if (rc <= 0)
 				break;
 			if (l->on_recv)
-				l->on_recv(l->arg, buf, (size_t)rc);
+				l->on_recv(l->arg, (struct sockaddr *)&src,
+					   srclen, buf, (size_t)rc);
 		}
 	}
 }
 
-int lanlink_send(struct lanlink *l, const uint8_t *data, size_t len)
+int lanlink_send(struct lanlink *l, const struct sockaddr_in6 *peer,
+		 const uint8_t *data, size_t len)
 {
-	if (!l->have_peer)
-		return -1;
 	if (sendto(l->fd, (const char *)data, (int)len, 0,
-		   (struct sockaddr *)&l->peer, sizeof(l->peer)) < 0)
+		   (const struct sockaddr *)peer, sizeof(*peer)) < 0)
 		return -1;
 	return 0;
 }
