@@ -22,23 +22,25 @@ brew install comrade          # hosting a session also needs: brew install tmux
 
 ## Updates
 
-Each tagged release publishes a prebuilt **bottle** per macOS arch, and the CI
-pins this tap's `comrade` formula to that release: a stable `url` at the tag's
-commit plus the matching bottle block. So `brew install comrade` fetches a binary
-rather than compiling on the user's machine, and `brew upgrade` moves to the next
-release. `brew install --HEAD comrade` still builds the current tip of `main` for
-anyone who wants it; the build date comes from the commit itself
-(`SOURCE_DATE_EPOCH`, honoured by the CMake build), so a given commit always
-builds the same bytes.
+Each tagged release publishes a prebuilt **bottle** per macOS arch for `comrade`
+**and** its three dependency formulae (`libjuice`, `kcp`, `libdht`), and the CI
+pins this tap's formulae to that release: comrade's `url` moves to the tag's
+commit, and every formula gets its matching bottle block. So `brew install
+comrade` fetches nothing but binaries -- no build tools or toolchain required --
+and `brew upgrade` moves to the next release. `brew install --HEAD comrade`
+still builds the current tip of `main` for anyone who wants it; the build date
+comes from the commit itself (`SOURCE_DATE_EPOCH`, honoured by the CMake
+build), so a given commit always builds the same bytes.
 
-The release CI builds the bottle per arch, and its `release` job attaches both to
-the tagged GitHub release alongside the Windows executables, in the one call that
-creates the release. Only then does it push the updated formulae to the tap repo
-**dangowrt/homebrew-comrade** under `Formula/` (also when a dependency version is
-bumped), so the formula's bottle block never names a download that is not on the
-release yet. Pushing the tap needs a token with write access to that repo,
-exposed as the `HOMEBREW_TAP_TOKEN` secret, the macOS counterpart of the apt
-repo's signing secret.
+The release CI builds all four bottles per arch, and its `release` job attaches
+every one of them to the tagged GitHub release alongside the Windows
+executables, in the one call that creates the release. Only then does it push
+the updated formulae to the tap repo **dangowrt/homebrew-comrade** under
+`Formula/` (also when a dependency version is bumped), so no formula's bottle
+block ever names a download that is not on the release yet. Pushing the tap
+needs a token with write access to that repo, exposed as the
+`HOMEBREW_TAP_TOKEN` secret, the macOS counterpart of the apt repo's signing
+secret.
 
 ## Dependency formulae and pins
 

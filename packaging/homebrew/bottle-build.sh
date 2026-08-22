@@ -1,9 +1,12 @@
 #!/bin/bash
-# Build a Homebrew bottle for comrade for ONE architecture -- the one this macOS
-# runner is -- and leave the .bottle.tar.gz and .bottle.json in the working
-# directory for the workflow to upload as an artifact. A macOS bottle must be
-# built natively per arch, so the release runs this on an Intel and an
-# Apple-Silicon runner; bottle-publish.sh then merges both arches into the tap.
+# Build a Homebrew bottle for comrade AND its three dependency formulae
+# (libjuice, kcp, libdht) for ONE architecture -- the one this macOS runner is
+# -- and leave every .bottle.tar.gz and .bottle.json in the working directory
+# for the workflow to upload as an artifact. Bottling the dependencies too
+# means `brew install comrade` never needs a build toolchain on the user's
+# machine. A macOS bottle must be built natively per arch, so the release runs
+# this on an Intel and an Apple-Silicon runner; bottle-publish.sh then merges
+# both arches into the tap.
 #
 # No tap token is needed here: this only builds and bottles, using a throwaway
 # local tap. bottle-publish.sh does the pushing.
@@ -56,13 +59,19 @@ for f in comrade libjuice kcp libdht; do
   brew uninstall --ignore-dependencies --force "$f" 2>/dev/null || true
 done
 
-# The deps have no bottles and --build-bottle will not build them from source,
-# so install them first, then build comrade for bottling.
-log "Install the source-built dependencies, then bottle-build comrade"
-brew install "${TAP}/libjuice" "${TAP}/kcp" "${TAP}/libdht"
-brew install --build-bottle "${TAP}/comrade"
-
-log "Produce the bottle and its JSON"
 rm -f ./*.bottle.tar.gz ./*.bottle.json
+
+# Each dependency needs --build-bottle on its own install, or `brew bottle`
+# refuses it later as not built for bottling; install and bottle it before
+# moving on to the next, then finally to comrade, which links against the
+# kegs just installed here.
+log "Build and bottle the dependencies"
+for f in libjuice kcp libdht; do
+  brew install --build-bottle "${TAP}/${f}"
+  brew bottle --json --no-rebuild --root-url="$ROOT_URL" "${TAP}/${f}"
+done
+
+log "Build and bottle comrade"
+brew install --build-bottle "${TAP}/comrade"
 brew bottle --json --no-rebuild --root-url="$ROOT_URL" "${TAP}/comrade"
 ls -la ./*.bottle.*

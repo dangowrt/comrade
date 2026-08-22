@@ -232,8 +232,10 @@ On a Debian testing system use `testing` in place of `stable`.
 
 ### macOS
 
-From the Homebrew tap. `brew install` fetches a prebuilt bottle for the latest
-release, and `brew upgrade` moves to the next one:
+From the Homebrew tap. `brew install` fetches prebuilt bottles for comrade
+and its three dependency formulae alike, so nothing is compiled on your
+machine and no build toolchain is required; `brew upgrade` moves to the
+next release:
 
     brew tap dangowrt/comrade
     brew trust dangowrt/comrade   # Homebrew 4.3+ requires trusting a third-party tap
@@ -242,11 +244,16 @@ release, and `brew upgrade` moves to the next one:
 ### OpenWrt
 
 comrade is small enough to run on OpenWrt routers, and its plain-C
-footprint keeps it that way. Packaging for the OpenWrt packages feed is
-not yet in the tree, though: libjuice and kcp still need feed packages
-and the jech/dht dependency is undecided (see Dependencies), so there is
-no `apk add comrade` to run yet. Until the feed packages land, build it
-from source against the dependencies below.
+footprint keeps it that way. `net/comrade` and its `libjuice`/`kcp`
+dependencies (see Dependencies) are in openwrt/packages master, so
+`apk add comrade` works on a snapshot build:
+
+    apk update
+    apk add comrade   # hosting a session also needs tmux: apk add tmux
+
+Neither comrade nor libjuice/kcp have been backported to a stable
+release branch (23.05, 24.10) yet -- only libdht has -- so on those,
+build it from source against the dependencies below instead.
 
 ### Arch Linux
 
@@ -456,10 +463,10 @@ resulting binary lacks the session stack and says so.
 | Library | Purpose | Arch Linux | OpenWrt |
 |---------|---------|------------|---------|
 | libssh | SSH server and client | extra/libssh | libssh (packages feed) |
-| libjuice | ICE/STUN hole punching | extra/libjuice | new package needed (plain CMake, no dependencies) |
+| libjuice | ICE/STUN hole punching | extra/libjuice | libjuice (packages feed, master only) |
 | a crypto library | ed25519, ChaCha20-Poly1305, BLAKE2b | whichever libssh uses | whichever libssh uses (see below) |
-| kcp | reliable stream over UDP | install from upstream: `cmake -B build && cmake --install build` | new package needed |
-| jech/dht | mainline DHT (Kademlia, BEP 32) | source checkout, pass `-DCOMRADE_DHT_DIR=<path>` | to be decided |
+| kcp | reliable stream over UDP | install from upstream: `cmake -B build && cmake --install build` | libkcp (packages feed, master only) |
+| jech/dht | mainline DHT (Kademlia, BEP 32) | source checkout, pass `-DCOMRADE_DHT_DIR=<path>` | libdht (packages feed) |
 
 Runtime dependency: tmux, on the host side only.
 

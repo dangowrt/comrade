@@ -275,15 +275,16 @@ jobs:
         if: steps.guard.outputs.skip != 'true'
         uses: actions/deploy-pages@v5
 
-  # macOS binaries: build a Homebrew bottle for comrade on each arch, which the
-  # release job attaches to the tag's release, so `brew install comrade` fetches
-  # a prebuilt binary on Intel and Apple Silicon alike; the three small
-  # dependency formulae still build from source. A macOS bottle must be built
-  # natively per arch, so this matrixes over an Intel runner (self-hosted, or
-  # GitHub's macos-13 for a fork) and a GitHub-hosted Apple-Silicon runner. Only
-  # on a tag, and only when HOMEBREW_TAP_TOKEN (write access to the tap) is set.
-  # bottle-publish then merges both arches into the tap. See bottle-build.sh and
-  # bottle-publish.sh.
+  # macOS binaries: build a Homebrew bottle for comrade AND its three
+  # dependency formulae (libjuice, kcp, libdht) on each arch, which the release
+  # job attaches to the tag's release, so `brew install comrade` fetches a
+  # complete set of prebuilt binaries on Intel and Apple Silicon alike -- a
+  # binary-only install that needs no build tools or toolchain. A macOS bottle
+  # must be built natively per arch, so this matrixes over an Intel runner
+  # (self-hosted, or GitHub's macos-13 for a fork) and a GitHub-hosted
+  # Apple-Silicon runner. Only on a tag, and only when HOMEBREW_TAP_TOKEN
+  # (write access to the tap) is set. bottle-publish then merges both arches
+  # into the tap. See bottle-build.sh and bottle-publish.sh.
   bottle-build:
     needs: prepare
     if: ${{ github.ref_type == 'tag' }}
@@ -559,7 +560,8 @@ jobs:
             comrade-arm64.exe. Hosting a session also needs tmux:
             winget install arndawg.tmux-windows
           - macOS: the Homebrew bottles attached here back
-            brew install dangowrt/comrade/comrade
+            brew install dangowrt/comrade/comrade, a binary-only install with
+            no build tools required
           - Debian and Ubuntu: the signed apt repository, see the README.
           EOF
           ls -l dist

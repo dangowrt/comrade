@@ -1,8 +1,11 @@
 #!/bin/bash
 # Merge the per-arch bottles built by bottle-build.sh into the tap's comrade
-# formula and push the tap, so `brew install comrade` fetches a prebuilt binary
-# for either macOS arch. The bottle JSONs from every arch are expected under
-# ./bottles; --merge reads those, not the tarballs.
+# formula AND its three dependency formulae (libjuice, kcp, libdht), then push
+# the tap, so `brew install comrade` fetches a complete set of prebuilt
+# binaries for either macOS arch with no build toolchain required. The bottle
+# JSONs from every arch and every formula are expected under ./bottles;
+# --merge reads those, not the tarballs, and groups them by the formula name
+# each JSON carries, so one invocation updates all four formula files.
 #
 # The tarballs themselves are already on the tag's GitHub release, put there by
 # the release workflow's `release` job together with every other release asset,
@@ -44,9 +47,11 @@ awk -v url="$GIT_URL" -v tag="$TAG" -v rev="$REVISION" '
 ' packaging/homebrew/comrade.rb > "$TAPS/Formula/comrade.rb"
 brew trust "$TAP" 2>/dev/null || true
 
-# --merge folds every arch's JSON into one bottle block (each JSON already
-# carries its own os/arch tag and the release root_url set at build time).
-log "Merge all arches into the formula and push the tap"
+# --merge folds every arch's JSON into one bottle block per formula (each JSON
+# already carries its own formula name, os/arch tag and the release root_url
+# set at build time), so this one call updates comrade.rb, libjuice.rb, kcp.rb
+# and libdht.rb together.
+log "Merge all arches and formulae, and push the tap"
 brew bottle --merge --write --no-commit bottles/*.bottle.json
 cd "$TAPS"
 git config user.name 'github-actions[bot]'

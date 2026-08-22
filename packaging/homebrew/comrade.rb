@@ -3,8 +3,10 @@ class Comrade < Formula
   homepage "https://github.com/dangowrt/comrade"
   # The release CI stamps a stable `url` (the tagged commit) and a bottle block
   # into this formula when it pushes the tap, so `brew install comrade` fetches a
-  # prebuilt bottle. `head` stays for `brew install --HEAD comrade`, which builds
-  # the current tip of main; the build date is taken from the checked-out commit
+  # prebuilt bottle; libjuice, kcp and libdht get the same treatment, so the
+  # whole dependency chain installs as binaries with no build toolchain needed.
+  # `head` stays for `brew install --HEAD comrade`, which builds the current tip
+  # of main; the build date is taken from the checked-out commit
   # (SOURCE_DATE_EPOCH, honoured by the CMake build) so the result is reproducible.
   head "https://github.com/dangowrt/comrade.git", branch: "main"
   license "AGPL-3.0-or-later"
