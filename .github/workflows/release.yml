@@ -184,7 +184,13 @@ jobs:
           if-no-files-found: error
 
   publish:
-    needs: [prepare, build]
+    # release is a dependency for ordering, not artifacts: the pages deploy
+    # runs only once the tag's GitHub release exists, so the landing page and
+    # the apt repo can reference release assets -- their hashes, working links
+    # to the Windows executables -- without racing their upload. On a branch
+    # push release is skipped and publish now skips with it, which is what its
+    # own tag guard reduced every step to anyway.
+    needs: [prepare, build, release]
     runs-on: ${{ vars.RUNNER_LINUX && fromJSON(vars.RUNNER_LINUX) || 'ubuntu-latest' }}
     timeout-minutes: 20
     permissions:
