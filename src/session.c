@@ -93,6 +93,16 @@ static int fam_idx(int family)
 #define STUN_WARN_MS 8000
 
 /*
+ * If a gather has held a private/CGNAT IPv4 this long with no reflexive one,
+ * the pool server this attempt drew is written off and the next one is tried
+ * -- but only while no peer has answered yet: from then on the ICE retry path
+ * owns rotation. Bounded, so a network that filters all STUN settles for the
+ * STUN_WARN_MS escalation instead of churning offers forever.
+ */
+#define STUN_ROTATE_MS 3000
+#define STUN_ROTATE_MAX 3
+
+/*
  * A path is qualified when an authenticated probe has round-tripped on it; the
  * probe cadences, the measurements and the choice between paths are the model
  * in path.h. This bounds only the wait: how long a client keeps probing after
@@ -293,9 +303,12 @@ struct sess {
 	int escalated;			/* observer: client warned of DHT warm */
 	int peer_state;			/* observer: highest SESSION_PEER_* sent */
 	int established_fired;		/* observer: established sent once */
-	int have_priv4;			/* a private/CGNAT v4 host candidate (needs STUN) */
-	int have_srflx4;		/* STUN gave us a public v4 (reflexive) */
+	volatile int have_priv4;	/* a private/CGNAT v4 host candidate (needs
+					 * STUN); set from the gather thread */
+	volatile int have_srflx4;	/* STUN gave us a public v4 (reflexive) */
 	int stun_warned;		/* warned once that STUN produced nothing */
+	uint64_t stun_since_ms;		/* current agent started gathering */
+	int stun_rotations;		/* pool servers written off this network */
 
 	char status_rdv[80];		/* located rendezvous endpoint (host side) */
 
@@ -1091,12 +1104,24 @@ static void on_local_sdp(void *arg, const char *sdp)
 	s->have_local_sdp = 1;
 }
 
-/* libjuice gather thread: a candidate is ready. Append it for the main loop. */
+/* libjuice gather thread: a candidate is ready. Append it for the main loop,
+ * and note the v4 facts the STUN watchdog runs on -- here rather than in the
+ * observer report, which not every caller wires up. */
 static void on_ice_candidate(void *arg, const char *cand)
 {
 	struct sess *s = ((struct conn *)arg)->sess;
 	size_t used, room, n = strlen(cand);
+	const char *p = strstr(cand, "candidate:");
+	char addr[64], typ[16];
 
+	if (p && sscanf(p, "candidate:%*s %*d %*s %*u %63s %*d typ %15s",
+			addr, typ) == 2 && !strchr(addr, ':')) {
+		if (!strcmp(typ, "srflx"))
+			s->have_srflx4 = 1;
+		else if (!strcmp(typ, "host") &&
+			 addr_scope(addr) != NET_SCOPE_GLOBAL)
+			s->have_priv4 = 1;
+	}
 	pthread_mutex_lock(&s->trickle_lock);
 	used = strlen(s->trickle_sdp);
 	room = sizeof(s->trickle_sdp) - used - 1;
@@ -2052,6 +2077,7 @@ static int nat_setup(struct conn *c)
 	c->nat = nat_create(&cfg);
 	if (!c->nat || nat_gather(c->nat))
 		return -1;
+	s->stun_since_ms = now_ms();
 	conn_add_ice_path(c);
 	return 0;
 }
@@ -2550,6 +2576,23 @@ static int client_regather(struct sess *s)
 	s->peer_state = SESSION_PEER_SEEN;
 	sig_redeliver(s->sig);		/* we discarded the offer we were given */
 	return nat_setup(&s->c) ? -1 : 0;
+}
+
+/*
+ * The current agent's STUN attempt has run its course with no reflexive v4
+ * while one is called for (a private/CGNAT v4 and no public one on the
+ * table). Only for the rotated pool -- an explicit --stun server is the
+ * operator's to keep alive -- and only while the rotation budget lasts.
+ */
+static int stun_stall(struct sess *s)
+{
+	if (s->cfg->stun_host || !s->cfg->stun_auto || s->stun_count < 2)
+		return 0;
+	if (!s->have_priv4 || s->have_srflx4)
+		return 0;
+	if (s->stun_rotations >= STUN_ROTATE_MAX)
+		return 0;
+	return now_ms() - s->stun_since_ms > STUN_ROTATE_MS;
 }
 
 /* The single-connection path (client, or a host serving one connection): run
@@ -3257,6 +3300,9 @@ static int host_turnstile(struct sess *s)
 			s->trickle_dirty = 0;
 			pthread_mutex_unlock(&s->trickle_lock);
 			ts = TS_GATHER;
+			s->stun_rotations = 0;	/* fresh budget on the new network */
+			s->have_priv4 = 0;	/* and fresh v4 facts to run it on */
+			s->have_srflx4 = 0;
 			if (o && o->net_reset)
 				o->net_reset(o->arg);
 		}
@@ -3339,6 +3385,25 @@ static int host_turnstile(struct sess *s)
 		for (i = 0; i < HOST_MAX_WORKERS; i++)
 			if (punching[i])
 				active = 1;
+
+		/*
+		 * The advertised offer was gathered through a pool server that
+		 * produced no public v4: retire the listener and offer again
+		 * through the next one. Claims in flight are untouched -- only
+		 * the listener rotates, exactly as when an answer cannot be
+		 * taken up.
+		 */
+		if (ts == TS_WAIT_CLAIM && listen && !s->have_peer_sdp &&
+		    stun_stall(s)) {
+			s->ice_attempt++;
+			s->stun_rotations++;
+			conn_free(listen);
+			listen = NULL;
+			s->offer_conn = NULL;
+			s->have_local_sdp = 0;
+			s->local_sdp[0] = '\0';
+			ts = TS_GATHER;
+		}
 
 		switch (ts) {
 		case TS_GATHER:
@@ -3553,6 +3618,16 @@ int session_run(const struct session_cfg *cfg)
 		return 1;
 	if (cfg->stun_auto)
 		s.stun_servers = stunlist_load(&s.stun_count);
+	/* Start the rotation at a random server: it spreads the install base
+	 * across the community pool instead of hammering whoever is listed
+	 * first, and one dead head entry no longer disables STUN for
+	 * everybody. */
+	if (s.stun_count > 1) {
+		uint8_t rb[2];
+
+		random_bytes(rb, 2);
+		s.ice_attempt = ((rb[0] << 8) | rb[1]) % s.stun_count;
+	}
 	nat_log_level(cfg->log_level);	/* < 0 silences libjuice (see nat_log_level) */
 
 	conn_gen_ice(&s.c);
@@ -3612,8 +3687,21 @@ int session_run(const struct session_cfg *cfg)
 			s.trickle_dirty = 0;
 			pthread_mutex_unlock(&s.trickle_lock);
 			st = ST_WAIT_DHT;
+			s.stun_rotations = 0;	/* fresh budget on the new network */
+			s.have_priv4 = 0;	/* and fresh v4 facts to run it on */
+			s.have_srflx4 = 0;
 			if (o && o->net_reset)
 				o->net_reset(o->arg);
+		}
+		/*
+		 * No peer has answered yet and the pool server this attempt drew
+		 * produced no public v4: re-claim through the next one. Once an
+		 * answer is in play the ICE retry path below owns rotation.
+		 */
+		if ((st == ST_GATHER || st == ST_SIGNAL) && stun_stall(&s)) {
+			s.ice_attempt++;
+			s.stun_rotations++;
+			st = client_regather(&s) ? ST_FAIL : ST_GATHER;
 		}
 		if (now_ms() >= s.c.next_status_ms) {
 			publish_status(&s.c,
@@ -3830,6 +3918,7 @@ int session_run(const struct session_cfg *cfg)
 				dbg_logf("session: rejoin (roam)");
 				deadline = now_ms() +
 					(uint64_t)cfg->connect_timeout_s * 1000;
+				s.stun_rotations = 0;
 				if (net_changed(&s) && sig_rebuild(&s))
 					st = ST_FAIL;
 				else
