@@ -96,8 +96,13 @@ fi
 # The switch has to be caused by the path dying, not by the ordinary drift a
 # multi-homed pair does anyway: it must come after the blackhole, name the
 # blackholed endpoint as the one it left, and that endpoint must have been
-# scoring probe loss by then. awk rather than grep, so a v6 endpoint's brackets
-# stay literal. Prints "<endpoint moved to> <loss the old path was at, ppt>".
+# scoring probe loss by then -- at either end. The selection combines both
+# ends' published views, and the peer's verdict can land first: its probes
+# still arrive on the muted path, carrying its own rising loss for it, while
+# this end's first suppressed probe may still be inside the loss deadline.
+# Either side's loss proves the death; only 0/0 is drift. awk rather than
+# grep, so a v6 endpoint's brackets stay literal. Prints
+# "<endpoint moved to> <own loss ppt> <peer loss ppt>".
 sw=$(awk -v bh="$bh" '
 	/path blackholed:/ { seen = 1; next }
 	seen && /path: carrying / {
@@ -108,19 +113,21 @@ sw=$(awk -v bh="$bh" '
 			if ($f == "carrying") { to = $(f + 1); break }
 		rest = substr($0, i)
 		sub(/.*loss=/, "", rest)
-		sub(/\/.*/, "", rest)
-		print to, rest
+		split(rest, L, /[\/)]/)
+		print to, L[1], L[2]
 		exit
 	}
 ' "$tmp/client.log" 2>/dev/null)
 to=${sw%% *}
-lost=${sw##* }
+rest=${sw#* }
+own=${rest%% *}
+peer=${rest##* }
 if [ -z "$sw" ]; then
 	echo "FAIL: the client stayed on the path it can no longer send on"
 	grep -E 'path (blackholed|: carrying)' "$tmp/client.log"; rc=1
-elif [ "$lost" -eq 0 ]; then
-	echo "FAIL: the client left $bh without ever scoring a loss on it," \
-	     "so it drifted rather than switched"
+elif [ "$own" -eq 0 ] && [ "$peer" -eq 0 ]; then
+	echo "FAIL: the client left $bh with neither end scoring a loss on" \
+	     "it, so it drifted rather than switched"
 	grep -E 'path (blackholed|: carrying)' "$tmp/client.log"; rc=1
 fi
 # The heartbeat may or may not notice a switch, depending on where in its
@@ -144,8 +151,8 @@ grep -q "E2E PASS client" "$tmp/c.out" 2>/dev/null || {
 	cat "$tmp/c.out" "$tmp/c.err"; rc=1; }
 
 if [ "$rc" -eq 0 ]; then
-	echo "path switch e2e: $warm paths warm, $bh taken away at ${lost}ppt" \
-	     "loss, session moved to $to and stayed up"
+	echo "path switch e2e: $warm paths warm, $bh taken away at" \
+	     "${own}/${peer}ppt loss, session moved to $to and stayed up"
 else
 	echo "path switch e2e FAILED (blackholed $bh of $warm warm paths)"
 fi
