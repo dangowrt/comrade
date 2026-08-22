@@ -935,6 +935,7 @@ static void feed(struct ui *u, char *ln)
 {
 	int a, b, c;
 	char s[160];
+	char tok[256];
 
 	switch (ln[0]) {
 	case 'N':
@@ -954,22 +955,12 @@ static void feed(struct ui *u, char *ln)
 			um_rdv_stage(u, a, b);
 		break;
 	case 'T':
-		if (sscanf(ln + 1, " %255s", u->token) == 1) {
-			u->have_token = 1;
-			if (!u->anim)
-				vlog(u, "token  %s", u->token);
-			else
-				u->dirty = 1;
-		}
+		if (sscanf(ln + 1, " %255s", tok) == 1)
+			um_token(u, tok);
 		break;
 	case 'U':
-		if (sscanf(ln + 1, " %255s", u->token_ro) == 1) {
-			u->have_token_ro = 1;
-			if (!u->anim)
-				vlog(u, "token  %s (read-only)", u->token_ro);
-			else
-				u->dirty = 1;
-		}
+		if (sscanf(ln + 1, " %255s", tok) == 1)
+			um_token_ro(u, tok);
 		break;
 	case 'P':
 		s[0] = '\0';
