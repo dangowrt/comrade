@@ -24,6 +24,7 @@
 #include "sshd.h"
 #include "stream.h"
 #include "stunlist.h"
+#include "stunprobe.h"
 #include "tokgen.h"
 
 #define SESSION_CONV 0x70326531
@@ -133,6 +134,16 @@ static int fam_idx(int family)
  * candpack_encode answers with a failed post rather than a truncated one.
  */
 #define POOL4_MAX 8
+
+/*
+ * The active probe that fills the pool set: this many servers asked, over one
+ * socket, the moment the session starts -- so the members are on the table
+ * when the first description posts, rather than trickling in one gather at a
+ * time (measured: one member per STUN name per agent, far too slow for a
+ * punch on the first attempt). A handful of packets, once per network.
+ */
+#define STUN_PROBE_SERVERS 6
+#define STUN_PROBE_MS 3000
 
 /*
  * Post-teardown linger for the bridge. The host keeps flushing generously, to
@@ -356,6 +367,11 @@ struct sess {
 	 */
 	uint8_t pool4[POOL4_MAX][4];
 	int npool4;
+	int pool_reported;		/* members the dashboard has been shown */
+	int pool_posted;		/* members the posted description fans */
+	pthread_t probe_th;		/* the active pool probe (stunprobe) */
+	int probe_running;
+	volatile int probe_stop;
 
 	/*
 	 * Host admission registry, all touched only on the host main thread (no
@@ -947,7 +963,7 @@ static void sdp_filter(const char *in, int family, char *out, size_t outlen)
  * that picks its egress per destination still aims a check at the member
  * chosen for it. With the single address of an ordinary NAT this is a no-op.
  */
-static void fan_local_sdp(struct sess *s)
+static int fan_local_sdp(struct sess *s)
 {
 	uint8_t pool[POOL4_MAX][4];
 	int n, i;
@@ -957,9 +973,45 @@ static void fan_local_sdp(struct sess *s)
 	for (i = 0; i < n; i++)
 		memcpy(pool[i], s->pool4[i], 4);
 	pthread_mutex_unlock(&s->trickle_lock);
-	if (n < 2)
-		return;
-	cand_sdp_fan_v4(s->local_sdp, sizeof(s->local_sdp), pool, (size_t)n);
+	if (n >= 2)
+		cand_sdp_fan_v4(s->local_sdp, sizeof(s->local_sdp), pool,
+				(size_t)n);
+	return n;
+}
+
+/*
+ * Members the probe found since the last pass: put them on the dashboard the
+ * moment they are known, and -- where the caller says a posted description may
+ * be replaced -- widen it with them and post again. The peer treats the
+ * re-post as a candidate trickle for the agent it already primed, so a punch
+ * in flight only gains targets.
+ */
+static void pool_pump(struct sess *s, int repost_ok)
+{
+	const struct session_obs *o = s->cfg->obs;
+	uint8_t pool[POOL4_MAX][4];
+	int n, i;
+
+	pthread_mutex_lock(&s->trickle_lock);
+	n = s->npool4;
+	for (i = 0; i < n; i++)
+		memcpy(pool[i], s->pool4[i], 4);
+	pthread_mutex_unlock(&s->trickle_lock);
+	if (o && o->net) {
+		for (i = s->pool_reported; i < n; i++) {
+			char ip[64];
+
+			if (inet_ntop(AF_INET, pool[i], ip, sizeof(ip)))
+				o->net(o->arg, 4, addr_scope(ip),
+				       NET_VIA_STUN, ip);
+		}
+	}
+	s->pool_reported = n;
+	if (repost_ok && s->have_local_sdp && n >= 2 && n > s->pool_posted) {
+		s->pool_posted = fan_local_sdp(s);
+		sig_post(s->sig, (const uint8_t *)s->local_sdp,
+			 strlen(s->local_sdp));
+	}
 }
 
 /* Like sdp_filter(), for a peer's SDP: also drops any host candidate that
@@ -1161,6 +1213,63 @@ static void on_local_sdp(void *arg, const char *sdp)
 /* libjuice gather thread: a candidate is ready. Append it for the main loop,
  * and note the v4 facts the STUN watchdog runs on -- here rather than in the
  * observer report, which not every caller wires up. */
+/* One more public v4 the NAT has been seen mapping us to; from the gather
+ * thread and the probe thread alike. */
+static void pool_note(struct sess *s, const uint8_t b[4])
+{
+	int i;
+
+	pthread_mutex_lock(&s->trickle_lock);
+	for (i = 0; i < s->npool4; i++)
+		if (!memcmp(s->pool4[i], b, 4))
+			break;
+	if (i == s->npool4 && i < POOL4_MAX)
+		memcpy(s->pool4[s->npool4++], b, 4);
+	pthread_mutex_unlock(&s->trickle_lock);
+}
+
+static void probe_hit(void *arg, const uint8_t addr[4])
+{
+	pool_note(arg, addr);
+}
+
+static void *stun_probe_thread(void *arg)
+{
+	struct sess *s = arg;
+	char *targets[STUN_PROBE_SERVERS];
+	uint8_t seed[STUN_PROBE_TXID_LEN];
+	int n = 0, i;
+
+	for (i = 0; i < s->stun_count && n < STUN_PROBE_SERVERS; i++)
+		targets[n++] = s->stun_servers[(s->ice_attempt + i) %
+					       s->stun_count];
+	random_bytes(seed, sizeof(seed));
+	stun_probe_run(targets, n, STUN_PROBE_MS, seed, &s->probe_stop,
+		       probe_hit, s);
+	return NULL;
+}
+
+static void stun_probe_halt(struct sess *s)
+{
+	if (!s->probe_running)
+		return;
+	s->probe_stop = 1;
+	pthread_join(s->probe_th, NULL);
+	s->probe_running = 0;
+}
+
+/* (Re)start the pool probe: at session start, and on each new network. An
+ * operator-pinned server is theirs alone to talk to, so no probing then. */
+static void stun_probe_kick(struct sess *s)
+{
+	if (s->cfg->stun_host || !s->cfg->stun_auto || s->stun_count < 1)
+		return;
+	stun_probe_halt(s);
+	s->probe_stop = 0;
+	if (!pthread_create(&s->probe_th, NULL, stun_probe_thread, s))
+		s->probe_running = 1;
+}
+
 static void on_ice_candidate(void *arg, const char *cand)
 {
 	struct sess *s = ((struct conn *)arg)->sess;
@@ -1172,18 +1281,10 @@ static void on_ice_candidate(void *arg, const char *cand)
 			addr, typ) == 2 && !strchr(addr, ':')) {
 		if (!strcmp(typ, "srflx")) {
 			uint8_t b[4];
-			int i;
 
 			s->have_srflx4 = 1;
-			if (inet_pton(AF_INET, addr, b) == 1) {
-				pthread_mutex_lock(&s->trickle_lock);
-				for (i = 0; i < s->npool4; i++)
-					if (!memcmp(s->pool4[i], b, 4))
-						break;
-				if (i == s->npool4 && i < POOL4_MAX)
-					memcpy(s->pool4[s->npool4++], b, 4);
-				pthread_mutex_unlock(&s->trickle_lock);
-			}
+			if (inet_pton(AF_INET, addr, b) == 1)
+				pool_note(s, b);
 		} else if (!strcmp(typ, "host") &&
 			   addr_scope(addr) != NET_SCOPE_GLOBAL)
 			s->have_priv4 = 1;
@@ -3385,6 +3486,9 @@ static int host_turnstile(struct sess *s)
 			s->stun_rotations = 0;	/* fresh budget on the new network */
 			s->have_priv4 = 0;	/* and fresh v4 facts to run it on */
 			s->have_srflx4 = 0;
+			s->pool_reported = 0;
+			s->pool_posted = 0;
+			stun_probe_kick(s);
 			if (o && o->net_reset)
 				o->net_reset(o->arg);
 		}
@@ -3475,6 +3579,7 @@ static int host_turnstile(struct sess *s)
 		 * the listener rotates, exactly as when an answer cannot be
 		 * taken up.
 		 */
+		pool_pump(s, ts == TS_WAIT_CLAIM && !s->have_peer_sdp);
 		if (ts == TS_WAIT_CLAIM && listen && !s->have_peer_sdp &&
 		    stun_stall(s)) {
 			s->ice_attempt++;
@@ -3512,7 +3617,7 @@ static int host_turnstile(struct sess *s)
 					   sizeof(filtered));
 				snprintf(s->local_sdp, sizeof(s->local_sdp),
 					 "%s", filtered);
-				fan_local_sdp(s);
+				s->pool_posted = fan_local_sdp(s);
 				sig_rotate(s->sig, (const uint8_t *)s->local_sdp,
 					   strlen(s->local_sdp));
 				sig_locate(s->sig);
@@ -3711,6 +3816,7 @@ int session_run(const struct session_cfg *cfg)
 		random_bytes(rb, 2);
 		s.ice_attempt = ((rb[0] << 8) | rb[1]) % s.stun_count;
 	}
+	stun_probe_kick(&s);
 	nat_log_level(cfg->log_level);	/* < 0 silences libjuice (see nat_log_level) */
 
 	conn_gen_ice(&s.c);
@@ -3774,6 +3880,9 @@ int session_run(const struct session_cfg *cfg)
 			s.stun_rotations = 0;	/* fresh budget on the new network */
 			s.have_priv4 = 0;	/* and fresh v4 facts to run it on */
 			s.have_srflx4 = 0;
+			s.pool_reported = 0;
+			s.pool_posted = 0;
+			stun_probe_kick(&s);
 			if (o && o->net_reset)
 				o->net_reset(o->arg);
 		}
@@ -3787,6 +3896,7 @@ int session_run(const struct session_cfg *cfg)
 			s.stun_rotations++;
 			st = client_regather(&s) ? ST_FAIL : ST_GATHER;
 		}
+		pool_pump(&s, st == ST_SIGNAL || st == ST_WAIT_ICE);
 		if (now_ms() >= s.c.next_status_ms) {
 			publish_status(&s.c,
 				       st == ST_WAIT_ICE ? CONN_PUNCHING :
@@ -3857,7 +3967,7 @@ int session_run(const struct session_cfg *cfg)
 					   sizeof(filtered));
 				snprintf(s.local_sdp, sizeof(s.local_sdp),
 					 "%s", filtered);
-				fan_local_sdp(&s);
+				s.pool_posted = fan_local_sdp(&s);
 				sig_post(s.sig, (const uint8_t *)s.local_sdp,
 					 strlen(s.local_sdp));
 				if (cfg->is_host && (cfg->sig_flags & SIG_DHT))
@@ -3885,7 +3995,8 @@ int session_run(const struct session_cfg *cfg)
 					snprintf(s.c.claim_ufrag,
 						 sizeof(s.c.claim_ufrag), "%s",
 						 ufrag);
-				fan_local_sdp(&s);	/* members learnt since
+				s.pool_posted = fan_local_sdp(&s);
+							/* members learnt since
 							 * the ST_GATHER post */
 				sig_post(s.sig, (const uint8_t *)s.local_sdp,
 					 strlen(s.local_sdp));
@@ -4019,6 +4130,9 @@ int session_run(const struct session_cfg *cfg)
 					pthread_mutex_lock(&s.trickle_lock);
 					s.npool4 = 0;
 					pthread_mutex_unlock(&s.trickle_lock);
+					s.pool_reported = 0;
+					s.pool_posted = 0;
+					stun_probe_kick(&s);
 					if (sig_rebuild(&s)) {
 						st = ST_FAIL;
 						break;
@@ -4062,6 +4176,7 @@ done:
 	if (s.lan)
 		lanlink_destroy(s.lan);
 	sig_destroy(s.sig);
+	stun_probe_halt(&s);
 	stunlist_free(s.stun_servers, s.stun_count);
 	pthread_mutex_destroy(&s.trickle_lock);
 	pthread_mutex_destroy(&s.c.status_lock);

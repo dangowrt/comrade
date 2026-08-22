@@ -439,6 +439,10 @@ add_library(comrade_nat STATIC src/nat.c)
 target_include_directories(comrade_nat PUBLIC src)
 target_link_libraries(comrade_nat PUBLIC LibJuice::LibJuice)
 
+add_library(comrade_stunprobe STATIC src/stunprobe.c)
+target_include_directories(comrade_stunprobe PUBLIC src)
+target_link_libraries(comrade_stunprobe PUBLIC comrade_compat)
+
 add_library(comrade_path STATIC src/path.c)
 target_include_directories(comrade_path PUBLIC src)
 target_link_libraries(comrade_path PUBLIC comrade_crypto comrade_compat)
@@ -494,8 +498,8 @@ add_library(comrade_session STATIC src/session.c)
 target_include_directories(comrade_session PUBLIC src)
 target_link_libraries(comrade_session PUBLIC
 	comrade_sig comrade_nat comrade_lanlink comrade_stream comrade_ssh
-	comrade_bridge comrade_token comrade_crypto comrade_stunlist comrade_conn
-	comrade_path comrade_ctlproto comrade_dbg)
+	comrade_bridge comrade_token comrade_crypto comrade_stunlist
+	comrade_stunprobe comrade_conn comrade_path comrade_ctlproto comrade_dbg)
 
 # The view: the only module that draws to the terminal (MVC).
 add_library(comrade_ui STATIC src/ui.c)
@@ -628,6 +632,10 @@ if(BUILD_TESTING)
 	add_executable(candpolicy_test tests/candpolicy_test.c)
 	target_link_libraries(candpolicy_test comrade_crypto)
 	add_test(NAME candpolicy_test COMMAND candpolicy_test)
+
+	add_executable(stunprobe_test tests/stunprobe_test.c)
+	target_link_libraries(stunprobe_test comrade_stunprobe)
+	add_test(NAME stunprobe_test COMMAND stunprobe_test)
 
 	add_executable(candpack_test tests/candpack_test.c)
 	target_link_libraries(candpack_test comrade_crypto)
@@ -811,7 +819,7 @@ if(BUILD_TESTING)
 	foreach(t IN ITEMS
 		token_test tokgen_test termfilter_test ctlproto_test netmon_test
 		candpolicy_test candpack_test mailbox_test roauth_test
-		path_test bep44_test
+		stunprobe_test path_test bep44_test
 		bep44_pin_test sig_rebuild_test natstream_test sshloop_test
 		sshfwd_test sshexit_test sshro_test sshkcp_test sshctl_test)
 		if(TARGET ${t})
