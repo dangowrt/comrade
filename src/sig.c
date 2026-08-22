@@ -43,6 +43,9 @@ struct sig {
 
 	struct sig_mcast *mc;
 	int mcast_delivered;
+	int mcast_claims;		/* host demultiplexes lanlink itself, so a
+					 * mcast claimant is a direct claim, not an
+					 * ICE offer for the turnstile */
 
 	struct mailbox mb;		/* the two-slot rendezvous container */
 	uint8_t mcast_mine[SIG_MCAST_SEALED_MAX];	/* our announcement, sealed (mcast) */
@@ -255,6 +258,11 @@ int sig_subscribe_direct(struct sig *s, sig_direct_cb *cb, void *arg)
 	return 0;
 }
 
+void sig_set_mcast_claims(struct sig *s, int on)
+{
+	s->mcast_claims = on;
+}
+
 int sig_seed_node(struct sig *s, const struct sockaddr *sa, socklen_t len)
 {
 	if (!s->dht_engaged && engage_dht(s))
@@ -394,28 +402,48 @@ static void on_dht_get(void *arg, const uint8_t *v, size_t v_len, int64_t seq,
 	}
 }
 
-static int addr_is_link_local(const struct sockaddr *sa)
+/*
+ * LAN scope: a source on our own layer-2 segment. Multicast is link-scoped
+ * (TTL/hops 1), so a claimant we hear is on our segment and reachable over the
+ * direct transport without ICE. Link-local, RFC1918 and ULA all qualify. This
+ * is not the trust boundary -- the seal is; it only decides which peers get the
+ * ICE-free bypass.
+ */
+static int addr_is_lan_scope(const struct sockaddr *sa)
 {
 	if (sa->sa_family == AF_INET6) {
 		const struct sockaddr_in6 *s6 = (const struct sockaddr_in6 *)sa;
+		const uint8_t *b = s6->sin6_addr.s6_addr;
 
-		return IN6_IS_ADDR_LINKLOCAL(&s6->sin6_addr);
+		if (IN6_IS_ADDR_LINKLOCAL(&s6->sin6_addr))
+			return 1;
+		return (b[0] & 0xfe) == 0xfc;			/* fc00::/7 ULA */
 	}
 	if (sa->sa_family == AF_INET) {
 		const struct sockaddr_in *s4 = (const struct sockaddr_in *)sa;
 		const uint8_t *b = (const uint8_t *)&s4->sin_addr;
 
-		return b[0] == 169 && b[1] == 254;
+		if (b[0] == 10)					/* 10.0.0.0/8 */
+			return 1;
+		if (b[0] == 172 && b[1] >= 16 && b[1] <= 31)	/* 172.16.0.0/12 */
+			return 1;
+		if (b[0] == 192 && b[1] == 168)			/* 192.168.0.0/16 */
+			return 1;
+		if (b[0] == 169 && b[1] == 254)			/* 169.254.0.0/16 */
+			return 1;
 	}
 	return 0;
 }
 
 /*
  * Open a multicast announcement: the peer's direct port (2 bytes) followed by
- * the routable candpack. Deliver the candidates to ICE as usual; and when the
- * announcement arrived from a link-local source -- a clear layer-2 path libjuice
- * will not touch -- hand the caller the peer's direct endpoint (that source,
- * zone id kept, at the announced port) for the bypass.
+ * the routable candpack. Split by role. A client feeds the candidates to ICE and
+ * learns the host's direct endpoint for the bypass. A host that demultiplexes
+ * the shared lanlink socket (mcast_claims) does NOT feed the candpack to its ICE
+ * turnstile -- it can serve a same-segment claimant directly over lanlink, so
+ * punching it too would serve the client twice; instead the claimant's endpoint
+ * becomes a direct claim. Either way the endpoint is (that source, zone id kept,
+ * at the announced port), adopted only from a LAN-scope source of a sealed blob.
  */
 static void deliver_peer_mcast(struct sig *s, const uint8_t *sealed, size_t len,
 			       const struct sockaddr *src, socklen_t srclen)
@@ -431,10 +459,10 @@ static void deliver_peer_mcast(struct sig *s, const uint8_t *sealed, size_t len,
 		return;
 	dport = (uint16_t)((plain[0] << 8) | plain[1]);
 	slen = candpack_decode(plain + 2, (size_t)n - 2, sdp, sizeof(sdp));
-	if (slen >= 0 && s->cb)
+	if (slen >= 0 && s->cb && !(s->is_host && s->mcast_claims))
 		s->cb(s->arg, (const uint8_t *)sdp, (size_t)slen);
 
-	if (s->direct_cb && dport && addr_is_link_local(src) &&
+	if (s->direct_cb && dport && addr_is_lan_scope(src) &&
 	    (size_t)srclen <= sizeof(ep)) {
 		memcpy(&ep, src, srclen);
 		if (ep.ss_family == AF_INET6)

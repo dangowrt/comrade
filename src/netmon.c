@@ -172,9 +172,12 @@ void netmon_fingerprint(uint8_t fp[32], struct netmon_addr *addrs, size_t n)
 		return;
 	}
 	for (i = 0; i < n; i++) {
+		size_t al = addrs[i].addrlen > sizeof(addrs[i].addr) ?
+			    sizeof(addrs[i].addr) : addrs[i].addrlen;
+
 		cc_blake2b_update(&ctx, (const uint8_t *)addrs[i].ifname,
 				  sizeof(addrs[i].ifname));
-		cc_blake2b_update(&ctx, &addrs[i].addr[0], addrs[i].addrlen);
+		cc_blake2b_update(&ctx, &addrs[i].addr[0], al);
 	}
 	cc_blake2b_final(&ctx, fp);
 }

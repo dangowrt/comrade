@@ -33,7 +33,7 @@ static size_t emit_seq(struct termfilter *f, char *out)
 
 	f->pend[f->npend] = '\0';
 	if (f->pend[f->npend - 1] == 't' && f->reserve > 0 &&
-	    sscanf(f->pend, "\033[8;%d;%dt", &rows, &cols) == 2 &&
+	    sscanf(f->pend, "\033[8;%5d;%5dt", &rows, &cols) == 2 &&
 	    rows > f->reserve) {
 		n = snprintf(out, sizeof(f->pend), "\033[8;%d;%dt",
 			     rows - f->reserve, cols);

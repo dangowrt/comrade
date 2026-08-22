@@ -96,11 +96,15 @@ void ctl_rdv_encode(uint8_t *pl, int family, const struct sockaddr *sa)
 	pl[2] = (uint8_t)port;
 }
 
-int ctl_rdv_decode(const uint8_t *pl, struct sockaddr_storage *out,
+int ctl_rdv_decode(const uint8_t *pl, size_t plen, struct sockaddr_storage *out,
 		   socklen_t *len)
 {
-	uint16_t port = (uint16_t)((pl[1] << 8) | pl[2]);
+	uint16_t port;
 
+	*len = 0;
+	if (plen < CTL_RDV_PLEN)
+		return 0;
+	port = (uint16_t)((pl[1] << 8) | pl[2]);
 	memset(out, 0, sizeof(*out));
 	if (pl[0] == 6) {
 		struct sockaddr_in6 *a = (struct sockaddr_in6 *)out;

@@ -49,7 +49,7 @@ void ctl_reframer_feed(struct ctl_reframer *r, const uint8_t *in, size_t n,
 /* A rendezvous node <-> a CTL_RDV payload (CTL_RDV_PLEN bytes). Decode returns
  * the family (4 or 6), or 0 if the payload names neither. */
 void ctl_rdv_encode(uint8_t *pl, int family, const struct sockaddr *sa);
-int ctl_rdv_decode(const uint8_t *pl, struct sockaddr_storage *out,
+int ctl_rdv_decode(const uint8_t *pl, size_t plen, struct sockaddr_storage *out,
 		   socklen_t *len);
 
 #endif

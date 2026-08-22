@@ -92,6 +92,10 @@ static int fam_idx(int family)
 #define LINGER_HOST_MS 5000
 #define LINGER_CLIENT_MS 200
 
+/* The host serves at most this many clients at once (ICE and LAN workers share
+ * the budget). Defined here so the LAN admission registry can size to it. */
+#define HOST_MAX_WORKERS 16
+
 enum state {
 	ST_WAIT_DHT,
 	ST_GATHER,
@@ -190,6 +194,7 @@ struct sess {
 	char peer_sdp[NAT_SDP_MAX];
 	volatile int have_peer_sdp;
 	int remote_set;
+	struct conn *offer_conn;		/* live conn the peer-offer callback feeds */
 
 	uint64_t ice_attempt_start;
 	int ice_attempt;
@@ -219,6 +224,18 @@ struct sess {
 	char **stun_servers;		/* rotated across ICE retries (host:port) */
 	int stun_count;
 	char stun_host[128];		/* the current attempt's host, split out */
+
+	/*
+	 * Host LAN admission registry, all touched only on the host main thread
+	 * (no lock): the active direct workers (for source-demux and dedup) and a
+	 * small bounded queue of newly-claimed endpoints awaiting a worker.
+	 */
+	struct conn *lan_conns[HOST_MAX_WORKERS];
+	struct {
+		struct sockaddr_storage sa;
+		socklen_t len;
+	} lan_pending[HOST_MAX_WORKERS];
+	int lan_pending_n;
 
 	struct conn c;			/* the (single, for now) connection */
 };
@@ -522,6 +539,62 @@ static int client_seed_rendezvous(struct sess *s)
 	return n;
 }
 
+/*
+ * Client accelerator (mirror of client_seed_rendezvous): for each family whose
+ * endpoint is direct (EPx_RDV clear) and non-zero, preload the host's endpoint
+ * as our lanlink peer at t=0, so KCP starts toward the host immediately instead
+ * of waiting to hear its multicast announcement. The host still learns us from
+ * our own sealed announcement; this only primes the reverse direction. A later
+ * multicast on_direct_peer overwrites this with the same endpoint. Only called
+ * once s->lan exists (transport_send would otherwise send on a NULL socket).
+ */
+static void client_direct_connect(struct sess *s)
+{
+	const struct token *t = &s->cfg->tok;
+	int i, any;
+
+	if (!(t->flags & TOKEN_FLAG_EP6_RDV) && t->ep6_port) {
+		struct sockaddr_in6 a;
+
+		for (i = 0, any = 0; i < TOKEN_EP6_LEN; i++)
+			if (t->ep6_addr[i])
+				any = 1;
+		if (any) {
+			memset(&a, 0, sizeof(a));
+			a.sin6_family = AF_INET6;
+			memcpy(&a.sin6_addr, t->ep6_addr, TOKEN_EP6_LEN);
+			a.sin6_port = htons(t->ep6_port);
+			if (!lanlink_map_peer((struct sockaddr *)&a, sizeof(a),
+					      &s->c.lan_peer)) {
+				s->c.have_lan_peer = 1;
+				fmt_sockaddr((struct sockaddr *)&a, sizeof(a),
+					     s->c.direct_addr,
+					     sizeof(s->c.direct_addr));
+			}
+		}
+	}
+	if (!(t->flags & TOKEN_FLAG_EP4_RDV) && t->ep4_port) {
+		struct sockaddr_in a;
+
+		for (i = 0, any = 0; i < TOKEN_EP4_LEN; i++)
+			if (t->ep4_addr[i])
+				any = 1;
+		if (any) {
+			memset(&a, 0, sizeof(a));
+			a.sin_family = AF_INET;
+			memcpy(&a.sin_addr, t->ep4_addr, TOKEN_EP4_LEN);
+			a.sin_port = htons(t->ep4_port);
+			if (!lanlink_map_peer((struct sockaddr *)&a, sizeof(a),
+					      &s->c.lan_peer)) {
+				s->c.have_lan_peer = 1;
+				fmt_sockaddr((struct sockaddr *)&a, sizeof(a),
+					     s->c.direct_addr,
+					     sizeof(s->c.direct_addr));
+			}
+		}
+	}
+}
+
 /* Host: if the token already carries rendezvous nodes -- a persisted anchor
  * from a previous idle attempt -- adopt and reinforce them instead of locating
  * fresh ones, so the shared token stays valid and the node does not churn. */
@@ -712,7 +785,7 @@ static void ctl_dispatch(void *arg, int type, const uint8_t *pl, size_t plen)
 	} else if (type == CTLM_RDV && plen >= CTL_RDV_PLEN) {
 		struct sockaddr_storage sa;
 		socklen_t sl = 0;
-		int fam = ctl_rdv_decode(pl, &sa, &sl);
+		int fam = ctl_rdv_decode(pl, plen, &sa, &sl);
 
 		if (fam) {
 			int i = fam_idx(fam);
@@ -776,14 +849,106 @@ static void on_direct_peer(void *arg, const struct sockaddr *peer, socklen_t len
 		return;
 	c->have_lan_peer = 1;
 	fmt_sockaddr(peer, len, c->direct_addr, sizeof(c->direct_addr));
+	/*
+	 * We share the host's segment and will carry the session over lanlink, so
+	 * a client stops contending for the DHT turnstile slot at once: it frees
+	 * the slot for a genuinely remote client and, more importantly, stops the
+	 * host serving us twice -- once over lanlink here, and once over ICE if it
+	 * had also picked up our DHT answer. Safe by the link-scope invariant: a
+	 * host we can hear over multicast is reachable over lanlink. A host learns
+	 * its claimants differently (on_direct_claim) and never withdraws.
+	 */
+	if (!c->sess->cfg->is_host)
+		sig_withdraw(c->sess->sig);
+}
+
+/*
+ * A LAN peer's identity on the segment is its lanlink port. The client announces
+ * that one port (inside the seal, so it is authenticated) and always sends from
+ * it, while its multicast announcement is heard once PER FAMILY from a different
+ * source address; keying on the port -- not the address -- folds those into one
+ * client, so a dual-stack peer is admitted once, not twice. The dual-stack socket
+ * receives either family, so the worker's send address may differ from the
+ * client's send address without harm (KCP tolerates an asymmetric path).
+ */
+static int lan_peer_same(const struct sockaddr_in6 *a, const struct sockaddr_in6 *b)
+{
+	return a->sin6_port == b->sin6_port;
+}
+
+/* Is this endpoint already an active LAN worker? (host main thread only) */
+static int lan_conn_active(struct sess *s, const struct sockaddr_in6 *peer)
+{
+	int i;
+
+	for (i = 0; i < HOST_MAX_WORKERS; i++)
+		if (s->lan_conns[i] && s->lan_conns[i]->have_lan_peer &&
+		    lan_peer_same(&s->lan_conns[i]->lan_peer, peer))
+			return 1;
+	return 0;
+}
+
+/*
+ * Host: a sealed multicast answer from a LAN-scope source is a direct claim. Its
+ * (source, announced-port) endpoint is its identity; queue it for admission
+ * unless it is already active or already queued (deduped by endpoint). Runs on
+ * the host main thread (from sig_dispatch in pump_once); no worker work here.
+ */
+static void on_direct_claim(void *arg, const struct sockaddr *src, socklen_t srclen)
+{
+	struct sess *s = arg;
+	struct sockaddr_in6 mapped, qmapped;
+	int i;
+
+	if (lanlink_map_peer(src, srclen, &mapped))
+		return;
+	if (lan_conn_active(s, &mapped))
+		return;
+	for (i = 0; i < s->lan_pending_n; i++)
+		if (lanlink_map_peer((struct sockaddr *)&s->lan_pending[i].sa,
+				     s->lan_pending[i].len, &qmapped) == 0 &&
+		    lan_peer_same(&qmapped, &mapped))
+			return;
+	if (s->lan_pending_n >= HOST_MAX_WORKERS)
+		return;			/* full: the 1 Hz re-broadcast re-offers */
+	memcpy(&s->lan_pending[s->lan_pending_n].sa, src, srclen);
+	s->lan_pending[s->lan_pending_n].len = srclen;
+	s->lan_pending_n++;
+}
+
+/*
+ * Host: an inbound lanlink datagram. Demultiplex it by source into the owning
+ * worker's stream. Runs on the host main thread (lanlink_dispatch from
+ * pump_once); lan_conns[] is mutated only here on the main thread, so no lock
+ * beyond the conn's stream_lock (taken by deliver_stream against a teardown).
+ */
+static void host_lan_recv(void *arg, const struct sockaddr *src, socklen_t srclen,
+			  const uint8_t *data, size_t len)
+{
+	struct sess *s = arg;
+	struct sockaddr_in6 mapped;
+	int i;
+
+	if (lanlink_map_peer(src, srclen, &mapped))
+		return;
+	for (i = 0; i < HOST_MAX_WORKERS; i++) {
+		struct conn *c = s->lan_conns[i];
+
+		if (c && c->have_lan_peer && lan_peer_same(&c->lan_peer, &mapped)) {
+			deliver_stream(c, data, len);
+			return;
+		}
+	}
 }
 
 static void on_peer_offer(void *arg, const uint8_t *data, size_t len)
 {
-	struct conn *c = arg;
-	struct sess *s = c->sess;
+	struct sess *s = arg;
+	struct conn *c = s->offer_conn;
 	char filtered[NAT_SDP_MAX];
 
+	if (!c)
+		return;
 	if (len >= sizeof(s->peer_sdp))
 		len = sizeof(s->peer_sdp) - 1;
 	memcpy(s->peer_sdp, data, len);
@@ -1576,7 +1741,6 @@ static void conn_free(struct conn *c)
 	free(c);
 }
 
-#define HOST_MAX_WORKERS 16
 #define HOST_IDLE_MS 3000		/* exit after this idle once we have served */
 
 struct worker {
@@ -1617,12 +1781,73 @@ static int worker_spawn(struct worker *ws, struct conn *c)
 }
 
 /*
+ * Admit each newly-claimed LAN endpoint: allocate a conn bound to that peer over
+ * the shared lanlink socket (no ICE, no punch -- a multicast claimant is already
+ * directly reachable) and spawn a worker for it, alongside the ICE turnstile.
+ * Runs on the host main thread each loop, fully concurrent with the ICE state
+ * machine. Endpoints that overflow the worker budget are dropped; the client's
+ * 1 Hz re-broadcast re-offers them.
+ */
+static void lan_drain(struct sess *s, struct worker *ws, int *dash_seq)
+{
+	const struct session_obs *o = s->cfg->obs;
+	int p, i;
+
+	for (p = 0; p < s->lan_pending_n; p++) {
+		struct sockaddr_in6 mapped;
+		struct conn *c;
+		int slot = -1;
+
+		if (lanlink_map_peer((struct sockaddr *)&s->lan_pending[p].sa,
+				     s->lan_pending[p].len, &mapped))
+			continue;
+		if (lan_conn_active(s, &mapped))
+			continue;		/* a re-broadcast during setup */
+		for (i = 0; i < HOST_MAX_WORKERS; i++)
+			if (!s->lan_conns[i]) {
+				slot = i;
+				break;
+			}
+		if (slot < 0)
+			break;			/* worker table full */
+		c = conn_alloc(s);
+		if (!c)
+			break;
+		c->lan_peer = mapped;
+		c->have_lan_peer = 1;		/* c->nat stays NULL: lanlink only */
+		fmt_sockaddr((struct sockaddr *)&s->lan_pending[p].sa,
+			     s->lan_pending[p].len, c->direct_addr,
+			     sizeof(c->direct_addr));
+		c->dash_id = ++*dash_seq;
+		snprintf(c->status_peer, sizeof(c->status_peer), "%s",
+			 c->direct_addr);
+		s->lan_conns[slot] = c;
+		if (o && o->peer) {
+			o->peer(o->arg, c->dash_id, SESSION_PEER_SEEN,
+				c->direct_addr);
+			o->peer(o->arg, c->dash_id, SESSION_PEER_LIVE,
+				c->direct_addr);
+		}
+		if (worker_spawn(ws, c)) {	/* worker table full */
+			if (o && o->peer)
+				o->peer(o->arg, c->dash_id, SESSION_PEER_GONE,
+					c->direct_addr);
+			s->lan_conns[slot] = NULL;
+			conn_free(c);
+		}
+	}
+	s->lan_pending_n = 0;			/* drained; overflow re-offered */
+}
+
+/*
  * Host turnstile: advertise one offer at a time (a fresh ICE identity per
  * offer), accept a client's claimed answer, punch, and on connect hand the
  * connection to a worker on the shared command, then rotate the offer for the
- * next client. Joins are serialised through the single mailbox slot; the worker
- * sessions run concurrently. Signalling and the rendezvous keep-warm stay on
- * this thread (sig is single-threaded); workers only pump their own transport.
+ * next client. DHT/ICE joins are serialised through the single mailbox slot;
+ * same-segment multicast claimants are admitted directly over the shared
+ * lanlink socket (lan_drain), fully concurrently. The worker sessions run
+ * concurrently. Signalling and the rendezvous keep-warm stay on this thread
+ * (sig is single-threaded); workers only pump their own transport.
  */
 static int host_turnstile(struct sess *s)
 {
@@ -1636,7 +1861,7 @@ static int host_turnstile(struct sess *s)
 	char filtered[NAT_SDP_MAX];
 	char pending[NAT_SDP_MAX], last_served[NAT_SDP_MAX];
 	sock_t end_fd = cfg->ssh_end_fd;
-	int served = 0, have_served = 0, dash_seq = 0, i;
+	int served = 0, have_served = 0, dash_seq = 0, i, j;
 
 	memset(ws, 0, sizeof(ws));
 
@@ -1646,6 +1871,7 @@ static int host_turnstile(struct sess *s)
 		pump_once(s, 100);		/* the main thread owns sig + lan */
 		maybe_announce_rendezvous(s);	/* mint and advertise the token */
 		rdv_keep_warm(s);
+		lan_drain(s, ws, &dash_seq);	/* admit same-segment claimants */
 
 		/*
 		 * Roamed while waiting for the next client: the current offer
@@ -1696,6 +1922,11 @@ static int host_turnstile(struct sess *s)
 					o->peer(o->arg, ws[i].c->dash_id,
 						SESSION_PEER_GONE,
 						ws[i].c->status_peer);
+				/* Unregister a LAN worker so a rejoining client
+				 * (same endpoint) is admitted afresh. */
+				for (j = 0; j < HOST_MAX_WORKERS; j++)
+					if (s->lan_conns[j] == ws[i].c)
+						s->lan_conns[j] = NULL;
 				conn_free(ws[i].c);
 				ws[i].used = 0;
 				served++;
@@ -1735,10 +1966,12 @@ static int host_turnstile(struct sess *s)
 				s->remote_set = 0;
 				s->local_sdp[0] = '\0';
 				s->peer_sdp[0] = '\0';
-				sig_subscribe(s->sig, on_peer_offer, listen);
+				s->offer_conn = listen;
+				sig_subscribe(s->sig, on_peer_offer, s);
 				if (nat_setup(listen)) {
 					conn_free(listen);
 					listen = NULL;
+					s->offer_conn = NULL;
 					break;
 				}
 			}
@@ -1776,6 +2009,7 @@ static int host_turnstile(struct sess *s)
 							       filtered)) {
 					conn_free(listen);
 					listen = NULL;
+					s->offer_conn = NULL;
 					ts = TS_GATHER;
 					break;
 				}
@@ -1850,6 +2084,7 @@ static int host_turnstile(struct sess *s)
 		}
 	}
 
+	s->offer_conn = NULL;
 	conn_free(listen);
 	for (i = 0; i < HOST_MAX_WORKERS; i++)
 		if (ws[i].used) {
@@ -1860,16 +2095,17 @@ static int host_turnstile(struct sess *s)
 }
 
 /*
- * A DHT host runs the turnstile (multi-user): many clients over per-connection
- * ICE, on the shared tmux. The link-local direct transport (lanlink) is
- * inherently one peer -- transport_send prefers it session-wide -- so it cannot
- * back concurrent workers; a multi-user host therefore serves everyone,
- * same-LAN included, over ICE and does not bring lanlink up. The single-
- * connection path keeps lanlink for an isolated LAN with no DHT (no internet).
+ * A host with any signalling backend serves many clients through the turnstile:
+ * DHT/ICE joins arrive over the mailbox, and same-segment multicast claimants
+ * are admitted over the one shared lanlink socket (demultiplexed by source),
+ * both concurrently on the shared tmux. An isolated LAN with no DHT is no longer
+ * capped at one client. Only the test-only single-connection flag forces the
+ * sequential re-serve state machine instead.
  */
 static int host_is_multiuser(const struct session_cfg *cfg)
 {
-	return cfg->is_host && (cfg->sig_flags & SIG_DHT) && !cfg->test_single_conn;
+	return cfg->is_host && (cfg->sig_flags & (SIG_DHT | SIG_MCAST)) &&
+	       !cfg->test_single_conn;
 }
 
 /*
@@ -1906,13 +2142,31 @@ static int sig_setup(struct sess *s)
 	s->sig = sig_create(cfg->tok.rdv, cfg->sig_flags, cfg->is_host);
 	if (!s->sig)
 		return -1;
-	sig_subscribe(s->sig, on_peer_offer, &s->c);
-	if ((cfg->sig_flags & SIG_MCAST) && !host_is_multiuser(cfg)) {
-		s->lan = lanlink_create(client_lan_recv, &s->c,
+	s->offer_conn = &s->c;
+	sig_subscribe(s->sig, on_peer_offer, s);
+	/*
+	 * The direct transport comes up for host and client alike whenever
+	 * multicast is on (the old !host_is_multiuser gate is gone): a multi-user
+	 * host demultiplexes the one shared socket by source into per-worker
+	 * streams and admits claimants (host_lan_recv / on_direct_claim), while a
+	 * client or single-connection host carries its one peer (client_lan_recv /
+	 * on_direct_peer). The host advertises the shared port in its offer.
+	 */
+	if (cfg->sig_flags & SIG_MCAST) {
+		int mu = host_is_multiuser(cfg);
+
+		s->lan = lanlink_create(mu ? host_lan_recv : client_lan_recv,
+					mu ? (void *)s : (void *)&s->c,
 					carried_lanlink_port(cfg));
 		if (s->lan) {
 			sig_set_direct_port(s->sig, lanlink_port(s->lan));
-			sig_subscribe_direct(s->sig, on_direct_peer, &s->c);
+			if (mu) {
+				sig_subscribe_direct(s->sig, on_direct_claim, s);
+				sig_set_mcast_claims(s->sig, 1);
+			} else {
+				sig_subscribe_direct(s->sig, on_direct_peer,
+						     &s->c);
+			}
 			if (cfg->obs && cfg->obs->link) {
 				struct sig_mcast_if ifs[16];
 				int ni = sig_link_ifaces(s->sig, ifs, 16), k;
@@ -1921,6 +2175,8 @@ static int sig_setup(struct sess *s)
 					cfg->obs->link(cfg->obs->arg, ifs[k].name,
 						       ifs[k].has4, ifs[k].has6);
 			}
+			if (!cfg->is_host)
+				client_direct_connect(s);
 		}
 	}
 	if (!cfg->is_host)

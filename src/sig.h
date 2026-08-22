@@ -93,6 +93,15 @@ void sig_set_direct_port(struct sig *s, uint16_t port);
 int sig_subscribe_direct(struct sig *s, sig_direct_cb *cb, void *arg);
 
 /*
+ * Host only: this host demultiplexes the shared lanlink socket itself, so a
+ * same-segment multicast claimant is served directly and must NOT also be fed to
+ * the ICE turnstile (which would serve it twice). With this set, deliver of a
+ * sealed multicast answer fires only the direct callback, not the ICE callback.
+ * DHT answers are unaffected (they always feed the turnstile).
+ */
+void sig_set_mcast_claims(struct sig *s, int on);
+
+/*
  * Rendezvous acceleration.
  *
  * sig_seed_node (client): plant a token's rendezvous node as a sticky DHT

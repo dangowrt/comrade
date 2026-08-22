@@ -107,12 +107,20 @@ static int safe_term(const char *t)
 static int do_auth(ssh_session s, const char *pw_rw, const char *pw_ro,
 		   int *read_only)
 {
+	int loops = 0;
+
 	for (;;) {
 		ssh_message m = ssh_message_get(s);
 		int type, subtype;
 
 		if (!m)
 			return -1;
+		/* Bound the exchange so a peer cannot pin a worker slot with an
+		 * endless stream of failed or unrelated auth messages. */
+		if (++loops > 64) {
+			ssh_message_free(m);
+			return -1;
+		}
 		type = ssh_message_type(m);
 		subtype = ssh_message_subtype(m);
 		if (type == SSH_REQUEST_AUTH &&
