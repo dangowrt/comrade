@@ -411,15 +411,37 @@ static int attach(const char *id)
 
 /* ---- the detached service ---- */
 
-/* Called (in the service) once the rendezvous is ready; write the full token
- * so the foreground can print it and so `comrade show` can read it. */
-static void on_rendezvous(void *arg, const struct sockaddr *sa, socklen_t len)
+/* Encode the current token (and its read-only twin), write both to the token
+ * file so the foreground can print them and `comrade show` can read them, and
+ * emit them to the foreground view. Shared by the rendezvous and endpoint mints. */
+static void svc_emit_token(struct svc *v)
 {
-	struct svc *v = arg;
 	char tokbuf[TOKEN_STR_LEN + 1];
 	char tokbuf_ro[TOKEN_STR_LEN + 1];
 	struct token ro;
 	FILE *f;
+
+	if (token_encode(&v->tok, tokbuf, sizeof(tokbuf)))
+		return;
+	ro = v->tok;
+	ro.flags |= TOKEN_FLAG_RO;
+	keys_derive_ro_auth(ro.auth, v->tok.auth);
+	if (token_encode(&ro, tokbuf_ro, sizeof(tokbuf_ro)))
+		return;
+	f = fopen(v->tokfile, "wb");
+	if (f) {
+		fprintf(f, "%s\n%s\n", tokbuf, tokbuf_ro);
+		fclose(f);
+	}
+	ui_emitter_token(&v->obs, tokbuf);	/* show it in the foreground */
+	ui_emitter_token_ro(&v->obs, tokbuf_ro);
+}
+
+/* Called (in the service) once the rendezvous is ready; embed the located DHT
+ * node for the family (EPx_RDV set) and write the token. */
+static void on_rendezvous(void *arg, const struct sockaddr *sa, socklen_t len)
+{
+	struct svc *v = arg;
 
 	(void)len;
 	if (sa && sa->sa_family == AF_INET6) {
@@ -435,20 +457,32 @@ static void on_rendezvous(void *arg, const struct sockaddr *sa, socklen_t len)
 		v->tok.ep4_port = ntohs(a->sin_port);
 		v->tok.flags |= TOKEN_FLAG_EP4_RDV;
 	}
-	if (token_encode(&v->tok, tokbuf, sizeof(tokbuf)))
-		return;
-	ro = v->tok;
-	ro.flags |= TOKEN_FLAG_RO;
-	keys_derive_ro_auth(ro.auth, v->tok.auth);
-	if (token_encode(&ro, tokbuf_ro, sizeof(tokbuf_ro)))
-		return;
-	f = fopen(v->tokfile, "wb");
-	if (f) {
-		fprintf(f, "%s\n%s\n", tokbuf, tokbuf_ro);
-		fclose(f);
+	svc_emit_token(v);
+}
+
+/* The isolated-LAN sibling of on_rendezvous: embed our own direct endpoint for
+ * the family (EPx_RDV clear) and mark the whole token NODHT, so the client
+ * skips the DHT and reaches us over multicast + lanlink. */
+static void on_endpoint(void *arg, const struct sockaddr *sa, socklen_t len)
+{
+	struct svc *v = arg;
+
+	(void)len;
+	if (sa && sa->sa_family == AF_INET6) {
+		const struct sockaddr_in6 *a = (const struct sockaddr_in6 *)sa;
+
+		memcpy(v->tok.ep6_addr, &a->sin6_addr, TOKEN_EP6_LEN);
+		v->tok.ep6_port = ntohs(a->sin6_port);
+		v->tok.flags &= ~TOKEN_FLAG_EP6_RDV;
+	} else if (sa && sa->sa_family == AF_INET) {
+		const struct sockaddr_in *a = (const struct sockaddr_in *)sa;
+
+		memcpy(v->tok.ep4_addr, &a->sin_addr, TOKEN_EP4_LEN);
+		v->tok.ep4_port = ntohs(a->sin_port);
+		v->tok.flags &= ~TOKEN_FLAG_EP4_RDV;
 	}
-	ui_emitter_token(&v->obs, tokbuf);	/* show it in the foreground */
-	ui_emitter_token_ro(&v->obs, tokbuf_ro);
+	v->tok.flags |= TOKEN_FLAG_NODHT;
+	svc_emit_token(v);
 }
 
 /* Serve the shared tmux over the punched link, again after each client, until
@@ -482,6 +516,7 @@ static void run_service(struct svc *v, void *hostkey, sock_t wfd)
 	cfg.no_fwd = v->no_fwd;
 	cfg.status_path = v->statusfile;
 	cfg.on_rendezvous = on_rendezvous;
+	cfg.on_endpoint = on_endpoint;
 	cfg.arg = v;
 	cfg.obs = &v->obs;
 

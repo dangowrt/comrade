@@ -77,7 +77,23 @@ struct svc {
 	struct session_obs obs;		/* view-event emitter to the foreground */
 };
 
-/* Per-user runtime directory for comrade session state; created if absent. */
+/* True only for a real directory we own with no group/other access -- not a
+ * symlink, not another user's -- so a pre-existing state directory is reused
+ * only if another user could not have planted it. */
+static int dir_ok(const char *path)
+{
+	struct stat st;
+
+	if (lstat(path, &st))
+		return 0;
+	return S_ISDIR(st.st_mode) && st.st_uid == getuid() &&
+	       (st.st_mode & 077) == 0;
+}
+
+/* Per-user runtime directory for comrade session state, created if absent. A
+ * predictable /tmp fallback that another user could pre-create (or symlink) is
+ * refused rather than silently reused, so the .sock/.tok/.status it holds only
+ * ever live in a directory this user owns. */
 static const char *state_dir(void)
 {
 	static char dir[256];
@@ -88,10 +104,17 @@ static const char *state_dir(void)
 		snprintf(fallback, sizeof(fallback), "/tmp/comrade-%u",
 			 (unsigned)getuid());
 		base = fallback;
-		mkdir(base, 0700);
+		if (mkdir(base, 0700) && (errno != EEXIST || !dir_ok(base))) {
+			fprintf(stderr, "comrade: refusing unsafe state dir %s\n",
+				base);
+			exit(1);
+		}
 	}
 	snprintf(dir, sizeof(dir), "%s/comrade", base);
-	mkdir(dir, 0700);
+	if (mkdir(dir, 0700) && (errno != EEXIST || !dir_ok(dir))) {
+		fprintf(stderr, "comrade: refusing unsafe state dir %s\n", dir);
+		exit(1);
+	}
 	return dir;
 }
 
@@ -482,15 +505,38 @@ static int attach(const char *id)
 	return 0;
 }
 
-/* Called (in the service) once the rendezvous is ready; write the full token
- * so the foreground can print it and so `comrade show` can read it. */
-static void on_rendezvous(void *arg, const struct sockaddr *sa, socklen_t len)
+/* Encode the current token (and its read-only twin), write both to the token
+ * file so the foreground can print them and `comrade show` can read them, and
+ * emit them to the foreground view. Shared by the rendezvous and endpoint mints. */
+static void svc_emit_token(struct svc *v)
 {
-	struct svc *v = arg;
 	char tokbuf[TOKEN_STR_LEN + 1];
 	char tokbuf_ro[TOKEN_STR_LEN + 1];
 	struct token ro;
 	int fd;
+
+	if (token_encode(&v->tok, tokbuf, sizeof(tokbuf)))
+		return;
+	ro = v->tok;
+	ro.flags |= TOKEN_FLAG_RO;
+	keys_derive_ro_auth(ro.auth, v->tok.auth);
+	if (token_encode(&ro, tokbuf_ro, sizeof(tokbuf_ro)))
+		return;
+	unlink(v->tokfile);
+	fd = open(v->tokfile, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+	if (fd >= 0) {
+		dprintf(fd, "%s\n%s\n", tokbuf, tokbuf_ro);
+		close(fd);
+	}
+	ui_emitter_token(&v->obs, tokbuf);	/* show it in the foreground */
+	ui_emitter_token_ro(&v->obs, tokbuf_ro);
+}
+
+/* Called (in the service) once the rendezvous is ready; embed the located DHT
+ * node for the family (EPx_RDV set) and write the token. */
+static void on_rendezvous(void *arg, const struct sockaddr *sa, socklen_t len)
+{
+	struct svc *v = arg;
 
 	(void)len;
 	if (sa && sa->sa_family == AF_INET6) {
@@ -506,20 +552,32 @@ static void on_rendezvous(void *arg, const struct sockaddr *sa, socklen_t len)
 		v->tok.ep4_port = ntohs(a->sin_port);
 		v->tok.flags |= TOKEN_FLAG_EP4_RDV;
 	}
-	if (token_encode(&v->tok, tokbuf, sizeof(tokbuf)))
-		return;
-	ro = v->tok;
-	ro.flags |= TOKEN_FLAG_RO;
-	keys_derive_ro_auth(ro.auth, v->tok.auth);
-	if (token_encode(&ro, tokbuf_ro, sizeof(tokbuf_ro)))
-		return;
-	fd = open(v->tokfile, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-	if (fd >= 0) {
-		dprintf(fd, "%s\n%s\n", tokbuf, tokbuf_ro);
-		close(fd);
+	svc_emit_token(v);
+}
+
+/* The isolated-LAN sibling of on_rendezvous: embed our own direct endpoint for
+ * the family (EPx_RDV clear) and mark the whole token NODHT, so the client
+ * skips the DHT and reaches us over multicast + lanlink. */
+static void on_endpoint(void *arg, const struct sockaddr *sa, socklen_t len)
+{
+	struct svc *v = arg;
+
+	(void)len;
+	if (sa && sa->sa_family == AF_INET6) {
+		const struct sockaddr_in6 *a = (const struct sockaddr_in6 *)sa;
+
+		memcpy(v->tok.ep6_addr, &a->sin6_addr, TOKEN_EP6_LEN);
+		v->tok.ep6_port = ntohs(a->sin6_port);
+		v->tok.flags &= ~TOKEN_FLAG_EP6_RDV;
+	} else if (sa && sa->sa_family == AF_INET) {
+		const struct sockaddr_in *a = (const struct sockaddr_in *)sa;
+
+		memcpy(v->tok.ep4_addr, &a->sin_addr, TOKEN_EP4_LEN);
+		v->tok.ep4_port = ntohs(a->sin_port);
+		v->tok.flags &= ~TOKEN_FLAG_EP4_RDV;
 	}
-	ui_emitter_token(&v->obs, tokbuf);	/* show it in the foreground */
-	ui_emitter_token_ro(&v->obs, tokbuf_ro);
+	v->tok.flags |= TOKEN_FLAG_NODHT;
+	svc_emit_token(v);
 }
 
 /* The backgrounded connection service: serve the shared tmux over the punched
@@ -566,6 +624,7 @@ static void run_service(struct svc *v, void *hostkey, int wfd, int no_mcast)
 	cfg.no_fwd = v->no_fwd;
 	cfg.status_path = v->statusfile;
 	cfg.on_rendezvous = on_rendezvous;
+	cfg.on_endpoint = on_endpoint;
 	cfg.arg = v;
 	cfg.obs = &v->obs;
 

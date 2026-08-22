@@ -283,6 +283,11 @@ int sig_located(struct sig *s, int family, struct sockaddr *out,
 	return 1;
 }
 
+int sig_dht_acked(struct sig *s, int family)
+{
+	return family == 6 ? s->rnode6_len != 0 : s->rnode4_len != 0;
+}
+
 int sig_reinforce(struct sig *s, int family, const struct sockaddr *sa,
 		  socklen_t len)
 {

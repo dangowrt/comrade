@@ -23,6 +23,7 @@
 #include "sshd.h"
 #include "stream.h"
 #include "stunlist.h"
+#include "tokgen.h"
 
 #define SESSION_CONV 0x70326531
 
@@ -182,8 +183,9 @@ struct sess {
 	uint64_t ice_attempt_start;
 	int ice_attempt;
 	int expect4, expect6;		/* host has DHT reach on this family */
-	int minted4, minted6;		/* family's rendezvous node is in the token */
-	int mcast_minted;		/* multicast-only: token published */
+	int minted4, minted6;		/* family's endpoint/rendezvous is in the token */
+	int noconn_warned;		/* operator told no family can be advertised */
+	uint64_t next_mint_ms;		/* throttle the per-family advert decision */
 
 	uint64_t start_ms;		/* observer: session start, for escalation */
 	int escalated;			/* observer: client warned of DHT warm */
@@ -1258,29 +1260,149 @@ static void update_expect(struct sess *s)
 }
 
 /*
- * Host rendezvous minting. Each family's node is located independently; report
- * both to the view as they arrive, and embed a family in the token the moment
- * it is ready. Hold the token until every reachable family is located (v4+v6 is
- * ideal, so a v4-only peer and a v6-only peer can both reach), but never past
- * the grace, so one slow family cannot block a usable single-family invite. A
- * family found after minting upgrades the token in place.
+ * Route-up but the DHT never acked (captive portal / UDP-blocked): mint the LAN
+ * endpoint only after this grace, well beyond DHT convergence, so a merely-slow
+ * global host is not mislabelled isolated.
+ */
+#define ISOLATED_ROUTE_GRACE_MS 25000
+
+/*
+ * First usable direct-endpoint address of `family` in the sdp: a "host" ICE
+ * candidate that is neither loopback nor -- for v6 -- link-local (a fe80
+ * address cannot be embedded in the 16-byte slot without a zone id). The bare
+ * address goes into out (out may be NULL to only test presence); 1 if found.
+ */
+static int fam_usable_addr(const char *sdp, int family, char *out, size_t n)
+{
+	const char *p = sdp;
+	char addr[64], typ[16];
+	unsigned char b[16];
+
+	while ((p = strstr(p, "candidate:")) != NULL) {
+		if (sscanf(p, "candidate:%*s %*d %*s %*u %63s %*d typ %15s",
+			   addr, typ) == 2 && !strcmp(typ, "host")) {
+			if (family == 6 && strchr(addr, ':') &&
+			    inet_pton(AF_INET6, addr, b) == 1) {
+				int ll = b[0] == 0xfe && (b[1] & 0xc0) == 0x80;
+				int lo = b[15] == 1, i;
+
+				for (i = 0; i < 15; i++)
+					if (b[i])
+						lo = 0;
+				if (!ll && !lo) {
+					if (out)
+						snprintf(out, n, "%s", addr);
+					return 1;
+				}
+			} else if (family == 4 && !strchr(addr, ':') &&
+				   inet_pton(AF_INET, addr, b) == 1) {
+				if (b[0] != 127) {
+					if (out)
+						snprintf(out, n, "%s", addr);
+					return 1;
+				}
+			}
+		}
+		p += 10;
+	}
+	return 0;
+}
+
+/* Build the host's own direct endpoint for `family`: its first usable host
+ * address at the shared lanlink port (0 if lanlink is not up yet). 1 if built. */
+static int fam_endpoint(struct sess *s, int family,
+			struct sockaddr_storage *ss, socklen_t *slen)
+{
+	char addr[64];
+	uint16_t port = s->lan ? lanlink_port(s->lan) : 0;
+
+	if (!fam_usable_addr(s->local_sdp, family, addr, sizeof(addr)))
+		return 0;
+	memset(ss, 0, sizeof(*ss));
+	if (family == 6) {
+		struct sockaddr_in6 *a = (struct sockaddr_in6 *)ss;
+
+		a->sin6_family = AF_INET6;
+		if (inet_pton(AF_INET6, addr, &a->sin6_addr) != 1)
+			return 0;
+		a->sin6_port = htons(port);
+		*slen = sizeof(*a);
+	} else {
+		struct sockaddr_in *a = (struct sockaddr_in *)ss;
+
+		a->sin_family = AF_INET;
+		if (inet_pton(AF_INET, addr, &a->sin_addr) != 1)
+			return 0;
+		a->sin_port = htons(port);
+		*slen = sizeof(*a);
+	}
+	return 1;
+}
+
+/* Gather the four tokgen facts for `family`. */
+static void gather_facts(struct sess *s, int family, struct tokgen_facts *f)
+{
+	int af = family == 6 ? AF_INET6 : AF_INET;
+	char buf[64];
+
+	memset(f, 0, sizeof(*f));
+	f->has_usable_addr = fam_usable_addr(s->local_sdp, family, NULL, 0);
+	f->has_default_route = source_addr(af, buf, sizeof(buf)) == 0;
+	f->dht_acked = sig_dht_acked(s->sig, family);
+	f->public_port_proven = 0;	/* no UPnP/NAT-PMP/PCP in the tree */
+}
+
+/*
+ * An ENDPOINT family is "settled" -- safe to mint -- when it can no longer turn
+ * out to be global: at once when the host is not on the DHT by policy or has no
+ * default route (the DHT can never ack), otherwise only after a grace so a
+ * genuinely global family that is merely slow to ack still mints RENDEZVOUS.
+ */
+static int endpoint_settled(struct sess *s, const struct tokgen_facts *f)
+{
+	if (!(s->cfg->sig_flags & SIG_DHT))
+		return 1;
+	if (!f->has_default_route)
+		return 1;
+	return now_ms() - s->start_ms > ISOLATED_ROUTE_GRACE_MS;
+}
+
+/* Mint the host's own LAN endpoint for `family` (EPx_RDV clear, NODHT set). */
+static void mint_endpoint(struct sess *s, int family)
+{
+	struct sockaddr_storage ss;
+	socklen_t slen = 0;
+
+	if (!fam_endpoint(s, family, &ss, &slen))
+		return;
+	s->cfg->on_endpoint(s->cfg->arg, (struct sockaddr *)&ss, slen);
+	if (family == 6)
+		s->minted6 = 1;
+	else
+		s->minted4 = 1;
+}
+
+/*
+ * Host token minting. A globally reachable family is located on the DHT and
+ * embedded as a RENDEZVOUS node the moment it is ready (upgraded in place when
+ * the second family converges). An isolated (LAN-only) family instead mints the
+ * host's own direct ENDPOINT once it is settled -- decided per family by the
+ * pure tokgen tree from four observed facts. If neither family can be
+ * advertised the operator is told, rather than the host hanging silently.
  */
 static void maybe_announce_rendezvous(struct sess *s)
 {
 	const struct session_obs *o = s->cfg->obs;
 	struct sockaddr_storage a4, a6;
 	socklen_t l4 = sizeof(a4), l6 = sizeof(a6);
+	struct tokgen_facts f4, f6;
+	struct tokgen_result verdict;
 	int have4, have6;
 
 	if (!s->cfg->is_host || !s->cfg->on_rendezvous)
 		return;
-	if (!(s->cfg->sig_flags & SIG_DHT)) {		/* nothing to locate */
-		if (!s->mcast_minted) {
-			s->cfg->on_rendezvous(s->cfg->arg, NULL, 0);
-			s->mcast_minted = 1;
-		}
+	if (!s->have_local_sdp)		/* no candidates yet: cannot decide */
 		return;
-	}
 
 	update_expect(s);
 	have4 = sig_located(s->sig, 4, (struct sockaddr *)&a4, &l4);
@@ -1321,10 +1443,9 @@ static void maybe_announce_rendezvous(struct sess *s)
 		}
 	}
 
-	/* Mint as soon as a family is ready, then upgrade the token in place when
-	 * the other arrives: a single-family-reachable host publishes at once, and
-	 * a dual-stack host's invite gains the second family the moment its DHT
-	 * converges. */
+	/* Mint a RENDEZVOUS family as soon as it is located, upgrading the token
+	 * in place when the other arrives: a single-family host publishes at once,
+	 * and a dual-stack host gains the second family when its DHT converges. */
 	if (have4 && !s->minted4) {
 		s->cfg->on_rendezvous(s->cfg->arg, (struct sockaddr *)&a4, l4);
 		s->minted4 = 1;
@@ -1333,6 +1454,34 @@ static void maybe_announce_rendezvous(struct sess *s)
 		s->cfg->on_rendezvous(s->cfg->arg, (struct sockaddr *)&a6, l6);
 		s->minted6 = 1;
 	}
+
+	/* Decide the isolated (ENDPOINT) families and the no-connectivity case
+	 * from the tokgen tree, throttled (its route probe is cheap but not free).
+	 * A family the DHT acked is never minted as an endpoint -- it took the
+	 * RENDEZVOUS path above. */
+	if ((s->minted4 && s->minted6) || now_ms() < s->next_mint_ms)
+		return;
+	s->next_mint_ms = now_ms() + 1000;
+
+	gather_facts(s, 4, &f4);
+	gather_facts(s, 6, &f6);
+	if (tokgen_decide_host(&f4, &f6, &verdict) < 0) {
+		if (o && o->escalate && !s->noconn_warned &&
+		    now_ms() - s->start_ms > 3000) {
+			o->escalate(o->arg, "no usable address on any family -- "
+				    "nothing to host over; check the network");
+			s->noconn_warned = 1;
+		}
+		return;
+	}
+	if (!s->cfg->on_endpoint)
+		return;
+	if (verdict.v4 == TOK_ADVERT_ENDPOINT && !s->minted4 &&
+	    !f4.dht_acked && endpoint_settled(s, &f4))
+		mint_endpoint(s, 4);
+	if (verdict.v6 == TOK_ADVERT_ENDPOINT && !s->minted6 &&
+	    !f6.dht_acked && endpoint_settled(s, &f6))
+		mint_endpoint(s, 6);
 }
 
 /* Keep the located rendezvous nodes warm (host, main thread only -- sig is
@@ -1694,6 +1843,25 @@ static int host_is_multiuser(const struct session_cfg *cfg)
  * (which is why a manual restart reconnects instantly but a reused socket does
  * not). Returns 0 on success.
  */
+/*
+ * The lanlink port a host should re-bind: the shared port already printed in a
+ * carried-forward NODHT endpoint token, so it stays valid across the re-serve
+ * loop. Either family's endpoint carries the one shared port. 0 (ephemeral) for
+ * a client, or a host with no such token.
+ */
+static uint16_t carried_lanlink_port(const struct session_cfg *cfg)
+{
+	const struct token *t = &cfg->tok;
+
+	if (!cfg->is_host || !(t->flags & TOKEN_FLAG_NODHT))
+		return 0;
+	if (!(t->flags & TOKEN_FLAG_EP6_RDV) && t->ep6_port)
+		return t->ep6_port;
+	if (!(t->flags & TOKEN_FLAG_EP4_RDV) && t->ep4_port)
+		return t->ep4_port;
+	return 0;
+}
+
 static int sig_setup(struct sess *s)
 {
 	const struct session_cfg *cfg = s->cfg;
@@ -1703,7 +1871,8 @@ static int sig_setup(struct sess *s)
 		return -1;
 	sig_subscribe(s->sig, on_peer_offer, &s->c);
 	if ((cfg->sig_flags & SIG_MCAST) && !host_is_multiuser(cfg)) {
-		s->lan = lanlink_create(on_transport_recv, &s->c);
+		s->lan = lanlink_create(on_transport_recv, &s->c,
+					carried_lanlink_port(cfg));
 		if (s->lan) {
 			sig_set_direct_port(s->sig, lanlink_port(s->lan));
 			sig_subscribe_direct(s->sig, on_direct_peer, s);

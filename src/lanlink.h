@@ -22,7 +22,14 @@ struct lanlink;
 
 typedef void lanlink_recv_cb(void *arg, const uint8_t *data, size_t len);
 
-struct lanlink *lanlink_create(lanlink_recv_cb *on_recv, void *arg);
+/*
+ * port: the UDP port to bind, or 0 for an ephemeral one. A host that carries a
+ * NODHT endpoint token forward across re-serves asks for that token's port so
+ * the already-printed token stays valid; if it is taken the bind falls back to
+ * ephemeral (the caller then re-mints).
+ */
+struct lanlink *lanlink_create(lanlink_recv_cb *on_recv, void *arg,
+			       uint16_t port);
 void lanlink_destroy(struct lanlink *l);
 
 /* The bound UDP port, to announce so the peer can reach us. */

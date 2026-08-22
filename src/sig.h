@@ -114,6 +114,14 @@ int sig_reinforce(struct sig *s, int family, const struct sockaddr *sa,
 int sig_located(struct sig *s, int family, struct sockaddr *out,
 		socklen_t *out_len);
 
+/*
+ * Whether the DHT has acknowledged our publish for `family` (4 or 6): true once
+ * a validated GET has had a k-close node serve our value back, which is exactly
+ * the tokgen "dht_acked" fact. A host with no reach on a family never sees this,
+ * so it is the signal that the family is isolated (LAN-only).
+ */
+int sig_dht_acked(struct sig *s, int family);
+
 /* Rendezvous progress for `family`: 0 cold, 1 warmup, 2 store, 3 get, 4 ready
  * (matches the RDV_* enum). The store/get phases are engine-wide; only ready is
  * truly per-family. Advisory, for the view's spinner. */

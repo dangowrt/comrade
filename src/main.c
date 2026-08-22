@@ -60,8 +60,11 @@ static int session_connect(const char *arg, int ui_mode, int no_mcast,
 	cfg.nfwd_r = nfwd_r;
 	/* Race the LAN (multicast) and the DHT: whichever reaches the host wins.
 	 * --no-multicast drops the LAN path, so two hosts on one segment can be
-	 * forced onto the DHT/STUN path for testing. */
-	cfg.sig_flags = SIG_DHT | (no_mcast ? 0 : SIG_MCAST);
+	 * forced onto the DHT/STUN path for testing. A NODHT token means the host
+	 * is not on the DHT (isolated LAN); drop the dead DHT path and find it over
+	 * multicast. (NODHT with --no-multicast leaves nothing, and cannot connect.) */
+	cfg.sig_flags = ((cfg.tok.flags & TOKEN_FLAG_NODHT) ? 0 : SIG_DHT) |
+			(no_mcast ? 0 : SIG_MCAST);
 	cfg.stun_port = 3478;
 	cfg.stun_auto = 1;
 	cfg.log_level = -1;

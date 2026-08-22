@@ -17,7 +17,8 @@ struct lanlink {
 	void *arg;
 };
 
-struct lanlink *lanlink_create(lanlink_recv_cb *on_recv, void *arg)
+struct lanlink *lanlink_create(lanlink_recv_cb *on_recv, void *arg,
+			       uint16_t port)
 {
 	struct lanlink *l = calloc(1, sizeof(*l));
 	struct sockaddr_in6 a;
@@ -43,8 +44,16 @@ struct lanlink *lanlink_create(lanlink_recv_cb *on_recv, void *arg)
 	memset(&a, 0, sizeof(a));
 	a.sin6_family = AF_INET6;
 	a.sin6_addr = in6addr_any;
-	if (bind(l->fd, (struct sockaddr *)&a, sizeof(a)))
-		goto fail;
+	a.sin6_port = htons(port);
+	if (bind(l->fd, (struct sockaddr *)&a, sizeof(a))) {
+		/* The requested fixed port is taken: fall back to ephemeral and
+		 * let the caller re-mint the token with the new port. */
+		if (!port)
+			goto fail;
+		a.sin6_port = 0;
+		if (bind(l->fd, (struct sockaddr *)&a, sizeof(a)))
+			goto fail;
+	}
 	if (getsockname(l->fd, (struct sockaddr *)&a, &alen))
 		goto fail;
 	l->port = ntohs(a.sin6_port);
