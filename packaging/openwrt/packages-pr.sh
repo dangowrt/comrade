@@ -141,25 +141,54 @@ done
 # being bumped to, same as when there is nothing to catch up on at all.
 [ "${#STEP_TAGS[@]}" -eq 0 ] && STEP_TAGS=("v$V")
 
-log "Build the changelog for the commit and the PR description"
 # Each step's commits become a bullet list of `owner/repo@hash` references,
 # GitHub's own autolink syntax for a commit in another repository -- left
 # unfenced (no code block) so GitHub actually renders the links instead of
-# showing literal text. --reverse so commits within a step read oldest
-# first, same direction as the steps themselves (v$OLD_V's successor first,
-# v$V last): one consistent chronological read top to bottom, not steps
-# going forward in time while each step's own commits count backward.
+# showing literal text. openwrt/packages' formalities bot caps a commit
+# body line at 100 columns (.github/formalities.json's max_body_line_len);
+# a "- dangowrt/comrade@hash " prefix plus a longer commit subject routinely
+# blows past that on its own, so wrap each bullet at 96, continuation lines
+# indented two spaces to read as part of the same bullet rather than a new
+# one.
+wrap_bullets() {
+  awk '
+    {
+      hash = $1
+      $1 = ""
+      sub(/^ /, "")
+      text = "- dangowrt/comrade@" hash " " $0
+      width = 96
+      indent = "  "
+      line = ""
+      n = split(text, words, " ")
+      for (i = 1; i <= n; i++) {
+        cand = (line == "" ? words[i] : line " " words[i])
+        if (length(cand) > width && line != "") {
+          print line
+          line = indent words[i]
+        } else {
+          line = cand
+        }
+      }
+      if (line != "") print line
+    }
+  '
+}
+
+log "Build the changelog for the commit and the PR description"
+# --reverse so commits within a step read oldest first, same direction as
+# the steps themselves (v$OLD_V's successor first, v$V last): one
+# consistent chronological read top to bottom, not steps going forward in
+# time while each step's own commits count backward.
 CHANGELOG=""
 prev="v$OLD_V"
 for t in "${STEP_TAGS[@]}"; do
   if git -C "$COMRADE_DIR" rev-parse -q --verify "refs/tags/$prev" >/dev/null; then
-    step="$(git -C "$COMRADE_DIR" log --oneline --reverse "$prev..$t" \
-      | sed -E 's#^([0-9a-f]+) (.*)$#- dangowrt/comrade@\1 \2#')"
+    step="$(git -C "$COMRADE_DIR" log --oneline --reverse "$prev..$t" | wrap_bullets)"
   else
     step="(v$OLD_V is not a tag here; showing the last 20 commits up to $t)
 
-$(git -C "$COMRADE_DIR" log --oneline --reverse -n 20 "$t" \
-      | sed -E 's#^([0-9a-f]+) (.*)$#- dangowrt/comrade@\1 \2#')"
+$(git -C "$COMRADE_DIR" log --oneline --reverse -n 20 "$t" | wrap_bullets)"
   fi
   CHANGELOG="${CHANGELOG:+$CHANGELOG$'\n\n'}### $t
 
