@@ -1,0 +1,19 @@
+# winget installer manifest (template). The release CI fills @VERSION@, @TAG@,
+# @DATE@ and the two @SHA256_*@ from the built comrade-<arch>.exe before
+# submitting to winget-pkgs. "portable" installs the bare .exe and exposes it
+# on PATH as `comrade`, so there is no installer, no bundle, one file per arch.
+PackageIdentifier: dangowrt.comrade
+PackageVersion: "@VERSION@"
+InstallerType: portable
+Commands:
+  - comrade
+ReleaseDate: "@DATE@"
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/dangowrt/comrade/releases/download/@TAG@/comrade-x64.exe
+    InstallerSha256: @SHA256_X64@
+  - Architecture: arm64
+    InstallerUrl: https://github.com/dangowrt/comrade/releases/download/@TAG@/comrade-arm64.exe
+    InstallerSha256: @SHA256_ARM64@
+ManifestType: installer
+ManifestVersion: 1.6.0

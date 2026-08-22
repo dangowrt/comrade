@@ -1,0 +1,31 @@
+PackageIdentifier: dangowrt.comrade
+PackageVersion: "@VERSION@"
+PackageLocale: en-US
+Publisher: Daniel Golle
+PublisherUrl: https://github.com/dangowrt
+PublisherSupportUrl: https://github.com/dangowrt/comrade/issues
+Author: Daniel Golle
+PackageName: comrade
+PackageUrl: https://github.com/dangowrt/comrade
+License: AGPL-3.0-or-later
+LicenseUrl: https://github.com/dangowrt/comrade/blob/main/LICENSE
+ShortDescription: Serverless peer-to-peer terminal sharing over a punched p2p link
+Description: >-
+  Peer-to-peer terminal sharing with tmate-like semantics and no central server.
+  A host shares a tmux session and a client joins it with a token passed
+  out-of-band; rendezvous happens on the BitTorrent mainline DHT, connectivity
+  is a direct ICE-hole-punched link, and the session is end-to-end SSH with the
+  host key pinned in the token. Joining needs nothing extra; hosting also needs
+  tmux (winget install arndawg.tmux-windows).
+Moniker: comrade
+Tags:
+  - terminal
+  - ssh
+  - tmux
+  - p2p
+  - peer-to-peer
+  - dht
+  - nat-traversal
+  - remote
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0
