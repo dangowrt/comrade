@@ -10,6 +10,8 @@
  *   to a local echo server, byte-exact both ways;
  * - -R: TCP into the host-side listener comes out of a client-side
  *   connect to a local echo server, byte-exact both ways;
+ * - -R bulk: several times the 2 MiB channel window one way, with the
+ *   consumer stalled long enough for the window to close and reopen;
  * - --no-forwarding: the host refuses, the session itself stays healthy.
  */
 
@@ -33,6 +35,8 @@
 
 #define ECHO_LEN 256
 #define HOLD_MS 4000
+#define BULK_LEN (8u * 1024 * 1024)
+#define BULK_STALL_MS 1200
 
 static uint64_t now_ms(void)
 {
@@ -111,7 +115,7 @@ out:
 	return NULL;
 }
 
-static void echo_start(struct echo *e)
+static void serve_start(struct echo *e, void *(*fn)(void *))
 {
 	struct sockaddr_in a;
 	socklen_t sl = sizeof(a);
@@ -125,13 +129,65 @@ static void echo_start(struct echo *e)
 	assert(!listen(e->lfd, 1));
 	assert(!getsockname(e->lfd, (struct sockaddr *)&a, &sl));
 	e->port = ntohs(a.sin_port);
-	assert(!pthread_create(&e->th, NULL, echo_thread, e));
+	assert(!pthread_create(&e->th, NULL, fn, e));
+}
+
+static void echo_start(struct echo *e)
+{
+	serve_start(e, echo_thread);
 }
 
 static void echo_stop(struct echo *e)
 {
 	pthread_join(e->th, NULL);
 	close(e->lfd);
+}
+
+/* A one-way source: serves one connection BULK_LEN bytes, then closes. */
+static void *bulk_thread(void *p)
+{
+	struct echo *e = p;
+	char buf[4096];
+	int fd = accept(e->lfd, NULL, NULL);
+	size_t left = BULK_LEN;
+
+	if (fd < 0)
+		return NULL;
+	memset(buf, 'B', sizeof(buf));
+	while (left) {
+		size_t n = left < sizeof(buf) ? left : sizeof(buf);
+		ssize_t w = write(fd, buf, n);
+
+		if (w <= 0)
+			break;
+		left -= (size_t)w;
+	}
+	close(fd);
+	return NULL;
+}
+
+/* Stall until the sender has filled the channel window, then drain it all:
+ * BULK_LEN bytes and a clean EOF, through the closed-and-reopened window. */
+static int bulk_check(int fd, uint64_t deadline)
+{
+	char buf[65536];
+	size_t got = 0;
+
+	usleep(BULK_STALL_MS * 1000);
+	while (now_ms() < deadline) {
+		struct pollfd p = { fd, POLLIN, 0 };
+		ssize_t n;
+
+		if (poll(&p, 1, 100) <= 0)
+			continue;
+		n = read(fd, buf, sizeof(buf));
+		if (n < 0)
+			return 0;
+		if (n == 0)
+			return got == BULK_LEN;
+		got += (size_t)n;
+	}
+	return 0;
 }
 
 /* Reserve a loopback port for a listener the engine will bind later. */
@@ -262,7 +318,7 @@ static int one_round(void *hostkey, const uint8_t fp[32],
 		     const uint8_t auth[TOKEN_AUTH_LEN], int no_fwd,
 		     const struct fwdspec *l, const struct fwdspec *r,
 		     uint16_t connect_port,
-		     int (*check)(int fd, uint64_t deadline))
+		     int (*check)(int fd, uint64_t deadline), int hold_ms)
 {
 	static const uint8_t ping[] = { 'p', 'i', 'n', 'g' };
 	uint8_t echo[4];
@@ -291,7 +347,7 @@ static int one_round(void *hostkey, const uint8_t fp[32],
 	ca.o.recv = echo;
 	ca.o.recv_cap = sizeof(echo);
 	ca.o.recv_len = &echo_len;
-	ca.o.hold_ms = HOLD_MS;
+	ca.o.hold_ms = hold_ms;
 	if (l) {
 		ca.o.fwd_l = l;
 		ca.o.nfwd_l = 1;
@@ -302,7 +358,7 @@ static int one_round(void *hostkey, const uint8_t fp[32],
 	}
 	assert(!pthread_create(&cth, NULL, cli_thread, &ca));
 
-	deadline = now_ms() + HOLD_MS - 500;
+	deadline = now_ms() + (uint64_t)hold_ms - 500;
 	fd = connect_retry(connect_port, deadline);
 	if (fd >= 0) {
 		ok = check(fd, deadline);
@@ -342,7 +398,8 @@ int main(void)
 	sp.bind_port = port;
 	snprintf(sp.host, sizeof(sp.host), "127.0.0.1");
 	sp.port = e.port;
-	if (!one_round(hostkey, fp, auth, 0, &sp, NULL, port, echo_check)) {
+	if (!one_round(hostkey, fp, auth, 0, &sp, NULL, port, echo_check,
+		       HOLD_MS)) {
 		fprintf(stderr, "FWD FAIL: -L echo\n");
 		return 1;
 	}
@@ -355,8 +412,24 @@ int main(void)
 	sp.bind_port = port;
 	snprintf(sp.host, sizeof(sp.host), "127.0.0.1");
 	sp.port = e.port;
-	if (!one_round(hostkey, fp, auth, 0, NULL, &sp, port, echo_check)) {
+	if (!one_round(hostkey, fp, auth, 0, NULL, &sp, port, echo_check,
+		       HOLD_MS)) {
 		fprintf(stderr, "FWD FAIL: -R echo\n");
+		return 1;
+	}
+	echo_stop(&e);
+
+	/* -R bulk: the transfer outgrows the channel window several times
+	 * over, and the stalled consumer forces the window to close. */
+	serve_start(&e, bulk_thread);
+	port = pick_port();
+	memset(&sp, 0, sizeof(sp));
+	sp.bind_port = port;
+	snprintf(sp.host, sizeof(sp.host), "127.0.0.1");
+	sp.port = e.port;
+	if (!one_round(hostkey, fp, auth, 0, NULL, &sp, port, bulk_check,
+		       12000)) {
+		fprintf(stderr, "FWD FAIL: -R bulk\n");
 		return 1;
 	}
 	echo_stop(&e);
@@ -369,7 +442,8 @@ int main(void)
 	sp.bind_port = port;
 	snprintf(sp.host, sizeof(sp.host), "127.0.0.1");
 	sp.port = e.port;
-	if (!one_round(hostkey, fp, auth, 1, &sp, NULL, port, refuse_check)) {
+	if (!one_round(hostkey, fp, auth, 1, &sp, NULL, port, refuse_check,
+		       HOLD_MS)) {
 		fprintf(stderr, "FWD FAIL: --no-forwarding still forwarded\n");
 		return 1;
 	}
@@ -378,7 +452,7 @@ int main(void)
 	pthread_join(e.th, NULL);
 
 	sshd_hostkey_free(hostkey);
-	printf("FWD PASS: -L and -R echo through the session, "
+	printf("FWD PASS: -L and -R echo, -R bulk past the window, "
 	       "--no-forwarding refuses\n");
 	return 0;
 }

@@ -14,14 +14,19 @@
 #define FWD_MAX_LISTEN 8		/* listeners (-L local, -R host-side) */
 #define FWD_MAX_PEND 8			/* in-flight connects / channel opens */
 #define FWD_CONNECT_TIMEOUT_MS 5000
+#define FWD_BUF 32768			/* one channel read, one max SSH packet */
 
-/* A live forwarded connection: fd <-> channel via two libssh connectors. */
+/* A live forwarded connection: fd <-> channel, pumped from sshfwd_tick.
+ * Not an ssh_connector pair: that mistakes a closed send window for fd EOF. */
 struct fwd_bridge {
 	int used;
 	sock_t fd;
 	ssh_channel chan;
-	ssh_connector in;		/* fd -> channel */
-	ssh_connector out;		/* channel -> fd */
+	int polled;			/* fd registered on the event */
+	int sent_eof;			/* local EOF relayed; fd reads done */
+	size_t buf_off;			/* channel bytes the fd has not taken */
+	size_t buf_len;
+	uint8_t buf[FWD_BUF];
 };
 
 /* A listening socket. On the client it carries the -L target spec; on the
@@ -270,23 +275,91 @@ static struct fwd_pend *pend_slot(struct sshfwd *f)
 	return NULL;
 }
 
-/* Wire fd <-> chan with two connectors on the event. Takes ownership of
- * both; on failure closes and frees them. Returns 0 on success. */
+/* On the event only so local traffic wakes dopoll; the tick pumps. */
+static int bridge_wake(socket_t fd, int revents, void *userdata)
+{
+	(void)fd;
+	(void)revents;
+	(void)userdata;
+	return 0;
+}
+
+/* Poll the fd only while the channel can take reads, or it spins dopoll. */
+static void bridge_poll_sync(struct sshfwd *f, struct fwd_bridge *b)
+{
+	int want = !b->sent_eof && ssh_channel_window_size(b->chan) > 0;
+
+	if (want && !b->polled) {
+		if (ssh_event_add_fd(f->ev, b->fd, POLLIN, bridge_wake,
+				     NULL) == SSH_OK)
+			b->polled = 1;
+	} else if (!want && b->polled) {
+		ssh_event_remove_fd(f->ev, b->fd);
+		b->polled = 0;
+	}
+}
+
+/* channel -> fd. Returns 0, or -1 to tear the bridge down. */
+static int bridge_pump_out(struct fwd_bridge *b)
+{
+	for (;;) {
+		ssize_t w;
+		int n;
+
+		while (b->buf_off < b->buf_len) {
+			w = sock_write(b->fd, b->buf + b->buf_off,
+				       b->buf_len - b->buf_off);
+			if (w <= 0)
+				return sock_err_would_block(sock_errno()) ?
+				       0 : -1;
+			b->buf_off += (size_t)w;
+		}
+		n = ssh_channel_read_nonblocking(b->chan, b->buf,
+						 sizeof(b->buf), 0);
+		if (n == SSH_ERROR)
+			return -1;
+		if (n <= 0)		/* idle, or EOF: the reap decides */
+			return 0;
+		b->buf_off = 0;
+		b->buf_len = (size_t)n;
+	}
+}
+
+/* fd -> channel, at most the send window. Returns 0, or -1 to tear down. */
+static int bridge_pump_in(struct fwd_bridge *b)
+{
+	uint8_t tmp[FWD_BUF];
+
+	while (!b->sent_eof) {
+		uint32_t win = ssh_channel_window_size(b->chan);
+		size_t cap = sizeof(tmp);
+		ssize_t n;
+
+		if (!win)
+			return 0;
+		if (cap > win)
+			cap = win;
+		n = sock_read(b->fd, tmp, cap);
+		if (n == 0) {
+			ssh_channel_send_eof(b->chan);
+			b->sent_eof = 1;
+			return 0;
+		}
+		if (n < 0)
+			return sock_err_would_block(sock_errno()) ? 0 : -1;
+		if (ssh_channel_write(b->chan, tmp, (uint32_t)n) != (int)n)
+			return -1;
+	}
+	return 0;
+}
+
+/* Wire fd <-> chan into a pumped bridge. Takes ownership of both; on
+ * failure closes and frees them. Returns 0 on success. */
 static int bridge_up(struct sshfwd *f, sock_t fd, ssh_channel chan)
 {
 	struct fwd_bridge *b = bridge_slot(f);
 
-	if (b) {
-		b->in = ssh_connector_new(f->s);
-		b->out = ssh_connector_new(f->s);
-	}
-	if (!b || !b->in || !b->out) {
-		if (b && b->in)
-			ssh_connector_free(b->in);
-		if (b && b->out)
-			ssh_connector_free(b->out);
-		if (b)
-			b->in = b->out = NULL;
+	if (!b) {
 		sock_close(fd);
 		if (ssh_channel_is_open(chan))
 			ssh_channel_close(chan);
@@ -294,24 +367,21 @@ static int bridge_up(struct sshfwd *f, sock_t fd, ssh_channel chan)
 		return -1;
 	}
 	sock_set_nonblock(fd);
-	ssh_connector_set_in_fd(b->in, fd);
-	ssh_connector_set_out_channel(b->in, chan, SSH_CONNECTOR_STDOUT);
-	ssh_connector_set_in_channel(b->out, chan, SSH_CONNECTOR_STDOUT);
-	ssh_connector_set_out_fd(b->out, fd);
-	ssh_event_add_connector(f->ev, b->in);
-	ssh_event_add_connector(f->ev, b->out);
 	b->fd = fd;
 	b->chan = chan;
+	b->polled = 0;
+	b->sent_eof = 0;
+	b->buf_off = 0;
+	b->buf_len = 0;
 	b->used = 1;
+	bridge_poll_sync(f, b);
 	return 0;
 }
 
 static void bridge_down(struct sshfwd *f, struct fwd_bridge *b)
 {
-	ssh_event_remove_connector(f->ev, b->in);
-	ssh_event_remove_connector(f->ev, b->out);
-	ssh_connector_free(b->in);
-	ssh_connector_free(b->out);
+	if (b->polled)
+		ssh_event_remove_fd(f->ev, b->fd);
 	sock_close(b->fd);
 	if (ssh_channel_is_open(b->chan))
 		ssh_channel_close(b->chan);
@@ -623,14 +693,19 @@ void sshfwd_tick(struct sshfwd *f)
 		if (f->pd[i].used && pend_step(f, &f->pd[i]))
 			memset(&f->pd[i], 0, sizeof(f->pd[i]));
 
-	/* Reap bridges whose channel has ended and drained. */
+	/* Pump the bridges; reap the broken and the ended-and-drained. */
 	for (i = 0; i < FWD_MAX_BRIDGE; i++) {
 		struct fwd_bridge *b = &f->br[i];
 
-		if (b->used && (!ssh_channel_is_open(b->chan) ||
-				(ssh_channel_is_eof(b->chan) &&
-				 ssh_channel_poll(b->chan, 0) <= 0)))
+		if (!b->used)
+			continue;
+		if (bridge_pump_out(b) || bridge_pump_in(b) ||
+		    !ssh_channel_is_open(b->chan) ||
+		    (ssh_channel_is_eof(b->chan) && b->buf_off >= b->buf_len)) {
 			bridge_down(f, b);
+			continue;
+		}
+		bridge_poll_sync(f, b);
 	}
 }
 
