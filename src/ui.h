@@ -34,10 +34,12 @@ void ui_bind(struct ui *u, struct session_obs *obs);
  * ui_emitter: service side. Fills obs to serialise each event to fd, the
  * channel back to the foreground -- a socketpair end, because on Windows the
  * two halves are separate processes and a socket is the only thing both can
- * poll. ui_emitter_token posts the minted invite.
+ * poll. ui_emitter_token posts the minted invite; ui_emitter_token_ro posts
+ * its read-only twin, shown alongside it.
  */
 void ui_emitter(struct session_obs *obs, sock_t fd);
 void ui_emitter_token(const struct session_obs *obs, const char *token_str);
+void ui_emitter_token_ro(const struct session_obs *obs, const char *token_str);
 
 /*
  * ui_host_wait: foreground side. Render events read from fd until the operator

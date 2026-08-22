@@ -79,6 +79,25 @@ int keys_derive(struct session_keys *keys, const uint8_t rdv[TOKEN_RDV_LEN])
 	return cc_ed25519_key_pair(keys->bep44_sk, keys->bep44_pk, seed);
 }
 
+/* The read-only auth secret is a one-way derivation of the read-write one
+ * (keyed BLAKE2b under the read-write secret). A host that holds only the
+ * read-write secret can mint and accept the read-only credential, while a
+ * read-only guest can never walk this back to the read-write secret it was
+ * cut from, so handing it out grants observation without control. */
+void keys_derive_ro_auth(uint8_t ro[TOKEN_AUTH_LEN],
+			 const uint8_t rw[TOKEN_AUTH_LEN])
+{
+	static const char ro_info[] = "comrade1 ro token";
+	uint8_t full[32];
+
+	/* BLAKE2b exists only at whole standard digest sizes under gcrypt, so
+	 * derive the 32-byte hash every backend agrees on and take its first
+	 * TOKEN_AUTH_LEN bytes rather than asking for a 16-byte digest direct. */
+	cc_blake2b_keyed(full, sizeof(full), rw, TOKEN_AUTH_LEN,
+			 (const uint8_t *)ro_info, sizeof(ro_info) - 1);
+	memcpy(ro, full, TOKEN_AUTH_LEN);
+}
+
 int msg_seal(uint8_t *dst, size_t dst_len, const uint8_t key[32],
 	     const uint8_t *plain, size_t plain_len)
 {

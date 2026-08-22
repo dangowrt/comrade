@@ -21,7 +21,16 @@
 struct sshd_opts {
 	void *hostkey;			/* ssh_key (private), from sshd_hostkey_new */
 	uint8_t auth[TOKEN_AUTH_LEN];	/* session password material */
+	/*
+	 * A second accepted secret that marks the client read-only. It is the
+	 * one-way derivation of auth (keys_derive_ro_auth): a guest holding it
+	 * authenticates but is served command_ro instead of command, and cannot
+	 * recover the read-write secret. have_ro gates whether it is honoured.
+	 */
+	uint8_t auth_ro[TOKEN_AUTH_LEN];
+	int have_ro;
 	const char *command;		/* /bin/sh -c argument; NULL => default */
+	const char *command_ro;		/* served to a read-only client; NULL => command */
 	int use_pty;			/* allocate a pty (interactive shell/tmux) */
 	/*
 	 * Optional end-of-session fd. The command we run is `tmux attach`, which

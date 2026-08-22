@@ -505,6 +505,8 @@ static void on_rendezvous(void *arg, const struct sockaddr *sa, socklen_t len)
 {
 	struct svc *v = arg;
 	char tokbuf[TOKEN_STR_LEN + 1];
+	char tokbuf_ro[TOKEN_STR_LEN + 1];
+	struct token ro;
 	int fd;
 
 	(void)len;
@@ -523,12 +525,18 @@ static void on_rendezvous(void *arg, const struct sockaddr *sa, socklen_t len)
 	}
 	if (token_encode(&v->tok, tokbuf, sizeof(tokbuf)))
 		return;
+	ro = v->tok;
+	ro.flags |= TOKEN_FLAG_RO;
+	keys_derive_ro_auth(ro.auth, v->tok.auth);
+	if (token_encode(&ro, tokbuf_ro, sizeof(tokbuf_ro)))
+		return;
 	fd = open(v->tokfile, O_WRONLY | O_CREAT | O_TRUNC, 0600);
 	if (fd >= 0) {
-		dprintf(fd, "%s\n", tokbuf);
+		dprintf(fd, "%s\n%s\n", tokbuf, tokbuf_ro);
 		close(fd);
 	}
 	ui_emitter_token(&v->obs, tokbuf);	/* show it in the foreground */
+	ui_emitter_token_ro(&v->obs, tokbuf_ro);
 }
 
 /* The backgrounded connection service: serve the shared tmux over the punched
@@ -536,6 +544,7 @@ static void on_rendezvous(void *arg, const struct sockaddr *sa, socklen_t len)
 static void run_service(struct svc *v, void *hostkey, int wfd, int no_mcast)
 {
 	char cmd[600];
+	char cmd_ro[600];
 	struct session_cfg cfg;
 	int devnull;
 	int end_fd;
@@ -552,6 +561,8 @@ static void run_service(struct svc *v, void *hostkey, int wfd, int no_mcast)
 			close(devnull);
 	}
 	snprintf(cmd, sizeof(cmd), "tmux -S %s attach -t comrade", v->sock);
+	snprintf(cmd_ro, sizeof(cmd_ro), "tmux -S %s attach -r -t comrade",
+		 v->sock);
 	end_fd = spawn_end_monitor(v->sock, &end_pid);
 
 	ui_emitter(&v->obs, wfd);	/* progress -> the foreground view */
@@ -566,6 +577,7 @@ static void run_service(struct svc *v, void *hostkey, int wfd, int no_mcast)
 	cfg.connect_timeout_s = 60;
 	cfg.hostkey = hostkey;
 	cfg.ssh_command = cmd;
+	cfg.ssh_command_ro = cmd_ro;
 	cfg.use_pty = 1;
 	cfg.ssh_end_fd = end_fd > 0 ? end_fd : 0;
 	cfg.no_fwd = v->no_fwd;
@@ -729,9 +741,13 @@ int host_show(void)
 			tok_path(tf, sizeof(tf), cand);
 			f = fopen(tf, "r");
 			if (f) {
-				if (fgets(tok, sizeof(tok), f)) {
-					printf("%s", tok);
+				int ln = 0;
+
+				while (fgets(tok, sizeof(tok), f)) {
+					printf("%s%s", ln ? "read-only   "
+						          : "read-write  ", tok);
 					shown = 1;
+					ln++;
 				}
 				fclose(f);
 			}

@@ -99,12 +99,17 @@ static int safe_term(const char *t)
 	return 1;
 }
 
-/* Authenticate: only password auth, only the token secret, constant-time. */
-static int do_auth(ssh_session s, const char *password)
+/* Authenticate: only password auth, only the token secret(s), constant-time.
+ * pw_ro is the optional read-only secret; when the client authenticates with
+ * it, *read_only is set so the caller serves the read-only command. Both
+ * candidates are the same length (base64url of a 16-byte secret), so the
+ * length gate leaks nothing about which one, if either, was presented. */
+static int do_auth(ssh_session s, const char *pw_rw, const char *pw_ro,
+		   int *read_only)
 {
 	for (;;) {
 		ssh_message m = ssh_message_get(s);
-		int type, subtype, ok = 0;
+		int type, subtype;
 
 		if (!m)
 			return -1;
@@ -113,16 +118,18 @@ static int do_auth(ssh_session s, const char *password)
 		if (type == SSH_REQUEST_AUTH &&
 		    subtype == SSH_AUTH_METHOD_PASSWORD) {
 			const char *pw = ssh_message_auth_password(m);
+			int m_rw = pw && strlen(pw) == strlen(pw_rw) &&
+				   ct_equal(pw, pw_rw, strlen(pw_rw));
+			int m_ro = pw_ro && pw && strlen(pw) == strlen(pw_ro) &&
+				   ct_equal(pw, pw_ro, strlen(pw_ro));
 
-			if (pw && strlen(pw) == strlen(password) &&
-			    ct_equal(pw, password, strlen(password))) {
+			if (m_rw || m_ro) {
+				*read_only = m_ro && !m_rw;
 				ssh_message_auth_reply_success(m, 0);
 				ssh_message_free(m);
 				return 0;
 			}
-			ok = 0;
 		}
-		(void)ok;
 		ssh_message_auth_set_methods(m, SSH_AUTH_METHOD_PASSWORD);
 		ssh_message_reply_default(m);
 		ssh_message_free(m);
@@ -392,6 +399,9 @@ out:
 int sshd_serve_fd(sock_t fd, const struct sshd_opts *o)
 {
 	char password[64];
+	char password_ro[64];
+	const char *cmd;
+	int read_only = 0;
 	ssh_bind bind = NULL;
 	ssh_session s = NULL;
 	ssh_channel chan = NULL;
@@ -402,10 +412,16 @@ int sshd_serve_fd(sock_t fd, const struct sshd_opts *o)
 	int exit_code = 0;
 	int rows = 0, cols = 0;
 	char term[64];
+	struct sshd_opts eff;
 
 	if (!o || !o->hostkey)
 		return -1;
 	if (!base64url_encode(o->auth, TOKEN_AUTH_LEN, password, sizeof(password)))
+		return -1;
+	password_ro[0] = '\0';
+	if (o->have_ro &&
+	    !base64url_encode(o->auth_ro, TOKEN_AUTH_LEN, password_ro,
+			      sizeof(password_ro)))
 		return -1;
 
 	bind = ssh_bind_new();
@@ -423,7 +439,7 @@ int sshd_serve_fd(sock_t fd, const struct sshd_opts *o)
 	gave_fd = 1;
 	if (ssh_handle_key_exchange(s) != SSH_OK)
 		goto out;
-	if (do_auth(s, password))
+	if (do_auth(s, password, o->have_ro ? password_ro : NULL, &read_only))
 		goto out;
 	chan = do_channel(s);
 	if (!chan)
@@ -436,15 +452,20 @@ int sshd_serve_fd(sock_t fd, const struct sshd_opts *o)
 	 * (tmux) uses exactly the rows it asked for. The client reserves its own
 	 * bottom status row by requesting one row fewer; honouring that here is
 	 * what keeps tmux off that row. */
-	child = cpty_spawn(o->command, o->use_pty || want_pty, rows, cols, term);
+	cmd = (read_only && o->command_ro) ? o->command_ro : o->command;
+	child = cpty_spawn(cmd, o->use_pty || want_pty, rows, cols, term);
 	if (!child)
 		goto out;
 
 	/* Live resizes arrive as window-change requests; the pump applies them
 	 * to the pty. A second channel requesting the comrade-ctl subsystem is
 	 * bridged to o->ctl_fd, and client port forwards are served unless
-	 * o->no_fwd declines them (all in drain_messages). */
-	pump(s, chan, child, o);
+	 * declined by o->no_fwd or the read-only grade (all in drain_messages):
+	 * a view-only guest cannot make the host connect() outbound. */
+	eff = *o;
+	if (read_only)
+		eff.no_fwd = 1;
+	pump(s, chan, child, &eff);
 	rc = 0;
 out:
 	if (child)

@@ -18,6 +18,8 @@ struct session_keys {
 };
 
 int keys_derive(struct session_keys *keys, const uint8_t rdv[TOKEN_RDV_LEN]);
+void keys_derive_ro_auth(uint8_t ro[TOKEN_AUTH_LEN],
+			 const uint8_t rw[TOKEN_AUTH_LEN]);
 int msg_seal(uint8_t *dst, size_t dst_len, const uint8_t key[32],
 	     const uint8_t *plain, size_t plain_len);
 int msg_open(uint8_t *dst, size_t dst_len, const uint8_t key[32],

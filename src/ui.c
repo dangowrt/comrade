@@ -70,6 +70,8 @@ struct ui {
 	int stage4, stage6;		/* per-family rendezvous stage, -1 unknown */
 	char token[256];
 	int have_token;
+	char token_ro[256];
+	int have_token_ro;
 	struct peerrow peer[8];
 	int npeer;
 	char escalate[160];
@@ -300,7 +302,11 @@ static void draw(struct ui *u)
 		}
 		line(CYN "INVITE" RST);
 		if (u->have_token) {
-			line("  " WHT "$ comrade %s" RST, u->token);
+			line("  " WHT "$ comrade %s" RST DIM "   (read-write)" RST,
+			     u->token);
+			if (u->have_token_ro)
+				line("  " WHT "$ comrade %s" RST DIM
+				     "   (read-only)" RST, u->token_ro);
 			if (r4 && r6)
 				line("  " BGR "reachable over IPv4 and IPv6" RST);
 			else if (r4 && p6)
@@ -519,6 +525,16 @@ static void um_token(struct ui *u, const char *tok)
 		u->dirty = 1;
 }
 
+static void um_token_ro(struct ui *u, const char *tok)
+{
+	snprintf(u->token_ro, sizeof(u->token_ro), "%s", tok);
+	u->have_token_ro = 1;
+	if (!u->anim)
+		vlog(u, "token  %s (read-only)", tok);
+	else
+		u->dirty = 1;
+}
+
 static void um_peer(struct ui *u, int id, int state, const char *addr)
 {
 	int have_addr = addr && addr[0] && addr[0] != '-';
@@ -616,6 +632,7 @@ static void cb_link(void *a, const char *n, int h4, int h6) { um_link(a, n, h4, 
 static void cb_rdv(void *a, int f, const char *ad, int rd) { um_rdv(a, f, rd, ad); }
 static void cb_rdv_stage(void *a, int f, int st) { um_rdv_stage(a, f, st); }
 static void cb_token(void *a, const char *t) { um_token(a, t); }
+static void cb_token_ro(void *a, const char *t) { um_token_ro(a, t); }
 static void cb_peer(void *a, int id, int s, const char *ad) { um_peer(a, id, s, ad); }
 static void cb_reset(void *a) { um_reset(a); }
 static void cb_net_reset(void *a) { um_net_reset(a); }
@@ -656,6 +673,7 @@ void ui_bind(struct ui *u, struct session_obs *obs)
 	obs->rendezvous = cb_rdv;
 	obs->rdv_stage = cb_rdv_stage;
 	obs->token = cb_token;
+	obs->token_ro = cb_token_ro;
 	obs->peer = cb_peer;
 	obs->reset = cb_reset;
 	obs->net_reset = cb_net_reset;
@@ -708,6 +726,10 @@ static void em_token(void *a, const char *t)
 {
 	emitf(a, "T %s\n", t);
 }
+static void em_token_ro(void *a, const char *t)
+{
+	emitf(a, "U %s\n", t);
+}
 static void em_peer(void *a, int id, int s, const char *ad)
 {
 	emitf(a, "P %d %d %s\n", id, s, ad && ad[0] ? ad : "-");
@@ -743,6 +765,7 @@ void ui_emitter(struct session_obs *obs, sock_t fd)
 	obs->rendezvous = em_rdv;
 	obs->rdv_stage = em_rdv_stage;
 	obs->token = em_token;
+	obs->token_ro = em_token_ro;
 	obs->peer = em_peer;
 	obs->reset = em_reset;
 	obs->net_reset = em_net_reset;
@@ -755,6 +778,12 @@ void ui_emitter_token(const struct session_obs *obs, const char *token_str)
 {
 	if (obs && obs->token)
 		obs->token(obs->arg, token_str);
+}
+
+void ui_emitter_token_ro(const struct session_obs *obs, const char *token_str)
+{
+	if (obs && obs->token_ro)
+		obs->token_ro(obs->arg, token_str);
 }
 
 /* ---- host foreground side: render service events, wait for the operator ---- */
@@ -786,6 +815,15 @@ static void feed(struct ui *u, char *ln)
 			u->have_token = 1;
 			if (!u->anim)
 				vlog(u, "token  %s", u->token);
+			else
+				u->dirty = 1;
+		}
+		break;
+	case 'U':
+		if (sscanf(ln + 1, " %255s", u->token_ro) == 1) {
+			u->have_token_ro = 1;
+			if (!u->anim)
+				vlog(u, "token  %s (read-only)", u->token_ro);
 			else
 				u->dirty = 1;
 		}

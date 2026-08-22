@@ -167,6 +167,13 @@ static void attach_cmd(char *out, size_t n, const char *sock)
 	snprintf(out, n, "tmux -S \"%s\" attach -t comrade", sock);
 }
 
+/* The read-only variant, served to a client that presents the read-only
+ * secret: tmux's -r puts that client in view-only mode. */
+static void attach_cmd_ro(char *out, size_t n, const char *sock)
+{
+	snprintf(out, n, "tmux -S \"%s\" attach -r -t comrade", sock);
+}
+
 /* ---- scanning the state directory ---- */
 
 /*
@@ -410,6 +417,8 @@ static void on_rendezvous(void *arg, const struct sockaddr *sa, socklen_t len)
 {
 	struct svc *v = arg;
 	char tokbuf[TOKEN_STR_LEN + 1];
+	char tokbuf_ro[TOKEN_STR_LEN + 1];
+	struct token ro;
 	FILE *f;
 
 	(void)len;
@@ -428,12 +437,18 @@ static void on_rendezvous(void *arg, const struct sockaddr *sa, socklen_t len)
 	}
 	if (token_encode(&v->tok, tokbuf, sizeof(tokbuf)))
 		return;
+	ro = v->tok;
+	ro.flags |= TOKEN_FLAG_RO;
+	keys_derive_ro_auth(ro.auth, v->tok.auth);
+	if (token_encode(&ro, tokbuf_ro, sizeof(tokbuf_ro)))
+		return;
 	f = fopen(v->tokfile, "wb");
 	if (f) {
-		fprintf(f, "%s\n", tokbuf);
+		fprintf(f, "%s\n%s\n", tokbuf, tokbuf_ro);
 		fclose(f);
 	}
 	ui_emitter_token(&v->obs, tokbuf);	/* show it in the foreground */
+	ui_emitter_token_ro(&v->obs, tokbuf_ro);
 }
 
 /* Serve the shared tmux over the punched link, again after each client, until
@@ -441,10 +456,12 @@ static void on_rendezvous(void *arg, const struct sockaddr *sa, socklen_t len)
 static void run_service(struct svc *v, void *hostkey, sock_t wfd)
 {
 	char cmd[600];
+	char cmd_ro[600];
 	struct session_cfg cfg;
 	sock_t end_fd;
 
 	attach_cmd(cmd, sizeof(cmd), v->sock);
+	attach_cmd_ro(cmd_ro, sizeof(cmd_ro), v->sock);
 	end_fd = spawn_end_monitor(v->sock);
 
 	ui_emitter(&v->obs, wfd);	/* progress -> the foreground view */
@@ -459,6 +476,7 @@ static void run_service(struct svc *v, void *hostkey, sock_t wfd)
 	cfg.connect_timeout_s = 60;
 	cfg.hostkey = hostkey;
 	cfg.ssh_command = cmd;
+	cfg.ssh_command_ro = cmd_ro;
 	cfg.use_pty = 1;
 	cfg.ssh_end_fd = sock_isset(end_fd) ? end_fd : 0;
 	cfg.no_fwd = v->no_fwd;
@@ -853,6 +871,7 @@ static void show_one(const char *id, void *arg)
 	int *shown = arg;
 	char sock[512], tf[512], tok[TOKEN_STR_LEN + 8];
 	FILE *f;
+	int ln = 0;
 
 	sock_path(sock, sizeof(sock), id);
 	if (!tmux_alive(sock))
@@ -861,9 +880,10 @@ static void show_one(const char *id, void *arg)
 	f = fopen(tf, "r");
 	if (!f)
 		return;
-	if (fgets(tok, sizeof(tok), f)) {
-		printf("%s", tok);
+	while (fgets(tok, sizeof(tok), f)) {
+		printf("%s%s", ln ? "read-only   " : "read-write  ", tok);
 		*shown = 1;
+		ln++;
 	}
 	fclose(f);
 }

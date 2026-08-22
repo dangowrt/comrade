@@ -61,6 +61,8 @@ struct session_obs {
 	void (*rdv_stage)(void *arg, int family, int stage);
 	/* The invite token is minted and ready to share (host). */
 	void (*token)(void *arg, const char *token_str);
+	/* The read-only twin of the invite token (host); grants view-only. */
+	void (*token_ro)(void *arg, const char *token_str);
 	/* A peer identified by `id` advanced to `state` (SESSION_PEER_*); addr may
 	 * be "". `id` is stable for one connection's lifetime, so a multi-user
 	 * host addresses each attached client's row independently (and can update
@@ -103,6 +105,7 @@ struct session_cfg {
 	int host_serve_max;		/* stop after serving this many clients
 					 * (0 = until the deadline / operator) */
 	const char *ssh_command;	/* command to serve; NULL => tmux default */
+	const char *ssh_command_ro;	/* command for a read-only client; NULL => none */
 	int use_pty;			/* allocate a pty (interactive/tmux) */
 	/*
 	 * Optional end-of-session fd, polled while a client is attached. It

@@ -930,7 +930,10 @@ static void *ssh_srv_thread(void *p)
 	memset(&o, 0, sizeof(o));
 	o.hostkey = s->cfg->hostkey;
 	memcpy(o.auth, s->auth, sizeof(o.auth));
+	keys_derive_ro_auth(o.auth_ro, s->auth);
+	o.have_ro = 1;
 	o.command = s->cfg->ssh_command;	/* NULL => tmux default */
+	o.command_ro = s->cfg->ssh_command_ro;
 	o.use_pty = s->cfg->use_pty;
 	o.end_fd = s->cfg->ssh_end_fd;
 	o.ctl_fd = c->ssh_ctl_fd;
