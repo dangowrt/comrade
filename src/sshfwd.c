@@ -54,6 +54,10 @@ struct fwd_pend {
 	uint16_t port;			/*   and port */
 	char orig[64];			/* PEND_REV_OPEN: originator */
 	uint16_t orig_port;
+	struct addrinfo *res;		/* PEND_*_CONNECT: every resolved target
+					 * address; freed when the pend ends */
+	struct addrinfo *next;		/*   the ones still untried */
+	char tgt[80];			/*   "host:port", for the failure log */
 };
 
 struct sshfwd {
@@ -96,31 +100,78 @@ static void peer_name(sock_t fd, char *addr, size_t alen, uint16_t *port)
 	}
 }
 
-/* Begin a non-blocking connect to host:port (first resolved address).
- * Returns the fd, or -1. getaddrinfo itself can block on real DNS; targets
- * here are typically loopback, numeric, or local names, and the punched
- * session tolerates a stall of that order (it rides KCP retransmission). */
-static sock_t start_connect(const char *host, uint16_t port)
+/* One non-blocking connect toward `ai`. Returns the fd, or INVALID_SOCK. */
+static sock_t connect_one(const struct addrinfo *ai)
 {
-	struct addrinfo hints, *res = NULL;
+	sock_t fd = socket(ai->ai_family, SOCK_STREAM, 0);
+
+	if (!sock_valid(fd))
+		return INVALID_SOCK;
+	sock_set_nonblock(fd);		/* SOCK_NONBLOCK is Linux-only */
+	if (connect(fd, ai->ai_addr, (int)ai->ai_addrlen) &&
+	    !sock_err_in_progress(sock_errno())) {
+		sock_close(fd);
+		return INVALID_SOCK;
+	}
+	return fd;
+}
+
+static void pend_res_free(struct fwd_pend *p)
+{
+	if (p->res)
+		freeaddrinfo(p->res);
+	p->res = NULL;
+	p->next = NULL;
+}
+
+/*
+ * Begin connecting the pend to host:port, keeping the whole resolved list: an
+ * address that fails hands the attempt to the next one, so a "localhost"
+ * target reaches a server bound to either family -- which family resolves
+ * first is the resolver's business, not the operator's. getaddrinfo itself
+ * can block on real DNS; targets here are typically loopback, numeric, or
+ * local names, and the punched session tolerates a stall of that order (it
+ * rides KCP retransmission). Returns 0 with a connect in flight.
+ */
+static int pend_connect_begin(struct fwd_pend *p, const char *host,
+			      uint16_t port)
+{
+	struct addrinfo hints;
 	char portstr[8];
-	sock_t fd = INVALID_SOCK;
 
 	memset(&hints, 0, sizeof(hints));
 	hints.ai_socktype = SOCK_STREAM;
 	snprintf(portstr, sizeof(portstr), "%u", port);
-	if (getaddrinfo(host, portstr, &hints, &res) || !res)
-		return INVALID_SOCK;
-	fd = socket(res->ai_family, SOCK_STREAM, 0);
-	if (sock_valid(fd))
-		sock_set_nonblock(fd);	/* SOCK_NONBLOCK is Linux-only */
-	if (sock_valid(fd) && connect(fd, res->ai_addr, (int)res->ai_addrlen) &&
-	    !sock_err_in_progress(sock_errno())) {
-		sock_close(fd);
-		fd = INVALID_SOCK;
+	p->res = NULL;
+	if (getaddrinfo(host, portstr, &hints, &p->res) || !p->res) {
+		p->res = NULL;
+		return -1;
 	}
-	freeaddrinfo(res);
-	return fd;
+	snprintf(p->tgt, sizeof(p->tgt), "%s:%u", host, port);
+	p->next = p->res;
+	p->fd = INVALID_SOCK;
+	while (p->next && !sock_valid(p->fd)) {
+		p->fd = connect_one(p->next);
+		p->next = p->next->ai_next;
+	}
+	if (!sock_valid(p->fd)) {
+		pend_res_free(p);
+		return -1;
+	}
+	return 0;
+}
+
+/* A failed connect moves on to the next resolved address; 0 with another
+ * attempt in flight, -1 when the list is exhausted. */
+static int pend_connect_next(struct fwd_pend *p)
+{
+	sock_close(p->fd);
+	p->fd = INVALID_SOCK;
+	while (p->next && !sock_valid(p->fd)) {
+		p->fd = connect_one(p->next);
+		p->next = p->next->ai_next;
+	}
+	return sock_valid(p->fd) ? 0 : -1;
 }
 
 /*
@@ -304,6 +355,7 @@ void sshfwd_destroy(struct sshfwd *f)
 		}
 		if (p->chan)
 			ssh_channel_free(p->chan);
+		pend_res_free(p);
 	}
 	free(f);
 }
@@ -441,6 +493,9 @@ static int pend_step(struct sshfwd *f, struct fwd_pend *p)
 		rc = finish_connect(p->fd);
 		if (!rc && fwd_now_ms() < p->deadline)
 			return 0;
+		if (rc < 0 && fwd_now_ms() < p->deadline &&
+		    !pend_connect_next(p))
+			return 0;
 		if (rc == 1) {
 			ssh_channel chan =
 				ssh_message_channel_request_open_reply_accept(p->msg);
@@ -448,25 +503,33 @@ static int pend_step(struct sshfwd *f, struct fwd_pend *p)
 			ssh_message_free(p->msg);
 			p->msg = NULL;
 			if (chan) {
+				pend_res_free(p);
 				bridge_up(f, p->fd, chan);
 				return 1;
 			}
 		} else {
+			dbg_logf("sshfwd -L: target %s unreachable", p->tgt);
 			ssh_message_reply_default(p->msg);	/* open failure */
 			ssh_message_free(p->msg);
 			p->msg = NULL;
 		}
+		pend_res_free(p);
 		sock_close(p->fd);
 		return 1;
 	case PEND_CLI_CONNECT:
 		rc = finish_connect(p->fd);
 		if (!rc && fwd_now_ms() < p->deadline)
 			return 0;
+		if (rc < 0 && fwd_now_ms() < p->deadline &&
+		    !pend_connect_next(p))
+			return 0;
 		if (rc == 1) {
+			pend_res_free(p);
 			bridge_up(f, p->fd, p->chan);
 			return 1;
 		}
-		dbg_logf("sshfwd -R: local target connect failed");
+		dbg_logf("sshfwd -R: target %s unreachable", p->tgt);
+		pend_res_free(p);
 		sock_close(p->fd);
 		if (ssh_channel_is_open(p->chan))
 			ssh_channel_close(p->chan);
@@ -536,8 +599,8 @@ void sshfwd_tick(struct sshfwd *f)
 				}
 			p = l ? pend_slot(f) : NULL;
 			if (p) {
-				p->fd = start_connect(l->sp.host, l->sp.port);
-				if (sock_valid(p->fd)) {
+				if (!pend_connect_begin(p, l->sp.host,
+							l->sp.port)) {
 					p->kind = PEND_CLI_CONNECT;
 					p->msg = NULL;
 					p->chan = chan;
@@ -546,6 +609,8 @@ void sshfwd_tick(struct sshfwd *f)
 					p->used = 1;
 					continue;
 				}
+				dbg_logf("sshfwd -R: target %s:%u unresolvable",
+					 l->sp.host, l->sp.port);
 			}
 			if (ssh_channel_is_open(chan))
 				ssh_channel_close(chan);
@@ -590,8 +655,7 @@ int sshfwd_srv_message(struct sshfwd *f, ssh_message m)
 			ssh_message_free(m);
 			return 1;
 		}
-		p->fd = start_connect(dest, (uint16_t)port);
-		if (!sock_valid(p->fd)) {
+		if (pend_connect_begin(p, dest, (uint16_t)port)) {
 			ssh_message_reply_default(m);
 			ssh_message_free(m);
 			return 1;
