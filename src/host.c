@@ -15,26 +15,9 @@
  * host is its own file: src/host_win.c. This one stays the POSIX host it
  * always was, with no #ifdefs in it.
  */
-#if defined(_WIN32) && defined(COMRADE_HAVE_SESSION)
+#ifdef _WIN32
 
 /* host_run/host_show live in host_win.c. */
-
-#elif !defined(COMRADE_HAVE_SESSION)
-
-int host_run(int ui_mode, int no_mcast, int no_fwd)
-{
-	(void)ui_mode;
-	(void)no_mcast;
-	(void)no_fwd;
-	fprintf(stderr, "comrade: built without the session stack\n");
-	return 1;
-}
-
-int host_show(void)
-{
-	fprintf(stderr, "comrade: built without the session stack\n");
-	return 1;
-}
 
 #else
 

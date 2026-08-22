@@ -12,9 +12,7 @@
 #include "ui.h"			/* UI_* enums used by main() in every build */
 #include "wsock.h"		/* WSAStartup before any socket is created */
 
-#ifdef COMRADE_HAVE_SESSION
 #include "sig.h"
-#endif
 
 /* CLI splash wordmark, ready for the interactive UX work. 7-bit ASCII. */
 static const char comrade_splash[] =
@@ -46,7 +44,6 @@ static int session_connect(const char *arg, int ui_mode, int no_mcast,
 			   const struct fwdspec *fwd_l, int nfwd_l,
 			   const struct fwdspec *fwd_r, int nfwd_r)
 {
-#ifdef COMRADE_HAVE_SESSION
 	struct session_cfg cfg;
 	struct session_obs obs;
 	struct ui *u;
@@ -82,20 +79,6 @@ static int session_connect(const char *arg, int ui_mode, int no_mcast,
 		return 1;
 	}
 	return 0;
-#else
-	struct token tok;
-
-	(void)ui_mode;
-	(void)no_mcast;
-	(void)fwd_l;
-	(void)nfwd_l;
-	(void)fwd_r;
-	(void)nfwd_r;
-	if (token_decode(&tok, arg))
-		fprintf(stderr, "comrade: invalid token\n");
-	fprintf(stderr, "comrade: built without the session stack\n");
-	return 1;
-#endif
 }
 
 /* Collect one -L/-R argument: the spec may be glued to the flag (ssh style,
@@ -148,7 +131,7 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-#if defined(_WIN32) && defined(COMRADE_HAVE_SESSION)
+#ifdef _WIN32
 	/*
 	 * The host's connection service, re-entered detached. Windows has no
 	 * fork, so the process that outlives the operator's terminal has to be

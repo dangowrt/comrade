@@ -7,7 +7,7 @@
 
 #include "host.h"
 
-#if defined(_WIN32) && defined(COMRADE_HAVE_SESSION)
+#ifdef _WIN32
 
 #include <libssh/libssh.h>
 
@@ -900,4 +900,4 @@ int host_show(void)
 	return 0;
 }
 
-#endif /* _WIN32 && COMRADE_HAVE_SESSION */
+#endif /* _WIN32 */

@@ -8,7 +8,7 @@
 int host_run(int ui_mode, int no_mcast, int no_fwd);
 int host_show(void);
 
-#if defined(_WIN32) && defined(COMRADE_HAVE_SESSION)
+#ifdef _WIN32
 /*
  * The detached service half of the Windows host, re-entered as
  * `comrade --win-service <socket handle>`. Not a user-facing command: the
