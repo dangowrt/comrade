@@ -111,8 +111,16 @@ static int fam_idx(int family)
  * claim still sitting in the slot is queued, however long the queue, and a
  * timeout that cannot tell those two apart livelocks one case or the other
  * (measured, both ways).
+ *
+ * Two bounds, because the slot's exit says how it left. A claim the host
+ * consumed is in all likelihood being punched right now, and a punch through
+ * carrier-grade NAT takes several seconds of checks before the first one
+ * lands, so it gets the long wait. One overwritten by a rival claimant is
+ * settled -- the host will punch the rival, never this agent -- and waits only
+ * long enough to absorb a stale read of the slot.
  */
-#define PATH_PROBE_MS 2500
+#define PATH_PROBE_MS 12000
+#define PATH_LOST_MS 2500
 
 /*
  * Post-teardown linger for the bridge. The host keeps flushing generously, to
@@ -195,8 +203,11 @@ struct conn {
 	 * claim reached the slot; released_ms is when it left again, which is the
 	 * host picking somebody up. If that somebody was us a worker now exists and
 	 * a probe answers within a round trip; if it was not, nothing ever will.
+	 * claim_lost records that the slot left HELD by being overwritten (BUSY):
+	 * a rival queued over us, so no pickup of our claim is coming.
 	 */
 	int claim_held_seen;
+	int claim_lost;
 	uint64_t claim_released_ms;
 	/* The claimant's ICE ufrag, carried for the worker's whole lifetime so the
 	 * host recognises the same client arriving over the other transport. */
@@ -1617,15 +1628,23 @@ static int path_probe_expired(struct conn *c)
 {
 	if (path_ready(c) || !c->claim_released_ms)
 		return 0;
-	return now_ms() - c->claim_released_ms > PATH_PROBE_MS;
+	return now_ms() - c->claim_released_ms >
+	       (uint64_t)(c->claim_lost ? PATH_LOST_MS : PATH_PROBE_MS);
 }
 
 /*
- * Has the host rotated past the offer this agent is primed against? Only
- * meaningful for a client that has primed one and not yet qualified: it means
- * somebody else was served, and that this agent can no longer pair with the
- * listener a pickup would use. Re-gathering against the current offer is the
- * only way back -- ICE credentials cannot be swapped into a live agent.
+ * Has the host rotated past the offer this agent is primed against, with this
+ * agent out of the running? Only meaningful for a client that has primed one
+ * and not yet qualified. A rotation alone proves nothing: release-on-pickup
+ * mints a fresh offer the instant the host takes a claim up, so the winner
+ * sees its own pickup as a rotation too -- and the rotated offer routinely
+ * outruns every signal that could say which one we are, because the claim
+ * slot's transitions ride the same eventually-consistent GET (measured: the
+ * rotation arrived 2-5s after pickup and aborted every punch slower than
+ * that, which through carrier-grade NAT is all of them). So the rotation is
+ * read as a loss only once the attempt has had its probe window from the
+ * moment this agent was primed, or once the slot has said outright that a
+ * rival overwrote us.
  */
 static int offer_moved_on(struct conn *c)
 {
@@ -1636,6 +1655,9 @@ static int offer_moved_on(struct conn *c)
 	if (!c->remote_ufrag[0] || !s->cur_offer_ufrag[0])
 		return 0;
 	if (!strcmp(s->cur_offer_ufrag, c->remote_ufrag))
+		return 0;
+	if (!c->claim_lost &&
+	    now_ms() - s->ice_attempt_start <= PATH_PROBE_MS)
 		return 0;
 	/*
 	 * Only a client that has actually reached the answer slot is queued
@@ -1659,12 +1681,15 @@ static void claim_watch(struct conn *c)
 	st = sig_claim_status(c->sess->sig);
 	if (st == SIG_CLAIM_HELD) {
 		c->claim_held_seen = 1;
+		c->claim_lost = 0;
 		c->claim_released_ms = 0;
 		return;
 	}
 	if (c->claim_held_seen && !c->claim_released_ms &&
-	    (st == SIG_CLAIM_FREE || st == SIG_CLAIM_BUSY))
+	    (st == SIG_CLAIM_FREE || st == SIG_CLAIM_BUSY)) {
 		c->claim_released_ms = now_ms();
+		c->claim_lost = st == SIG_CLAIM_BUSY;
+	}
 }
 
 static void on_transport_recv(void *arg, const uint8_t *data, size_t len)
@@ -2029,6 +2054,7 @@ static void conn_gen_ice(struct conn *c)
 	path_table_reset_stats(&c->paths);
 	pthread_mutex_unlock(&c->path_lock);
 	c->claim_held_seen = 0;
+	c->claim_lost = 0;
 	c->claim_released_ms = 0;
 	c->remote_ufrag[0] = '\0';
 }
