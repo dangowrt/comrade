@@ -3,6 +3,7 @@
 
 #define _GNU_SOURCE
 #include "wsock.h"
+#include <stdio.h>
 #include <string.h>
 #include <stdint.h>
 
@@ -165,6 +166,72 @@ void cand_sdp_filter(const char *in, int family_filter,
 		line = nl + 1;
 	}
 	out[o] = '\0';
+}
+
+void cand_sdp_fan_v4(char *sdp, size_t cap, const uint8_t (*pool)[4],
+		     size_t npool)
+{
+	uint8_t seen[8][4];
+	const char *line = sdp;
+	size_t nseen = 0, o, i, k;
+	unsigned prio = 0;
+	int port = -1;
+
+	while (*line) {
+		const char *nl = strchr(line, '\n');
+		size_t len = nl ? (size_t)(nl - line + 1) : strlen(line);
+		const char *p = os_memmem(line, len, "candidate:", 10);
+		char addr[64], typ[16];
+		uint8_t b[4];
+		unsigned pr;
+		int pt;
+
+		if (p && sscanf(p, "candidate:%*s %*d %*s %u %63s %d typ %15s",
+				&pr, addr, &pt, typ) == 4 &&
+		    !strcmp(typ, "srflx") && inet_pton(AF_INET, addr, b) == 1) {
+			if (port >= 0 && pt != port)
+				return;
+			port = pt;
+			if (!prio || pr < prio)
+				prio = pr;
+			if (nseen < sizeof(seen) / sizeof(seen[0])) {
+				memcpy(seen[nseen], b, 4);
+				nseen++;
+			}
+		}
+		if (!nl)
+			break;
+		line = nl + 1;
+	}
+	if (port <= 0)
+		return;
+
+	o = strlen(sdp);
+	if (o && sdp[o - 1] != '\n') {
+		if (o + 1 >= cap)
+			return;
+		sdp[o++] = '\n';
+		sdp[o] = '\0';
+	}
+	for (i = 0; i < npool; i++) {
+		char abuf[64], cand[96];
+		int n, dup = 0;
+
+		for (k = 0; k < nseen; k++)
+			if (!memcmp(seen[k], pool[i], 4))
+				dup = 1;
+		if (dup || !inet_ntop(AF_INET, pool[i], abuf, sizeof(abuf)))
+			continue;
+		n = snprintf(cand, sizeof(cand),
+			     "a=candidate:pool%u 1 UDP %u %s %d typ srflx "
+			     "raddr 0.0.0.0 rport 0\n", (unsigned)i,
+			     prio > (unsigned)i + 1 ? prio - (unsigned)i - 1 : 1,
+			     abuf, port);
+		if (n < 0 || o + (size_t)n >= cap)
+			return;
+		memcpy(sdp + o, cand, (size_t)n + 1);
+		o += (size_t)n;
+	}
 }
 
 void cand_sdp_drop_self(const char *in, const struct netmon_addr *local,

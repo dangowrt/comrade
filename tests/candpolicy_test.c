@@ -2,6 +2,7 @@
 /* Copyright (C) 2026 Daniel Golle <daniel@makrotopia.org> */
 
 #include <assert.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "candpolicy.h"
@@ -119,11 +120,81 @@ static void drop_self_check(void)
 	assert(strstr(out, "192.168.5.164"));
 }
 
+static void fan_check(void)
+{
+	uint8_t pool[3][4];
+	char sdp[1024];
+	char *at;
+	unsigned pr;
+	static const char base[] =
+		"a=ice-ufrag:abcd\r\n"
+		"a=ice-pwd:secretpwd\r\n"
+		"a=candidate:1 1 UDP 2130706431 192.168.5.164 40000 typ host\r\n"
+		"a=candidate:2 1 UDP 1678769919 203.0.113.9 40002 typ srflx raddr 0.0.0.0 rport 0\r\n";
+
+	assert(inet_pton(AF_INET, "203.0.113.9", pool[0]) == 1);
+	assert(inet_pton(AF_INET, "198.51.100.7", pool[1]) == 1);
+	assert(inet_pton(AF_INET, "192.0.2.33", pool[2]) == 1);
+
+	/* Every pool member is advertised once, at the reflexive port, ranked
+	 * below the observed candidate; the observed one is not repeated. */
+	strcpy(sdp, base);
+	cand_sdp_fan_v4(sdp, sizeof(sdp), pool, 3);
+	assert(strstr(sdp, "198.51.100.7 40002 typ srflx"));
+	assert(strstr(sdp, "192.0.2.33 40002 typ srflx"));
+	at = strstr(sdp, "203.0.113.9");
+	assert(at && !strstr(at + 1, "203.0.113.9"));
+	at = strstr(sdp, "a=candidate:pool");
+	assert(at && sscanf(at, "a=candidate:%*s %*d %*s %u", &pr) == 1 &&
+	       pr < 1678769919);
+
+	/* The host candidate is never a fan source. */
+	assert(!strstr(sdp, "192.168.5.164 40000 typ srflx"));
+
+	/* No reflexive candidate: nothing to fan from. */
+	strcpy(sdp,
+	       "a=ice-ufrag:abcd\r\n"
+	       "a=candidate:1 1 UDP 2 192.168.5.164 40000 typ host\r\n");
+	cand_sdp_fan_v4(sdp, sizeof(sdp), pool, 3);
+	assert(!strstr(sdp, "198.51.100.7"));
+
+	/* Reflexive ports disagree: the mapping is per-destination in the
+	 * port too, and no variant can be named. */
+	strcpy(sdp,
+	       "a=candidate:1 1 UDP 9 203.0.113.9 40002 typ srflx raddr 0.0.0.0 rport 0\r\n"
+	       "a=candidate:2 1 UDP 8 192.0.2.33 40007 typ srflx raddr 0.0.0.0 rport 0\r\n");
+	cand_sdp_fan_v4(sdp, sizeof(sdp), pool, 3);
+	assert(!strstr(sdp, "198.51.100.7"));
+
+	/* Two observed members at one port (a multi-homed STUN name): only
+	 * the missing third is added. */
+	strcpy(sdp,
+	       "a=candidate:1 1 UDP 9 203.0.113.9 40002 typ srflx raddr 0.0.0.0 rport 0\r\n"
+	       "a=candidate:2 1 UDP 8 192.0.2.33 40002 typ srflx raddr 0.0.0.0 rport 0\r\n");
+	cand_sdp_fan_v4(sdp, sizeof(sdp), pool, 3);
+	assert(strstr(sdp, "198.51.100.7 40002 typ srflx"));
+	at = strstr(sdp, "192.0.2.33");
+	assert(at && !strstr(at + 1, "192.0.2.33"));
+
+	/* A description without a trailing newline still parses whole. */
+	strcpy(sdp,
+	       "a=candidate:1 1 UDP 9 203.0.113.9 40002 typ srflx raddr 0.0.0.0 rport 0");
+	cand_sdp_fan_v4(sdp, sizeof(sdp), pool, 3);
+	assert(strstr(sdp, "198.51.100.7 40002 typ srflx"));
+	assert(strstr(sdp, "192.0.2.33 40002 typ srflx"));
+
+	/* A buffer with no room for a whole variant line stays as it was. */
+	strcpy(sdp, base);
+	cand_sdp_fan_v4(sdp, strlen(base) + 40, pool, 3);
+	assert(!strcmp(sdp, base));
+}
+
 int main(void)
 {
 	default_policy_check();
 	opt_in_check();
 	sdp_filter_check();
 	drop_self_check();
+	fan_check();
 	return 0;
 }

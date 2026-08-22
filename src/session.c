@@ -123,6 +123,18 @@ static int fam_idx(int family)
 #define PATH_LOST_MS 2500
 
 /*
+ * Public v4 addresses remembered per network for the reflexive fan-out. A
+ * subscriber's flows spread only as wide as the NAT group behind its session
+ * anchor, never the operator's whole pool: paired pooling is the deployed
+ * default (RFC 6888 REQ-2) and per-subscriber traceability pushes the same
+ * way, so the measured three-member spray is already the pathology and eight
+ * bounds it with headroom. The cap prices only observations -- the wire
+ * carries observed members alone, 12 bytes each against SIG_MAX_VALUE, which
+ * candpack_encode answers with a failed post rather than a truncated one.
+ */
+#define POOL4_MAX 8
+
+/*
  * Post-teardown linger for the bridge. The host keeps flushing generously, to
  * land the dedicated end-of-session signal (the channel exit-status and close)
  * on the client even over a lossy link -- it returns as soon as the client
@@ -334,6 +346,16 @@ struct sess {
 	char **stun_servers;		/* rotated across ICE retries (host:port) */
 	int stun_count;
 	char stun_host[128];		/* the current attempt's host, split out */
+	/*
+	 * Distinct public v4 addresses this network's NAT has been seen mapping
+	 * our sockets to. One entry is the ordinary case; more mean a carrier
+	 * pool that picks its member per destination, which is what the posted
+	 * description must fan across (see fan_local_sdp). Grown from the
+	 * gather thread and read at post time, both under trickle_lock; a roam
+	 * empties it with the other per-network facts.
+	 */
+	uint8_t pool4[POOL4_MAX][4];
+	int npool4;
 
 	/*
 	 * Host admission registry, all touched only on the host main thread (no
@@ -919,6 +941,27 @@ static void sdp_filter(const char *in, int family, char *out, size_t outlen)
 	cand_sdp_filter(in, family, &pol, out, outlen);
 }
 
+/*
+ * Fan the description about to be posted across every public v4 this
+ * network's NAT has shown for our sockets, so a peer behind a carrier pool
+ * that picks its egress per destination still aims a check at the member
+ * chosen for it. With the single address of an ordinary NAT this is a no-op.
+ */
+static void fan_local_sdp(struct sess *s)
+{
+	uint8_t pool[POOL4_MAX][4];
+	int n, i;
+
+	pthread_mutex_lock(&s->trickle_lock);
+	n = s->npool4;
+	for (i = 0; i < n; i++)
+		memcpy(pool[i], s->pool4[i], 4);
+	pthread_mutex_unlock(&s->trickle_lock);
+	if (n < 2)
+		return;
+	cand_sdp_fan_v4(s->local_sdp, sizeof(s->local_sdp), pool, (size_t)n);
+}
+
 /* Like sdp_filter(), for a peer's SDP: also drops any host candidate that
  * names one of our own local addresses (see cand_sdp_drop_self). */
 static void sdp_filter_peer(const char *in, int family, char *out, size_t outlen)
@@ -1127,10 +1170,22 @@ static void on_ice_candidate(void *arg, const char *cand)
 
 	if (p && sscanf(p, "candidate:%*s %*d %*s %*u %63s %*d typ %15s",
 			addr, typ) == 2 && !strchr(addr, ':')) {
-		if (!strcmp(typ, "srflx"))
+		if (!strcmp(typ, "srflx")) {
+			uint8_t b[4];
+			int i;
+
 			s->have_srflx4 = 1;
-		else if (!strcmp(typ, "host") &&
-			 addr_scope(addr) != NET_SCOPE_GLOBAL)
+			if (inet_pton(AF_INET, addr, b) == 1) {
+				pthread_mutex_lock(&s->trickle_lock);
+				for (i = 0; i < s->npool4; i++)
+					if (!memcmp(s->pool4[i], b, 4))
+						break;
+				if (i == s->npool4 && i < POOL4_MAX)
+					memcpy(s->pool4[s->npool4++], b, 4);
+				pthread_mutex_unlock(&s->trickle_lock);
+			}
+		} else if (!strcmp(typ, "host") &&
+			   addr_scope(addr) != NET_SCOPE_GLOBAL)
 			s->have_priv4 = 1;
 	}
 	pthread_mutex_lock(&s->trickle_lock);
@@ -3324,6 +3379,7 @@ static int host_turnstile(struct sess *s)
 			pthread_mutex_lock(&s->trickle_lock);
 			s->trickle_sdp[0] = '\0';
 			s->trickle_dirty = 0;
+			s->npool4 = 0;
 			pthread_mutex_unlock(&s->trickle_lock);
 			ts = TS_GATHER;
 			s->stun_rotations = 0;	/* fresh budget on the new network */
@@ -3456,6 +3512,7 @@ static int host_turnstile(struct sess *s)
 					   sizeof(filtered));
 				snprintf(s->local_sdp, sizeof(s->local_sdp),
 					 "%s", filtered);
+				fan_local_sdp(s);
 				sig_rotate(s->sig, (const uint8_t *)s->local_sdp,
 					   strlen(s->local_sdp));
 				sig_locate(s->sig);
@@ -3711,6 +3768,7 @@ int session_run(const struct session_cfg *cfg)
 			pthread_mutex_lock(&s.trickle_lock);
 			s.trickle_sdp[0] = '\0';
 			s.trickle_dirty = 0;
+			s.npool4 = 0;
 			pthread_mutex_unlock(&s.trickle_lock);
 			st = ST_WAIT_DHT;
 			s.stun_rotations = 0;	/* fresh budget on the new network */
@@ -3792,6 +3850,7 @@ int session_run(const struct session_cfg *cfg)
 					   sizeof(filtered));
 				snprintf(s.local_sdp, sizeof(s.local_sdp),
 					 "%s", filtered);
+				fan_local_sdp(&s);
 				sig_post(s.sig, (const uint8_t *)s.local_sdp,
 					 strlen(s.local_sdp));
 				if (cfg->is_host && (cfg->sig_flags & SIG_DHT))
@@ -3819,6 +3878,8 @@ int session_run(const struct session_cfg *cfg)
 					snprintf(s.c.claim_ufrag,
 						 sizeof(s.c.claim_ufrag), "%s",
 						 ufrag);
+				fan_local_sdp(&s);	/* members learnt since
+							 * the ST_GATHER post */
 				sig_post(s.sig, (const uint8_t *)s.local_sdp,
 					 strlen(s.local_sdp));
 				s.remote_set = 1;
@@ -3944,12 +4005,20 @@ int session_run(const struct session_cfg *cfg)
 				dbg_logf("session: rejoin (roam)");
 				deadline = now_ms() +
 					(uint64_t)cfg->connect_timeout_s * 1000;
-				s.stun_rotations = 0;
-				if (net_changed(&s) && sig_rebuild(&s))
-					st = ST_FAIL;
-				else
-					st = client_regather(&s) ? ST_FAIL :
-								   ST_GATHER;
+				if (net_changed(&s)) {
+					s.stun_rotations = 0;
+					s.have_priv4 = 0;
+					s.have_srflx4 = 0;
+					pthread_mutex_lock(&s.trickle_lock);
+					s.npool4 = 0;
+					pthread_mutex_unlock(&s.trickle_lock);
+					if (sig_rebuild(&s)) {
+						st = ST_FAIL;
+						break;
+					}
+				}
+				st = client_regather(&s) ? ST_FAIL :
+							   ST_GATHER;
 			} else if (!cfg->is_host && now_ms() + 10000 < deadline) {
 				/*
 				 * The nominated pair never carried a session. It is
