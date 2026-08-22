@@ -14,8 +14,22 @@ license=('AGPL-3.0-or-later')
 depends=('libssh' 'libjuice' 'openssl' 'kcp' 'libdht')
 optdepends=('tmux: required to host a session (not to join one)')
 makedepends=('cmake' 'ninja' 'git')
-source=("git+$url.git")
-sha256sums=('SKIP')
+source=("git+$url.git"
+        'git+https://github.com/pradt2/always-online-stun.git')
+sha256sums=('SKIP'
+            'SKIP')
+
+# The STUN server pool is a submodule; without it configure refuses to
+# bake the minimal fallback. Wire the second source in as its origin so
+# makepkg's own checkout satisfies the pin offline.
+prepare() {
+	cd "$srcdir/$pkgname"
+	git submodule init deps/always-online-stun
+	git config submodule.deps/always-online-stun.url \
+		"$srcdir/always-online-stun"
+	git -c protocol.file.allow=always submodule update \
+		deps/always-online-stun
+}
 
 pkgver() {
 	cd "$srcdir/$pkgname"

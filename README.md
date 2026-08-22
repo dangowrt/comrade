@@ -269,10 +269,12 @@ and jech/dht are not packaged for Arch either, so build those two first:
 ### Nix
 
 The flake builds comrade together with the dependencies nixpkgs does not
-carry. Run it without installing, or add it to a profile:
+carry. Fetch it with submodules (the `github:` fetcher omits them, and the
+build needs the STUN pool submodule). Run it without installing, or add it
+to a profile:
 
-    nix run github:dangowrt/comrade
-    nix profile install github:dangowrt/comrade
+    nix run 'git+https://github.com/dangowrt/comrade?submodules=1'
+    nix profile install 'git+https://github.com/dangowrt/comrade?submodules=1'
 
 ### Windows (EXPERIMENTAL!)
 
@@ -445,8 +447,10 @@ Measured findings folded into the design:
     ctest --test-dir build
 
 The submodule is data, not code: the community always-online-stun list.
-Without it configure warns and bakes a minimal fallback; either way
-`comrade stun-update` refreshes the list at runtime.
+Without it configure stops rather than silently baking the three-server
+fallback (available behind `-DCOMRADE_STUN_FALLBACK=ON` for builds that
+truly cannot fetch the list); either way `comrade stun-update` refreshes
+the list at runtime.
 
 Dependencies installed outside the system prefix are picked up via
 `-DCMAKE_PREFIX_PATH`, and the jech/dht checkout via `-DCOMRADE_DHT_DIR`,

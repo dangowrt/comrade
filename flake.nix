@@ -87,6 +87,18 @@
             version = "0.1.0+git${self.shortRev or "dirty"}";
             src = self;
             SOURCE_DATE_EPOCH = toString (self.lastModified or 0);
+            # `self` carries no submodule content unless the flake was
+            # fetched with ?submodules=1, and configure refuses the baked
+            # STUN fallback; say so in nix terms before CMake's own error.
+            preConfigure = ''
+              if [ ! -s deps/always-online-stun/valid_nat_testing_hosts.txt ]; then
+                echo "error: the STUN pool submodule is empty in this source tree." >&2
+                echo "fetch the flake with submodules, e.g.:" >&2
+                echo "  nix run 'git+https://github.com/dangowrt/comrade?submodules=1'" >&2
+                echo "  nix build '.?submodules=1'" >&2
+                exit 1
+              fi
+            '';
             nativeBuildInputs = [ pkgs.cmake pkgs.ninja pkgs.pkg-config ];
             buildInputs = [ pkgs.libssh pkgs.openssl libjuice kcp libdht ];
             # No -DCOMRADE_DHT_DIR: find and link the packaged shared libdht,

@@ -289,13 +289,27 @@ target_link_libraries(comrade_statusbar PUBLIC comrade_conn comrade_compat)
 # always-online-stun submodule (its RFC 5780-capable list, which also serves
 # for plain reflexive gathering); `comrade stun-update` refreshes it into the
 # user's data folder at runtime. The list is never copied into our own tree.
+# A source tree without it (GitHub tarballs carry the submodule as an empty
+# directory) does not configure: a three-server fallback is too little to
+# ship silently, and the released Arch and OpenWrt packages have both baked
+# it that way without anyone noticing. The fallback stays available behind
+# an explicit switch for builds that truly cannot fetch the list.
+option(COMRADE_STUN_FALLBACK "Bake a minimal STUN fallback when the always-online-stun submodule is absent" OFF)
 set(STUN_LIST_SRC "${CMAKE_CURRENT_SOURCE_DIR}/deps/always-online-stun/valid_nat_testing_hosts.txt")
 set(STUN_BUNDLE_INC "${CMAKE_CURRENT_BINARY_DIR}/stun_bundle.inc")
 if(EXISTS "${STUN_LIST_SRC}")
 	file(STRINGS "${STUN_LIST_SRC}" STUN_LIST_LINES)
-else()
-	message(WARNING "always-online-stun submodule not present; baking a minimal STUN fallback. Run: git submodule update --init --depth 1 deps/always-online-stun")
+elseif(COMRADE_STUN_FALLBACK)
+	message(WARNING "always-online-stun submodule not present; baking the minimal STUN fallback (COMRADE_STUN_FALLBACK=ON)")
 	set(STUN_LIST_LINES "stun.nextcloud.com:443" "stun.sipgate.net:3478" "stun.ipfire.org:3478")
+else()
+	message(FATAL_ERROR
+		"The STUN server pool is missing: deps/always-online-stun has no "
+		"valid_nat_testing_hosts.txt. Run\n"
+		"   git submodule update --init --depth 1 deps/always-online-stun\n"
+		"or place the pinned list there yourself (as the OpenWrt package "
+		"does), or pass -DCOMRADE_STUN_FALLBACK=ON to knowingly bake a "
+		"three-server fallback.")
 endif()
 # Anti-big-tech filter: drop servers whose hostname matches a blocklist entry
 # (operators and cloud/CDN hosting of hyperscalers). Applied to the baked pool
