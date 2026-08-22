@@ -17,6 +17,14 @@
 # anything this repo builds, so this only needs the tag to exist -- it does
 # not wait on the release job.
 #
+# The PR description quotes release notes, but not just this release's: a
+# bump PR sitting open across several comrade releases -- or a reviewer
+# taking a while to get to it -- means the version openwrt/packages
+# currently has can be several releases behind v$VERSION, so the notes for
+# everything in between belong in the description too, not just the last
+# one. That "currently has" version is read straight out of upstream's own
+# net/comrade/Makefile, not tracked separately here.
+#
 # Environment: VERSION, OPENWRT_PACKAGES_TOKEN.
 #
 # OPENWRT_PACKAGES_TOKEN must be a *classic* PAT (public_repo scope) for the
@@ -91,6 +99,9 @@ if [ -z "$ADOPT_PR" ]; then
 fi
 git checkout --quiet -B "$BRANCH" upstream/master
 
+log "Read the version net/comrade currently references upstream"
+OLD_V="$(sed -n 's/^PKG_VERSION:=//p' "$PKG_DIR/Makefile")"
+
 log "Bump PKG_VERSION, reset PKG_RELEASE, refresh PKG_HASH"
 sed -i \
   -e "s/^PKG_VERSION:=.*/PKG_VERSION:=$V/" \
@@ -103,10 +114,36 @@ grep -q "^PKG_HASH:=$HASH$" "$PKG_DIR/Makefile"
 git config user.name "$NAME"
 git config user.email "$EMAIL"
 
-log "Pull the release notes for the commit and PR body"
+log "Pull this release's notes for the commit"
 # Left unwrapped: the GitHub release body is a markdown bullet list, and
 # blindly re-wrapping it (fmt et al.) merges the bullets into one paragraph.
 NOTES="$(gh release view "v$V" --repo dangowrt/comrade --json body --jq .body)"
+
+log "Pull every release's notes since v$OLD_V for the PR description"
+# openwrt/packages may be several comrade releases behind v$V by the time
+# this runs (a bump PR left open a while, or several releases in a row with
+# nothing to adopt), so the description should not silently drop what
+# changed in between. Fall back to just this release's notes if v$OLD_V
+# does not resolve to a real release (deleted, or the Makefile did not
+# actually carry a version) or if there is nothing to catch up on.
+ALL_RELEASES="$(gh release list --repo dangowrt/comrade --json tagName,createdAt --limit 1000)"
+OLD_DATE="$(jq -r --arg t "v$OLD_V" '[.[] | select(.tagName == $t)][0].createdAt // empty' <<<"$ALL_RELEASES")"
+NEW_DATE="$(jq -r --arg t "v$V" '[.[] | select(.tagName == $t)][0].createdAt // empty' <<<"$ALL_RELEASES")"
+if [ -n "$OLD_DATE" ] && [ -n "$NEW_DATE" ] && [ "$OLD_V" != "$V" ]; then
+  NOTE_TAGS="$(jq -r --arg lo "$OLD_DATE" --arg hi "$NEW_DATE" \
+    '[.[] | select(.createdAt > $lo and .createdAt <= $hi)] | sort_by(.createdAt) | .[].tagName' \
+    <<<"$ALL_RELEASES")"
+else
+  NOTE_TAGS="v$V"
+fi
+ALL_NOTES=""
+while IFS= read -r tag; do
+  [ -n "$tag" ] || continue
+  tag_notes="$(gh release view "$tag" --repo dangowrt/comrade --json body --jq .body)"
+  ALL_NOTES="${ALL_NOTES:+$ALL_NOTES$'\n\n'}### $tag
+
+$tag_notes"
+done <<<"$NOTE_TAGS"
 
 log "Commit and force-push over whatever was on $BRANCH before"
 git add "$PKG_DIR/Makefile"
@@ -123,18 +160,15 @@ cat > "$BODY" <<EOF
 **Description:**
 Update net/comrade to $V.
 
-$NOTES
+$ALL_NOTES
 
 ---
 
 ## 🧪 Run Testing Details
 
-- **OpenWrt Version:**
-- **OpenWrt Target/Subtarget:**
-- **OpenWrt Device:**
-
-Not build-tested against the OpenWrt SDK by this automation; relies on the
-openwrt/packages CI for the version bump itself.
+- **OpenWrt Version:** -
+- **OpenWrt Target/Subtarget:** -
+- **OpenWrt Device:** -
 
 ---
 
