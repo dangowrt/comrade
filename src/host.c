@@ -80,9 +80,9 @@ struct svc {
 /* Per-user runtime directory for comrade session state; created if absent. */
 static const char *state_dir(void)
 {
-	static char dir[512];
+	static char dir[256];
 	const char *base = getenv("XDG_RUNTIME_DIR");
-	char fallback[400];
+	char fallback[200];
 
 	if (!base || !*base) {
 		snprintf(fallback, sizeof(fallback), "/tmp/comrade-%u",

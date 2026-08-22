@@ -493,7 +493,8 @@ static void um_rdv(struct ui *u, int family, int ready, const char *addr)
 	slot = family == 4 ? 0 : 1;
 	u->rdv[slot].family = family;
 	u->rdv[slot].ready = ready;
-	snprintf(u->rdv[slot].addr, sizeof(u->rdv[slot].addr), "%s", addr);
+	snprintf(u->rdv[slot].addr, sizeof(u->rdv[slot].addr), "%.*s",
+		 (int)(sizeof(u->rdv[slot].addr) - 1), addr);
 	u->dirty = 1;
 }
 

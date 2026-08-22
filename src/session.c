@@ -275,7 +275,7 @@ static int cand_addr(const char *cand, char *out, size_t n)
 static void fmt_sockaddr(const struct sockaddr *sa, socklen_t len,
 			 char *out, size_t n)
 {
-	char host[64], serv[16];
+	char host[64], serv[8];		/* serv is NI_NUMERICSERV: 5 digits max */
 
 	out[0] = '\0';
 	if (getnameinfo(sa, len, host, sizeof(host), serv, sizeof(serv),
@@ -1559,8 +1559,8 @@ static int host_turnstile(struct sess *s)
 			if (s->have_local_sdp) {
 				sdp_filter(s->local_sdp, cfg->family, filtered,
 					   sizeof(filtered));
-				strncpy(s->local_sdp, filtered,
-					sizeof(s->local_sdp) - 1);
+				snprintf(s->local_sdp, sizeof(s->local_sdp),
+					 "%s", filtered);
 				sig_rotate(s->sig, (const uint8_t *)s->local_sdp,
 					   strlen(s->local_sdp));
 				sig_locate(s->sig);
@@ -1855,8 +1855,8 @@ int session_run(const struct session_cfg *cfg)
 			if (s.have_local_sdp) {
 				sdp_filter(s.local_sdp, cfg->family, filtered,
 					   sizeof(filtered));
-				strncpy(s.local_sdp, filtered,
-					sizeof(s.local_sdp) - 1);
+				snprintf(s.local_sdp, sizeof(s.local_sdp),
+					 "%s", filtered);
 				sig_post(s.sig, (const uint8_t *)s.local_sdp,
 					 strlen(s.local_sdp));
 				if (cfg->is_host && (cfg->sig_flags & SIG_DHT))
