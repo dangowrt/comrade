@@ -91,7 +91,7 @@ static void pump(struct dhtnode *n, uint64_t until_ms)
 static void nodestr(const struct sockaddr *sa, socklen_t len,
 		    char *out, size_t outlen)
 {
-	char host[128], serv[32];
+	char host[128], serv[8];	/* serv is NI_NUMERICSERV: 5 digits max */
 
 	if (getnameinfo(sa, len, host, sizeof(host), serv, sizeof(serv),
 			NI_NUMERICHOST | NI_NUMERICSERV) != 0)
