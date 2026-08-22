@@ -3824,6 +3824,13 @@ int session_run(const struct session_cfg *cfg)
 					    "`comrade stun-update`");
 				s.stun_warned = 1;
 			}
+			/* The fact the warning reported has stopped being true:
+			 * a reflexive v4 did arrive, just late. */
+			if (s.stun_warned && s.have_srflx4) {
+				s.stun_warned = 0;
+				if (o->escalate_clear)
+					o->escalate_clear(o->arg);
+			}
 			if (o->peer && s.have_peer_sdp &&
 			    s.peer_state < SESSION_PEER_SEEN) {
 				char b[64];

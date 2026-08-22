@@ -83,6 +83,8 @@ struct session_obs {
 	void (*net_reset)(void *arg);
 	/* The client had to fall back from a seeded node to a full DHT warm. */
 	void (*escalate)(void *arg, const char *why);
+	/* The condition the last escalation warned about has resolved. */
+	void (*escalate_clear)(void *arg);
 	/* A path is up and the session is about to seize the terminal. */
 	void (*established)(void *arg);
 	/* Periodic heartbeat, ~10/s: advance spinners, repaint. */

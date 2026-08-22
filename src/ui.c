@@ -641,6 +641,18 @@ static void um_escalate(struct ui *u, const char *why)
 	u->dirty = 1;
 }
 
+static void um_escalate_clear(struct ui *u)
+{
+	if (!u->anim) {
+		vlog(u, "rdv    warning cleared");
+		return;
+	}
+	if (!u->have_escalate)
+		return;
+	u->have_escalate = 0;
+	u->dirty = 1;
+}
+
 static void um_live(struct ui *u)
 {
 	u->established = 1;
@@ -689,6 +701,7 @@ static void cb_peer_ro(void *a, int id) { um_peer_ro(a, id); }
 static void cb_reset(void *a) { um_reset(a); }
 static void cb_net_reset(void *a) { um_net_reset(a); }
 static void cb_esc(void *a, const char *w) { um_escalate(a, w); }
+static void cb_esc_clear(void *a) { um_escalate_clear(a); }
 static void cb_tick(void *a)
 {
 	struct ui *u = a;
@@ -731,6 +744,7 @@ void ui_bind(struct ui *u, struct session_obs *obs)
 	obs->reset = cb_reset;
 	obs->net_reset = cb_net_reset;
 	obs->escalate = cb_esc;
+	obs->escalate_clear = cb_esc_clear;
 	obs->established = cb_established;
 	obs->tick = cb_tick;
 }
@@ -872,6 +886,10 @@ static void em_esc(void *a, const char *w)
 {
 	emitf(a, "E %s\n", w);
 }
+static void em_esc_clear(void *a)
+{
+	emitf(a, "C\n");
+}
 static void em_live(void *a)
 {
 	emitf(a, "L\n");
@@ -913,6 +931,7 @@ void ui_emitter(struct session_obs *obs, sock_t fd)
 	obs->reset = em_reset;
 	obs->net_reset = em_net_reset;
 	obs->escalate = em_esc;
+	obs->escalate_clear = em_esc_clear;
 	obs->established = em_live;
 	/* tick is local to the view; the foreground animates on its own clock */
 }
@@ -974,6 +993,9 @@ static void feed(struct ui *u, char *ln)
 	case 'E':
 		if (sscanf(ln + 1, " %159[^\n]", s) == 1)
 			um_escalate(u, s);
+		break;
+	case 'C':
+		um_escalate_clear(u);
 		break;
 	case 'L':
 		um_live(u);
