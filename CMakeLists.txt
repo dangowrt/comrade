@@ -626,6 +626,15 @@ if(COMRADE_BUILD_TOOLS)
 		set_tests_properties(multiuser_e2e PROPERTIES
 			SKIP_RETURN_CODE 77 TIMEOUT 300)
 
+		# Isolated-LAN token mint + connect over real multicast on this host
+		# Needs no DHT and no network beyond one up
+		# multicast interface; SKIPs (77) when none exists.
+		add_test(NAME isolated_lan_e2e
+			COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/isolated_lan.sh
+				$<TARGET_FILE:comrade-e2e>)
+		set_tests_properties(isolated_lan_e2e PROPERTIES
+			SKIP_RETURN_CODE 77 TIMEOUT 120)
+
 	endif()
 endif()
 
