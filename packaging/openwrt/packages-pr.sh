@@ -1,17 +1,21 @@
 #!/bin/bash
 # Bump net/comrade/Makefile in the dangowrt fork of openwrt/packages to the
 # tagged release, then open the version-bump PR against openwrt/packages -- or,
-# if an earlier release's bump PR is still open and unmerged, adopt it: force-
-# push the new commit onto that same PR's branch and replace its title and
-# description, rather than leaving it stale and opening a second PR next to
-# it. The branch is always the fixed name below, a singleton by construction
-# (there is only ever at most one comrade bump PR open at a time), rather than
-# a version-suffixed name that would suggest otherwise. When there is no open
-# PR left to adopt -- the last one merged or was closed -- the same-named
-# branch from that PR is deleted from the fork before being recreated fresh,
-# so a merged bump never lingers as a dangling ref; the branch content itself
-# is likewise never a merge/rebase of what used to be there, always a fresh
-# commit off upstream's current master.
+# if an earlier release's bump PR is still open and unmerged, adopt it: check
+# out that PR's branch, content included, squash the bump into its single
+# commit and force-push, replacing the PR's title and description, rather than
+# leaving it stale and opening a second PR next to it. Adoption takes the
+# branch, not just the number: an open PR may carry more than the previous
+# bump (a new sub-package, a test), and a branch rebuilt from scratch would
+# silently drop all of that. The adopted branch is rebased onto upstream's
+# current master where that is conflict-free, and left on its old base --
+# still correct, just older -- where it is not. The branch is always the fixed
+# name below, a singleton by construction (there is only ever at most one
+# comrade bump PR open at a time), rather than a version-suffixed name that
+# would suggest otherwise. When there is no open PR left to adopt -- the last
+# one merged or was closed -- the same-named branch from that PR is deleted
+# from the fork before being recreated fresh off upstream's current master, so
+# a merged bump never lingers as a dangling ref.
 #
 # PKG_HASH is taken from GitHub's own codeload tarball for v$VERSION, not from
 # anything this repo builds, so this only needs the tag to exist -- it does
@@ -100,48 +104,73 @@ ADOPT_PR="$(gh pr list --repo "$UPSTREAM_REPO" --author dangowrt --state open \
 log "Compute the tarball hash codeload will serve for v$V"
 HASH="$(curl -fsSL "https://codeload.github.com/dangowrt/comrade/tar.gz/v$V" | sha256sum | cut -d' ' -f1)"
 
+log "Clone the fork"
+WORK="$(mktemp -d)"
+git clone --quiet "https://x-access-token:${OPENWRT_PACKAGES_TOKEN}@github.com/${FORK_REPO}.git" "$WORK"
+cd "$WORK"
+git config user.name "$NAME"
+git config user.email "$EMAIL"
+git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+git fetch --quiet upstream master
+
+if [ -n "$ADOPT_PR" ]; then
+  # The PR's branch carries its content, which may be more than the previous
+  # bump -- a new sub-package, a test -- so the bump lands on that branch,
+  # squashed into its single commit further down, never on a fresh branch
+  # that would silently drop the rest. Keep it current with upstream where
+  # that is conflict-free; a conflict leaves the branch on its old base for
+  # a human to sort out rather than failing the bump over it.
+  log "Adopt PR #$ADOPT_PR's branch, content included"
+  git checkout --quiet "$BRANCH"
+  if ! git rebase --quiet upstream/master; then
+    git rebase --abort
+    log "Rebase onto upstream/master conflicts -- keeping the branch's base"
+  fi
+else
+  # Nothing open to adopt, so any $BRANCH still on the fork is a leftover
+  # from a PR that already merged or got closed -- drop it rather than build
+  # the new commit on top of stale history.
+  log "No open PR -- rebuild $BRANCH fresh off upstream's current master"
+  git push --quiet origin --delete "$BRANCH" 2>/dev/null || true
+  git checkout --quiet -B "$BRANCH" upstream/master
+fi
+
+log "Read the version net/comrade currently references upstream"
+# From upstream's master, not the checkout: an adopted branch already carries
+# the previous bump, and the changelog must still cover everything upstream
+# has not merged yet.
+OLD_V="$(git show upstream/master:"$PKG_DIR/Makefile" | sed -n 's/^PKG_VERSION:=//p')"
+
+log "Bump PKG_VERSION, reset PKG_RELEASE, refresh PKG_HASH"
+sed -i \
+  -e "s/^PKG_VERSION:=.*/PKG_VERSION:=$V/" \
+  -e "s/^PKG_RELEASE:=.*/PKG_RELEASE:=1/" \
+  -e "s/^PKG_HASH:=.*/PKG_HASH:=$HASH/" \
+  "$PKG_DIR/Makefile"
+grep -q "^PKG_VERSION:=$V$" "$PKG_DIR/Makefile"
+grep -q "^PKG_HASH:=$HASH$" "$PKG_DIR/Makefile"
+
 # The codeload tarball carries the STUN submodule as an empty directory, so
 # net/comrade downloads the pinned list separately (Download/stunlist) and
 # installs it before configure. Keep that pin in step with the submodule
 # commit the tag actually references -- readable straight off the tag's tree,
 # no submodule checkout needed -- and hash the very file OpenWrt will fetch.
-log "Read the STUN list pin the v$V tag references and hash that list"
-STUN_REV="$(git -C "$COMRADE_DIR" ls-tree "v$V" deps/always-online-stun | awk '{print $3}')"
-[ -n "$STUN_REV" ]
-STUN_SHA="$(curl -fsSL "https://raw.githubusercontent.com/pradt2/always-online-stun/$STUN_REV/valid_nat_testing_hosts.txt" | sha256sum | cut -d' ' -f1)"
-
-log "Clone the fork and rebuild $BRANCH fresh off upstream's current master"
-WORK="$(mktemp -d)"
-git clone --quiet "https://x-access-token:${OPENWRT_PACKAGES_TOKEN}@github.com/${FORK_REPO}.git" "$WORK"
-cd "$WORK"
-git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
-git fetch --quiet upstream master
-if [ -z "$ADOPT_PR" ]; then
-  # Nothing open to adopt, so any $BRANCH still on the fork is a leftover
-  # from a PR that already merged or got closed -- drop it rather than build
-  # the new commit on top of stale history.
-  git push --quiet origin --delete "$BRANCH" 2>/dev/null || true
+# A Makefile without the machinery has no pin to keep in step, and the bump
+# must not fail over its absence.
+if grep -q '^STUN_LIST_VERSION:=' "$PKG_DIR/Makefile"; then
+  log "Read the STUN list pin the v$V tag references and hash that list"
+  STUN_REV="$(git -C "$COMRADE_DIR" ls-tree "v$V" deps/always-online-stun | awk '{print $3}')"
+  [ -n "$STUN_REV" ]
+  STUN_SHA="$(curl -fsSL "https://raw.githubusercontent.com/pradt2/always-online-stun/$STUN_REV/valid_nat_testing_hosts.txt" | sha256sum | cut -d' ' -f1)"
+  sed -i \
+    -e "s/^STUN_LIST_VERSION:=.*/STUN_LIST_VERSION:=$STUN_REV/" \
+    -e "s/^  HASH:=.*/  HASH:=$STUN_SHA/" \
+    "$PKG_DIR/Makefile"
+  grep -q "^STUN_LIST_VERSION:=$STUN_REV$" "$PKG_DIR/Makefile"
+  grep -q "^  HASH:=$STUN_SHA$" "$PKG_DIR/Makefile"
+else
+  log "No STUN_LIST_VERSION in net/comrade -- skipping the pin bump"
 fi
-git checkout --quiet -B "$BRANCH" upstream/master
-
-log "Read the version net/comrade currently references upstream"
-OLD_V="$(sed -n 's/^PKG_VERSION:=//p' "$PKG_DIR/Makefile")"
-
-log "Bump PKG_VERSION, reset PKG_RELEASE, refresh PKG_HASH and the STUN pin"
-sed -i \
-  -e "s/^PKG_VERSION:=.*/PKG_VERSION:=$V/" \
-  -e "s/^PKG_RELEASE:=.*/PKG_RELEASE:=1/" \
-  -e "s/^PKG_HASH:=.*/PKG_HASH:=$HASH/" \
-  -e "s/^STUN_LIST_VERSION:=.*/STUN_LIST_VERSION:=$STUN_REV/" \
-  -e "s/^  HASH:=.*/  HASH:=$STUN_SHA/" \
-  "$PKG_DIR/Makefile"
-grep -q "^PKG_VERSION:=$V$" "$PKG_DIR/Makefile"
-grep -q "^PKG_HASH:=$HASH$" "$PKG_DIR/Makefile"
-grep -q "^STUN_LIST_VERSION:=$STUN_REV$" "$PKG_DIR/Makefile"
-grep -q "^  HASH:=$STUN_SHA$" "$PKG_DIR/Makefile"
-
-git config user.name "$NAME"
-git config user.email "$EMAIL"
 
 log "Walk this repo's own tags from v$OLD_V (exclusive) to v$V (inclusive)"
 # version:refname is git's numeric tag sort (vN.N.N in numeric rather than
@@ -229,7 +258,22 @@ fi
 
 log "Commit and force-push over whatever was on $BRANCH before"
 git add "$PKG_DIR/Makefile"
-git commit --quiet --signoff -m "$TITLE" -m "$COMMIT_REF"
+if [ -n "$ADOPT_PR" ]; then
+  # Squash the bump into the branch's single commit: the subject's version
+  # moves along, the compare/tag links move with it, and the rest of the
+  # message -- the PR's story may be bigger than this bump -- stands, its
+  # Signed-off-by included.
+  MSG="$(git log -1 --format=%B | sed -E \
+    -e "1s/update to v?[0-9][0-9.a-z-]*/update to $V/" \
+    -e "s|(compare/v[0-9][0-9.]*\.\.\.)v[0-9][0-9.]*|\\1v$V|" \
+    -e "s|(releases/tag/)v[0-9][0-9.]*|\\1v$V|")"
+  git commit --quiet --amend -m "$MSG"
+else
+  git commit --quiet --signoff -m "$TITLE" -m "$COMMIT_REF"
+fi
+# The PR title follows the commit subject: an adopted PR's subject may say
+# more than "update to $V", and the two must not drift apart.
+TITLE="$(git log -1 --format=%s)"
 git push --quiet --force-with-lease origin "$BRANCH:$BRANCH"
 
 log "Write the PR title and description, openwrt/packages' own template"
