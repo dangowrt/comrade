@@ -49,7 +49,10 @@
 # dangowrt does not own -- which fine-grained tokens reject with 403 even
 # when the head branch sits in a fork the token can otherwise push to freely.
 # Classic PATs are not repo-scoped that way, so they are the only kind that
-# actually works here.
+# actually works here. The PR create/edit calls further down go through the
+# plain REST endpoints (gh api), not gh's PR porcelain: `gh pr edit` fronts
+# a GraphQL query whose review/team fields want read:org on the openwrt
+# organisation, which is more than this token has or needs.
 #
 # No commit signing key: openwrt/packages' CONTRIBUTING.md only requires a
 # Signed-off-by trailer with a real, non-noreply name and email
@@ -303,11 +306,18 @@ $CHANGELOG
 - [x] I have reviewed the [CONTRIBUTING.md](https://github.com/openwrt/packages/blob/master/CONTRIBUTING.md) file for detailed contributing guidelines.
 EOF
 
+# Through the plain REST endpoints rather than gh's PR porcelain: `gh pr
+# edit` fronts a GraphQL query whose review/team fields demand read:org on
+# the openwrt organisation, which the minimal public_repo token deliberately
+# lacks -- first bitten the first time the adoption path actually ran. The
+# REST calls need nothing beyond public_repo on a public repository.
 if [ -n "$ADOPT_PR" ]; then
   log "Replacing PR #$ADOPT_PR's title and description"
-  gh pr edit "$ADOPT_PR" --repo "$UPSTREAM_REPO" --title "$TITLE" --body-file "$BODY"
+  gh api --silent -X PATCH "repos/$UPSTREAM_REPO/pulls/$ADOPT_PR" \
+    -f title="$TITLE" -F "body=@$BODY"
 else
   log "Opening the PR"
-  gh pr create --repo "$UPSTREAM_REPO" --base master --head "dangowrt:$BRANCH" \
-    --title "$TITLE" --body-file "$BODY"
+  gh api --silent -X POST "repos/$UPSTREAM_REPO/pulls" \
+    -f base=master -f head="dangowrt:$BRANCH" \
+    -f title="$TITLE" -F "body=@$BODY"
 fi
