@@ -635,6 +635,24 @@ if(COMRADE_BUILD_TOOLS)
 		set_tests_properties(isolated_lan_e2e PROPERTIES
 			SKIP_RETURN_CODE 77 TIMEOUT 120)
 
+		# Concurrent isolated-LAN admission: N clients join one no-DHT host at
+		# once over multicast. Offline and
+		# deterministic; SKIPs (77) with no multicast interface.
+		add_test(NAME lan_concurrent_e2e
+			COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/lan_concurrent.sh
+				$<TARGET_FILE:comrade-e2e> 4)
+		set_tests_properties(lan_concurrent_e2e PROPERTIES
+			SKIP_RETURN_CODE 77 TIMEOUT 180)
+
+		# Mixed lanlink + DHT/ICE peers in one session: a
+		# lanlink worker and an ICE worker must coexist live. Needs the live
+		# DHT, so SKIPs (77) unless COMRADE_E2E_NET=1.
+		add_test(NAME lan_mixed_e2e
+			COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/lan_mixed.sh
+				$<TARGET_FILE:comrade-e2e>)
+		set_tests_properties(lan_mixed_e2e PROPERTIES
+			SKIP_RETURN_CODE 77 TIMEOUT 300)
+
 	endif()
 endif()
 

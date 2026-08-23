@@ -32,8 +32,11 @@ cleanup() { kill "$hpid" $cpid 2>/dev/null; rm -rf "$tmp"; }
 trap cleanup EXIT INT TERM
 cpid=""
 
-# Isolated host: multicast only, no DHT. Serves one client then exits.
-"$E2E" host --mcast --no-dht --timeout 30 >"$tmp/host.out" 2>"$tmp/host.err" &
+# Isolated host: multicast only, no DHT. Serves one client through the turnstile
+# then exits (--serve 1: an isolated host's ICE listener never gets a DHT claim,
+# so it would otherwise run to the deadline).
+"$E2E" host --mcast --no-dht --stun none --serve 1 --timeout 30 \
+	>"$tmp/host.out" 2>"$tmp/host.err" &
 hpid=$!
 
 tok=""
@@ -59,7 +62,7 @@ if ! grep -q 'ep6_rdv=0 ep4_rdv=0' "$tmp/flags.out"; then
 fi
 
 # The client honours NODHT automatically (drops the DHT); --mcast enables the LAN.
-"$E2E" client "$tok" --mcast --timeout 30 >"$tmp/client.out" 2>"$tmp/client.err" &
+"$E2E" client "$tok" --mcast --stun none --timeout 30 >"$tmp/client.out" 2>"$tmp/client.err" &
 cpid=$!
 wait "$cpid"; crc=$?
 
