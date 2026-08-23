@@ -62,6 +62,14 @@ struct sshd_opts {
 	 */
 	int no_fwd;
 	/*
+	 * Optional transport back-pressure for the forwards (sshfwd_set_tx_room):
+	 * bulk is fed only while tx_room(tx_room_arg) is nonzero, keeping the
+	 * terminal and control plane responsive under a saturating transfer.
+	 * NULL means unthrottled.
+	 */
+	int (*tx_room)(void *arg);
+	void *tx_room_arg;
+	/*
 	 * Optional out-parameter for the read-only grade. Only the auth exchange
 	 * knows which secret a client presented, so when non-NULL this is set to
 	 * 1/0 once the client has authenticated, letting the controller mark that

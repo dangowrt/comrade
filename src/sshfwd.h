@@ -40,6 +40,14 @@ struct sshfwd *sshfwd_create(ssh_session s, ssh_event ev);
 void sshfwd_destroy(struct sshfwd *f);
 
 /*
+ * Optional transport back-pressure: when set, bridge data is fed toward the
+ * peer only while fn(arg) is nonzero, so bulk forwards cannot pool a whole
+ * channel window in the transport's send queue ahead of the terminal and the
+ * control plane. Unset means always room (a plain TCP-backed session).
+ */
+void sshfwd_set_tx_room(struct sshfwd *f, int (*fn)(void *arg), void *arg);
+
+/*
  * One housekeeping pass from the session's poll loop: accept on
  * listeners, progress pending connects and channel opens, pick up
  * host-accepted -R connections, reap finished bridges. Non-blocking.

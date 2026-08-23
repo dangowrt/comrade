@@ -25,4 +25,13 @@ void stream_set_output(struct stream *s, stream_output_fn *out, void *arg);
 /* Smoothed round-trip time in ms (KCP's rx_srtt); 0 before the first sample. */
 int stream_rtt(struct stream *s);
 
+/*
+ * Nonzero while the unsent queue has room for more bulk payload. The queue is
+ * bounded to ~STREAM_TXQ_MS of transmission at the measured delivery rate, so
+ * anything written behind bulk (a keystroke, a heartbeat) waits a bounded
+ * moment, not the whole backlog. Bulk senders ask before writing; everything
+ * else writes regardless.
+ */
+int stream_tx_room(struct stream *s);
+
 #endif

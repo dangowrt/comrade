@@ -342,8 +342,10 @@ static void pump(ssh_session s, ssh_channel chan, struct cpty *child,
 	c.child = child;
 	c.ctl_fd = o->ctl_fd;
 	c.event = ssh_event_new();
-	if (c.event && !o->no_fwd)
+	if (c.event && !o->no_fwd) {
 		c.fwd = sshfwd_create(s, c.event);
+		sshfwd_set_tx_room(c.fwd, o->tx_room, o->tx_room_arg);
+	}
 	c_in = ssh_connector_new(s);
 	c_out = ssh_connector_new(s);
 	if (!c.event || !c_in || !c_out)

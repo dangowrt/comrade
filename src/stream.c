@@ -12,11 +12,18 @@
 #define STREAM_WND 256
 #define STREAM_DEAD_LINK 1000
 
+#define STREAM_RATE_MS 100		/* delivery-rate sample period */
+#define STREAM_TXQ_MS 300		/* unsent-queue bound, in transmit time */
+#define STREAM_TXQ_MIN 16		/* segments; startup / idle-restart floor */
+
 struct stream {
 	ikcpcb *kcp;
 	stream_output_fn *out;
 	void *out_arg;
 	pthread_mutex_t lock;
+	uint32_t rate_t;		/* last delivery-rate sample time */
+	uint32_t rate_una;		/* snd_una at that sample */
+	uint32_t rate_sps;		/* EWMA delivered segments per second */
 };
 
 /* Called from ikcp_input/ikcp_update with s->lock held (non-recursive), so the
@@ -101,11 +108,24 @@ int stream_input(struct stream *s, const uint8_t *data, size_t len)
 
 uint32_t stream_update(struct stream *s, uint32_t now_ms)
 {
-	uint32_t next;
+	uint32_t next, dt;
 
 	pthread_mutex_lock(&s->lock);
 	ikcp_update(s->kcp, now_ms);
 	next = ikcp_check(s->kcp, now_ms);
+	if (!s->rate_t) {
+		s->rate_t = now_ms ? now_ms : 1;
+		s->rate_una = s->kcp->snd_una;
+	}
+	dt = now_ms - s->rate_t;
+	if (dt >= STREAM_RATE_MS) {
+		uint32_t d = s->kcp->snd_una - s->rate_una;
+
+		s->rate_sps -= s->rate_sps / 4;
+		s->rate_sps += d * 1000 / dt / 4;
+		s->rate_t = now_ms ? now_ms : 1;
+		s->rate_una = s->kcp->snd_una;
+	}
 	pthread_mutex_unlock(&s->lock);
 	return next;
 }
@@ -118,6 +138,20 @@ int stream_waitsnd(struct stream *s)
 	rc = ikcp_waitsnd(s->kcp);
 	pthread_mutex_unlock(&s->lock);
 	return rc;
+}
+
+int stream_tx_room(struct stream *s)
+{
+	uint32_t target;
+	int room;
+
+	pthread_mutex_lock(&s->lock);
+	target = s->rate_sps * STREAM_TXQ_MS / 1000;
+	if (target < STREAM_TXQ_MIN)
+		target = STREAM_TXQ_MIN;
+	room = s->kcp->nsnd_que < target;
+	pthread_mutex_unlock(&s->lock);
+	return room;
 }
 
 int stream_rtt(struct stream *s)

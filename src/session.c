@@ -2329,6 +2329,20 @@ static void pump_once(struct sess *s, int timeout_cap_ms)
 		lanlink_dispatch(s->lan, fds + nfds, lnf);
 }
 
+/* From the ssh thread: does the KCP stream take more bulk? (The thread is
+ * joined before the stream dies; the lock covers future reordering.) */
+static int conn_tx_room(void *arg)
+{
+	struct conn *c = arg;
+	int room = 1;
+
+	pthread_mutex_lock(&c->stream_lock);
+	if (c->stream)
+		room = stream_tx_room(c->stream);
+	pthread_mutex_unlock(&c->stream_lock);
+	return room;
+}
+
 static void *ssh_srv_thread(void *p)
 {
 	struct conn *c = p;
@@ -2347,6 +2361,8 @@ static void *ssh_srv_thread(void *p)
 	o.ctl_fd = c->ssh_ctl_fd;
 	o.no_fwd = s->cfg->no_fwd;
 	o.ro_out = &c->read_only;
+	o.tx_room = conn_tx_room;
+	o.tx_room_arg = c;
 	sshd_serve_fd(c->ssh_fd, &o);
 	return NULL;
 }
@@ -2368,6 +2384,8 @@ static void *ssh_cli_thread(void *p)
 	o.nfwd_l = s->cfg->nfwd_l;
 	o.fwd_r = s->cfg->fwd_r;
 	o.nfwd_r = s->cfg->nfwd_r;
+	o.tx_room = conn_tx_room;
+	o.tx_room_arg = c;
 	o.status = session_status;
 	o.status_arg = c;
 	o.send = s->cfg->test_send;

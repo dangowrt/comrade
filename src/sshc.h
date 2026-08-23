@@ -59,6 +59,15 @@ struct sshc_opts {
 	int nfwd_r;
 
 	/*
+	 * Optional transport back-pressure for the forwards (sshfwd_set_tx_room):
+	 * bulk is fed only while tx_room(tx_room_arg) is nonzero, keeping the
+	 * terminal and control plane responsive under a saturating transfer.
+	 * NULL means unthrottled.
+	 */
+	int (*tx_room)(void *arg);
+	void *tx_room_arg;
+
+	/*
 	 * Optional local status. When set, interactive mode reserves the bottom
 	 * terminal row (runs the remote tmux one row shorter) and has the view
 	 * paint this connection status there each tick -- staying live even when
