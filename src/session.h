@@ -184,6 +184,10 @@ struct session_cfg {
 					 * connecting needs the moves to end, or
 					 * the period races its own connect
 					 * attempt and nothing ever completes */
+	int test_roam_hard;		/* a roam also silences every live
+					 * worker's transport, as a real move off
+					 * the network does; the resume graft
+					 * unmutes on adoption */
 	int test_blackhole_ms;		/* this long into a live session, stop
 					 * sending on the path then carrying it
 					 * (0 = never), as if that path had been

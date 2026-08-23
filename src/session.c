@@ -2007,6 +2007,15 @@ static void sdp_ufrag(const char *sdp, char *out)
 
 /* Is this claimant already admitted over the direct path -- served by a LAN
  * worker, or queued for one? (host main thread only) */
+static int conn_is_lost(struct conn *c);
+
+/*
+ * A claimant already served over lanlink is refused a second admission -- once
+ * per client, not once per transport. Unless the connection serving it is
+ * lost: then the claim is that client returning, over whichever transport
+ * reaches us now (a host that roamed off the shared segment hears its old
+ * LAN clients over the DHT), and admission or resumption is what it needs.
+ */
 static int lan_ufrag_claimed(const struct sess *s, const char *ufrag)
 {
 	int i;
@@ -2016,7 +2025,7 @@ static int lan_ufrag_claimed(const struct sess *s, const char *ufrag)
 	for (i = 0; i < HOST_MAX_WORKERS; i++)
 		if (s->lan_conns[i] &&
 		    !strcmp(s->lan_conns[i]->claim_ufrag, ufrag))
-			return 1;
+			return !conn_is_lost(s->lan_conns[i]);
 	for (i = 0; i < s->lan_pending_n; i++)
 		if (!strcmp(s->lan_pending[i].ufrag, ufrag))
 			return 1;
@@ -2638,6 +2647,7 @@ static void resume_tick(struct conn *c)
 			sig_post(s->sig, (const uint8_t *)s->local_sdp,
 				 strlen(s->local_sdp));
 			sig_redeliver(s->sig);
+			dbg_logf("resume: claim posted");
 			c->rs_state = 2;
 		} else if (now >= c->rs_deadline) {
 			c->rs_state = 0;
@@ -2655,6 +2665,7 @@ static void resume_tick(struct conn *c)
 				snprintf(c->remote_ufrag,
 					 sizeof(c->remote_ufrag), "%s", ufrag);
 				s->remote_set = 1;
+				dbg_logf("resume: primed offer %s", ufrag);
 			}
 		}
 		if (now >= c->rs_deadline)
@@ -2773,6 +2784,12 @@ static int conn_run(struct conn *c, int drive_sig)
 			conn_add_ice_path(c);
 			if (old)
 				nat_destroy(old);
+			c->bh_mute = 0;
+			/* The resumed link earns a full liveness window; without
+			 * this it is judged by silence that predates it. */
+			pthread_mutex_lock(&c->hb_lock);
+			c->hb_last_heard = now_ms();
+			pthread_mutex_unlock(&c->hb_lock);
 			dbg_logf("resume: adopted the re-punched agent");
 		}
 		if (drive_sig) {
@@ -2898,9 +2915,14 @@ static int conn_run(struct conn *c, int drive_sig)
 			 * silence is bounded by connect_timeout_s instead of the
 			 * tighter heartbeat-loss window. */
 			if (s->cfg->is_host) {
+				/* A recent resume pickup restarts the clock: the
+				 * client is actively coming back, and its half of
+				 * the punch may still be completing. */
 				if (pong_seen && c->lost_since_ms &&
 				    !c->resume_pending &&
-				    now - c->lost_since_ms > HOST_REAP_MS)
+				    now - c->lost_since_ms > HOST_REAP_MS &&
+				    (!c->resume_last_ms ||
+				     now - c->resume_last_ms > HOST_REAP_MS))
 					done = 1;
 				else if (!pong_seen && now - conn_start >
 					 (uint64_t)s->cfg->connect_timeout_s * 1000) {
@@ -3786,6 +3808,10 @@ static int host_turnstile(struct sess *s)
 				listen = NULL;
 				s->offer_conn = NULL;
 			}
+			if (cfg->test_roam_hard)
+				for (i = 0; i < HOST_MAX_WORKERS; i++)
+					if (ws[i].used)
+						ws[i].c->bh_mute = 1;
 			if (sig_rebuild(s))
 				break;
 			s->have_local_sdp = 0;

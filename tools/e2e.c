@@ -165,7 +165,7 @@ int main(int argc, char **argv)
 			"usage: %s host    [--stun host|none] [--family 4|6] [opts]\n"
 			"       %s client <TOKEN>          [--stun ...]      [opts]\n"
 			"  opts: [--stun-port p] [--timeout s] [--log N]\n"
-			"        [--mcast] [--no-dht] [--roam-ms N] [--roams N]\n"
+			"        [--mcast] [--no-dht] [--roam-ms N] [--roams N] [--roam-hard]\n"
 			"        [--blackhole-ms N]\n",
 			argv[0], argv[0]);
 		return 2;
@@ -193,6 +193,8 @@ int main(int argc, char **argv)
 			cfg.test_roam_ms = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--roams") && i + 1 < argc)
 			cfg.test_roam_max = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--roam-hard"))
+			cfg.test_roam_hard = 1;
 		else if (!strcmp(argv[i], "--blackhole-ms") && i + 1 < argc)
 			cfg.test_blackhole_ms = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--blackhole-lift-ms") && i + 1 < argc)
