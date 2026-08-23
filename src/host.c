@@ -26,6 +26,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
 #ifdef __APPLE__
 #include <util.h>			/* forkpty lives here, not in pty.h */
 #else
@@ -43,6 +44,7 @@
 #include <unistd.h>
 
 #include "conn.h"
+#include "mview.h"
 #include "dbg.h"
 #include "keys.h"
 #include "oscompat.h"
@@ -70,6 +72,8 @@
 #define ID_MAX 32			/* longest id, generated or named */
 
 struct svc {
+	int serve_max;			/* bounded grant: sessions to serve */
+	int admit_max;			/* and claimants to admit */
 	struct token tok;
 	char last_tok[TOKEN_STR_LEN + 1];	/* the token last written out */
 	char sock[512];
@@ -100,8 +104,18 @@ static const char *state_dir(void)
 {
 	static char dir[256];
 	const char *base = getenv("XDG_RUNTIME_DIR");
+	const char *fixed = getenv("COMRADE_STATE_DIR");
 	char fallback[200];
 
+	if (fixed && *fixed) {
+		snprintf(dir, sizeof(dir), "%s", fixed);
+		if (mkdir(dir, 0700) && (errno != EEXIST || !dir_ok(dir))) {
+			fprintf(stderr, "comrade: refusing unsafe state dir "
+				"%s\n", dir);
+			exit(1);
+		}
+		return dir;
+	}
 	if (!base || !*base) {
 		snprintf(fallback, sizeof(fallback), "/tmp/comrade-%u",
 			 (unsigned)getuid());
@@ -135,6 +149,34 @@ static void tok_path(char *out, size_t n, const char *id)
 static void status_path(char *out, size_t n, const char *id)
 {
 	snprintf(out, n, "%s/%s.status", state_dir(), id);
+}
+
+/* The machine view's state document and the headless service's pidfile. */
+static void json_path(char *out, size_t n, const char *id)
+{
+	snprintf(out, n, "%s/%s.json", state_dir(), id);
+}
+
+static void pid_path(char *out, size_t n, const char *id)
+{
+	snprintf(out, n, "%s/%s.pid", state_dir(), id);
+}
+
+/* A supervisor-chosen id: path-safe, bounded, never empty. */
+static int valid_id(const char *id)
+{
+	size_t i, n = strlen(id);
+
+	if (!n || n > ID_MAX)
+		return 0;
+	for (i = 0; i < n; i++) {
+		char c = id[i];
+
+		if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+		      (c >= '0' && c <= '9') || c == '-' || c == '_'))
+			return 0;
+	}
+	return 1;
 }
 
 static int gen_id(char *out)
@@ -292,13 +334,14 @@ static void sweep_stale(void)
 	if (!d)
 		return;
 	while ((e = readdir(d))) {
-		char cand[ID_LEN + 1], sock[512], tok[512];
+		char cand[ID_MAX + 1], sock[512], tok[512];
+		size_t idl = strlen(e->d_name);
 
-		if (strlen(e->d_name) != ID_LEN + 5 ||
-		    strcmp(e->d_name + ID_LEN, ".sock"))
+		if (idl <= 5 || idl > ID_MAX + 5 ||
+		    strcmp(e->d_name + idl - 5, ".sock"))
 			continue;
-		memcpy(cand, e->d_name, ID_LEN);
-		cand[ID_LEN] = '\0';
+		memcpy(cand, e->d_name, idl - 5);
+		cand[idl - 5] = '\0';
 		sock_path(sock, sizeof(sock), cand);
 		if (tmux_alive(sock))
 			continue;		/* a live session: leave it */
@@ -306,6 +349,10 @@ static void sweep_stale(void)
 		tok_path(tok, sizeof(tok), cand);
 		unlink(tok);
 		status_path(tok, sizeof(tok), cand);
+		unlink(tok);
+		json_path(tok, sizeof(tok), cand);
+		unlink(tok);
+		pid_path(tok, sizeof(tok), cand);
 		unlink(tok);
 	}
 	closedir(d);
@@ -331,6 +378,11 @@ static int find_live(char *id)
 		cand[ID_LEN] = '\0';
 		sock_path(sock, sizeof(sock), cand);
 		if (!tmux_alive(sock))
+			continue;
+		/* A headless session (it has a pidfile) belongs to its
+		 * supervisor: the interactive `comrade` never adopts it. */
+		pid_path(path, sizeof(path), cand);
+		if (access(path, F_OK) == 0)
 			continue;
 		snprintf(path, sizeof(path), "%s/%s", state_dir(), e->d_name);
 		if (!stat(path, &st) && st.st_mtime >= best) {
@@ -561,38 +613,26 @@ static void on_token_state(void *arg, int family, int state,
 	svc_emit_token(v);
 }
 
-/* The backgrounded connection service: serve the shared tmux over the punched
- * link, again after each client, until the tmux server is gone. */
-static void run_service(struct svc *v, void *hostkey, int wfd, int no_mcast,
-			int no_dht)
+/* The serving core: sessions over the shared tmux, again after each client,
+ * until the tmux server is gone. The observer in v->obs is already bound. */
+static void svc_serve(struct svc *v, void *hostkey, int no_mcast, int no_dht)
 {
 	char cmd[600];
 	char cmd_ro[600];
 	struct session_cfg cfg;
-	int devnull;
 	int end_fd;
 	pid_t end_pid = -1;
 
-	setsid();
-	signal(SIGPIPE, SIG_IGN);	/* foreground may exec away mid-session */
-	devnull = open("/dev/null", O_RDWR);
-	if (devnull >= 0) {
-		dup2(devnull, STDIN_FILENO);
-		dup2(devnull, STDOUT_FILENO);
-		dup2(devnull, STDERR_FILENO);
-		if (devnull > STDERR_FILENO)
-			close(devnull);
-	}
 	snprintf(cmd, sizeof(cmd), "tmux -S %s attach -t comrade", v->sock);
 	snprintf(cmd_ro, sizeof(cmd_ro), "tmux -S %s attach -r -t comrade",
 		 v->sock);
 	end_fd = spawn_end_monitor(v->sock, &end_pid);
 
-	ui_emitter(&v->obs, wfd);	/* progress -> the foreground view */
-
 	memset(&cfg, 0, sizeof(cfg));
 	cfg.is_host = 1;
 	cfg.tok = v->tok;
+	cfg.host_serve_max = v->serve_max;
+	cfg.host_admit_max = v->admit_max;
 	cfg.sig_flags = (no_dht ? 0 : SIG_DHT) | (no_mcast ? 0 : SIG_MCAST);
 	cfg.stun_port = 3478;
 	cfg.stun_auto = 1;
@@ -614,6 +654,15 @@ static void run_service(struct svc *v, void *hostkey, int wfd, int no_mcast,
 					 * next idle attempt reinforces it rather
 					 * than locating (and churning) a new one */
 		session_run(&cfg);
+		if (v->serve_max) {
+			/* The bounded grant is spent: end for good, taking
+			 * the shared tmux with us. */
+			char *k[] = { "tmux", "-S", v->sock, "kill-server",
+				      NULL };
+
+			run_wait(k);
+			break;
+		}
 	}
 	if (end_fd > 0)
 		close(end_fd);
@@ -623,6 +672,26 @@ static void run_service(struct svc *v, void *hostkey, int wfd, int no_mcast,
 	}
 	unlink(v->tokfile);
 	unlink(v->statusfile);
+}
+
+/* The backgrounded connection service behind the interactive dashboard. */
+static void run_service(struct svc *v, void *hostkey, int wfd, int no_mcast,
+			int no_dht)
+{
+	int devnull;
+
+	setsid();
+	signal(SIGPIPE, SIG_IGN);	/* foreground may exec away mid-session */
+	devnull = open("/dev/null", O_RDWR);
+	if (devnull >= 0) {
+		dup2(devnull, STDIN_FILENO);
+		dup2(devnull, STDOUT_FILENO);
+		dup2(devnull, STDERR_FILENO);
+		if (devnull > STDERR_FILENO)
+			close(devnull);
+	}
+	ui_emitter(&v->obs, wfd);	/* progress -> the foreground view */
+	svc_serve(v, hostkey, no_mcast, no_dht);
 	_exit(0);
 }
 
@@ -636,6 +705,38 @@ static void teardown(pid_t svc, const char *sock, const char *tokfile)
 	run_wait(k);
 	unlink(tokfile);
 	unlink(sock);
+}
+
+/*
+ * Start the shared tmux session. The lifecycle options are pinned against
+ * whatever the operator's own tmux.conf says: guests' attaches are
+ * disposable and the operator owns the session's lifetime, so a
+ * destroy-unattached/exit-unattached carried over from their personal
+ * config must not let the first guest's departure take the whole service
+ * down (it did: one join-and-leave before the operator entered ended the
+ * session).
+ */
+static int tmux_start(const char *sock)
+{
+	char *mk[] = { "tmux", "-S", (char *)sock, "new-session", "-d",
+		       "-s", "comrade",
+		       ";", "set", "-g", "status-position", "top",
+		       ";", "set", "-g", "window-size", "smallest",
+		       ";", "set", "-g", "destroy-unattached", "off",
+		       ";", "set", "-s", "exit-unattached", "off",
+		       NULL };
+	char err[256];
+
+	if (run_capture(mk, err, sizeof(err))) {
+		if (err[0])
+			fprintf(stderr, "comrade: could not start tmux: %s\n",
+				err);
+		else
+			fprintf(stderr, "comrade: could not start tmux "
+				"(is it installed?)\n");
+		return -1;
+	}
+	return 0;
 }
 
 static int start_new(int ui_mode, int no_mcast, int no_dht, int no_fwd)
@@ -669,35 +770,8 @@ static int start_new(int ui_mode, int no_mcast, int no_dht, int no_fwd)
 		return 1;
 	}
 
-	{
-		/*
-		 * The lifecycle options are pinned against whatever the
-		 * operator's own tmux.conf says: guests' attaches are
-		 * disposable and the operator owns the session's lifetime, so
-		 * a destroy-unattached/exit-unattached carried over from their
-		 * personal config must not let the first guest's departure
-		 * take the whole service down (it did: one join-and-leave
-		 * before the operator entered ended the session).
-		 */
-		char *mk[] = { "tmux", "-S", v.sock, "new-session", "-d",
-			       "-s", "comrade",
-			       ";", "set", "-g", "status-position", "top",
-			       ";", "set", "-g", "window-size", "smallest",
-			       ";", "set", "-g", "destroy-unattached", "off",
-			       ";", "set", "-s", "exit-unattached", "off",
-			       NULL };
-		char err[256];
-
-		if (run_capture(mk, err, sizeof(err))) {
-			if (err[0])
-				fprintf(stderr, "comrade: could not start tmux: %s\n",
-					err);
-			else
-				fprintf(stderr, "comrade: could not start tmux "
-					"(is it installed?)\n");
-			return 1;
-		}
-	}
+	if (tmux_start(v.sock))
+		return 1;
 
 	/* Close-on-exec so neither the tmux we exec into nor the service's tmux
 	 * helpers inherit the pipe; the service ignores the resulting SIGPIPE. */
@@ -795,6 +869,25 @@ static int read_tokens(const char *id, char *tok, size_t tn,
 	return tok[0] ? 0 : -1;
 }
 
+/* A headless session's own state document, newline-stripped, or NULL. */
+static char *read_statejson(const char *id, char *buf, size_t n)
+{
+	char path[512];
+	FILE *f;
+	size_t got;
+
+	snprintf(path, sizeof(path), "%s/%s.json", state_dir(), id);
+	f = fopen(path, "r");
+	if (!f)
+		return NULL;
+	got = fread(buf, 1, n - 1, f);
+	fclose(f);
+	while (got && (buf[got - 1] == '\n' || buf[got - 1] == '\r'))
+		got--;
+	buf[got] = '\0';
+	return got ? buf : NULL;
+}
+
 int host_show(int what)
 {
 	DIR *d = opendir(state_dir());
@@ -806,6 +899,7 @@ int host_show(int what)
 		while ((e = readdir(d))) {
 			char cand[ID_MAX + 1], sock[512];
 			char tok[TOKEN_STR_LEN + 8], ro[TOKEN_STR_LEN + 8];
+			char state[4096];
 			size_t idl = strlen(e->d_name);
 
 			if (idl <= 5 || idl > ID_MAX + 5 ||
@@ -818,11 +912,260 @@ int host_show(int what)
 				continue;
 			if (read_tokens(cand, tok, sizeof(tok), ro, sizeof(ro)))
 				continue;
-			showfmt_session(&f, cand, sock, tok, ro, NULL);
+			showfmt_session(&f, cand, sock, tok, ro,
+					read_statejson(cand, state,
+						       sizeof(state)));
 		}
 		closedir(d);
 	}
 	return showfmt_end(&f);
+}
+
+/* Every live session; `only` picks the single one when the caller gave no
+ * id. Returns the count. */
+static int live_sessions(char *only, size_t n)
+{
+	DIR *d = opendir(state_dir());
+	struct dirent *e;
+	int count = 0;
+
+	if (!d)
+		return 0;
+	while ((e = readdir(d))) {
+		char cand[ID_MAX + 1], sock[512];
+		size_t idl = strlen(e->d_name);
+
+		if (idl <= 5 || idl > ID_MAX + 5 ||
+		    strcmp(e->d_name + idl - 5, ".sock"))
+			continue;
+		memcpy(cand, e->d_name, idl - 5);
+		cand[idl - 5] = '\0';
+		sock_path(sock, sizeof(sock), cand);
+		if (!tmux_alive(sock))
+			continue;
+		if (only && !count)
+			snprintf(only, n, "%s", cand);
+		count++;
+	}
+	closedir(d);
+	return count;
+}
+
+/* The one session an id-less machine verb may act on; -1 when ambiguous. */
+static int resolve_id(const char *id_opt, char *id, size_t n)
+{
+	int count;
+
+	if (id_opt) {
+		if (!valid_id(id_opt)) {
+			fprintf(stderr, "comrade: invalid --id\n");
+			return -1;
+		}
+		snprintf(id, n, "%s", id_opt);
+		return 0;
+	}
+	count = live_sessions(id, n);
+	if (count > 1) {
+		fprintf(stderr, "comrade: several sessions running -- name "
+			"one with --id\n");
+		return -1;
+	}
+	return count ? 0 : 1;
+}
+
+static volatile sig_atomic_t g_stop;
+
+static void on_stop_sig(int sig)
+{
+	(void)sig;
+	g_stop = 1;
+}
+
+/*
+ * SIGTERM/SIGINT end a headless session by killing its tmux server: the end
+ * monitor sees that, every worker's sshd closes, the serve loop drains and
+ * returns. A signal handler cannot run tmux, so this thread does.
+ */
+struct stop_watch {
+	const char *sock;
+	uint64_t deadline;		/* --expire, as mono_ms; 0 = none */
+	volatile int done;
+};
+
+static void *stop_watch_thread(void *arg)
+{
+	struct stop_watch *w = arg;
+	int fire = 0;
+
+	while (!w->done) {
+		if (g_stop || (w->deadline && mono_ms() >= w->deadline)) {
+			fire = 1;
+			break;
+		}
+		usleep(200 * 1000);
+	}
+	if (fire && !w->done) {
+		char *k[] = { "tmux", "-S", (char *)w->sock, "kill-server",
+			      NULL };
+
+		run_wait(k);
+	}
+	return NULL;
+}
+
+int host_headless(const char *id_opt, int no_mcast, int no_dht, int no_fwd,
+		  int expire_s, int max_clients)
+{
+	struct svc v;
+	struct mview *m;
+	struct stop_watch w;
+	char id[ID_MAX + 1], jsonp[512], pidp[512];
+	void *hostkey;
+	pthread_t th;
+	FILE *pf;
+
+	memset(&v, 0, sizeof(v));
+	v.no_fwd = no_fwd;
+	v.serve_max = max_clients;
+	v.admit_max = max_clients;
+	sweep_stale();
+	if (id_opt) {
+		if (!valid_id(id_opt)) {
+			fprintf(stderr, "comrade: invalid --id (a-z, 0-9, "
+				"'-', '_', at most %d chars)\n", ID_MAX);
+			return 2;
+		}
+		snprintf(id, sizeof(id), "%s", id_opt);
+		sock_path(v.sock, sizeof(v.sock), id);
+		if (tmux_alive(v.sock)) {
+			fprintf(stderr, "comrade: session '%s' is already "
+				"running (comrade stop --id %s)\n", id, id);
+			return 2;
+		}
+	} else if (gen_id(id)) {
+		fprintf(stderr, "comrade: random generation failed\n");
+		return 1;
+	}
+	sock_path(v.sock, sizeof(v.sock), id);
+	tok_path(v.tokfile, sizeof(v.tokfile), id);
+	status_path(v.statusfile, sizeof(v.statusfile), id);
+	json_path(jsonp, sizeof(jsonp), id);
+	pid_path(pidp, sizeof(pidp), id);
+
+	v.tok.version = TOKEN_VERSION;
+	hostkey = sshd_hostkey_new(v.tok.hostpub);
+	if (!hostkey) {
+		fprintf(stderr, "comrade: host key generation failed\n");
+		return 1;
+	}
+	if (random_bytes(v.tok.rdv, TOKEN_RDV_LEN) ||
+	    random_bytes(v.tok.auth, TOKEN_AUTH_LEN)) {
+		fprintf(stderr, "comrade: random generation failed\n");
+		return 1;
+	}
+	m = mview_create(id, jsonp, v.sock);
+	if (!m)
+		return 1;
+	if (tmux_start(v.sock)) {
+		/* The error document stays for the supervisor's page; the
+		 * next sweep collects it. */
+		mview_error(m, "no_tmux");
+		return 3;
+	}
+	pf = fopen(pidp, "w");
+	if (pf) {
+		fprintf(pf, "%ld\n", os_getpid());
+		fclose(pf);
+	}
+	signal(SIGTERM, on_stop_sig);
+	signal(SIGINT, on_stop_sig);
+	signal(SIGPIPE, SIG_IGN);
+
+	mview_limits(m, expire_s, max_clients);
+	mview_bind(m, &v.obs);
+	w.sock = v.sock;
+	w.deadline = expire_s > 0 ? mono_ms() + (uint64_t)expire_s * 1000 : 0;
+	w.done = 0;
+	if (pthread_create(&th, NULL, stop_watch_thread, &w)) {
+		fprintf(stderr, "comrade: thread creation failed\n");
+		unlink(pidp);
+		mview_destroy(m);
+		return 1;
+	}
+	svc_serve(&v, hostkey, no_mcast, no_dht);
+	w.done = 1;
+	pthread_join(th, NULL);
+	unlink(pidp);
+	mview_destroy(m);
+	sshd_hostkey_free(hostkey);
+	return 0;
+}
+
+int host_stop(const char *id_opt)
+{
+	char id[ID_MAX + 1], sock[512], path[512];
+	FILE *pf;
+	long pid = 0;
+	int r, i;
+
+	sweep_stale();
+	r = resolve_id(id_opt, id, sizeof(id));
+	if (r < 0)
+		return 1;
+	if (r > 0)
+		return 0;		/* nothing running: stop is idempotent */
+	sock_path(sock, sizeof(sock), id);
+	pid_path(path, sizeof(path), id);
+	pf = fopen(path, "r");
+	if (pf) {
+		if (fscanf(pf, "%ld", &pid) != 1)
+			pid = 0;
+		fclose(pf);
+	}
+	if (tmux_alive(sock)) {
+		char *k[] = { "tmux", "-S", sock, "kill-server", NULL };
+
+		run_wait(k);
+	}
+	if (pid > 0) {
+		kill((pid_t)pid, SIGTERM);
+		for (i = 0; i < 30 && !kill((pid_t)pid, 0); i++)
+			usleep(100 * 1000);
+	}
+	sweep_stale();			/* collect whatever the exit left */
+	return 0;
+}
+
+int host_capture(const char *id_opt, int ansi)
+{
+	char id[ID_MAX + 1], sock[512];
+	char *cv[9];
+	int n = 0, r;
+
+	r = resolve_id(id_opt, id, sizeof(id));
+	if (r < 0)
+		return 1;
+	if (r > 0) {
+		fprintf(stderr, "comrade: no running session\n");
+		return 1;
+	}
+	sock_path(sock, sizeof(sock), id);
+	if (!tmux_alive(sock)) {
+		fprintf(stderr, "comrade: no running session\n");
+		return 1;
+	}
+	cv[n++] = "tmux";
+	cv[n++] = "-S";
+	cv[n++] = sock;
+	cv[n++] = "capture-pane";
+	cv[n++] = "-p";
+	if (ansi)
+		cv[n++] = "-e";
+	cv[n++] = "-t";
+	cv[n++] = "comrade";
+	cv[n] = NULL;
+	r = run_wait(cv);
+	return r < 0 ? 1 : r;
 }
 
 #endif

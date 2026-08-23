@@ -109,6 +109,13 @@ struct session_cfg {
 	int no_fwd;			/* refuse all client port forwarding */
 	int host_serve_max;		/* stop after serving this many clients
 					 * (0 = until the deadline / operator) */
+	/*
+	 * Cap on how many claimants are admitted over the session's lifetime
+	 * (0 = no cap). A resumption of an admitted client never counts.
+	 * With host_serve_max it gives a bounded grant: --max-clients N
+	 * admits N and ends once they are gone.
+	 */
+	int host_admit_max;
 	const char *ssh_command;	/* command to serve; NULL => tmux default */
 	const char *ssh_command_ro;	/* command for a read-only client; NULL => none */
 	int use_pty;			/* allocate a pty (interactive/tmux) */

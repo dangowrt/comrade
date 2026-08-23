@@ -3,6 +3,7 @@
 
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "fwdspec.h"
@@ -29,11 +30,17 @@ static int usage(int ret)
 	(void)comrade_splash;
 	fprintf(stderr,
 		"usage: comrade            start a shared session\n"
+		"       comrade --headless [--id NAME] [--expire SECONDS]\n"
+		"                          [--max-clients N]  host as a service:\n"
+		"                          no tty, JSON state file + events on stdout\n"
 		"       comrade <token>    connect to a shared session\n"
 		"       comrade show       print the tokens of the running session\n"
 		"         --token | --token-ro   just the one token, for scripts,\n"
 		"                                clipboards and screen readers\n"
 		"         --json                 machine-readable (INTEGRATION.md)\n"
+		"       comrade stop [--id NAME]     end a session (idempotent)\n"
+		"       comrade capture [--id NAME] [--ansi]  print the shared\n"
+		"                                    terminal's current contents\n"
 		"       comrade stun-update  refresh the STUN server list\n"
 		"opts:  -v, --verbose      log lines instead of the dashboard\n"
 		"       --plain            log lines, no colour, no animation\n"
@@ -135,6 +142,8 @@ int main(int argc, char **argv)
 	static char stdout_buf[65536];
 	int nfwd_l = 0, nfwd_r = 0, no_fwd = 0;
 	int ui_mode = UI_AUTO, no_mcast = 0, no_dht = 0;
+	int headless = 0, expire_s = 0, max_clients = 0;
+	const char *host_id = NULL;
 	const char *pos = NULL;
 	int i;
 
@@ -175,7 +184,8 @@ int main(int argc, char **argv)
 		return host_win_service(argv[2]);
 #endif
 
-	/* `show` before the option loop: its own flags are not session options. */
+	/* The machine verbs before the option loop: their flags are not
+	 * session options. */
 	if (argc >= 2 && !strcmp(argv[1], "show")) {
 		int what = SHOWFMT_HUMAN;
 
@@ -190,6 +200,31 @@ int main(int argc, char **argv)
 				return usage(1);
 		}
 		return host_show(what);
+	}
+	if (argc >= 2 && !strcmp(argv[1], "stop")) {
+		const char *sid = NULL;
+
+		for (i = 2; i < argc; i++) {
+			if (!strcmp(argv[i], "--id") && i + 1 < argc)
+				sid = argv[++i];
+			else
+				return usage(1);
+		}
+		return host_stop(sid);
+	}
+	if (argc >= 2 && !strcmp(argv[1], "capture")) {
+		const char *sid = NULL;
+		int ansi = 0;
+
+		for (i = 2; i < argc; i++) {
+			if (!strcmp(argv[i], "--id") && i + 1 < argc)
+				sid = argv[++i];
+			else if (!strcmp(argv[i], "--ansi"))
+				ansi = 1;
+			else
+				return usage(1);
+		}
+		return host_capture(sid, ansi);
 	}
 
 	for (i = 1; i < argc; i++) {
@@ -207,6 +242,14 @@ int main(int argc, char **argv)
 			no_dht = 1;
 		else if (!strcmp(argv[i], "--no-forwarding"))
 			no_fwd = 1;
+		else if (!strcmp(argv[i], "--headless"))
+			headless = 1;
+		else if (!strcmp(argv[i], "--id") && i + 1 < argc)
+			host_id = argv[++i];
+		else if (!strcmp(argv[i], "--expire") && i + 1 < argc)
+			expire_s = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--max-clients") && i + 1 < argc)
+			max_clients = atoi(argv[++i]);
 		else if (!strncmp(argv[i], "-L", 2)) {
 			if (fwd_arg(argv, argc, &i, fwd_l, &nfwd_l))
 				return usage(1);
@@ -232,7 +275,20 @@ int main(int argc, char **argv)
 				"(they are client options)\n");
 			return usage(1);
 		}
+		if (headless)
+			return host_headless(host_id, no_mcast, no_dht, no_fwd,
+					     expire_s, max_clients);
+		if (host_id || expire_s || max_clients) {
+			fprintf(stderr, "comrade: --id/--expire/--max-clients "
+				"need --headless\n");
+			return usage(1);
+		}
 		return host_run(ui_mode, no_mcast, no_dht, no_fwd);
+	}
+	if (headless || host_id || expire_s || max_clients) {
+		fprintf(stderr, "comrade: --headless/--id/--expire/"
+			"--max-clients are host options\n");
+		return usage(1);
 	}
 	if (no_fwd) {
 		fprintf(stderr, "comrade: --no-forwarding is a host option\n");

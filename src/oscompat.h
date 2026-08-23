@@ -21,6 +21,9 @@
  */
 int os_rename_replace(const char *tmp, const char *dst);
 
+/* getpid() / GetCurrentProcessId(). */
+long os_getpid(void);
+
 /*
  * Run argv to completion and return its exit status (-1 if it could not be
  * started). fork+execvp+waitpid on POSIX; _spawnvp(_P_WAIT) on Windows, which

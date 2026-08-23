@@ -20,6 +20,11 @@ int os_rename_replace(const char *tmp, const char *dst)
 	return MoveFileExA(tmp, dst, MOVEFILE_REPLACE_EXISTING) ? 0 : -1;
 }
 
+long os_getpid(void)
+{
+	return (long)GetCurrentProcessId();
+}
+
 int os_spawn_wait(char *const argv[])
 {
 	intptr_t rc = _spawnvp(_P_WAIT, argv[0], (const char *const *)argv);
@@ -62,6 +67,11 @@ uint64_t os_mono_ms(void)
 int os_rename_replace(const char *tmp, const char *dst)
 {
 	return rename(tmp, dst);
+}
+
+long os_getpid(void)
+{
+	return (long)getpid();
 }
 
 int os_spawn_wait(char *const argv[])

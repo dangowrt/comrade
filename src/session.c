@@ -432,7 +432,9 @@ struct sess {
 	int adopt_tokens;			/* thousandths of a token */
 	uint64_t adopt_ms;
 	char punch_ufrag[HOST_MAX_WORKERS][40];	/* each punch's claimant id */
-	char last_served_ufrag[40];		/* the most recently served one */
+	char last_served_ufrag[40];
+	int admitted_n;			/* claimants admitted this run (the
+					 * host_admit_max budget) */		/* the most recently served one */
 	int have_served;
 
 	struct conn c;			/* the (single, for now) connection */
@@ -3517,6 +3519,9 @@ static void lan_drain(struct sess *s, struct worker *ws, int *dash_seq)
 			continue;
 		if (lan_conn_active(s, &mapped))
 			continue;		/* a re-broadcast during setup */
+		if (s->cfg->host_admit_max &&
+		    s->admitted_n >= s->cfg->host_admit_max)
+			continue;		/* the admission budget is spent */
 		for (i = 0; i < HOST_MAX_WORKERS; i++)
 			if (!s->lan_conns[i]) {
 				slot = i;
@@ -3541,6 +3546,7 @@ static void lan_drain(struct sess *s, struct worker *ws, int *dash_seq)
 				 c->claim_ufrag);
 			s->have_served = 1;
 		}
+		s->admitted_n++;
 		c->dash_id = ++*dash_seq;
 		snprintf(c->status_peer, sizeof(c->status_peer), "%s", addr);
 		s->lan_conns[slot] = c;
@@ -4012,6 +4018,15 @@ static int host_turnstile(struct sess *s)
 						break;
 					}
 				}
+				/* A fresh claimant past the admission budget is
+				 * left unserved; a resumption always passes. */
+				if (!resume && cfg->host_admit_max &&
+				    s->admitted_n >= cfg->host_admit_max) {
+					dbg_logf("host: admission budget spent "
+						 "-- claim ignored");
+					s->have_peer_sdp = 0;
+					break;
+				}
 				/* Room to punch? (a free in-flight slot within the
 				 * combined worker + punch budget). If not, keep the
 				 * claim advertised and pick it up once room frees. */
@@ -4050,6 +4065,8 @@ static int host_turnstile(struct sess *s)
 				if (resume) {
 					resume->resume_pending = 1;
 					resume->resume_last_ms = now_ms();
+				} else {
+					s->admitted_n++;
 				}
 				snprintf(listen->claim_ufrag,
 					 sizeof(listen->claim_ufrag), "%s", cu);

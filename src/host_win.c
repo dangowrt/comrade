@@ -946,4 +946,33 @@ int host_show(int what)
 	return showfmt_end(&f);
 }
 
+/* The machine-facing verbs are POSIX-first: OpenWrt and friends. */
+int host_headless(const char *id, int no_mcast, int no_dht, int no_fwd,
+		  int expire_s, int max_clients)
+{
+	(void)id;
+	(void)no_mcast;
+	(void)no_dht;
+	(void)no_fwd;
+	(void)expire_s;
+	(void)max_clients;
+	fprintf(stderr, "comrade: --headless is not supported on Windows yet\n");
+	return 1;
+}
+
+int host_stop(const char *id)
+{
+	(void)id;
+	fprintf(stderr, "comrade: stop is not supported on Windows yet\n");
+	return 1;
+}
+
+int host_capture(const char *id, int ansi)
+{
+	(void)id;
+	(void)ansi;
+	fprintf(stderr, "comrade: capture is not supported on Windows yet\n");
+	return 1;
+}
+
 #endif /* _WIN32 */

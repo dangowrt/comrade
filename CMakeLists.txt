@@ -532,7 +532,8 @@ target_link_libraries(comrade_ui PUBLIC comrade_token comrade_qr comrade_compat)
 # so exactly one of them defines host_run/host_show, which keeps both readable
 # -- the alternative was an #ifdef through every function in host.c, since
 # almost every line of it is a fork, a pty or a signal.
-add_library(comrade_host STATIC src/host.c src/host_win.c src/showfmt.c)
+add_library(comrade_host STATIC src/host.c src/host_win.c src/showfmt.c
+	src/mview.c)
 target_include_directories(comrade_host PUBLIC src)
 target_link_libraries(comrade_host PUBLIC comrade_token comrade_dbg comrade_termfilter
 	comrade_session comrade_ui)
