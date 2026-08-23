@@ -21,9 +21,16 @@ int host_show(int what);		/* a SHOWFMT_* shape */
  * current contents.
  */
 int host_headless(const char *id, int no_mcast, int no_dht, int no_fwd,
-		  int expire_s, int max_clients);
+		  int forward_only, int expire_s, int max_clients);
 int host_stop(const char *id);
 int host_capture(const char *id, int ansi);
+/*
+ * Attach a local terminal to a session's shared tmux: exec the right
+ * `tmux attach`, so a web front end (ttyd, uhttpd) can wire a PTY/websocket
+ * to a stable command rather than reach into tmux internals. Returns non-zero
+ * only on failure to launch; on success it does not return (execs tmux).
+ */
+int host_attach(const char *id, int read_only);
 
 #ifdef _WIN32
 /*

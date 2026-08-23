@@ -16,6 +16,7 @@ struct mv_peer {
 	int id;
 	int state;			/* SESSION_PEER_* */
 	int read_only;
+	int fwd_refused;		/* a forwarding attempt was declined */
 	char addr[80];
 };
 
@@ -112,6 +113,8 @@ static void mv_doc(const struct mview *m, FILE *out)
 		fprintf(out, "%s{\"id\":%d,\"state\":\"%s\",\"grade\":\"%s\"",
 			first ? "" : ",", p->id, mv_peer_state(p->state),
 			p->read_only ? "ro" : "rw");
+		if (p->fwd_refused)
+			fputs(",\"forward_refused\":true", out);
 		if (p->addr[0] && p->addr[0] != '-') {
 			fputs(",\"addr\":", out);
 			showfmt_json_str(out, p->addr);
@@ -173,6 +176,8 @@ static void det_peer(const struct mview *m, FILE *out, int i)
 	fprintf(out, ",\"peer\":{\"id\":%d,\"peer_state\":\"%s\","
 		"\"grade\":\"%s\"", p->id, mv_peer_state(p->state),
 		p->read_only ? "ro" : "rw");
+	if (p->fwd_refused)
+		fputs(",\"forward_refused\":true", out);
 	if (p->addr[0] && p->addr[0] != '-') {
 		fputs(",\"addr\":", out);
 		showfmt_json_str(out, p->addr);
@@ -252,6 +257,18 @@ static void mv_peer_ro(void *arg, int id)
 	mv_event(m, "peer", det_peer, (int)(p - m->peer));
 }
 
+static void mv_peer_fwd_refused(void *arg, int id)
+{
+	struct mview *m = arg;
+	struct mv_peer *p = mv_peer_slot(m, id);
+
+	if (!p || p->fwd_refused)
+		return;
+	p->fwd_refused = 1;
+	mv_write(m);
+	mv_event(m, "forward_refused", det_peer, (int)(p - m->peer));
+}
+
 static void mv_escalate(void *arg, const char *why)
 {
 	struct mview *m = arg;
@@ -306,6 +323,7 @@ void mview_bind(struct mview *m, struct session_obs *obs)
 	obs->token_ro = mv_token_ro;
 	obs->peer = mv_peer_cb;
 	obs->peer_ro = mv_peer_ro;
+	obs->peer_fwd_refused = mv_peer_fwd_refused;
 	obs->escalate = mv_escalate;
 	obs->escalate_clear = mv_escalate_clear;
 }

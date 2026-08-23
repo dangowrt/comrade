@@ -41,6 +41,8 @@ static int usage(int ret)
 		"       comrade stop [--id NAME]     end a session (idempotent)\n"
 		"       comrade capture [--id NAME] [--ansi]  print the shared\n"
 		"                                    terminal's current contents\n"
+		"       comrade attach [--id NAME] [-r]  exec tmux attach (for a\n"
+		"                                    web front end on a PTY)\n"
 		"       comrade stun-update  refresh the STUN server list\n"
 		"opts:  -v, --verbose      log lines instead of the dashboard\n"
 		"       --plain            log lines, no colour, no animation\n"
@@ -49,7 +51,10 @@ static int usage(int ret)
 		"       --no-dht           skip the DHT, link-local discovery only\n"
 		"client: -L [bind:]port:host:hostport  forward a local port via the host\n"
 		"        -R [bind:]port:host:hostport  forward a host-side port back here\n"
-		"host:  --no-forwarding    decline all client port forwarding\n");
+		"        -N                 no shell, only the -L/-R forwards\n"
+		"host:  --no-forwarding    decline all client port forwarding\n"
+		"       --forward-only     with --headless: serve no shell, only\n"
+		"                          forwarding (no tmux)\n");
 	return ret;
 }
 
@@ -68,7 +73,8 @@ static int print_version(void)
 
 static int session_connect(const char *arg, int ui_mode, int no_mcast,
 			   int no_dht, const struct fwdspec *fwd_l, int nfwd_l,
-			   const struct fwdspec *fwd_r, int nfwd_r)
+			   const struct fwdspec *fwd_r, int nfwd_r,
+			   int forward_only)
 {
 	struct session_cfg cfg;
 	struct session_obs obs;
@@ -96,6 +102,9 @@ static int session_connect(const char *arg, int ui_mode, int no_mcast,
 	cfg.log_level = -1;
 	cfg.connect_timeout_s = 120;
 	cfg.interactive = 1;
+	cfg.forward_only = forward_only;	/* -N: no shell, forwarding only */
+	if (forward_only && !nfwd_l && !nfwd_r)
+		fprintf(stderr, "comrade: -N with no -L/-R forwards nothing\n");
 	u = ui_create(UI_ROLE_CLIENT, ui_mode);	/* the view drives the dashboard */
 	if (u) {
 		ui_bind(u, &obs);
@@ -143,6 +152,7 @@ int main(int argc, char **argv)
 	int nfwd_l = 0, nfwd_r = 0, no_fwd = 0;
 	int ui_mode = UI_AUTO, no_mcast = 0, no_dht = 0;
 	int headless = 0, expire_s = 0, max_clients = 0;
+	int forward_only = 0, no_shell = 0;
 	const char *host_id = NULL;
 	const char *pos = NULL;
 	int i;
@@ -226,6 +236,21 @@ int main(int argc, char **argv)
 		}
 		return host_capture(sid, ansi);
 	}
+	if (argc >= 2 && !strcmp(argv[1], "attach")) {
+		const char *sid = NULL;
+		int ro = 0;
+
+		for (i = 2; i < argc; i++) {
+			if (!strcmp(argv[i], "--id") && i + 1 < argc)
+				sid = argv[++i];
+			else if (!strcmp(argv[i], "--read-only") ||
+				 !strcmp(argv[i], "-r"))
+				ro = 1;
+			else
+				return usage(1);
+		}
+		return host_attach(sid, ro);
+	}
 
 	for (i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help"))
@@ -242,6 +267,10 @@ int main(int argc, char **argv)
 			no_dht = 1;
 		else if (!strcmp(argv[i], "--no-forwarding"))
 			no_fwd = 1;
+		else if (!strcmp(argv[i], "--forward-only"))
+			forward_only = 1;
+		else if (!strcmp(argv[i], "-N"))
+			no_shell = 1;
 		else if (!strcmp(argv[i], "--headless"))
 			headless = 1;
 		else if (!strcmp(argv[i], "--id") && i + 1 < argc)
@@ -275,9 +304,19 @@ int main(int argc, char **argv)
 				"(they are client options)\n");
 			return usage(1);
 		}
+		if (no_shell) {
+			fprintf(stderr, "comrade: -N is a client option "
+				"(the host uses --forward-only)\n");
+			return usage(1);
+		}
+		if (forward_only && !headless) {
+			fprintf(stderr, "comrade: --forward-only needs "
+				"--headless (it is the no-terminal mode)\n");
+			return usage(1);
+		}
 		if (headless)
 			return host_headless(host_id, no_mcast, no_dht, no_fwd,
-					     expire_s, max_clients);
+					     forward_only, expire_s, max_clients);
 		if (host_id || expire_s || max_clients) {
 			fprintf(stderr, "comrade: --id/--expire/--max-clients "
 				"need --headless\n");
@@ -285,9 +324,9 @@ int main(int argc, char **argv)
 		}
 		return host_run(ui_mode, no_mcast, no_dht, no_fwd);
 	}
-	if (headless || host_id || expire_s || max_clients) {
+	if (headless || host_id || expire_s || max_clients || forward_only) {
 		fprintf(stderr, "comrade: --headless/--id/--expire/"
-			"--max-clients are host options\n");
+			"--max-clients/--forward-only are host options\n");
 		return usage(1);
 	}
 	if (no_fwd) {
@@ -306,5 +345,5 @@ int main(int argc, char **argv)
 		return 0;
 	}
 	return session_connect(pos, ui_mode, no_mcast, no_dht,
-			       fwd_l, nfwd_l, fwd_r, nfwd_r);
+			       fwd_l, nfwd_l, fwd_r, nfwd_r, no_shell);
 }

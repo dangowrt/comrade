@@ -642,6 +642,10 @@ if(BUILD_TESTING)
 	target_link_libraries(showfmt_test comrade_token comrade_compat)
 	add_test(NAME showfmt_test COMMAND showfmt_test)
 
+	add_executable(mview_test tests/mview_test.c src/mview.c src/showfmt.c)
+	target_link_libraries(mview_test comrade_token comrade_compat)
+	add_test(NAME mview_test COMMAND mview_test)
+
 	add_executable(tokgen_test tests/tokgen_test.c)
 	target_link_libraries(tokgen_test comrade_token)
 	add_test(NAME tokgen_test COMMAND tokgen_test)
@@ -886,7 +890,7 @@ if(BUILD_TESTING)
 		stunprobe_test path_test bep44_test
 		bep44_pin_test sig_rebuild_test natstream_test stream_room_test
 		stream_cc_test sshloop_test sshfwd_test sshexit_test sshro_test
-		sshkcp_test sshctl_test qr_test showfmt_test)
+		sshkcp_test sshctl_test qr_test showfmt_test mview_test)
 		if(TARGET ${t})
 			target_compile_options(${t} PRIVATE -UNDEBUG)
 		endif()

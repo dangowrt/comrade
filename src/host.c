@@ -80,6 +80,9 @@ struct svc {
 	char tokfile[512];
 	char statusfile[512];
 	int no_fwd;			/* decline all client port forwarding */
+	int forward_only;		/* serve no shell/tmux, forwarding only */
+	volatile int stop;		/* forward-only: end the serve loop */
+	sock_t stop_wfd;		/* shut to release the turnstile promptly */
 	struct session_obs obs;		/* view-event emitter to the foreground */
 };
 
@@ -96,42 +99,55 @@ static int dir_ok(const char *path)
 	       (st.st_mode & 077) == 0;
 }
 
-/* Per-user runtime directory for comrade session state, created if absent. A
- * predictable /tmp fallback that another user could pre-create (or symlink) is
- * refused rather than silently reused, so the .sock/.tok/.status it holds only
- * ever live in a directory this user owns. */
-static const char *state_dir(void)
+/* mkdir the directory 0700 and insist we own it exclusively, so a state dir
+ * another user could have planted (or symlinked) is refused, never reused. */
+static const char *state_ok(char *dir)
 {
-	static char dir[256];
-	const char *base = getenv("XDG_RUNTIME_DIR");
-	const char *fixed = getenv("COMRADE_STATE_DIR");
-	char fallback[200];
-
-	if (fixed && *fixed) {
-		snprintf(dir, sizeof(dir), "%s", fixed);
-		if (mkdir(dir, 0700) && (errno != EEXIST || !dir_ok(dir))) {
-			fprintf(stderr, "comrade: refusing unsafe state dir "
-				"%s\n", dir);
-			exit(1);
-		}
-		return dir;
-	}
-	if (!base || !*base) {
-		snprintf(fallback, sizeof(fallback), "/tmp/comrade-%u",
-			 (unsigned)getuid());
-		base = fallback;
-		if (mkdir(base, 0700) && (errno != EEXIST || !dir_ok(base))) {
-			fprintf(stderr, "comrade: refusing unsafe state dir %s\n",
-				base);
-			exit(1);
-		}
-	}
-	snprintf(dir, sizeof(dir), "%s/comrade", base);
 	if (mkdir(dir, 0700) && (errno != EEXIST || !dir_ok(dir))) {
 		fprintf(stderr, "comrade: refusing unsafe state dir %s\n", dir);
 		exit(1);
 	}
 	return dir;
+}
+
+/*
+ * The directory holding comrade session state, created if absent.
+ *
+ * COMRADE_STATE_DIR overrides everything. Otherwise root is pinned to a
+ * stable /var/run/comrade regardless of XDG_RUNTIME_DIR: this is the one
+ * process whose two entry points -- an operator at the console and a
+ * supervisor such as luci-app-remoteassist -- must always coincide, or a
+ * grant made through one is invisible (and unstoppable) through the other,
+ * and the console is exactly where you go to end a stranger's shell when the
+ * web UI is unreachable. A pinned path an env var cannot perturb is also the
+ * only thing an ACL can name literally. Non-root keeps the per-user path
+ * (XDG_RUNTIME_DIR, else /tmp/comrade-$UID), where no such second door exists.
+ */
+static const char *state_dir(void)
+{
+	static char dir[256];
+	const char *fixed = getenv("COMRADE_STATE_DIR");
+	const char *base = getenv("XDG_RUNTIME_DIR");
+	char parent[200];
+
+	if (fixed && *fixed) {
+		snprintf(dir, sizeof(dir), "%s", fixed);
+		return state_ok(dir);
+	}
+	if (getuid() == 0) {
+		/* /var is tmpfs on OpenWrt (a symlink to /tmp) and /run
+		 * elsewhere: either way session state belongs on tmpfs. */
+		snprintf(dir, sizeof(dir), "/var/run/comrade");
+		return state_ok(dir);
+	}
+	if (base && *base) {
+		snprintf(dir, sizeof(dir), "%s/comrade", base);
+		return state_ok(dir);
+	}
+	snprintf(parent, sizeof(parent), "/tmp/comrade-%u", (unsigned)getuid());
+	state_ok(parent);
+	snprintf(dir, sizeof(dir), "%s/comrade", parent);
+	return state_ok(dir);
 }
 
 static void sock_path(char *out, size_t n, const char *id)
@@ -177,6 +193,80 @@ static int valid_id(const char *id)
 			return 0;
 	}
 	return 1;
+}
+
+static int tmux_alive(const char *sock);
+
+/* The service pid a session's pidfile names, alive; 0 if none or dead. */
+static long pid_of(const char *id)
+{
+	char pp[512];
+	FILE *f;
+	long pid = 0;
+
+	pid_path(pp, sizeof(pp), id);
+	f = fopen(pp, "r");
+	if (!f)
+		return 0;
+	if (fscanf(f, "%ld", &pid) != 1)
+		pid = 0;
+	fclose(f);
+	return (pid > 0 && kill((pid_t)pid, 0) == 0) ? pid : 0;
+}
+
+/*
+ * A session is live if its tmux server answers (interactive or tmux-headless)
+ * or its headless service pid is alive (forward-only has no tmux, so the pid
+ * is its only liveness). Enumeration and the machine verbs use this so a
+ * forward-only session is as manageable as any other.
+ */
+static int session_live(const char *id)
+{
+	char sock[512];
+
+	sock_path(sock, sizeof(sock), id);
+	if (tmux_alive(sock))
+		return 1;
+	return pid_of(id) != 0;
+}
+
+/*
+ * Visit every session id once (deduped): a tmux socket names one, and so does
+ * a headless pidfile, and a tmux-headless session has both. Iterate pidfiles
+ * first, then sockets whose id has no pidfile, so each id is seen once.
+ */
+static void each_session(void (*fn)(const char *id, void *arg), void *arg)
+{
+	const char *suf[2] = { ".pid", ".sock" };
+	int pass;
+
+	for (pass = 0; pass < 2; pass++) {
+		DIR *d = opendir(state_dir());
+		struct dirent *e;
+		size_t sl = strlen(suf[pass]);
+
+		if (!d)
+			return;
+		while ((e = readdir(d))) {
+			char id[ID_MAX + 1], pp[512];
+			size_t nl = strlen(e->d_name);
+
+			if (nl <= sl || nl - sl > ID_MAX ||
+			    strcmp(e->d_name + nl - sl, suf[pass]))
+				continue;
+			memcpy(id, e->d_name, nl - sl);
+			id[nl - sl] = '\0';
+			/* Second pass (.sock): skip ids a pidfile already
+			 * carried, so a tmux-headless session is not doubled. */
+			if (pass == 1) {
+				pid_path(pp, sizeof(pp), id);
+				if (access(pp, F_OK) == 0)
+					continue;
+			}
+			fn(id, arg);
+		}
+		closedir(d);
+	}
 }
 
 static int gen_id(char *out)
@@ -323,39 +413,32 @@ static int spawn_end_monitor(const char *sock, pid_t *pid)
 	return p[0];
 }
 
-/* Newest live session id into id[ID_LEN+1]; returns 1 if one was found. */
-/* Remove socket/token files whose tmux server is gone, so stale state from an
- * earlier run cannot linger or confuse a fresh start. */
+/* Drop every state file of one dead session. */
+static void sweep_one(const char *id, void *arg)
+{
+	char p[512];
+
+	(void)arg;
+	if (session_live(id))
+		return;			/* a live session: leave it */
+	sock_path(p, sizeof(p), id);
+	unlink(p);
+	tok_path(p, sizeof(p), id);
+	unlink(p);
+	status_path(p, sizeof(p), id);
+	unlink(p);
+	json_path(p, sizeof(p), id);
+	unlink(p);
+	pid_path(p, sizeof(p), id);
+	unlink(p);
+}
+
+/* Remove the state files of sessions whose tmux server or service pid is
+ * gone, so stale state from an earlier run cannot linger or confuse a fresh
+ * start. */
 static void sweep_stale(void)
 {
-	DIR *d = opendir(state_dir());
-	struct dirent *e;
-
-	if (!d)
-		return;
-	while ((e = readdir(d))) {
-		char cand[ID_MAX + 1], sock[512], tok[512];
-		size_t idl = strlen(e->d_name);
-
-		if (idl <= 5 || idl > ID_MAX + 5 ||
-		    strcmp(e->d_name + idl - 5, ".sock"))
-			continue;
-		memcpy(cand, e->d_name, idl - 5);
-		cand[idl - 5] = '\0';
-		sock_path(sock, sizeof(sock), cand);
-		if (tmux_alive(sock))
-			continue;		/* a live session: leave it */
-		unlink(sock);
-		tok_path(tok, sizeof(tok), cand);
-		unlink(tok);
-		status_path(tok, sizeof(tok), cand);
-		unlink(tok);
-		json_path(tok, sizeof(tok), cand);
-		unlink(tok);
-		pid_path(tok, sizeof(tok), cand);
-		unlink(tok);
-	}
-	closedir(d);
+	each_session(sweep_one, NULL);
 }
 
 static int find_live(char *id)
@@ -620,13 +703,26 @@ static void svc_serve(struct svc *v, void *hostkey, int no_mcast, int no_dht)
 	char cmd[600];
 	char cmd_ro[600];
 	struct session_cfg cfg;
-	int end_fd;
+	sock_t end_fd = INVALID_SOCK;
 	pid_t end_pid = -1;
 
-	snprintf(cmd, sizeof(cmd), "tmux -S %s attach -t comrade", v->sock);
-	snprintf(cmd_ro, sizeof(cmd_ro), "tmux -S %s attach -r -t comrade",
-		 v->sock);
-	end_fd = spawn_end_monitor(v->sock, &end_pid);
+	if (v->forward_only) {
+		/* No tmux to anchor on, so a socketpair is the end signal: the
+		 * turnstile polls end_fd and returns the moment stop shuts the
+		 * write end, instead of waiting out its idle/deadline. */
+		sock_t sp[2];
+
+		if (!sock_pair(sp)) {
+			end_fd = sp[0];
+			v->stop_wfd = sp[1];
+		}
+	} else {
+		snprintf(cmd, sizeof(cmd), "tmux -S %s attach -t comrade",
+			 v->sock);
+		snprintf(cmd_ro, sizeof(cmd_ro),
+			 "tmux -S %s attach -r -t comrade", v->sock);
+		end_fd = spawn_end_monitor(v->sock, &end_pid);
+	}
 
 	memset(&cfg, 0, sizeof(cfg));
 	cfg.is_host = 1;
@@ -639,33 +735,48 @@ static void svc_serve(struct svc *v, void *hostkey, int no_mcast, int no_dht)
 	cfg.log_level = -1;
 	cfg.connect_timeout_s = 60;
 	cfg.hostkey = hostkey;
-	cfg.ssh_command = cmd;
-	cfg.ssh_command_ro = cmd_ro;
-	cfg.use_pty = 1;
-	cfg.ssh_end_fd = end_fd > 0 ? end_fd : 0;
 	cfg.no_fwd = v->no_fwd;
+	cfg.forward_only = v->forward_only;
+	cfg.ssh_end_fd = sock_isset(end_fd) ? end_fd : 0;
+	if (!v->forward_only) {
+		cfg.ssh_command = cmd;
+		cfg.ssh_command_ro = cmd_ro;
+		cfg.use_pty = 1;
+	}
 	cfg.status_path = v->statusfile;
 	cfg.on_token_state = on_token_state;
 	cfg.arg = v;
 	cfg.obs = &v->obs;
 
-	while (tmux_alive(v->sock)) {
+	/*
+	 * Non-forward-only is anchored to tmux: the shared session is the
+	 * durable state and the loop runs while it lives. Forward-only has no
+	 * tmux, so it runs until stopped (v->stop, set by the supervisor's
+	 * signal watcher or the operator) or the bounded grant is spent.
+	 */
+	while (v->forward_only ? !v->stop : tmux_alive(v->sock)) {
 		cfg.tok = v->tok;	/* carry the located anchor forward, so the
 					 * next idle attempt reinforces it rather
 					 * than locating (and churning) a new one */
 		session_run(&cfg);
 		if (v->serve_max) {
 			/* The bounded grant is spent: end for good, taking
-			 * the shared tmux with us. */
-			char *k[] = { "tmux", "-S", v->sock, "kill-server",
-				      NULL };
+			 * the shared tmux (if any) with us. */
+			if (!v->forward_only) {
+				char *k[] = { "tmux", "-S", v->sock,
+					      "kill-server", NULL };
 
-			run_wait(k);
+				run_wait(k);
+			}
 			break;
 		}
 	}
-	if (end_fd > 0)
-		close(end_fd);
+	if (sock_isset(end_fd))
+		sock_close(end_fd);
+	if (sock_isset(v->stop_wfd)) {
+		sock_close(v->stop_wfd);
+		v->stop_wfd = INVALID_SOCK;
+	}
 	if (end_pid > 0) {
 		kill(end_pid, SIGTERM);
 		waitpid(end_pid, NULL, 0);
@@ -888,67 +999,54 @@ static char *read_statejson(const char *id, char *buf, size_t n)
 	return got ? buf : NULL;
 }
 
+static void show_one(const char *id, void *arg)
+{
+	struct showfmt *f = arg;
+	char sock[512], tok[TOKEN_STR_LEN + 8], ro[TOKEN_STR_LEN + 8];
+	char state[4096];
+
+	if (!session_live(id))
+		return;
+	sock_path(sock, sizeof(sock), id);
+	if (read_tokens(id, tok, sizeof(tok), ro, sizeof(ro)))
+		return;
+	showfmt_session(f, id, sock, tok, ro,
+			read_statejson(id, state, sizeof(state)));
+}
+
 int host_show(int what)
 {
-	DIR *d = opendir(state_dir());
-	struct dirent *e;
 	struct showfmt f;
 
 	showfmt_begin(&f, what, stdout);
-	if (d) {
-		while ((e = readdir(d))) {
-			char cand[ID_MAX + 1], sock[512];
-			char tok[TOKEN_STR_LEN + 8], ro[TOKEN_STR_LEN + 8];
-			char state[4096];
-			size_t idl = strlen(e->d_name);
-
-			if (idl <= 5 || idl > ID_MAX + 5 ||
-			    strcmp(e->d_name + idl - 5, ".sock"))
-				continue;
-			memcpy(cand, e->d_name, idl - 5);
-			cand[idl - 5] = '\0';
-			sock_path(sock, sizeof(sock), cand);
-			if (!tmux_alive(sock))
-				continue;
-			if (read_tokens(cand, tok, sizeof(tok), ro, sizeof(ro)))
-				continue;
-			showfmt_session(&f, cand, sock, tok, ro,
-					read_statejson(cand, state,
-						       sizeof(state)));
-		}
-		closedir(d);
-	}
+	each_session(show_one, &f);
 	return showfmt_end(&f);
+}
+
+struct only_ctx { char *only; size_t n; int count; };
+
+static void live_one(const char *id, void *arg)
+{
+	struct only_ctx *c = arg;
+
+	if (!session_live(id))
+		return;
+	if (c->only && !c->count)
+		snprintf(c->only, c->n, "%s", id);
+	c->count++;
 }
 
 /* Every live session; `only` picks the single one when the caller gave no
  * id. Returns the count. */
 static int live_sessions(char *only, size_t n)
 {
-	DIR *d = opendir(state_dir());
-	struct dirent *e;
-	int count = 0;
+	struct only_ctx c;
 
-	if (!d)
-		return 0;
-	while ((e = readdir(d))) {
-		char cand[ID_MAX + 1], sock[512];
-		size_t idl = strlen(e->d_name);
-
-		if (idl <= 5 || idl > ID_MAX + 5 ||
-		    strcmp(e->d_name + idl - 5, ".sock"))
-			continue;
-		memcpy(cand, e->d_name, idl - 5);
-		cand[idl - 5] = '\0';
-		sock_path(sock, sizeof(sock), cand);
-		if (!tmux_alive(sock))
-			continue;
-		if (only && !count)
-			snprintf(only, n, "%s", cand);
-		count++;
-	}
-	closedir(d);
-	return count;
+	c.only = only;
+	c.n = n;
+	c.count = 0;
+	each_session(live_one, &c);
+	return c.count;
 }
 
 /* The one session an id-less machine verb may act on; -1 when ambiguous. */
@@ -987,11 +1085,18 @@ static void on_stop_sig(int sig)
  * returns. A signal handler cannot run tmux, so this thread does.
  */
 struct stop_watch {
+	struct svc *v;			/* forward-only: set v->stop; else NULL */
 	const char *sock;
 	uint64_t deadline;		/* --expire, as mono_ms; 0 = none */
 	volatile int done;
 };
 
+/*
+ * End the session on the supervisor's signal or the --expire deadline. A
+ * tmux-anchored session is ended by killing its server (the serve loop's
+ * tmux_alive goes false); a forward-only one has no tmux, so its serve flag
+ * is raised instead. A signal handler cannot run tmux, so this thread does.
+ */
 static void *stop_watch_thread(void *arg)
 {
 	struct stop_watch *w = arg;
@@ -1005,16 +1110,23 @@ static void *stop_watch_thread(void *arg)
 		usleep(200 * 1000);
 	}
 	if (fire && !w->done) {
-		char *k[] = { "tmux", "-S", (char *)w->sock, "kill-server",
-			      NULL };
+		if (w->v) {
+			w->v->stop = 1;
+			/* Wake the turnstile's end-fd so it returns at once. */
+			if (sock_isset(w->v->stop_wfd))
+				sock_shutdown(w->v->stop_wfd, SHUT_RDWR);
+		} else {
+			char *k[] = { "tmux", "-S", (char *)w->sock,
+				      "kill-server", NULL };
 
-		run_wait(k);
+			run_wait(k);
+		}
 	}
 	return NULL;
 }
 
 int host_headless(const char *id_opt, int no_mcast, int no_dht, int no_fwd,
-		  int expire_s, int max_clients)
+		  int forward_only, int expire_s, int max_clients)
 {
 	struct svc v;
 	struct mview *m;
@@ -1026,6 +1138,7 @@ int host_headless(const char *id_opt, int no_mcast, int no_dht, int no_fwd,
 
 	memset(&v, 0, sizeof(v));
 	v.no_fwd = no_fwd;
+	v.forward_only = forward_only;
 	v.serve_max = max_clients;
 	v.admit_max = max_clients;
 	sweep_stale();
@@ -1066,7 +1179,9 @@ int host_headless(const char *id_opt, int no_mcast, int no_dht, int no_fwd,
 	m = mview_create(id, jsonp, v.sock);
 	if (!m)
 		return 1;
-	if (tmux_start(v.sock)) {
+	/* Forward-only serves no shell, so it starts no tmux -- and needs
+	 * none installed. The others anchor the session on the shared tmux. */
+	if (!forward_only && tmux_start(v.sock)) {
 		/* The error document stays for the supervisor's page; the
 		 * next sweep collects it. */
 		mview_error(m, "no_tmux");
@@ -1083,6 +1198,7 @@ int host_headless(const char *id_opt, int no_mcast, int no_dht, int no_fwd,
 
 	mview_limits(m, expire_s, max_clients);
 	mview_bind(m, &v.obs);
+	w.v = forward_only ? &v : NULL;
 	w.sock = v.sock;
 	w.deadline = expire_s > 0 ? mono_ms() + (uint64_t)expire_s * 1000 : 0;
 	w.done = 0;
@@ -1151,7 +1267,10 @@ int host_capture(const char *id_opt, int ansi)
 	}
 	sock_path(sock, sizeof(sock), id);
 	if (!tmux_alive(sock)) {
-		fprintf(stderr, "comrade: no running session\n");
+		/* A live forward-only session has no terminal to capture. */
+		fprintf(stderr, session_live(id) ?
+			"comrade: that session is forwarding-only "
+			"(no terminal)\n" : "comrade: no running session\n");
 		return 1;
 	}
 	cv[n++] = "tmux";
@@ -1166,6 +1285,42 @@ int host_capture(const char *id_opt, int ansi)
 	cv[n] = NULL;
 	r = run_wait(cv);
 	return r < 0 ? 1 : r;
+}
+
+int host_attach(const char *id_opt, int read_only)
+{
+	char id[ID_MAX + 1], sock[512];
+	char *cv[8];
+	int n = 0, r;
+
+	r = resolve_id(id_opt, id, sizeof(id));
+	if (r < 0)
+		return 1;
+	if (r > 0) {
+		fprintf(stderr, "comrade: no running session\n");
+		return 1;
+	}
+	sock_path(sock, sizeof(sock), id);
+	if (!tmux_alive(sock)) {
+		fprintf(stderr, session_live(id) ?
+			"comrade: that session is forwarding-only "
+			"(no terminal)\n" : "comrade: no running session\n");
+		return 1;
+	}
+	/* Exec tmux attach, taking over this process: a web front end spawns
+	 * this on a PTY and wires its websocket to it, without knowing the
+	 * socket path or the session name. -r is read-only. */
+	cv[n++] = "tmux";
+	cv[n++] = "-S";
+	cv[n++] = sock;
+	cv[n++] = "attach";
+	if (read_only)
+		cv[n++] = "-r";
+	cv[n++] = "-t";
+	cv[n++] = "comrade";
+	execvp(cv[0], cv);
+	fprintf(stderr, "comrade: could not exec tmux\n");
+	return 1;
 }
 
 #endif

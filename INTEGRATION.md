@@ -51,6 +51,15 @@ configured bounds appear in the state document as `expire_s` and
 `max_clients` (static values; the countdown is the supervisor's
 arithmetic, and expiry itself shows up as the session ending).
 
+`--forward-only` (with `--headless`) serves no shell at all: no tmux is
+started (and none need be installed), the primary SSH channel is an
+inert keepalive, and only the control plane and `-L`/`-R` port
+forwarding run. This is the "no terminal" host. `comrade capture` and
+`comrade attach` report such a session as forwarding-only rather than
+showing a pane. A client joins a forward-only host -- or any host, to
+forward without a shell -- with `comrade <token> -N -L... -R...`, the
+OpenSSH spelling: no shell is requested, only the forwards.
+
 Exit codes: 0 the session ended or was stopped, 1 an internal failure,
 2 a bad or already-running `--id`, 3 a startup failure -- the state
 file then carries `"state":"error"` and a stable `"error"` enum (today:
@@ -79,14 +88,40 @@ the single live session and refuses (exit 1) when there are several.
 
 Prints the shared terminal's current contents (tmux capture-pane) to
 stdout; `--ansi` keeps the colour escapes. For read-only surfaces such
-as a web page's session preview, polled alongside the state file.
+as a web page's session preview, polled alongside the state file. A
+forward-only session has no terminal, so this reports it as such.
+
+    comrade attach [--id NAME] [-r]
+
+Execs `tmux attach` for the session, taking over the process: a web
+front end spawns this on a PTY and wires its websocket to it, without
+hard-coding the tmux socket path or session name. `-r` attaches
+read-only. Fails on a forward-only session (no terminal).
 
 ## The state directory
 
-`$COMRADE_STATE_DIR` when set, else `$XDG_RUNTIME_DIR/comrade`, else
-`/tmp/comrade-$UID`. The directory is 0700, files 0600 -- state files
-carry tokens, and a read-write token is a shell credential. On OpenWrt
-set `COMRADE_STATE_DIR=/var/run/comrade` in the init script.
+`$COMRADE_STATE_DIR` overrides everything. Otherwise **root is pinned to
+`/var/run/comrade`** regardless of `$XDG_RUNTIME_DIR`, and a non-root user
+gets `$XDG_RUNTIME_DIR/comrade`, else `/tmp/comrade-$UID`. The directory
+is 0700, files 0600 -- state files carry tokens, and a read-write token
+is a shell credential.
+
+The root pin is deliberate and load-bearing: comrade has exactly two
+entry points -- an operator at a console and a supervisor such as
+luci-app-remoteassist -- and they must resolve to the same directory
+with no configuration, or a grant made through one is invisible (and so
+un-stoppable) through the other. The console is exactly where an
+operator goes to end a stranger's shell when the web UI is unreachable,
+so that must never depend on which door the session came in by. A fixed
+path is also the only thing an ACL can name literally, so an ACL points
+at `/var/run/comrade/<id>.json` directly. Do not set `COMRADE_STATE_DIR`
+for root; let both entry points take the default. (`/var` is a symlink
+to `/tmp` on OpenWrt and `/run` elsewhere, so the path is tmpfs either
+way -- correct for session state, which must not survive a reboot.)
+
+comrade ships no init script and is never a system service: a session
+is started by an operator or by a supervisor's transient procd instance,
+so nothing lives in `/etc` and no grant survives a reboot.
 
 For `--id NAME` the paths are exactly:
 
@@ -139,6 +174,10 @@ For `--id NAME` the paths are exactly:
   `direct`) with `addr`/`port` accompany `ready`.
 - `peers[].state`: `seen` | `punching` | `connected` (gone peers leave
   the list); `grade`: `rw` | `ro` -- which token the peer presented.
+- `peers[].forward_refused`: `true` once a peer's `-L`/`-R` attempt was
+  declined (the host runs `--no-forwarding`, or the peer is read-only --
+  a read-only grade never gets a tunnel, since a tunnel into the host's
+  LAN is more capability than the shell it withholds). Absent otherwise.
 - `warning`: the current operator-facing warning, cleared when the
   condition passes. Advisory prose beside the machine state, never the
   only carrier of one.
@@ -155,6 +194,8 @@ One JSON object per line. Every event carries the resulting `"state"`.
     {"event":"token","token":"...","token_ro":"...","state":"rendezvous"}
     {"event":"peer","peer":{"id":1,"peer_state":"connected","grade":"rw",
      "addr":"..."},"state":"serving"}
+    {"event":"forward_refused","peer":{"id":1,"peer_state":"connected",
+     "grade":"ro","forward_refused":true},"state":"serving"}
     {"event":"warning","warning":"...","state":"ready"}
     {"event":"warning_cleared","state":"ready"}
     {"event":"error","state":"error"}
