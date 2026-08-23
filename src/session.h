@@ -71,6 +71,10 @@ struct session_obs {
 	/* The peer identified by `id` authenticated read-only (view-only guest);
 	 * fired once, after its row exists, so the dashboard can mark it. */
 	void (*peer_ro)(void *arg, int id);
+	/* A forwarding request from peer `id` was refused (the host declines
+	 * forwarding, or the guest is read-only). Fired once, so an operator
+	 * sees an attempted tunnel rather than the guest failing silently. */
+	void (*peer_fwd_refused)(void *arg, int id);
 	/* The connection context was torn down and is being rebuilt (a roam or
 	 * reconnect): drop stale local candidates, the peer, and the "link up"
 	 * state, so the dashboard reflects the fresh attempt rather than the
@@ -107,6 +111,8 @@ struct session_cfg {
 	/* Host only. */
 	void *hostkey;			/* ssh_key (private) */
 	int no_fwd;			/* refuse all client port forwarding */
+	int forward_only;		/* serve no shell: forwarding + control
+					 * only, no tmux (host) */
 	int host_serve_max;		/* stop after serving this many clients
 					 * (0 = until the deadline / operator) */
 	/*

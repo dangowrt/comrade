@@ -309,6 +309,8 @@ struct conn {
 	 * dashboard once. Written from the ssh thread, so volatile like done. */
 	volatile int read_only;
 	int ro_reported;		/* main-thread only: sent to the view yet */
+	volatile int fwd_refused;	/* forwards the ssh thread refused */
+	int fwd_reported;		/* main-thread only: refusal surfaced yet */
 };
 
 struct sess {
@@ -2371,7 +2373,9 @@ static void *ssh_srv_thread(void *p)
 	o.end_fd = s->cfg->ssh_end_fd;
 	o.ctl_fd = c->ssh_ctl_fd;
 	o.no_fwd = s->cfg->no_fwd;
+	o.forward_only = s->cfg->forward_only;
 	o.ro_out = &c->read_only;
+	o.fwd_refused_out = &c->fwd_refused;
 	o.tx_room = conn_tx_room;
 	o.tx_room_arg = c;
 	sshd_serve_fd(c->ssh_fd, &o);
@@ -2387,7 +2391,8 @@ static void *ssh_cli_thread(void *p)
 	memset(&o, 0, sizeof(o));
 	memcpy(o.host_fp, s->cfg->tok.hostpub, 32);
 	memcpy(o.auth, s->auth, sizeof(o.auth));
-	o.interactive = s->cfg->interactive;
+	o.interactive = s->cfg->interactive && !s->cfg->forward_only;
+	o.forward_only = s->cfg->forward_only;
 	o.read_only = (s->cfg->tok.flags & TOKEN_FLAG_RO) != 0;
 	o.connect_timeout_s = s->cfg->connect_timeout_s;
 	o.ctl_fd = c->ssh_ctl_fd;
@@ -3916,6 +3921,13 @@ static int host_turnstile(struct sess *s)
 			    !ws[i].c->ro_reported) {
 				ws[i].c->ro_reported = 1;
 				o->peer_ro(o->arg, ws[i].c->dash_id);
+			}
+			/* A forwarding attempt the ssh thread refused: surface
+			 * it once so the operator sees the attempted tunnel. */
+			if (o && o->peer_fwd_refused && ws[i].c->fwd_refused &&
+			    !ws[i].c->fwd_reported) {
+				ws[i].c->fwd_reported = 1;
+				o->peer_fwd_refused(o->arg, ws[i].c->dash_id);
 			}
 		}
 

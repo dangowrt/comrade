@@ -27,6 +27,7 @@ struct sshc_opts {
 	uint8_t auth[TOKEN_AUTH_LEN];	/* session password material */
 
 	int interactive;		/* bridge local stdin/stdout raw */
+	int forward_only;		/* -N: request no shell, forward only */
 	int connect_timeout_s;		/* SSH_OPTIONS_TIMEOUT; 0 = libssh default */
 
 	/*

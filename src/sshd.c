@@ -226,12 +226,14 @@ static void apply_winch(struct cpty *child, ssh_message m)
 struct pump_ctx {
 	ssh_session s;
 	ssh_event event;
-	struct cpty *child;		/* the shell pty, for window-change */
+	struct cpty *child;		/* the shell pty, for window-change;
+					 * NULL in forward-only */
 	sock_t ctl_fd;			/* control-plane socket, 0 if none */
 	ssh_channel ctl_chan;		/* the accepted control channel */
 	ssh_connector ctl_in;		/* ctl_fd -> channel */
 	ssh_connector ctl_out;		/* channel -> ctl_fd */
 	struct sshfwd *fwd;		/* port forwarding; NULL = declined */
+	volatile int *fwd_refused;	/* count refused forwards, or NULL */
 	int end_hit;
 };
 
@@ -279,7 +281,8 @@ static void drain_messages(struct pump_ctx *c)
 		}
 		if (type == SSH_REQUEST_CHANNEL &&
 		    sub == SSH_CHANNEL_REQUEST_WINDOW_CHANGE) {
-			apply_winch(c->child, m);
+			if (c->child)		/* no pty in forward-only */
+				apply_winch(c->child, m);
 			ssh_message_reply_default(m);
 			ssh_message_free(m);
 			continue;
@@ -299,9 +302,19 @@ static void drain_messages(struct pump_ctx *c)
 		}
 		/* Port forwarding (direct-tcpip, tcpip-forward): the engine
 		 * consumes these when the host allows it; with no engine they
-		 * fall through to the default reply, i.e. are refused. */
+		 * fall through to the default reply, i.e. are refused -- noted
+		 * so the operator sees a refused tunnel rather than a silent
+		 * failure on the guest's side. */
 		if (c->fwd && sshfwd_srv_message(c->fwd, m))
 			continue;
+		if ((type == SSH_REQUEST_CHANNEL_OPEN &&
+		     sub == SSH_CHANNEL_DIRECT_TCPIP) ||
+		    (type == SSH_REQUEST_GLOBAL &&
+		     sub == SSH_GLOBAL_REQUEST_TCPIP_FORWARD)) {
+			if (c->fwd_refused)
+				(*c->fwd_refused)++;
+			dbg_logf("sshd: forwarding refused (declined by host)");
+		}
 		ssh_message_reply_default(m);
 		ssh_message_free(m);
 	}
@@ -334,30 +347,40 @@ static void pump(ssh_session s, ssh_channel chan, struct cpty *child,
 {
 	sock_t end_fd = o->end_fd;
 	struct pump_ctx c;
-	ssh_connector c_in, c_out;	/* shell channel <-> child */
+	ssh_connector c_in = NULL, c_out = NULL;	/* shell channel <-> child */
 	int ending = 0, drain = 0;
 
 	memset(&c, 0, sizeof(c));
 	c.s = s;
 	c.child = child;
 	c.ctl_fd = o->ctl_fd;
+	c.fwd_refused = o->fwd_refused_out;
 	c.event = ssh_event_new();
 	if (c.event && !o->no_fwd) {
 		c.fwd = sshfwd_create(s, c.event);
 		sshfwd_set_tx_room(c.fwd, o->tx_room, o->tx_room_arg);
 	}
-	c_in = ssh_connector_new(s);
-	c_out = ssh_connector_new(s);
-	if (!c.event || !c_in || !c_out)
+	if (!c.event)
 		goto out;
-
-	ssh_connector_set_out_fd(c_in, cpty_in(child));
-	ssh_connector_set_in_channel(c_in, chan, SSH_CONNECTOR_STDOUT);
-	ssh_connector_set_in_fd(c_out, cpty_out(child));
-	ssh_connector_set_out_channel(c_out, chan, SSH_CONNECTOR_STDOUT);
-
-	ssh_event_add_connector(c.event, c_in);
-	ssh_event_add_connector(c.event, c_out);
+	/* The shell channel <-> child connectors, only when there is a child:
+	 * forward-only keeps the primary channel as an inert keepalive. Those
+	 * connectors are also what put the session's socket in the event, so
+	 * with no child the session is added directly or dopoll would never
+	 * see an incoming packet (a forwarding request, a ctl open). */
+	if (child) {
+		c_in = ssh_connector_new(s);
+		c_out = ssh_connector_new(s);
+		if (!c_in || !c_out)
+			goto out;
+		ssh_connector_set_out_fd(c_in, cpty_in(child));
+		ssh_connector_set_in_channel(c_in, chan, SSH_CONNECTOR_STDOUT);
+		ssh_connector_set_in_fd(c_out, cpty_out(child));
+		ssh_connector_set_out_channel(c_out, chan, SSH_CONNECTOR_STDOUT);
+		ssh_event_add_connector(c.event, c_in);
+		ssh_event_add_connector(c.event, c_out);
+	} else {
+		ssh_event_add_session(c.event, s);
+	}
 	if (sock_isset(end_fd))
 		ssh_event_add_fd(c.event, end_fd,
 				 POLLIN | POLLHUP | POLLERR | POLLNVAL,
@@ -373,7 +396,7 @@ static void pump(ssh_session s, ssh_channel chan, struct cpty *child,
 		sshfwd_tick(c.fwd);
 		if (!ending && c.end_hit)
 			ending = 1;
-		if (!ending && cpty_exited(child))
+		if (!ending && child && cpty_exited(child))
 			ending = 1;
 		if (ending && ++drain >= 3)
 			break;
@@ -383,8 +406,12 @@ static void pump(ssh_session s, ssh_channel chan, struct cpty *child,
 	c.fwd = NULL;
 	if (sock_isset(end_fd))
 		ssh_event_remove_fd(c.event, end_fd);
-	ssh_event_remove_connector(c.event, c_in);
-	ssh_event_remove_connector(c.event, c_out);
+	if (c_in)
+		ssh_event_remove_connector(c.event, c_in);
+	if (c_out)
+		ssh_event_remove_connector(c.event, c_out);
+	if (!child)
+		ssh_event_remove_session(c.event, s);
 	if (c.ctl_in) {
 		ssh_event_remove_connector(c.event, c.ctl_in);
 		ssh_event_remove_connector(c.event, c.ctl_out);
@@ -466,6 +493,24 @@ int sshd_serve_fd(sock_t fd, const struct sshd_opts *o)
 		dbg_logf("sshd: channel open failed/aborted");
 		goto out;
 	}
+	/* A view-only guest cannot make the host connect() outbound: a tunnel
+	 * into the host's LAN is more capability than the shell it withholds. */
+	eff = *o;
+	if (read_only)
+		eff.no_fwd = 1;
+
+	/*
+	 * Forward-only: no shell request, no command, no pty. The primary
+	 * channel is an inert keepalive; the pump serves the control plane and
+	 * port forwarding until it, the transport, or the end fd closes.
+	 */
+	if (o->forward_only) {
+		dbg_logf("sshd: forward-only, no shell -- entering pump");
+		pump(s, chan, NULL, &eff);
+		rc = 0;
+		goto out;
+	}
+
 	dbg_logf("sshd: channel open ok, shell request");
 	term[0] = '\0';
 	if (do_shell_request(s, &want_pty, &rows, &cols, term, sizeof(term))) {
@@ -490,11 +535,7 @@ int sshd_serve_fd(sock_t fd, const struct sshd_opts *o)
 	/* Live resizes arrive as window-change requests; the pump applies them
 	 * to the pty. A second channel requesting the comrade-ctl subsystem is
 	 * bridged to o->ctl_fd, and client port forwards are served unless
-	 * declined by o->no_fwd or the read-only grade (all in drain_messages):
-	 * a view-only guest cannot make the host connect() outbound. */
-	eff = *o;
-	if (read_only)
-		eff.no_fwd = 1;
+	 * declined by o->no_fwd or the read-only grade (all in drain_messages). */
 	pump(s, chan, child, &eff);
 	rc = 0;
 out:

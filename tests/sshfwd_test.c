@@ -279,6 +279,8 @@ struct srv_arg {
 	void *hostkey;
 	uint8_t auth[TOKEN_AUTH_LEN];
 	int no_fwd;
+	int forward_only;
+	volatile int fwd_refused;
 };
 
 static void *srv_thread(void *p)
@@ -292,6 +294,8 @@ static void *srv_thread(void *p)
 	o.command = "cat";
 	o.use_pty = 0;
 	o.no_fwd = a->no_fwd;
+	o.forward_only = a->forward_only;
+	o.fwd_refused_out = &a->fwd_refused;
 	sshd_serve_fd(a->fd, &o);
 	return NULL;
 }
@@ -374,6 +378,71 @@ static int one_round(void *hostkey, const uint8_t fp[32],
 	return ok;
 }
 
+/*
+ * A forward-only session: the host serves no shell, the client requests none.
+ * A -R forward still works end to end, and (when refuse is set) the host
+ * declining forwarding is counted through fwd_refused_out. The client's
+ * run_forward loops until the transport ends, so the harness closes both fds
+ * to finish. Returns 1 on the expected outcome.
+ */
+static int forward_only_round(void *hostkey, const uint8_t fp[32],
+			      const uint8_t auth[TOKEN_AUTH_LEN], int no_fwd,
+			      const struct fwdspec *r, uint16_t connect_port,
+			      int expect_forward)
+{
+	struct srv_arg sa;
+	struct cli_arg ca;
+	pthread_t sth, cth;
+	uint64_t deadline;
+	int sp[2], fd, ok;
+
+	assert(!socketpair(AF_UNIX, SOCK_STREAM, 0, sp));
+
+	memset(&sa, 0, sizeof(sa));
+	sa.fd = sp[1];
+	sa.hostkey = hostkey;
+	memcpy(sa.auth, auth, sizeof(sa.auth));
+	sa.no_fwd = no_fwd;
+	sa.forward_only = 1;
+	assert(!pthread_create(&sth, NULL, srv_thread, &sa));
+
+	memset(&ca, 0, sizeof(ca));
+	ca.fd = sp[0];
+	memcpy(ca.o.host_fp, fp, 32);
+	memcpy(ca.o.auth, auth, sizeof(ca.o.auth));
+	ca.o.forward_only = 1;
+	ca.o.fwd_r = r;
+	ca.o.nfwd_r = 1;
+	assert(!pthread_create(&cth, NULL, cli_thread, &ca));
+
+	if (expect_forward) {
+		deadline = now_ms() + HOLD_MS - 500;
+		fd = connect_retry(connect_port, deadline);
+		ok = fd >= 0 && echo_check(fd, deadline);
+		if (fd >= 0)
+			close(fd);
+	} else {
+		/* A refused -R binds no host listener, so there is nothing to
+		 * connect to: the refusal shows only in the host's counter.
+		 * Give the client a moment to attempt it and the host to
+		 * decline. */
+		usleep(500 * 1000);
+		ok = 1;
+	}
+
+	/* End the forward-only client and server: no shell means no natural
+	 * EOF, so drop the transport under them. */
+	shutdown(sp[0], SHUT_RDWR);
+	shutdown(sp[1], SHUT_RDWR);
+	pthread_join(cth, NULL);
+	pthread_join(sth, NULL);
+
+	if (expect_forward)
+		return ok;
+	/* Refusal: the host counted the declined forward. */
+	return sa.fwd_refused > 0;
+}
+
 int main(void)
 {
 	uint8_t fp[32], auth[TOKEN_AUTH_LEN];
@@ -451,8 +520,39 @@ int main(void)
 	pthread_cancel(e.th);
 	pthread_join(e.th, NULL);
 
+	/* Forward-only: the host serves no shell, yet -R still tunnels. */
+	echo_start(&e);
+	port = pick_port();
+	memset(&sp, 0, sizeof(sp));
+	sp.bind_port = port;
+	snprintf(sp.host, sizeof(sp.host), "127.0.0.1");
+	sp.port = e.port;
+	if (!forward_only_round(hostkey, fp, auth, 0, &sp, port, 1)) {
+		fprintf(stderr, "FWD FAIL: forward-only -R echo\n");
+		return 1;
+	}
+	echo_stop(&e);
+
+	/* Forward-only + declined: no tunnel, and the host counts the
+	 * refusal so the operator can be shown it. */
+	echo_start(&e);
+	port = pick_port();
+	memset(&sp, 0, sizeof(sp));
+	sp.bind_port = port;
+	snprintf(sp.host, sizeof(sp.host), "127.0.0.1");
+	sp.port = e.port;
+	if (!forward_only_round(hostkey, fp, auth, 1, &sp, port, 0)) {
+		fprintf(stderr, "FWD FAIL: refusal not counted / still "
+			"forwarded\n");
+		return 1;
+	}
+	close(e.lfd);
+	pthread_cancel(e.th);
+	pthread_join(e.th, NULL);
+
 	sshd_hostkey_free(hostkey);
 	printf("FWD PASS: -L and -R echo, -R bulk past the window, "
-	       "--no-forwarding refuses\n");
+	       "--no-forwarding refuses, forward-only serves no shell, "
+	       "refusals counted\n");
 	return 0;
 }

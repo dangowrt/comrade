@@ -62,6 +62,21 @@ struct sshd_opts {
 	 */
 	int no_fwd;
 	/*
+	 * Serve no shell at all: accept the session channel as an inert
+	 * keepalive and run only the control plane and port forwarding. No
+	 * pty, no command, no tmux -- the "no terminal, forwarding only"
+	 * host. use_pty/command are then unused.
+	 */
+	int forward_only;
+	/*
+	 * Optional out-parameter, like ro_out: incremented (from the ssh
+	 * thread) each time a client forwarding request is refused because
+	 * the host declines forwarding -- a read-only guest, or --no-forwarding.
+	 * The controller surfaces it so an operator sees a refused tunnel
+	 * rather than the guest silently failing. NULL to ignore.
+	 */
+	volatile int *fwd_refused_out;
+	/*
 	 * Optional transport back-pressure for the forwards (sshfwd_set_tx_room):
 	 * bulk is fed only while tx_room(tx_room_arg) is nonzero, keeping the
 	 * terminal and control plane responsive under a saturating transfer.

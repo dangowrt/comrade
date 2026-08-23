@@ -293,6 +293,72 @@ out:
 }
 
 /*
+ * Forward-only (-N): no shell was requested, so the primary channel is an
+ * inert keepalive. Run the control plane, the -L/-R forwarding and path
+ * upkeep until the channel ends or the transport drops. Returns 0 on a clean
+ * end, -1 on failure.
+ */
+static int run_forward(ssh_session s, ssh_channel chan,
+		       const struct sshc_opts *o)
+{
+	ssh_channel ctl = NULL;
+	ssh_connector c_ctl_in = NULL, c_ctl_out = NULL;
+	ssh_event event = ssh_event_new();
+	struct sshfwd *fwd = NULL;
+	int rc = 0;
+
+	if (event)
+		fwd = fwd_up(s, event, o);
+	ctl_open(s, event, o, &ctl, &c_ctl_in, &c_ctl_out);
+	/* With no shell connectors bridging the session, the event would not
+	 * poll the session socket, so an incoming forwarded-tcpip channel (a
+	 * -R connection) would never be seen. Add the session directly. */
+	if (event)
+		ssh_event_add_session(event, s);
+
+	while (ssh_channel_is_open(chan) && !ssh_channel_is_eof(chan)) {
+		char sink[4096];
+
+		/* Nothing should arrive on the keepalive channel, but drain it
+		 * so a stray byte never wedges the window. */
+		while (ssh_channel_poll(chan, 0) > 0 &&
+		       ssh_channel_read_nonblocking(chan, sink, sizeof(sink),
+						    0) > 0)
+			;
+		if (event) {
+			if (ssh_event_dopoll(event, 200) == SSH_ERROR) {
+				rc = -1;
+				break;
+			}
+			sshfwd_tick(fwd);
+		} else {
+			os_msleep(200);
+		}
+	}
+
+	sshfwd_destroy(fwd);
+	if (c_ctl_in) {
+		ssh_event_remove_connector(event, c_ctl_in);
+		ssh_event_remove_connector(event, c_ctl_out);
+	}
+	if (ctl && ssh_channel_is_open(ctl)) {
+		ssh_channel_send_eof(ctl);
+		ssh_channel_close(ctl);
+	}
+	if (c_ctl_in)
+		ssh_connector_free(c_ctl_in);
+	if (c_ctl_out)
+		ssh_connector_free(c_ctl_out);
+	if (ctl)
+		ssh_channel_free(ctl);
+	if (event) {
+		ssh_event_remove_session(event, s);
+		ssh_event_free(event);
+	}
+	return rc;
+}
+
+/*
  * Interactive mode: put the terminal in raw mode and bridge stdin/stdout/stderr
  * to the channel with libssh's connectors (the same mechanism the server uses),
  * relaying window-size changes to the remote pty. Runs until the channel ends
@@ -522,7 +588,12 @@ int sshc_connect_fd(sock_t fd, const struct sshc_opts *o)
 		goto out;
 	}
 	dbg_logf("sshc: channel open ok");
-	if (o->interactive) {
+	if (o->forward_only) {
+		/* No shell: hold the session channel open as a keepalive and
+		 * run forwarding + the control plane only. */
+		dbg_logf("sshc: forward-only, no shell requested");
+		rc = run_forward(s, chan, o);
+	} else if (o->interactive) {
 		const char *term = getenv("TERM");
 		int reserve, prows, rows, cols;
 
