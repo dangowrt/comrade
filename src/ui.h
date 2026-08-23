@@ -13,7 +13,7 @@
  * ICE, or KCP -- only the semantic events it is handed.
  */
 
-enum { UI_AUTO, UI_ANIM, UI_VERBOSE };		/* rendering mode */
+enum { UI_AUTO, UI_ANIM, UI_VERBOSE, UI_PLAIN };	/* rendering mode */
 enum { UI_ROLE_HOST, UI_ROLE_CLIENT };
 
 struct ui;

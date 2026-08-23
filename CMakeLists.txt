@@ -532,7 +532,7 @@ target_link_libraries(comrade_ui PUBLIC comrade_token comrade_qr comrade_compat)
 # so exactly one of them defines host_run/host_show, which keeps both readable
 # -- the alternative was an #ifdef through every function in host.c, since
 # almost every line of it is a fork, a pty or a signal.
-add_library(comrade_host STATIC src/host.c src/host_win.c)
+add_library(comrade_host STATIC src/host.c src/host_win.c src/showfmt.c)
 target_include_directories(comrade_host PUBLIC src)
 target_link_libraries(comrade_host PUBLIC comrade_token comrade_dbg comrade_termfilter
 	comrade_session comrade_ui)
@@ -636,6 +636,10 @@ if(BUILD_TESTING)
 	add_executable(qr_test tests/qr_test.c)
 	target_link_libraries(qr_test comrade_qr)
 	add_test(NAME qr_test COMMAND qr_test)
+
+	add_executable(showfmt_test tests/showfmt_test.c src/showfmt.c)
+	target_link_libraries(showfmt_test comrade_token comrade_compat)
+	add_test(NAME showfmt_test COMMAND showfmt_test)
 
 	add_executable(tokgen_test tests/tokgen_test.c)
 	target_link_libraries(tokgen_test comrade_token)
@@ -881,7 +885,7 @@ if(BUILD_TESTING)
 		stunprobe_test path_test bep44_test
 		bep44_pin_test sig_rebuild_test natstream_test stream_room_test
 		stream_cc_test sshloop_test sshfwd_test sshexit_test sshro_test
-		sshkcp_test sshctl_test qr_test)
+		sshkcp_test sshctl_test qr_test showfmt_test)
 		if(TARGET ${t})
 			target_compile_options(${t} PRIVATE -UNDEBUG)
 		endif()

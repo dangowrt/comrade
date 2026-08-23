@@ -4,6 +4,7 @@
 #include <stdio.h>
 
 #include "host.h"
+#include "showfmt.h"
 
 /*
  * Hosting is the half of comrade that is genuinely Unix-shaped: it forks, it
@@ -65,7 +66,8 @@
  * live session, and a session ends when its tmux server dies.
  */
 
-#define ID_LEN 12			/* hex chars of the per-session id */
+#define ID_LEN 12			/* hex chars of a generated session id */
+#define ID_MAX 32			/* longest id, generated or named */
 
 struct svc {
 	struct token tok;
@@ -771,47 +773,56 @@ int host_run(int ui_mode, int no_mcast, int no_dht, int no_fwd)
 	return start_new(ui_mode, no_mcast, no_dht, no_fwd);
 }
 
-int host_show(void)
+/* Both token lines of a session's token file, newline-stripped; 0 when the
+ * read-write line is there. */
+static int read_tokens(const char *id, char *tok, size_t tn,
+		       char *ro, size_t rn)
+{
+	char tf[512];
+	FILE *f;
+	char *nl;
+
+	tok[0] = ro[0] = '\0';
+	tok_path(tf, sizeof(tf), id);
+	f = fopen(tf, "r");
+	if (!f)
+		return -1;
+	if (fgets(tok, (int)tn, f) && (nl = strchr(tok, '\n')) != NULL)
+		*nl = '\0';
+	if (fgets(ro, (int)rn, f) && (nl = strchr(ro, '\n')) != NULL)
+		*nl = '\0';
+	fclose(f);
+	return tok[0] ? 0 : -1;
+}
+
+int host_show(int what)
 {
 	DIR *d = opendir(state_dir());
 	struct dirent *e;
-	int shown = 0;
+	struct showfmt f;
 
+	showfmt_begin(&f, what, stdout);
 	if (d) {
 		while ((e = readdir(d))) {
-			char cand[ID_LEN + 1], sock[512], tf[512];
-			char tok[TOKEN_STR_LEN + 8];
-			FILE *f;
+			char cand[ID_MAX + 1], sock[512];
+			char tok[TOKEN_STR_LEN + 8], ro[TOKEN_STR_LEN + 8];
+			size_t idl = strlen(e->d_name);
 
-			if (strlen(e->d_name) != ID_LEN + 5 ||
-			    strcmp(e->d_name + ID_LEN, ".sock"))
+			if (idl <= 5 || idl > ID_MAX + 5 ||
+			    strcmp(e->d_name + idl - 5, ".sock"))
 				continue;
-			memcpy(cand, e->d_name, ID_LEN);
-			cand[ID_LEN] = '\0';
+			memcpy(cand, e->d_name, idl - 5);
+			cand[idl - 5] = '\0';
 			sock_path(sock, sizeof(sock), cand);
 			if (!tmux_alive(sock))
 				continue;
-			tok_path(tf, sizeof(tf), cand);
-			f = fopen(tf, "r");
-			if (f) {
-				int ln = 0;
-
-				while (fgets(tok, sizeof(tok), f)) {
-					printf("%s%s", ln ? "read-only   "
-						          : "read-write  ", tok);
-					shown = 1;
-					ln++;
-				}
-				fclose(f);
-			}
+			if (read_tokens(cand, tok, sizeof(tok), ro, sizeof(ro)))
+				continue;
+			showfmt_session(&f, cand, sock, tok, ro, NULL);
 		}
 		closedir(d);
 	}
-	if (!shown) {
-		fprintf(stderr, "comrade: no running session\n");
-		return 1;
-	}
-	return 0;
+	return showfmt_end(&f);
 }
 
 #endif

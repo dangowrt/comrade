@@ -7,6 +7,7 @@
 
 #include "fwdspec.h"
 #include "host.h"
+#include "showfmt.h"
 #include "stunlist.h"
 #include "token.h"
 #include "ui.h"			/* UI_* enums used by main() in every build */
@@ -30,8 +31,12 @@ static int usage(int ret)
 		"usage: comrade            start a shared session\n"
 		"       comrade <token>    connect to a shared session\n"
 		"       comrade show       print the tokens of the running session\n"
+		"         --token | --token-ro   just the one token, for scripts,\n"
+		"                                clipboards and screen readers\n"
+		"         --json                 machine-readable (INTEGRATION.md)\n"
 		"       comrade stun-update  refresh the STUN server list\n"
 		"opts:  -v, --verbose      log lines instead of the dashboard\n"
+		"       --plain            log lines, no colour, no animation\n"
 		"       -V, --version      print the version and exit\n"
 		"       --no-multicast     skip link-local discovery, DHT/STUN only\n"
 		"       --no-dht           skip the DHT, link-local discovery only\n"
@@ -170,6 +175,23 @@ int main(int argc, char **argv)
 		return host_win_service(argv[2]);
 #endif
 
+	/* `show` before the option loop: its own flags are not session options. */
+	if (argc >= 2 && !strcmp(argv[1], "show")) {
+		int what = SHOWFMT_HUMAN;
+
+		for (i = 2; i < argc; i++) {
+			if (!strcmp(argv[i], "--token"))
+				what = SHOWFMT_TOKEN;
+			else if (!strcmp(argv[i], "--token-ro"))
+				what = SHOWFMT_TOKEN_RO;
+			else if (!strcmp(argv[i], "--json"))
+				what = SHOWFMT_JSON;
+			else
+				return usage(1);
+		}
+		return host_show(what);
+	}
+
 	for (i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help"))
 			return usage(0);
@@ -177,6 +199,8 @@ int main(int argc, char **argv)
 			return print_version();
 		if (!strcmp(argv[i], "-v") || !strcmp(argv[i], "--verbose"))
 			ui_mode = UI_VERBOSE;
+		else if (!strcmp(argv[i], "--plain"))
+			ui_mode = UI_PLAIN;
 		else if (!strcmp(argv[i], "--no-multicast"))
 			no_mcast = 1;
 		else if (!strcmp(argv[i], "--no-dht"))
@@ -215,7 +239,7 @@ int main(int argc, char **argv)
 		return usage(1);
 	}
 	if (!strcmp(pos, "show"))
-		return host_show();
+		return host_show(SHOWFMT_HUMAN);
 	if (!strcmp(pos, "stun-update")) {
 		int count = 0;
 

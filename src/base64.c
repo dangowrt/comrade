@@ -6,6 +6,41 @@
 static const char b64url_alphabet[] =
 	"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
+/* Standard alphabet with padding (RFC 4648 section 4), as OSC 52 wants. */
+static const char b64_alphabet[] =
+	"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+size_t base64_encode(const uint8_t *src, size_t src_len, char *dest,
+		     size_t dest_len)
+{
+	size_t rem = src_len % 3;
+	size_t need = (src_len + 2) / 3 * 4 + 1;
+	size_t i, o = 0;
+	uint32_t v;
+
+	if (dest_len < need)
+		return 0;
+
+	for (i = 0; i + 3 <= src_len; i += 3) {
+		v = (uint32_t)src[i] << 16 | (uint32_t)src[i + 1] << 8 | src[i + 2];
+		dest[o++] = b64_alphabet[v >> 18];
+		dest[o++] = b64_alphabet[v >> 12 & 63];
+		dest[o++] = b64_alphabet[v >> 6 & 63];
+		dest[o++] = b64_alphabet[v & 63];
+	}
+	if (rem) {
+		v = (uint32_t)src[i] << 16;
+		if (rem == 2)
+			v |= (uint32_t)src[i + 1] << 8;
+		dest[o++] = b64_alphabet[v >> 18];
+		dest[o++] = b64_alphabet[v >> 12 & 63];
+		dest[o++] = rem == 2 ? b64_alphabet[v >> 6 & 63] : '=';
+		dest[o++] = '=';
+	}
+	dest[o] = '\0';
+	return o;
+}
+
 size_t base64url_encode(const uint8_t *src, size_t src_len, char *dest, size_t dest_len)
 {
 	size_t rem = src_len % 3;

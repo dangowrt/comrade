@@ -9,7 +9,7 @@
  * discovery; no_dht: drop the DHT, leaving link-local discovery alone.
  */
 int host_run(int ui_mode, int no_mcast, int no_dht, int no_fwd);
-int host_show(void);
+int host_show(int what);		/* a SHOWFMT_* shape */
 
 #ifdef _WIN32
 /*

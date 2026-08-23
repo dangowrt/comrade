@@ -17,6 +17,7 @@
 #include <string.h>
 #include <time.h>
 
+#include "base64.h"
 #include "dbg.h"
 #include "oscompat.h"
 #include "qr.h"
@@ -87,6 +88,8 @@ struct ui {
 	int have_escalate;
 	int established;
 	int view;			/* enum ui_view */
+	char notice[96];		/* transient footer note (copy feedback) */
+	uint64_t notice_until;
 
 	struct tty_saved saved;
 	int raw;
@@ -121,17 +124,46 @@ static uint64_t now_ms(void)
 	return (uint64_t)ts.tv_sec * 1000 + (uint64_t)(ts.tv_nsec / 1000000);
 }
 
+/* Colour on unless --plain or NO_COLOR asked otherwise (set at create). */
+static int ui_color = 1;
+
+/* Body text as-is, or with the SGR sequences stripped: only the styling
+ * goes, cursor and erase controls stay functional. */
+static void emit_body(const char *s)
+{
+	if (ui_color) {
+		fputs(s, stdout);
+		return;
+	}
+	while (*s) {
+		if (s[0] == '\033' && s[1] == '[') {
+			const char *p = s + 2;
+
+			while (*p && !((*p >= 'A' && *p <= 'Z') ||
+				       (*p >= 'a' && *p <= 'z')))
+				p++;
+			if (*p == 'm') {
+				s = p + 1;
+				continue;
+			}
+		}
+		putchar(*s++);
+	}
+}
+
 /* ---- log-line rendering (verbose / non-tty) ---- */
 
 static void vlog(struct ui *u, const char *fmt, ...)
 {
+	char buf[640];
 	va_list ap;
 	double el = (double)(now_ms() - u->start) / 1000.0;
 
-	printf(DIM "%6.1f  " RST, el);
+	printf(ui_color ? DIM "%6.1f  " RST : "%6.1f  ", el);
 	va_start(ap, fmt);
-	vprintf(fmt, ap);
+	vsnprintf(buf, sizeof(buf), fmt, ap);
 	va_end(ap);
+	emit_body(buf);
 	putchar('\n');
 	fflush(stdout);
 }
@@ -169,11 +201,13 @@ static void winsize(struct ui *u)
 /* One dashboard line: body text, cleared to end of line, then down. */
 static void line(const char *fmt, ...)
 {
+	char buf[640];
 	va_list ap;
 
 	va_start(ap, fmt);
-	vprintf(fmt, ap);
+	vsnprintf(buf, sizeof(buf), fmt, ap);
 	va_end(ap);
+	emit_body(buf);
 	fputs("\033[K\n", stdout);
 }
 
@@ -243,6 +277,35 @@ static int rdv_combined(int s4, int s6)
 	return c > 8 ? 8 : c;
 }
 
+/* Hand `text` to the terminal's clipboard (OSC 52): works locally and
+ * through SSH, and spares anyone -- a screen-reader user above all --
+ * selecting a 130-character token off a raw screen by hand. */
+static void osc52_copy(const char *text)
+{
+	char b64[512];
+
+	if (!base64_encode((const uint8_t *)text, strlen(text), b64,
+			   sizeof(b64)))
+		return;
+	printf("\033]52;c;%s\a", b64);
+	fflush(stdout);
+}
+
+static void notice_set(struct ui *u, const char *msg)
+{
+	snprintf(u->notice, sizeof(u->notice), "%s", msg);
+	u->notice_until = now_ms() + 4000;
+	if (u->anim)
+		u->dirty = 1;
+	else
+		vlog(u, "local  %s", msg);
+}
+
+static int notice_live(struct ui *u)
+{
+	return u->notice[0] && now_ms() < u->notice_until;
+}
+
 /* The token's reachability classification, one dashboard line after
  * whatever `pre` puts in front of it. */
 static void token_class_line(struct ui *u, const char *pre)
@@ -293,7 +356,7 @@ static void draw_qr(struct ui *u)
 	const char *kind = u->view == UI_VIEW_QR_RO ? "read-only" : "read-write";
 	const char *nxt = u->view == UI_VIEW_QR_RW && u->have_token_ro ?
 			  "read-only QR" : "dashboard";
-	char enc[280], pre[96];
+	char enc[280], pre[224];
 	struct qr_art art;
 	int i, pad;
 
@@ -317,8 +380,17 @@ static void draw_qr(struct ui *u)
 		 CYN "INVITE" RST "  " WHT "%s" RST DIM " -- " RST, kind);
 	token_class_line(u, pre);
 	/* The footer may sit on the last row: no newline, or it scrolls. */
-	printf(DIM "[ " BYE "Q" DIM " %s / " BYE "ESC" DIM " dashboard / " BYE
-	       "ENTER" DIM " enter the session ]" RST "\033[K", nxt);
+	if (notice_live(u)) {
+		snprintf(pre, sizeof(pre), BGR "[ %s ]" RST "\033[K",
+			 u->notice);
+		emit_body(pre);
+	} else {
+		snprintf(pre, sizeof(pre),
+			 DIM "[ " BYE "Q" DIM " %s / " BYE "C" DIM " copy / "
+			 BYE "ESC" DIM " dashboard / " BYE "ENTER" DIM
+			 " enter ]" RST "\033[K", nxt);
+		emit_body(pre);
+	}
 	fputs("\033[J", stdout);
 	fflush(stdout);
 	u->last_paint = now_ms();
@@ -431,10 +503,12 @@ static void draw(struct ui *u)
 			     p->read_only ? "  " YEL "view-only" RST : "");
 		}
 		line("");
-		if (u->have_token)
+		if (notice_live(u))
+			line(BGR "[ %s ]" RST, u->notice);
+		else if (u->have_token)
 			line(DIM "[ " BYE "ENTER" DIM " / " BYE "SPACE" DIM
 			     " to enter the shared session / " BYE "Q" DIM
-			     " invite QR ]" RST);
+			     " invite QR / " BYE "C" DIM " copy token ]" RST);
 		else
 			line(DIM "[ " BYE "ENTER" DIM " / " BYE "SPACE" DIM
 			     " to enter the shared session ]" RST);
@@ -1239,6 +1313,35 @@ int ui_host_wait(struct ui *u, sock_t fd)
 						else
 							u->view = UI_VIEW_DASH;
 						u->dirty = 1;
+					}
+					/* c copies the token in view, C the
+					 * read-only one, via the terminal. */
+					if ((c == 'c' || c == 'C') &&
+					    u->role == UI_ROLE_HOST) {
+						const char *t = NULL, *w = NULL;
+
+						if (c == 'C' ||
+						    u->view == UI_VIEW_QR_RO) {
+							if (u->have_token_ro) {
+								t = u->token_ro;
+								w = "read-only "
+								    "token copied "
+								    "to the "
+								    "clipboard";
+							}
+						} else if (u->have_token) {
+							t = u->token;
+							w = "read-write token "
+							    "copied to the "
+							    "clipboard";
+						}
+						if (t) {
+							osc52_copy(t);
+							notice_set(u, w);
+						} else {
+							notice_set(u, "no such "
+								   "token yet");
+						}
 					}
 				}
 				if (result)

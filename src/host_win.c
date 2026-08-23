@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "host.h"
+#include "showfmt.h"
 
 #ifdef _WIN32
 
@@ -912,36 +913,37 @@ int host_run(int ui_mode, int no_mcast, int no_dht, int no_fwd)
 
 static void show_one(const char *id, void *arg)
 {
-	int *shown = arg;
-	char sock[512], tf[512], tok[TOKEN_STR_LEN + 8];
-	FILE *f;
-	int ln = 0;
+	struct showfmt *f = arg;
+	char sock[512], tf[512];
+	char tok[TOKEN_STR_LEN + 8], ro[TOKEN_STR_LEN + 8];
+	char *nl;
+	FILE *fp;
 
 	sock_path(sock, sizeof(sock), id);
 	if (!tmux_alive(sock))
 		return;
 	tok_path(tf, sizeof(tf), id);
-	f = fopen(tf, "r");
-	if (!f)
+	fp = fopen(tf, "r");
+	if (!fp)
 		return;
-	while (fgets(tok, sizeof(tok), f)) {
-		printf("%s%s", ln ? "read-only   " : "read-write  ", tok);
-		*shown = 1;
-		ln++;
-	}
-	fclose(f);
+	tok[0] = ro[0] = '\0';
+	if (fgets(tok, sizeof(tok), fp) && (nl = strchr(tok, '\n')) != NULL)
+		*nl = '\0';
+	if (fgets(ro, sizeof(ro), fp) && (nl = strchr(ro, '\n')) != NULL)
+		*nl = '\0';
+	fclose(fp);
+	if (!tok[0])
+		return;
+	showfmt_session(f, id, sock, tok, ro, NULL);
 }
 
-int host_show(void)
+int host_show(int what)
 {
-	int shown = 0;
+	struct showfmt f;
 
-	each_session(show_one, &shown);
-	if (!shown) {
-		fprintf(stderr, "comrade: no running session\n");
-		return 1;
-	}
-	return 0;
+	showfmt_begin(&f, what, stdout);
+	each_session(show_one, &f);
+	return showfmt_end(&f);
 }
 
 #endif /* _WIN32 */
