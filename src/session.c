@@ -3255,12 +3255,20 @@ static void token_pump(struct sess *s)
 		naddrs = netmon_snapshot(addrs, NETMON_MAX_ADDRS);
 		gather_facts(s, 4, addrs, naddrs, &f4);
 		gather_facts(s, 6, addrs, naddrs, &f6);
-		if (tokgen_decide_host(&f4, &f6, &verdict) < 0 && o &&
-		    o->escalate && !s->noconn_warned &&
-		    now_ms() - s->start_ms > 3000) {
-			o->escalate(o->arg, "no usable address on any family -- "
-				    "nothing to host over; check the network");
-			s->noconn_warned = 1;
+		if (tokgen_decide_host(&f4, &f6, &verdict) < 0) {
+			if (o && o->escalate && !s->noconn_warned &&
+			    now_ms() - s->start_ms > 3000) {
+				o->escalate(o->arg,
+					    "no usable address on any family -- "
+					    "nothing to host over; check the network");
+				s->noconn_warned = 1;
+			}
+		} else if (s->noconn_warned) {
+			/* The fact the warning reported has stopped being true:
+			 * a roam brought addresses back. */
+			s->noconn_warned = 0;
+			if (o && o->escalate_clear)
+				o->escalate_clear(o->arg);
 		}
 		adv[0] = verdict.v4;
 		adv[1] = verdict.v6;
