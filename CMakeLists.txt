@@ -451,7 +451,21 @@ add_library(comrade_lanlink STATIC src/lanlink.c)
 target_include_directories(comrade_lanlink PUBLIC src)
 target_link_libraries(comrade_lanlink PUBLIC comrade_compat)
 
+# kcp >= 2.1 has pluggable congestion control (ikcp_setcc); the rate-based
+# controller in stream.c needs it. Probe rather than pin, so an older kcp
+# still builds -- it just keeps kcp's builtin controller.
+include(CheckSymbolExists)
+get_target_property(COMRADE_KCP_INCLUDES kcp::kcp INTERFACE_INCLUDE_DIRECTORIES)
+set(CMAKE_REQUIRED_INCLUDES ${COMRADE_KCP_INCLUDES})
+set(CMAKE_REQUIRED_LIBRARIES kcp::kcp)
+check_symbol_exists(ikcp_setcc "ikcp.h" COMRADE_HAVE_KCP_CC)
+unset(CMAKE_REQUIRED_INCLUDES)
+unset(CMAKE_REQUIRED_LIBRARIES)
+
 add_library(comrade_stream STATIC src/stream.c)
+if(COMRADE_HAVE_KCP_CC)
+	target_compile_definitions(comrade_stream PRIVATE COMRADE_HAVE_KCP_CC=1)
+endif()
 target_include_directories(comrade_stream PUBLIC src)
 target_link_libraries(comrade_stream PUBLIC kcp::kcp Threads::Threads)
 
@@ -680,6 +694,13 @@ if(BUILD_TESTING)
 	add_test(NAME stream_room_test COMMAND stream_room_test)
 	set_tests_properties(stream_room_test PROPERTIES TIMEOUT 30)
 
+	if(COMRADE_HAVE_KCP_CC)
+		add_executable(stream_cc_test tests/stream_cc_test.c)
+		target_link_libraries(stream_cc_test comrade_stream)
+		add_test(NAME stream_cc_test COMMAND stream_cc_test)
+		set_tests_properties(stream_cc_test PROPERTIES TIMEOUT 60)
+	endif()
+
 	add_executable(sshloop_test tests/sshloop_test.c)
 	target_link_libraries(sshloop_test comrade_ssh comrade_token Threads::Threads)
 	add_test(NAME sshloop_test COMMAND sshloop_test)
@@ -835,8 +856,8 @@ if(BUILD_TESTING)
 		candpolicy_test candpack_test mailbox_test roauth_test
 		stunprobe_test path_test bep44_test
 		bep44_pin_test sig_rebuild_test natstream_test stream_room_test
-		sshloop_test sshfwd_test sshexit_test sshro_test sshkcp_test
-		sshctl_test)
+		stream_cc_test sshloop_test sshfwd_test sshexit_test sshro_test
+		sshkcp_test sshctl_test)
 		if(TARGET ${t})
 			target_compile_options(${t} PRIVATE -UNDEBUG)
 		endif()
