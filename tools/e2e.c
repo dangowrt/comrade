@@ -181,6 +181,8 @@ int main(int argc, char **argv)
 			cfg.test_hold_ms = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--single"))
 			cfg.test_single_conn = 1;
+		else if (!strcmp(argv[i], "--stuck") && i + 1 < argc)
+			cfg.test_stuck_punches = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--log") && i + 1 < argc)
 			cfg.log_level = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--mcast"))
