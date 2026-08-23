@@ -89,17 +89,48 @@ int qr_render(const char *text, int mode, struct qr_art *art)
 	if (mode == QR_SEXTANT) {
 		art->cols = (size + 1) / 2;
 		art->rows = (size + 2) / 3;
-	} else {
+		x = art->cols * 4;
+	} else if (mode == QR_HALF_BLOCK) {
 		art->cols = size;
 		art->rows = (size + 1) / 2;
+		x = art->cols * 3;
+	} else {
+		art->cols = size * 2;
+		art->rows = size;
+		/* two spaces per module, reverse video toggled per run */
+		x = size * 2 + (size / 2 + 2) * 9;
 	}
-	if (art->rows > QR_ART_ROWS ||
-	    art->cols * (mode == QR_SEXTANT ? 4 : 3) + 1 > QR_ART_LINE)
+	if (art->rows > QR_ART_ROWS || x + 1 > QR_ART_LINE)
 		return -1;
 
 	for (r = 0; r < art->rows; r++) {
 		char *o = art->row[r];
 
+		if (mode == QR_DOUBLE) {
+			int on = 0;
+
+			for (x = 0; x < size; x++) {
+				unsigned m = px(qr, size, x, r);
+
+				if (m && !on) {
+					memcpy(o, "\033[7m", 4);
+					o += 4;
+					on = 1;
+				} else if (!m && on) {
+					memcpy(o, "\033[27m", 5);
+					o += 5;
+					on = 0;
+				}
+				*o++ = ' ';
+				*o++ = ' ';
+			}
+			if (on) {
+				memcpy(o, "\033[27m", 5);
+				o += 5;
+			}
+			*o = '\0';
+			continue;
+		}
 		for (x = 0; x < art->cols; x++) {
 			if (mode == QR_SEXTANT) {
 				unsigned bits = 0;
@@ -135,6 +166,9 @@ int qr_render(const char *text, int mode, struct qr_art *art)
 
 int qr_render_fit(const char *text, int rows, int cols, struct qr_art *art)
 {
+	if (!qr_render(text, QR_DOUBLE, art) &&
+	    art->rows <= rows && art->cols <= cols)
+		return 0;
 	if (!qr_render(text, QR_HALF_BLOCK, art) &&
 	    art->rows <= rows && art->cols <= cols)
 		return 0;

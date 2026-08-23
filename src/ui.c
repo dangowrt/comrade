@@ -278,11 +278,13 @@ static void token_class_line(struct ui *u, const char *pre)
 
 /*
  * One token full-screen as a QR code, the geometry picked to fit the
- * terminal: half blocks (square pixels) wherever they fit, sextants only
- * where nothing else does -- their pixels are ~4:3 tall on a 1:2 cell,
- * which the pickiest scanners refuse, so the page runs lean (no header,
- * type and classification share a line) to keep half blocks viable down
- * to a ~27-row terminal. The blank rows above and below and the centring
+ * terminal, largest first: double spaces in reverse video (a whole 2x1
+ * cell per module, the easiest scan) on roomy terminals, half blocks
+ * (square pixels) wherever they fit, sextants only where nothing else
+ * does -- their pixels are ~4:3 tall on a 1:2 cell, which the pickiest
+ * scanners refuse, so the page runs lean (no header, type and
+ * classification share a line) to keep half blocks viable down to a
+ * ~27-row terminal. The blank rows above and below and the centring
  * margin are the quiet zone the art itself no longer carries.
  */
 static void draw_qr(struct ui *u)

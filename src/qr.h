@@ -7,23 +7,27 @@
 /*
  * Token QR codes as terminal cell art, for the dashboard. A pure view
  * helper: it builds UTF-8 rows into a caller's buffer and writes nothing
- * itself. Two pixel geometries: half blocks (two modules per cell --
- * square pixels on the usual 1:2 cell, every font has them) and sextants
- * (2x3 modules per cell, Unicode 13 Symbols for Legacy Computing, a third
- * of the height but inherently stretched ~4:3 tall on a 1:2 cell, so a
- * last resort for terminals nothing else fits). The art is the module
- * grid alone: the caller owes the quiet zone -- a blank line above and
+ * itself. Three pixel geometries, largest first: double spaces in
+ * reverse video (one module = two whole cells, exactly square on the
+ * usual 1:2 cell and the easiest scan), half blocks (two modules per
+ * cell, square pixels, every font has them), and sextants (2x3 modules
+ * per cell, Unicode 13 Symbols for Legacy Computing, a third of the
+ * height but inherently stretched ~4:3 tall on a 1:2 cell, so a last
+ * resort for terminals nothing else fits). The art is the module grid
+ * alone: the caller owes the quiet zone -- a blank line above and
  * below, two blank columns beside -- which the dashboard's margins
- * provide for free. Modules render as filled blocks: on the usual
- * light-on-dark terminal that is a consistently inverted code, which
- * scanners accept, and on a dark-on-light one the normal polarity.
+ * provide for free. Modules render lit (reverse video, or a filled
+ * block in the foreground colour): on the usual light-on-dark terminal
+ * that is a consistently inverted code, which scanners accept, and on
+ * a dark-on-light one the normal polarity.
  */
 
-#define QR_HALF_BLOCK 0
-#define QR_SEXTANT 1
+#define QR_DOUBLE 0
+#define QR_HALF_BLOCK 1
+#define QR_SEXTANT 2
 
-#define QR_ART_ROWS 34			/* enough for version 10 half blocks */
-#define QR_ART_LINE 200
+#define QR_ART_ROWS 58			/* a version-10 double-space code */
+#define QR_ART_LINE 512
 
 struct qr_art {
 	int rows, cols;			/* size in character cells */
