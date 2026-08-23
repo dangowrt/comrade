@@ -30,7 +30,20 @@ void mailbox_withdraw(struct mailbox *m)
 
 void mailbox_arm_release(struct mailbox *m)
 {
-	m->clear_peer = 1;
+	memcpy(m->released, m->slot_a, m->slot_a_len);
+	m->released_len = m->slot_a_len;
+}
+
+void mailbox_note_own_answer(struct mailbox *m, int own)
+{
+	m->slot_a_own = own;
+}
+
+/* The claim under release: gone or replaced means the release is done. */
+static int releasing(const struct mailbox *m)
+{
+	return m->released_len && m->slot_a_len == m->released_len &&
+	       !memcmp(m->slot_a, m->released, m->released_len);
 }
 
 /* Pull one slot's sealed string out of the container into dst. */
@@ -47,11 +60,16 @@ static size_t slot_extract(const uint8_t *v, size_t v_len, const char *key,
 	return str_len;
 }
 
-/* Raw slot extraction only; no bookkeeping (the merge path uses this). */
+/* Raw slot extraction; a fresh read invalidates the own-claim note and
+ * completes a release whose claim is observed gone or replaced. */
 static void parse_slots(struct mailbox *m, const uint8_t *v, size_t v_len)
 {
 	m->slot_o_len = slot_extract(v, v_len, "o", m->slot_o, sizeof(m->slot_o));
 	m->slot_a_len = slot_extract(v, v_len, "a", m->slot_a, sizeof(m->slot_a));
+	m->slot_a_own = 0;
+	if (m->released_len && (m->slot_a_len != m->released_len ||
+				memcmp(m->slot_a, m->released, m->released_len)))
+		m->released_len = 0;
 }
 
 /* We must (re)write when our slot in the container does not match ours. */
@@ -85,10 +103,8 @@ size_t mailbox_build(struct mailbox *m, uint8_t *out, size_t outlen)
 		lo = m->mine_len;
 		pa = m->slot_a;
 		la = m->slot_a_len;
-		if (m->clear_peer) {
+		if (releasing(m))
 			la = 0;			/* release the answer slot */
-			m->clear_peer = 0;	/* one-shot per rotate */
-		}
 	} else {
 		pa = m->mine;
 		la = m->mine_len;
@@ -130,6 +146,8 @@ enum mailbox_claim mailbox_claim_status(const struct mailbox *m)
 		return MAILBOX_CLAIM_UNKNOWN;
 	if (!m->slot_a_len)
 		return MAILBOX_CLAIM_FREE;
+	if (m->slot_a_own)
+		return MAILBOX_CLAIM_HELD;
 	if (m->have_mine && m->slot_a_len == m->mine_len &&
 	    !memcmp(m->slot_a, m->mine, m->mine_len))
 		return MAILBOX_CLAIM_HELD;
@@ -139,7 +157,7 @@ enum mailbox_claim mailbox_claim_status(const struct mailbox *m)
 int mailbox_client_should_claim(const struct mailbox *m)
 {
 	return !m->is_host && m->have_mine && m->need_write && m->have_cur &&
-	       m->slot_a_len == 0;
+	       (m->slot_a_len == 0 || m->slot_a_own);
 }
 
 size_t mailbox_peer_slot(const struct mailbox *m, const uint8_t **out)

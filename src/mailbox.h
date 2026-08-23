@@ -19,8 +19,9 @@
  *
  * Each slot holds an opaque, already-sealed byte blob; this layer never looks
  * inside it. The host owns 'o' and the client owns 'a'. A writer preserves the
- * peer's slot on every read-modify-write, except that the host clears 'a' once
- * per rotate to release the turnstile.
+ * peer's slot on every read-modify-write, except that the host, once per
+ * rotate, drops the claim it picked up from 'a' -- from every write until a
+ * read shows it gone -- to release the turnstile.
  */
 
 #define MAILBOX_SLOT_MAX 512	/* one sealed slot; holds SIG_SEALED_MAX */
@@ -46,7 +47,14 @@ struct mailbox {
 	size_t slot_a_len;
 	int have_cur;			/* the container has been read at least once */
 	int need_write;			/* our slot in the container is stale */
-	int clear_peer;			/* host one-shot: drop 'a' on the next build */
+	int slot_a_own;			/* the answer slot holds OUR claimant's
+					 * claim (possibly a superseded one); set
+					 * by the owner via mailbox_note_own_answer,
+					 * cleared on every parse */
+	uint8_t released[MAILBOX_SLOT_MAX];	/* host: the claim being released;
+						 * omitted from builds until a read
+						 * shows it gone or superseded */
+	size_t released_len;
 };
 
 void mailbox_init(struct mailbox *m, int is_host);
@@ -58,16 +66,24 @@ void mailbox_set_mine(struct mailbox *m, const uint8_t *data, size_t len);
  * re-claimed automatically. A later mailbox_set_mine re-arms it. */
 void mailbox_withdraw(struct mailbox *m);
 
-/* Host: arm the one-shot that drops the answer slot on the next build, the
- * turnstile release paired with a fresh offer in mailbox_set_mine. */
+/* Host: release the turnstile, paired with a fresh offer in mailbox_set_mine.
+ * The answer slot's current claim is omitted from every build until a read
+ * shows it gone or replaced, so a write that loses a store race and is
+ * retried still releases it -- a new claim arriving meanwhile is kept. */
 void mailbox_arm_release(struct mailbox *m);
+
+/* Client: the owner has looked inside the answer slot and recognised (or not)
+ * its own claimant's claim. An own claim -- typically a superseded one from an
+ * earlier attempt -- may be overwritten; without this, a client could wedge
+ * itself out of the turnstile behind its own stale claim. Cleared on parse. */
+void mailbox_note_own_answer(struct mailbox *m, int own);
 
 /* Parse a container into the two slots; marks it read and recomputes need_write. */
 void mailbox_parse(struct mailbox *m, const uint8_t *v, size_t v_len);
 
 /* Build the merged container (our slot plus the peer's, if known) into out;
- * returns its length, or 0 on error. Consumes a pending host release, dropping
- * the answer slot exactly once. */
+ * returns its length, or 0 on error. A pending host release omits the
+ * released claim from the answer slot. */
 size_t mailbox_build(struct mailbox *m, uint8_t *out, size_t outlen);
 
 /*

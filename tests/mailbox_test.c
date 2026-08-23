@@ -4,8 +4,9 @@
 /*
  * Unit tests for the rendezvous mailbox: the
  * two-slot container build/parse/merge, the turnstile claim decision (the
- * answer slot as a mutex), the host rotate that clears the answer slot exactly
- * once, and the CAS/seq contract modelled with an in-test store so that two
+ * answer slot as a mutex), the host rotate that releases the answer slot
+ * until it is observed gone, and the CAS/seq contract modelled with an
+ * in-test store so that two
  * claimants against one empty slot resolve to exactly one winner. The slot
  * payloads are arbitrary byte blobs -- the container layer never inspects the
  * sealed contents -- so no crypto or DHT is involved.
@@ -179,12 +180,14 @@ int main(void)
 		assert(probe.slot_o_len == sizeof(OFFER_E));	/* our offer written */
 	}
 
-	/* Host rotate omits the answer slot EXACTLY once (the one-shot release):
-	 * the first build after arming drops 'a', the next build keeps it. */
+	/* Host rotate releases the answer slot until it is OBSERVED gone: every
+	 * build omits the released claim -- a write that loses the store race
+	 * and is remerged still releases it -- and a read showing the slot
+	 * empty (or replaced) ends the release. */
 	{
 		struct mailbox h, probe;
-		uint8_t cur[64];
-		size_t clen, b1, b2;
+		uint8_t cur[64], cur3[64];
+		size_t clen, c3len, b1, b2;
 
 		mailbox_init(&h, 0);
 		mailbox_set_mine(&h, ANS1, sizeof(ANS1));
@@ -196,15 +199,67 @@ int main(void)
 		assert(h.slot_a_len == sizeof(ANS1));
 
 		mailbox_arm_release(&h);
-		b1 = mailbox_build(&h, out, sizeof(out));	/* clears 'a' this once */
+		b1 = mailbox_build(&h, out, sizeof(out));	/* clears 'a' */
 		mailbox_init(&probe, 1);
 		mailbox_parse(&probe, out, b1);
 		assert(probe.slot_a_len == 0);
 		assert(probe.slot_o_len == sizeof(OFFER_E));
 
-		b2 = mailbox_build(&h, out, sizeof(out));	/* not armed: 'a' returns */
+		/* The write was lost and the store still holds ANS1: the retried
+		 * merge must STILL release it, not resurrect it. */
+		assert(mailbox_merge(&h, cur, clen, out, &b2, sizeof(out)) == 0);
+		mailbox_parse(&probe, out, b2);
+		assert(probe.slot_a_len == 0);
+
+		/* A NEW claim in the store meanwhile ends the release: the merge
+		 * keeps it, so releasing one claim never eats the next. */
+		mailbox_init(&probe, 0);
+		mailbox_set_mine(&probe, ANS3, sizeof(ANS3));
+		c3len = mailbox_build(&probe, cur3, sizeof(cur3));
+		assert(mailbox_merge(&h, cur3, c3len, out, &b2, sizeof(out)) == 0);
+		mailbox_init(&probe, 1);
+		mailbox_parse(&probe, out, b2);
+		assert(probe.slot_a_len == sizeof(ANS3));
+		assert(!memcmp(probe.slot_a, ANS3, sizeof(ANS3)));
+
+		/* Observed empty: the release ends; a later claim is kept. */
+		mailbox_parse(&h, out, b1);		/* the offer-only value */
+		mailbox_parse(&h, cur, clen);		/* ANS1 claims again */
+		b2 = mailbox_build(&h, out, sizeof(out));
+		mailbox_init(&probe, 1);
 		mailbox_parse(&probe, out, b2);
 		assert(probe.slot_a_len == sizeof(ANS1));
+	}
+
+	/* A client behind its OWN superseded claim: the slot bytes differ from
+	 * its current answer, so alone they read as a foreign claim -- but once
+	 * the owner recognises the claimant as itself (mailbox_note_own_answer)
+	 * the slot is HELD, the overwrite is allowed, and the turnstile cannot
+	 * be wedged by a stale claim the host failed to release. The note is
+	 * observation-bound: any fresh parse clears it. */
+	{
+		struct mailbox c, old;
+		uint8_t cur[64];
+		size_t clen;
+
+		mailbox_init(&old, 0);
+		mailbox_set_mine(&old, ANS1, sizeof(ANS1));	/* the old attempt */
+		mailbox_parse(&old, offv, offlen);
+		clen = mailbox_build(&old, cur, sizeof(cur));
+
+		mailbox_init(&c, 0);
+		mailbox_set_mine(&c, ANS2, sizeof(ANS2));	/* the new attempt */
+		mailbox_parse(&c, cur, clen);
+		assert(mailbox_claim_status(&c) == MAILBOX_CLAIM_BUSY);
+		assert(!mailbox_client_should_claim(&c));
+
+		mailbox_note_own_answer(&c, 1);
+		assert(mailbox_claim_status(&c) == MAILBOX_CLAIM_HELD);
+		assert(mailbox_client_should_claim(&c));
+
+		mailbox_parse(&c, cur, clen);			/* fresh read */
+		assert(mailbox_claim_status(&c) == MAILBOX_CLAIM_BUSY);
+		assert(!mailbox_client_should_claim(&c));
 	}
 
 	/* ---- 2. Turnstile claim / mutex logic ---- */
@@ -425,8 +480,10 @@ int main(void)
 		assert(!mailbox_client_should_claim(&c2));
 		assert(!mailbox_client_should_claim(&c3));
 
-		/* Host picks up the winner and releases: fresh offer, 'a' cleared. */
+		/* Host picks up the winner (the read that delivered the claim)
+		 * and releases: fresh offer, 'a' cleared. */
 		read_seq = st.seq;
+		mailbox_parse(&hst, st.v, st.len);
 		mailbox_set_mine(&hst, OFFER_E1, sizeof(OFFER_E1));
 		mailbox_arm_release(&hst);
 		assert(mailbox_merge(&hst, st.v, st.len, hw, &hlen, sizeof(hw)) == 0);

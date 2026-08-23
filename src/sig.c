@@ -8,6 +8,7 @@
 #include <time.h>
 
 #include "bep44.h"
+#include "dbg.h"
 #include "candpack.h"
 #include "dhtnode.h"
 #include "keys.h"
@@ -64,6 +65,9 @@ struct sig {
 	uint8_t last_peer[SIG_MAX_VALUE];
 	size_t last_peer_len;
 	int have_last;
+	char my_ufrag[64];		/* our claim's ICE ufrag: recognises our
+					 * own (possibly superseded) answer in
+					 * the slot, see mailbox_note_own_answer */
 
 	int locate;
 	int put_inflight;		/* a convergent host store is running */
@@ -191,6 +195,21 @@ int sig_ready(struct sig *s)
 	return s->dht_engaged && dhtnode_ready(s->node);
 }
 
+/* The ICE ufrag an sdp names, "" when absent. */
+static void sdp_ufrag_of(const char *sdp, char *out, size_t outlen)
+{
+	const char *p = strstr(sdp, "ice-ufrag:");
+	size_t i = 0;
+
+	out[0] = '\0';
+	if (!p)
+		return;
+	p += 10;
+	while (*p && *p != '\r' && *p != '\n' && i + 1 < outlen)
+		out[i++] = *p++;
+	out[i] = '\0';
+}
+
 int sig_post(struct sig *s, const uint8_t *data, size_t len)
 {
 	char sdp[SIG_SDP_MAX];
@@ -205,6 +224,7 @@ int sig_post(struct sig *s, const uint8_t *data, size_t len)
 		return -1;
 	memcpy(sdp, data, len);
 	sdp[len] = '\0';
+	sdp_ufrag_of(sdp, s->my_ufrag, sizeof(s->my_ufrag));
 	plen = candpack_encode(sdp, 1, packed, sizeof(packed));
 	if (plen <= 0)
 		return -1;
@@ -394,6 +414,7 @@ static void deliver_peer(struct sig *s, const uint8_t *sealed, size_t len)
 	if (s->have_last && s->last_peer_len == (size_t)n &&
 	    !memcmp(s->last_peer, plain, (size_t)n))
 		return;
+	dbg_logf("sig: peer slot delivered (%d bytes)", n);
 	memcpy(s->last_peer, plain, (size_t)n);
 	s->last_peer_len = (size_t)n;
 	s->have_last = 1;
@@ -415,6 +436,25 @@ static void on_dht_get(void *arg, const uint8_t *v, size_t v_len, int64_t seq,
 		return;
 	mailbox_parse(&s->mb, v, v_len);
 	s->cur_seq = seq;
+
+	/* A client recognises its own claimant's claim in the answer slot --
+	 * typically a superseded attempt the host never released -- so the
+	 * turnstile rule lets it overwrite that one rather than wedge itself
+	 * out behind it. */
+	if (!s->mb.is_host && s->mb.slot_a_len && s->my_ufrag[0]) {
+		uint8_t plain[SIG_MAX_VALUE];
+		char sdp[SIG_SDP_MAX];
+		char uf[64];
+		int n = msg_open(plain, sizeof(plain), s->keys.sig_key,
+				 s->mb.slot_a, s->mb.slot_a_len);
+
+		if (n >= 0 &&
+		    candpack_decode(plain, (size_t)n, sdp, sizeof(sdp)) >= 0) {
+			sdp_ufrag_of(sdp, uf, sizeof(uf));
+			mailbox_note_own_answer(&s->mb, uf[0] &&
+						!strcmp(uf, s->my_ufrag));
+		}
+	}
 
 	peer_len = mailbox_peer_slot(&s->mb, &peer);
 	if (peer_len)
@@ -633,6 +673,7 @@ static void dht_pump(struct sig *s, uint64_t now)
 			s->next_put_ms = now + SIG_DHT_PUT_MS;
 		}
 	} else if (mailbox_client_should_claim(&s->mb)) {
+		dbg_logf("sig: writing claim to the rendezvous");
 		/*
 		 * The client claims by writing its answer straight to the pinned
 		 * rendezvous node once it has read the offer -- a round-trip, not
