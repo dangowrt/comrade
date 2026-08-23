@@ -17,9 +17,11 @@
 # from the fork before being recreated fresh off upstream's current master, so
 # a merged bump never lingers as a dangling ref.
 #
-# PKG_HASH is taken from GitHub's own codeload tarball for v$VERSION, not from
-# anything this repo builds, so this only needs the tag to exist -- it does
-# not wait on the release job.
+# PKG_HASH is taken from the release's own source tarball for v$VERSION, not
+# from a GitHub-generated archive (see the note further down) or anything
+# this repo builds itself -- but that tarball is minted and attached by the
+# release job, so this does need to wait on it, unlike PKG_VERSION/PKG_RELEASE
+# which only need the tag to exist.
 #
 # The PR description quotes a changelog built from this repo's own
 # `git log`, not from GitHub Release notes: the release notes turned out
@@ -104,8 +106,15 @@ ADOPT_PR="$(gh pr list --repo "$UPSTREAM_REPO" --author dangowrt --state open \
   --limit 100 --json number,headRefName \
   --jq "[.[] | select(.headRefName == \"$BRANCH\")][0].number // empty")"
 
-log "Compute the tarball hash codeload will serve for v$V"
-HASH="$(curl -fsSL "https://codeload.github.com/dangowrt/comrade/tar.gz/v$V" | sha256sum | cut -d' ' -f1)"
+log "Compute the hash of the release's own source tarball for v$V"
+# Not codeload: GitHub does not guarantee the bytes of an auto-generated
+# "Source code (tar.gz)" download stay stable (they changed the archive
+# compression once already, and only commit to a renewable minimum-notice
+# window before doing so again -- see
+# https://github.blog/changelog/2023-01-30-git-archive-checksums-may-change/).
+# The release job mints its own tarball and attaches it as a release asset
+# instead, which immutability actually does freeze.
+HASH="$(curl -fsSL "https://github.com/dangowrt/comrade/releases/download/v$V/comrade-$V.tar.gz" | sha256sum | cut -d' ' -f1)"
 
 log "Clone the fork"
 WORK="$(mktemp -d)"
@@ -144,20 +153,27 @@ log "Read the version net/comrade currently references upstream"
 # has not merged yet.
 OLD_V="$(git show upstream/master:"$PKG_DIR/Makefile" | sed -n 's/^PKG_VERSION:=//p')"
 
-log "Bump PKG_VERSION, reset PKG_RELEASE, refresh PKG_HASH"
+log "Bump PKG_VERSION, reset PKG_RELEASE, point PKG_SOURCE_URL at the release, refresh PKG_HASH"
+# PKG_SOURCE_URL is rewritten unconditionally, not left alone if already
+# correct: a Makefile still pinned to the old codeload URL from before this
+# script minted release-tarball assets gets migrated the moment it is next
+# bumped, rather than needing a human to notice and fix it by hand.
 sed -i \
   -e "s/^PKG_VERSION:=.*/PKG_VERSION:=$V/" \
   -e "s/^PKG_RELEASE:=.*/PKG_RELEASE:=1/" \
+  -e "s|^PKG_SOURCE_URL:=.*|PKG_SOURCE_URL:=https://github.com/dangowrt/comrade/releases/download/v\$(PKG_VERSION)|" \
   -e "s/^PKG_HASH:=.*/PKG_HASH:=$HASH/" \
   "$PKG_DIR/Makefile"
 grep -q "^PKG_VERSION:=$V$" "$PKG_DIR/Makefile"
+grep -q '^PKG_SOURCE_URL:=https://github.com/dangowrt/comrade/releases/download/v\$(PKG_VERSION)$' "$PKG_DIR/Makefile"
 grep -q "^PKG_HASH:=$HASH$" "$PKG_DIR/Makefile"
 
-# The codeload tarball carries the STUN submodule as an empty directory, so
-# net/comrade downloads the pinned list separately (Download/stunlist) and
-# installs it before configure. Keep that pin in step with the submodule
-# commit the tag actually references -- readable straight off the tag's tree,
-# no submodule checkout needed -- and hash the very file OpenWrt will fetch.
+# The release tarball carries the STUN submodule as an empty directory (git
+# archive does not recurse into submodules), so net/comrade downloads the
+# pinned list separately (Download/stunlist) and installs it before
+# configure. Keep that pin in step with the submodule commit the tag
+# actually references -- readable straight off the tag's tree, no submodule
+# checkout needed -- and hash the very file OpenWrt will fetch.
 # A Makefile without the machinery has no pin to keep in step, and the bump
 # must not fail over its absence.
 if grep -q '^STUN_LIST_VERSION:=' "$PKG_DIR/Makefile"; then

@@ -5,10 +5,10 @@
 # the tag (v0.1.0 becomes 0.1.0). workflow_dispatch runs the same pipeline by
 # hand with a rolling pre-release version, for a dry run before tagging.
 #
-# Everything that ends up on the tag's GitHub release -- the Windows executables
-# and the macOS bottles -- is attached by the single `release` job, in one call,
-# so a published release is never edited afterwards and the repository can keep
-# release immutability switched on.
+# Everything that ends up on the tag's GitHub release -- the source tarball,
+# the Windows executables and the macOS bottles -- is attached by the single
+# `release` job, in one call, so a published release is never edited
+# afterwards and the repository can keep release immutability switched on.
 #
 # Publishing each channel takes its own deliberate switch, so an unconfigured
 # fork or a dry run never deploys anything: the apt repo needs the signing key
@@ -504,13 +504,13 @@ jobs:
           if-no-files-found: error
 
   # The one job that touches the tag's GitHub release. Every release asset --
-  # the Windows executables and the macOS bottles -- is attached here in a
-  # single `gh release create`, so the release is published complete and is
-  # never edited afterwards. That is what the repository's release immutability
-  # setting requires: once published, a release's assets and its tag are frozen.
-  # `gh release create` with assets creates a draft, uploads into it and only
-  # then publishes, so the whole upload happens while the release is still
-  # mutable.
+  # the source tarball, the Windows executables and the macOS bottles -- is
+  # attached here in a single `gh release create`, so the release is
+  # published complete and is never edited afterwards. That is what the
+  # repository's release immutability setting requires: once published, a
+  # release's assets and its tag are frozen. `gh release create` with assets
+  # creates a draft, uploads into it and only then publishes, so the whole
+  # upload happens while the release is still mutable.
   #
   # The corollary is that re-running a tag whose release already exists fails
   # rather than clobbering it: under immutability a botched release is
@@ -528,6 +528,25 @@ jobs:
       TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
       VERSION: ${{ needs.prepare.outputs.version }}
     steps:
+      - uses: actions/checkout@v5
+
+      # GitHub's own auto-generated "Source code (tar.gz)" download (what
+      # codeload.github.com serves for any ref, tag or not) is explicitly not
+      # guaranteed byte-stable: GitHub changed its archive compression once
+      # already in 2023 and only commits to a renewable minimum-notice window
+      # before doing so again, which broke a hash pinned against v0.1.12
+      # within hours of that release going out. Minting our own tarball and
+      # attaching it as a release asset instead makes it exactly as immutable
+      # as the Windows exe's and the macOS bottles: release immutability
+      # freezes uploaded assets, not codeload's on-the-fly output. The prefix
+      # matches what codeload itself used ($(PKG_NAME)-$(PKG_VERSION)/), the
+      # same convention OpenWrt's own tar extraction already assumes.
+      - name: Mint the source tarball as a release asset
+        run: |
+          mkdir -p dist
+          git archive --format=tar.gz --prefix="comrade-$VERSION/" \
+            -o "dist/comrade-$VERSION.tar.gz" HEAD
+
       - uses: actions/download-artifact@v7
         with:
           pattern: comrade-windows-*
