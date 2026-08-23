@@ -160,6 +160,10 @@ struct session_cfg {
 	int test_single_conn;		/* host: force the single-connection path even
 					 * on DHT (exercise the sequential re-serve
 					 * loop that the product host uses) */
+	int test_stuck_punches;		/* host: force the first N ICE pickups to
+					 * never connect (a wedged punch), so the
+					 * release-on-pickup turnstile can be shown
+					 * not to head-of-line-block (L1-stuck) */
 };
 
 /* Run the session to completion; returns 0 on success, non-zero on failure. */

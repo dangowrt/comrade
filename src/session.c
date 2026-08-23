@@ -1839,12 +1839,94 @@ static void lan_drain(struct sess *s, struct worker *ws, int *dash_seq)
 	s->lan_pending_n = 0;			/* drained; overflow re-offered */
 }
 
+/* The ICE ufrag of an answer (its client's single-use identity), into out
+ * (>= 40 bytes). candpack round-trips it, so it is stable across the mailbox. */
+static void sdp_ufrag(const char *sdp, char *out)
+{
+	const char *p = strstr(sdp, "ice-ufrag:");
+
+	out[0] = '\0';
+	if (p)
+		sscanf(p, "ice-ufrag:%39s", out);
+}
+
+/* Is this ufrag one of the punches already in flight? (host main thread only) */
+static int ufrag_in_flight(struct conn **punching, char punch_ufrag[][40],
+			   const char *cu)
+{
+	int i;
+
+	for (i = 0; i < HOST_MAX_WORKERS; i++)
+		if (punching[i] && !strcmp(punch_ufrag[i], cu))
+			return 1;
+	return 0;
+}
+
+/*
+ * Advance each in-flight ICE punch. Release-on-pickup means the listener has
+ * already rotated on, so a wedged punch here never head-of-line-blocks the next
+ * joiner. A connected punch becomes a worker (its dashboard row opens here); a
+ * failed or timed-out one is freed and its slot reused. On connect the served
+ * identity is recorded so the stale-claim guard ignores a lagging DHT re-read of
+ * it. test_stuck_punches forces the first punches to stay wedged (never spawn,
+ * only time out), which the L1-stuck e2e uses to prove the no-block property.
+ * Host main thread.
+ */
+static void punch_scan(struct sess *s, struct worker *ws, struct conn **punching,
+		       uint64_t *punch_start, int *punch_stuck,
+		       char punch_ufrag[][40], char *last_served_ufrag,
+		       int *have_served, int *dash_seq)
+{
+	const struct session_obs *o = s->cfg->obs;
+	int i;
+
+	for (i = 0; i < HOST_MAX_WORKERS; i++) {
+		struct conn *c = punching[i];
+
+		if (!c)
+			continue;
+		if (!punch_stuck[i] && nat_connected(c->nat)) {
+			snprintf(last_served_ufrag, 40, "%.39s", punch_ufrag[i]);
+			*have_served = 1;
+			dbg_logf("host: punch connected -> spawn worker");
+			if (o && o->peer) {
+				char loc[192], rem[192], addr[80];
+
+				addr[0] = '\0';
+				if (!nat_selected(c->nat, loc, sizeof(loc), rem,
+						  sizeof(rem)))
+					cand_addr(rem, addr, sizeof(addr));
+				/* SEEN opens this client's row, LIVE marks it up;
+				 * dash_id keys the row for updates and GONE. */
+				c->dash_id = ++*dash_seq;
+				snprintf(c->status_peer, sizeof(c->status_peer),
+					 "%s", addr);
+				o->peer(o->arg, c->dash_id, SESSION_PEER_SEEN,
+					addr);
+				o->peer(o->arg, c->dash_id, SESSION_PEER_LIVE,
+					addr);
+			}
+			punching[i] = NULL;
+			if (worker_spawn(ws, c))
+				conn_free(c);		/* table full */
+		} else if (now_ms() - punch_start[i] > ICE_ATTEMPT_MS ||
+			   (!punch_stuck[i] && nat_failed(c->nat))) {
+			dbg_logf("host: punch %s -> drop",
+				 punch_stuck[i] ? "wedged (test)" : "failed");
+			punching[i] = NULL;
+			conn_free(c);
+		}
+	}
+}
+
 /*
  * Host turnstile: advertise one offer at a time (a fresh ICE identity per
- * offer), accept a client's claimed answer, punch, and on connect hand the
- * connection to a worker on the shared command, then rotate the offer for the
- * next client. DHT/ICE joins are serialised through the single mailbox slot;
- * same-segment multicast claimants are admitted directly over the shared
+ * offer) and accept a client's claimed answer. On pickup the listener hands the
+ * punch to an in-flight set (punching[]) and rotates a fresh offer at once, so
+ * the next client is admitted immediately instead of after the punch completes
+ * (release-on-pickup); punch_scan turns a connected punch into a worker and
+ * frees a wedged one. DHT/ICE joins are serialised through the single mailbox
+ * slot; same-segment multicast claimants are admitted directly over the shared
  * lanlink socket (lan_drain), fully concurrently. The worker sessions run
  * concurrently. Signalling and the rendezvous keep-warm stay on this thread
  * (sig is single-threaded); workers only pump their own transport.
@@ -1855,15 +1937,23 @@ static int host_turnstile(struct sess *s)
 	const struct session_obs *o = cfg->obs;
 	struct worker ws[HOST_MAX_WORKERS];
 	struct conn *listen = NULL;
-	enum { TS_GATHER, TS_WAIT_CLAIM, TS_WAIT_ICE } ts = TS_GATHER;
+	struct conn *punching[HOST_MAX_WORKERS];	/* in-flight ICE punches */
+	uint64_t punch_start[HOST_MAX_WORKERS];
+	int punch_stuck[HOST_MAX_WORKERS];		/* test: never connect */
+	char punch_ufrag[HOST_MAX_WORKERS][40];		/* each punch's claimant id */
+	enum { TS_GATHER, TS_WAIT_CLAIM } ts = TS_GATHER;
 	uint64_t deadline = now_ms() + (uint64_t)cfg->connect_timeout_s * 1000;
-	uint64_t ice_start = 0, last_active = now_ms();
+	uint64_t last_active = now_ms();
 	char filtered[NAT_SDP_MAX];
-	char pending[NAT_SDP_MAX], last_served[NAT_SDP_MAX];
+	char last_served_ufrag[40];	/* the most recently served claimant id */
 	sock_t end_fd = cfg->ssh_end_fd;
 	int served = 0, have_served = 0, dash_seq = 0, i, j;
+	int stuck_left = cfg->test_stuck_punches;
 
 	memset(ws, 0, sizeof(ws));
+	memset(punching, 0, sizeof(punching));
+	memset(punch_stuck, 0, sizeof(punch_stuck));
+	last_served_ufrag[0] = '\0';
 
 	while (cfg->host_serve_max == 0 || served < cfg->host_serve_max) {
 		int active = 0;
@@ -1955,6 +2045,15 @@ static int host_turnstile(struct sess *s)
 			}
 		}
 
+		/* Advance in-flight punches (connect -> worker, wedged -> freed),
+		 * concurrently with the listener below. An in-flight punch keeps the
+		 * host non-idle. */
+		punch_scan(s, ws, punching, punch_start, punch_stuck, punch_ufrag,
+			   last_served_ufrag, &have_served, &dash_seq);
+		for (i = 0; i < HOST_MAX_WORKERS; i++)
+			if (punching[i])
+				active = 1;
+
 		switch (ts) {
 		case TS_GATHER:
 			if (!listen) {
@@ -1990,19 +2089,44 @@ static int host_turnstile(struct sess *s)
 			break;
 		case TS_WAIT_CLAIM:
 			if (s->have_peer_sdp && !s->remote_set) {
-				/* Ignore the answer we just served: it lingers in
-				 * the slot until the rotate's clear lands, and the
-				 * rotate re-arms delivery, so it would otherwise be
-				 * punched again (an already-served client) and burn
-				 * a whole ICE attempt. Wait for a fresh claimant. */
-				if (have_served &&
-				    !strcmp(s->peer_sdp, last_served)) {
-					dbg_logf("host: ignore stale claim "
-						 "(== last served)");
+				char cu[40];
+				int pslot = -1, inflight = 0;
+
+				/*
+				 * Ignore an answer that is already being served or
+				 * punched: the DHT is eventually consistent, so a
+				 * lagging node re-serves a just-picked-up answer, and
+				 * a still-punching client keeps re-claiming the slot
+				 * the rotate cleared; either would be punched again
+				 * (double-serve). The claimant is its ICE ufrag. This
+				 * is the stale-claim guard (have_served/last_served),
+				 * keyed by ufrag so it covers concurrent punches.
+				 */
+				sdp_ufrag(s->peer_sdp, cu);
+				if (cu[0] && ((have_served &&
+					       !strcmp(cu, last_served_ufrag)) ||
+					      ufrag_in_flight(punching, punch_ufrag,
+							      cu))) {
+					dbg_logf("host: ignore stale/in-flight claim");
 					s->have_peer_sdp = 0;
 					break;
 				}
-				dbg_logf("host: claim received -> punch");
+				/* Room to punch? (a free in-flight slot within the
+				 * combined worker + punch budget). If not, keep the
+				 * claim advertised and pick it up once room frees. */
+				for (i = 0; i < HOST_MAX_WORKERS; i++) {
+					if (ws[i].used)
+						inflight++;
+					if (punching[i]) {
+						inflight++;
+						continue;
+					}
+					if (pslot < 0)
+						pslot = i;
+				}
+				if (pslot < 0 || inflight >= HOST_MAX_WORKERS)
+					break;
+				dbg_logf("host: claim received -> punch (release)");
 				sdp_filter(s->peer_sdp, cfg->family, filtered,
 					   sizeof(filtered));
 				if (nat_set_remote_description(listen->nat,
@@ -2013,47 +2137,16 @@ static int host_turnstile(struct sess *s)
 					ts = TS_GATHER;
 					break;
 				}
-				snprintf(pending, sizeof(pending), "%s",
-					 s->peer_sdp);
-				s->remote_set = 1;
-				ice_start = now_ms();
-				ts = TS_WAIT_ICE;
-			}
-			break;
-		case TS_WAIT_ICE:
-			if (nat_connected(listen->nat)) {
-				snprintf(last_served, sizeof(last_served), "%s",
-					 pending);
-				have_served = 1;
-				dbg_logf("host: connected -> spawn worker");
-				if (o && o->peer) {
-					char loc[192], rem[192], addr[80];
-
-					addr[0] = '\0';
-					if (!nat_selected(listen->nat, loc,
-							  sizeof(loc), rem,
-							  sizeof(rem)))
-						cand_addr(rem, addr,
-							  sizeof(addr));
-					/* SEEN opens this client's row, LIVE marks it
-					 * up (see the view's um_peer); dash_id keys
-					 * the row for later address updates and GONE. */
-					listen->dash_id = ++dash_seq;
-					snprintf(listen->status_peer,
-						 sizeof(listen->status_peer),
-						 "%s", addr);
-					o->peer(o->arg, listen->dash_id,
-						SESSION_PEER_SEEN, addr);
-					o->peer(o->arg, listen->dash_id,
-						SESSION_PEER_LIVE, addr);
-				}
-				if (worker_spawn(ws, listen))
-					conn_free(listen);	/* table full */
-				listen = NULL;
-				ts = TS_GATHER;		/* rotate for the next */
-			} else if (nat_failed(listen->nat) ||
-				   now_ms() - ice_start > ICE_ATTEMPT_MS) {
-				conn_free(listen);
+				/* Release on pickup: hand the punch to the in-flight
+				 * set and rotate a fresh offer at once, so the next
+				 * client is admitted without waiting for this punch. */
+				punching[pslot] = listen;
+				punch_start[pslot] = now_ms();
+				punch_stuck[pslot] = stuck_left > 0;
+				if (stuck_left > 0)
+					stuck_left--;
+				snprintf(punch_ufrag[pslot], sizeof(punch_ufrag[pslot]),
+					 "%s", cu);
 				listen = NULL;
 				ts = TS_GATHER;
 			}
@@ -2086,11 +2179,14 @@ static int host_turnstile(struct sess *s)
 
 	s->offer_conn = NULL;
 	conn_free(listen);
-	for (i = 0; i < HOST_MAX_WORKERS; i++)
+	for (i = 0; i < HOST_MAX_WORKERS; i++) {
+		if (punching[i])
+			conn_free(punching[i]);
 		if (ws[i].used) {
 			pthread_join(ws[i].th, NULL);
 			conn_free(ws[i].c);
 		}
+	}
 	return 0;
 }
 
