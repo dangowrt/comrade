@@ -312,7 +312,9 @@ configurable, so exposing that server buys little.
 
 A survey of the FOSS landscape (August 2026) turned up no project with
 the same combination of properties, though several are close in one
-dimension or another. The closest neighbours, by user-visible behaviour:
+dimension or another. The closest neighbours, by user-visible
+behaviour; every row is free software except share terminal, whose
+MIT client fronts a proprietary service:
 
 | Project | Shares | Relay in the data path | Control plane you must trust | NAT traversal |
 |---------|--------|------------------------|------------------------------|---------------|
@@ -320,6 +322,7 @@ dimension or another. The closest neighbours, by user-visible behaviour:
 | tmate | tmux session | yes | the relay | none |
 | upterm | terminal | yes (self-hostable) | the relay | none |
 | sshx | browser terminal | yes; always relayed | author's hosted service | none |
+| share terminal | browser terminal | whatever TURN the operator sets | its proprietary backend, plus a Google account | ICE/STUN, TURN if configured |
 | shwim | terminal | fallback only | wormhole mailbox server | direct, relay fallback |
 | tunshell | one-off shell | fallback only | own relay server | punch, relay fallback |
 | dhtnet | netcat, shell | TURN by default | OpenDHT + bootstrap | ICE, TURN default |
@@ -371,6 +374,16 @@ The nearest neighbours, and what each one teaches:
   relay fallback where comrade takes the mainline DHT and the no-relay
   stance, and ships a Go binary with a browser client where comrade is
   plain C with the host key pinned in the token.
+- share terminal (`npx share-terminal start`; MIT client, proprietary
+  service, <https://www.shareterminal.cloud/>): a PTY punched to a
+  browser viewer over a WebRTC DataChannel, ICE by libdatachannel and
+  so libjuice underneath. It ranks first for this kind of search and
+  reads as open source, but the MIT covers the client alone: pairing,
+  Google OAuth, the signaller and the per-session ICE list sit behind
+  an unpublished backend on a $5-a-month subscription, so identity is a
+  Google account rather than a pinned host key, and a relay in the path
+  is the operator's call. The advertised 140 KB also wants 77 MB of
+  `node_modules` under a 60 MB runtime.
 - tuntox over c-toxcore (C, GPL-3.0): plain-C tunnels over the Tox DHT
   with volunteer bootstrap; the nearest language-and-footprint cousin.
   Tox TCP relays carry traffic as a routine fallback, the address is a
@@ -434,7 +447,9 @@ Measured findings folded into the design:
   tinc 450 KB, tmate 625 KB (tmate and tmate-ssh-server are already
   feed packages, easing comrade's path in). The sub-1 MB budget is
   realistic; the Go tools (croc 8.7 MB, netbird 33 MB) confirm the
-  language constraint.
+  language constraint, and the Node ones put it beyond argument: share
+  terminal's 140 KB bundle needs 77 MB of `node_modules` and a 60 MB
+  runtime under it, on an architecture that runtime was ported to.
 - Citable design context: chr15m's essay "BEP44 for decentralized
   applications", and BitTorrent proposal issue #178, a DHT
   hole-punching extension that was never adopted.
