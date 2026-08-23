@@ -653,6 +653,15 @@ if(COMRADE_BUILD_TOOLS)
 		set_tests_properties(lan_mixed_e2e PROPERTIES
 			SKIP_RETURN_CODE 77 TIMEOUT 300)
 
+		# Release-on-pickup: a wedged ICE punch must not head-of-line-block the
+		# next joiner. The wedge is host-controlled
+		# (deterministic); the joiners use the live DHT, so SKIPs (77) unless
+		# COMRADE_E2E_NET=1. Passes only when release-on-pickup works.
+		add_test(NAME turnstile_stuck_e2e
+			COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/turnstile_stuck.sh
+				$<TARGET_FILE:comrade-e2e>)
+		set_tests_properties(turnstile_stuck_e2e PROPERTIES
+			SKIP_RETURN_CODE 77 TIMEOUT 300)
 	endif()
 endif()
 
