@@ -834,8 +834,9 @@ if(BUILD_TESTING)
 		token_test tokgen_test termfilter_test ctlproto_test netmon_test
 		candpolicy_test candpack_test mailbox_test roauth_test
 		stunprobe_test path_test bep44_test
-		bep44_pin_test sig_rebuild_test natstream_test sshloop_test
-		sshfwd_test sshexit_test sshro_test sshkcp_test sshctl_test)
+		bep44_pin_test sig_rebuild_test natstream_test stream_room_test
+		sshloop_test sshfwd_test sshexit_test sshro_test sshkcp_test
+		sshctl_test)
 		if(TARGET ${t})
 			target_compile_options(${t} PRIVATE -UNDEBUG)
 		endif()
