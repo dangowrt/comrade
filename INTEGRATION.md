@@ -57,6 +57,13 @@ file then carries `"state":"error"` and a stable `"error"` enum (today:
 `no_tmux`), so a UI can say what is wrong. On clean exit the state file
 is removed: a stopped session is an absent document.
 
+An error document persists so the failure stays explainable: the next
+`--headless` with the same `--id` overwrites it, and any comrade
+invocation that sweeps stale state collects it. Since the pidfile is
+only written once startup has succeeded, an error document with no
+`NAME.pid` beside it reads as "failed, not running now" rather than
+"failing".
+
     comrade stop [--id NAME]
 
 Ends a session, completely: the tmux server is killed first, which
@@ -96,6 +103,9 @@ For `--id NAME` the paths are exactly:
       "id": "remoteassist",
       "pid": 1234,
       "state": "serving",
+      "doc_uptime_s": 4821.7,
+      "expire_s": 1800,
+      "expires_in_s": 1523,
       "token": "112F...",
       "token_ro": "112F...",
       "reach": {
@@ -112,6 +122,13 @@ For `--id NAME` the paths are exactly:
       "warning": "..."
     }
 
+- `doc_uptime_s`: seconds since boot (`/proc/uptime`'s clock) at the
+  moment the document was written. Every relative duration in the
+  document ages from that instant: a stateless reader computes
+  `remaining = expires_in_s - (uptime_now - doc_uptime_s)` with its own
+  `/proc/uptime`, immune to stepped wall clocks and its own restarts.
+- `expire_s` / `expires_in_s`: with `--expire` only -- the configured
+  bound, and the remainder as of `doc_uptime_s`.
 - `state`: `starting` | `rendezvous` (locating nodes; joining already
   works via a full DHT warm-up) | `ready` (a rendezvous is in the token)
   | `serving` (at least one connected peer) | `error`.
@@ -155,3 +172,13 @@ audit trail.
   views, the token shown) and `C` the read-only token to the system
   clipboard via OSC 52, which works across SSH; the footer confirms it.
 - `comrade show --token` is the zero-interaction path to the same thing.
+
+## What a QR code carries
+
+Every comrade QR -- the terminal's and any UI's -- encodes exactly
+`comrade:<token>`. That is a URL: a URI in the `comrade` scheme, which a
+device acts on through a registered handler rather than by fetching it
+over the network. This is contractual: an `http`/`https` join URL is a
+different scheme and is not planned (it would need comrade compiled to
+WebAssembly and protocol changes of the BitTorrent-vs-WebTorrent kind),
+so nothing should mint one.

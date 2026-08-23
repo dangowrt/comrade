@@ -25,6 +25,13 @@ int os_rename_replace(const char *tmp, const char *dst);
 long os_getpid(void);
 
 /*
+ * Seconds since boot, monotonic: /proc/uptime where it exists (the clock
+ * OpenWrt supervisors age-correct state documents against), else the
+ * closest monotonic clock the platform has.
+ */
+double os_uptime_s(void);
+
+/*
  * Run argv to completion and return its exit status (-1 if it could not be
  * started). fork+execvp+waitpid on POSIX; _spawnvp(_P_WAIT) on Windows, which
  * is a CreateProcess wrapper in the CRT and needs no fork.

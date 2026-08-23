@@ -25,6 +25,11 @@ long os_getpid(void)
 	return (long)GetCurrentProcessId();
 }
 
+double os_uptime_s(void)
+{
+	return (double)GetTickCount64() / 1000.0;
+}
+
 int os_spawn_wait(char *const argv[])
 {
 	intptr_t rc = _spawnvp(_P_WAIT, argv[0], (const char *const *)argv);
@@ -72,6 +77,24 @@ int os_rename_replace(const char *tmp, const char *dst)
 long os_getpid(void)
 {
 	return (long)getpid();
+}
+
+double os_uptime_s(void)
+{
+	FILE *f = fopen("/proc/uptime", "r");
+	struct timespec ts;
+	double up;
+
+	if (f) {
+		int ok = fscanf(f, "%lf", &up) == 1;
+
+		fclose(f);
+		if (ok)
+			return up;
+	}
+	if (!clock_gettime(CLOCK_MONOTONIC, &ts))
+		return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+	return 0.0;
 }
 
 int os_spawn_wait(char *const argv[])

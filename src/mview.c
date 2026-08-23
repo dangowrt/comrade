@@ -31,6 +31,7 @@ struct mview {
 	int npeer;
 	int expire_s;
 	int max_clients;
+	double expire_deadline;		/* os_uptime_s() at which the grant ends */
 };
 
 /* The stable service-state enum, derived from what has been observed. */
@@ -75,8 +76,15 @@ static void mv_doc(const struct mview *m, FILE *out)
 	showfmt_json_str(out, m->id);
 	fprintf(out, ",\"pid\":%ld,\"state\":\"%s\"", (long)os_getpid(),
 		mv_state(m));
-	if (m->expire_s)
-		fprintf(out, ",\"expire_s\":%d", m->expire_s);
+	/* The write stamp a stateless reader age-corrects every relative
+	 * duration against: remaining = field - (uptime_now - doc_uptime_s). */
+	fprintf(out, ",\"doc_uptime_s\":%.1f", os_uptime_s());
+	if (m->expire_s) {
+		long rem = (long)(m->expire_deadline - os_uptime_s());
+
+		fprintf(out, ",\"expire_s\":%d,\"expires_in_s\":%ld",
+			m->expire_s, rem > 0 ? rem : 0);
+	}
 	if (m->max_clients)
 		fprintf(out, ",\"max_clients\":%d", m->max_clients);
 	if (m->error[0])
@@ -285,6 +293,8 @@ void mview_limits(struct mview *m, int expire_s, int max_clients)
 {
 	m->expire_s = expire_s;
 	m->max_clients = max_clients;
+	if (expire_s > 0)
+		m->expire_deadline = os_uptime_s() + expire_s;
 	mv_write(m);
 }
 
