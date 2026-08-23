@@ -517,9 +517,16 @@ target_link_libraries(comrade_session PUBLIC
 	comrade_stunprobe comrade_conn comrade_path comrade_ctlproto comrade_dbg)
 
 # The view: the only module that draws to the terminal (MVC).
+# Token QR codes for the dashboard. qrcodegen.c is vendored from Project
+# Nayuki's QR Code generator library (MIT), like the vendored jech/dht kept
+# out of the warning bar.
+add_library(comrade_qr STATIC src/qr.c src/qrcodegen.c)
+target_include_directories(comrade_qr PUBLIC src)
+set_source_files_properties(src/qrcodegen.c PROPERTIES COMPILE_OPTIONS -w)
+
 add_library(comrade_ui STATIC src/ui.c)
 target_include_directories(comrade_ui PUBLIC src)
-target_link_libraries(comrade_ui PUBLIC comrade_token comrade_compat)
+target_link_libraries(comrade_ui PUBLIC comrade_token comrade_qr comrade_compat)
 
 # The host, in two files: the POSIX one and the Windows one. Each is guarded
 # so exactly one of them defines host_run/host_show, which keeps both readable
@@ -623,6 +630,12 @@ if(BUILD_TESTING)
 	add_executable(token_test tests/token_test.c)
 	target_link_libraries(token_test comrade_token)
 	add_test(NAME token_test COMMAND token_test)
+
+	# qr_test includes qr.c for its statics; the archive still supplies
+	# qrcodegen.
+	add_executable(qr_test tests/qr_test.c)
+	target_link_libraries(qr_test comrade_qr)
+	add_test(NAME qr_test COMMAND qr_test)
 
 	add_executable(tokgen_test tests/tokgen_test.c)
 	target_link_libraries(tokgen_test comrade_token)
@@ -868,7 +881,7 @@ if(BUILD_TESTING)
 		stunprobe_test path_test bep44_test
 		bep44_pin_test sig_rebuild_test natstream_test stream_room_test
 		stream_cc_test sshloop_test sshfwd_test sshexit_test sshro_test
-		sshkcp_test sshctl_test)
+		sshkcp_test sshctl_test qr_test)
 		if(TARGET ${t})
 			target_compile_options(${t} PRIVATE -UNDEBUG)
 		endif()

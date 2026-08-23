@@ -19,6 +19,7 @@
 
 #include "dbg.h"
 #include "oscompat.h"
+#include "qr.h"
 #include "token.h"
 #include "tty.h"
 #include "ui.h"
@@ -54,6 +55,10 @@ struct linkrow { char name[32]; int has4, has6; };
 struct rdvrow { int family; int ready; char addr[80]; };
 struct peerrow { int id; int state; int read_only; char addr[80]; };
 
+/* What the host foreground shows: the dashboard, or one token full-screen
+ * as a QR code. Q cycles, ESC returns. */
+enum ui_view { UI_VIEW_DASH, UI_VIEW_QR_RW, UI_VIEW_QR_RO };
+
 struct ui {
 	int role;
 	int anim;			/* 1 = dashboard, 0 = log lines */
@@ -81,6 +86,7 @@ struct ui {
 	char escalate[160];
 	int have_escalate;
 	int established;
+	int view;			/* enum ui_view */
 
 	struct tty_saved saved;
 	int raw;
@@ -237,10 +243,97 @@ static int rdv_combined(int s4, int s6)
 	return c > 8 ? 8 : c;
 }
 
+/* The token's reachability classification, one dashboard line after
+ * whatever `pre` puts in front of it. */
+static void token_class_line(struct ui *u, const char *pre)
+{
+	int r4 = u->tok_st4 == TOKEN_STATE_RENDEZVOUS ||
+		 u->tok_st4 == TOKEN_STATE_DIRECT;
+	int r6 = u->tok_st6 == TOKEN_STATE_RENDEZVOUS ||
+		 u->tok_st6 == TOKEN_STATE_DIRECT;
+
+	if (r4 && r6)
+		line("%s" BGR "reachable over IPv4 and IPv6" RST, pre);
+	else if (r4 && u->tok_st6 == TOKEN_STATE_PENDING)
+		line("%s" BGR "IPv4 ready" RST DIM
+		     " -- locating IPv6 ..." RST, pre);
+	else if (r6 && u->tok_st4 == TOKEN_STATE_PENDING)
+		line("%s" BGR "IPv6 ready" RST DIM
+		     " -- locating IPv4 ..." RST, pre);
+	else if (r4)
+		line("%s" YEL "IPv4 only" RST, pre);
+	else if (r6)
+		line("%s" RED "! IPv6 only" RST DIM
+		     " -- IPv4-only peers cannot connect" RST, pre);
+	else if (u->tok_st4 == TOKEN_STATE_PENDING ||
+		 u->tok_st6 == TOKEN_STATE_PENDING)
+		line("%s" YEL "locating rendezvous nodes ..." RST
+		     DIM " -- joining works now, via a full DHT "
+		     "warm-up" RST, pre);
+	else
+		line("%s" YEL "! no rendezvous nodes" RST DIM
+		     " -- joining needs a full DHT warm-up "
+		     "(slower, less reliable)" RST, pre);
+}
+
+/*
+ * One token full-screen as a QR code, the geometry picked to fit the
+ * terminal: half blocks (square pixels) wherever they fit, sextants only
+ * where nothing else does -- their pixels are ~4:3 tall on a 1:2 cell,
+ * which the pickiest scanners refuse, so the page runs lean (no header,
+ * type and classification share a line) to keep half blocks viable down
+ * to a ~27-row terminal. The blank rows above and below and the centring
+ * margin are the quiet zone the art itself no longer carries.
+ */
+static void draw_qr(struct ui *u)
+{
+	const char *tok = u->view == UI_VIEW_QR_RO ? u->token_ro : u->token;
+	const char *kind = u->view == UI_VIEW_QR_RO ? "read-only" : "read-write";
+	const char *nxt = u->view == UI_VIEW_QR_RW && u->have_token_ro ?
+			  "read-only QR" : "dashboard";
+	char enc[280], pre[96];
+	struct qr_art art;
+	int i, pad;
+
+	hide_cursor(u);
+	winsize(u);			/* re-pick the geometry on resize */
+	fputs("\033[H", stdout);
+	line("");
+	snprintf(enc, sizeof(enc), "comrade:%s", tok);
+	if (qr_render_fit(enc, u->rows - 4, u->cols - 4, &art)) {
+		line(YEL "  the terminal is too small for a scannable QR "
+		     "code" RST);
+	} else {
+		pad = (u->cols - art.cols) / 2;
+		if (pad < 0)
+			pad = 0;
+		for (i = 0; i < art.rows; i++)
+			line("%*s%s", pad, "", art.row[i]);
+	}
+	line("");
+	snprintf(pre, sizeof(pre),
+		 CYN "INVITE" RST "  " WHT "%s" RST DIM " -- " RST, kind);
+	token_class_line(u, pre);
+	/* The footer may sit on the last row: no newline, or it scrolls. */
+	printf(DIM "[ " BYE "Q" DIM " %s / " BYE "ESC" DIM " dashboard / " BYE
+	       "ENTER" DIM " enter the session ]" RST "\033[K", nxt);
+	fputs("\033[J", stdout);
+	fflush(stdout);
+	u->last_paint = now_ms();
+	u->dirty = 0;
+}
+
 static void draw(struct ui *u)
 {
 	int i, f = u->spin & 3, ns = 0, rc;
 
+	if (u->view == UI_VIEW_QR_RO && !u->have_token_ro)
+		u->view = UI_VIEW_QR_RW;
+	if (u->role == UI_ROLE_HOST && u->view != UI_VIEW_DASH &&
+	    u->have_token) {
+		draw_qr(u);
+		return;
+	}
 	hide_cursor(u);
 	fputs("\033[H", stdout);
 
@@ -307,11 +400,6 @@ static void draw(struct ui *u)
 	line("");
 
 	if (u->role == UI_ROLE_HOST) {
-		int r4 = u->tok_st4 == TOKEN_STATE_RENDEZVOUS ||
-			 u->tok_st4 == TOKEN_STATE_DIRECT;
-		int r6 = u->tok_st6 == TOKEN_STATE_RENDEZVOUS ||
-			 u->tok_st6 == TOKEN_STATE_DIRECT;
-
 		line(CYN "INVITE" RST);
 		if (u->have_token) {
 			line("  " WHT "$ comrade %s" RST DIM "   (read-write)" RST,
@@ -319,28 +407,7 @@ static void draw(struct ui *u)
 			if (u->have_token_ro)
 				line("  " WHT "$ comrade %s" RST DIM
 				     "   (read-only)" RST, u->token_ro);
-			if (r4 && r6)
-				line("  " BGR "reachable over IPv4 and IPv6" RST);
-			else if (r4 && u->tok_st6 == TOKEN_STATE_PENDING)
-				line("  " BGR "IPv4 ready" RST DIM
-				     " -- locating IPv6 ..." RST);
-			else if (r6 && u->tok_st4 == TOKEN_STATE_PENDING)
-				line("  " BGR "IPv6 ready" RST DIM
-				     " -- locating IPv4 ..." RST);
-			else if (r4)
-				line("  " YEL "IPv4 only" RST);
-			else if (r6)
-				line("  " RED "! IPv6 only" RST DIM
-				     " -- IPv4-only peers cannot connect" RST);
-			else if (u->tok_st4 == TOKEN_STATE_PENDING ||
-				 u->tok_st6 == TOKEN_STATE_PENDING)
-				line("  " YEL "locating rendezvous nodes ..." RST
-				     DIM " -- joining works now, via a full DHT "
-				     "warm-up" RST);
-			else
-				line("  " YEL "! no rendezvous nodes" RST DIM
-				     " -- joining needs a full DHT warm-up "
-				     "(slower, less reliable)" RST);
+			token_class_line(u, "  ");
 		} else {
 			line(DIM "  locating a rendezvous node ..." RST);
 		}
@@ -362,8 +429,13 @@ static void draw(struct ui *u)
 			     p->read_only ? "  " YEL "view-only" RST : "");
 		}
 		line("");
-		line(DIM "[ " BYE "ENTER" DIM " / " BYE "SPACE" DIM
-		     " to enter the shared session ]" RST);
+		if (u->have_token)
+			line(DIM "[ " BYE "ENTER" DIM " / " BYE "SPACE" DIM
+			     " to enter the shared session / " BYE "Q" DIM
+			     " invite QR ]" RST);
+		else
+			line(DIM "[ " BYE "ENTER" DIM " / " BYE "SPACE" DIM
+			     " to enter the shared session ]" RST);
 	} else {
 		const char *pa = u->npeer && u->peer[0].addr[0] &&
 				 u->peer[0].addr[0] != '-' ? u->peer[0].addr : NULL;
@@ -1068,8 +1140,14 @@ int ui_host_wait(struct ui *u, sock_t fd)
 		nfds_t nfds = 1;
 
 		if (esc_pending && now_ms() > esc_deadline) {
-			result = -1;
-			break;
+			esc_pending = 0;
+			if (u->view != UI_VIEW_DASH) {
+				u->view = UI_VIEW_DASH;
+				u->dirty = 1;
+			} else {
+				result = -1;
+				break;
+			}
 		}
 		fds[0].fd = fd;
 		fds[0].events = POLLIN;
@@ -1145,6 +1223,20 @@ int ui_host_wait(struct ui *u, sock_t fd)
 					if (c == '\r' || c == '\n' || c == ' ') {
 						result = 1;
 						break;
+					}
+					/* Q pages through the invite QR codes;
+					 * ESC (above) leads back. */
+					if ((c == 'q' || c == 'Q') &&
+					    u->role == UI_ROLE_HOST &&
+					    u->have_token) {
+						if (u->view == UI_VIEW_DASH)
+							u->view = UI_VIEW_QR_RW;
+						else if (u->view == UI_VIEW_QR_RW &&
+							 u->have_token_ro)
+							u->view = UI_VIEW_QR_RO;
+						else
+							u->view = UI_VIEW_DASH;
+						u->dirty = 1;
 					}
 				}
 				if (result)
