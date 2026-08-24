@@ -160,8 +160,33 @@ void stun_probe_run(char *const *servers, int nservers, int total_ms,
 			if (r > 0 &&
 			    !stun_probe_mapped4(buf, (size_t)r, seed, addr,
 						&port))
-				hit(arg, addr);
+				hit(arg, addr, port);
 		}
 	}
 	sock_close(fd);
+}
+
+void stun_mapping_reset(struct stun_mapping *m)
+{
+	memset(m, 0, sizeof(*m));
+}
+
+void stun_mapping_add(struct stun_mapping *m, const uint8_t addr[4],
+		      uint16_t port)
+{
+	if (m->nsamples == 0) {
+		memcpy(m->addr, addr, 4);
+		m->port = port;
+		m->agree = 1;
+	} else if (memcmp(m->addr, addr, 4) || m->port != port) {
+		m->agree = 0;
+	}
+	m->nsamples++;
+}
+
+int stun_mapping_result(const struct stun_mapping *m)
+{
+	if (m->nsamples < 2)
+		return STUN_MAPPING_UNKNOWN;
+	return m->agree ? STUN_MAPPING_INDEPENDENT : STUN_MAPPING_DEPENDENT;
 }

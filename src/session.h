@@ -53,6 +53,10 @@ struct session_obs {
 	/* A local path (family 4/6), classified by scope and how it was learnt;
 	 * the pair fixes the label, e.g. GLOBAL+STUN is "global, behind NAT". */
 	void (*net)(void *arg, int family, int scope, int via, const char *addr);
+	/* This network's NAT maps our probe socket differently per destination
+	 * server (1) or the same way to all of them (0) -- known only once the
+	 * STUN pool probe has heard back from at least two servers. */
+	void (*mapping4)(void *arg, int dependent);
 	/* An up multicast interface being serviced, and the families it has. */
 	void (*link)(void *arg, const char *ifname, int have4, int have6);
 	/* A per-family rendezvous node: located (host) or seeded (client). */

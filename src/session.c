@@ -407,6 +407,13 @@ struct sess {
 	pthread_t probe_th;		/* the active pool probe (stunprobe) */
 	int probe_running;
 	volatile int probe_stop;
+	/*
+	 * RFC 4787 mapping classification built from the same probe's
+	 * responses (see stun_mapping_add) -- read and grown under
+	 * trickle_lock alongside pool4.
+	 */
+	struct stun_mapping map4;
+	int mapping_reported;		/* 0 not yet, 1 sent independent, 2 sent dependent */
 
 	/*
 	 * Host admission registry, all touched only on the host main thread (no
@@ -1005,16 +1012,17 @@ static void sdp_filter(const char *in, int family, char *out, size_t outlen)
 static int fan_local_sdp(struct sess *s)
 {
 	uint8_t pool[POOL4_MAX][4];
-	int n, i;
+	int n, i, st;
 
 	pthread_mutex_lock(&s->trickle_lock);
 	n = s->npool4;
 	for (i = 0; i < n; i++)
 		memcpy(pool[i], s->pool4[i], 4);
+	st = stun_mapping_result(&s->map4);
 	pthread_mutex_unlock(&s->trickle_lock);
 	if (n >= 2)
 		cand_sdp_fan_v4(s->local_sdp, sizeof(s->local_sdp), pool,
-				(size_t)n);
+				(size_t)n, st == STUN_MAPPING_DEPENDENT);
 	return n;
 }
 
@@ -1029,12 +1037,13 @@ static void pool_pump(struct sess *s, int repost_ok)
 {
 	const struct session_obs *o = s->cfg->obs;
 	uint8_t pool[POOL4_MAX][4];
-	int n, i;
+	int n, i, st, rep;
 
 	pthread_mutex_lock(&s->trickle_lock);
 	n = s->npool4;
 	for (i = 0; i < n; i++)
 		memcpy(pool[i], s->pool4[i], 4);
+	st = stun_mapping_result(&s->map4);
 	pthread_mutex_unlock(&s->trickle_lock);
 	if (o && o->net) {
 		for (i = s->pool_reported; i < n; i++) {
@@ -1046,6 +1055,14 @@ static void pool_pump(struct sess *s, int repost_ok)
 		}
 	}
 	s->pool_reported = n;
+	if (st != STUN_MAPPING_UNKNOWN) {
+		rep = st == STUN_MAPPING_DEPENDENT ? 2 : 1;
+		if (rep != s->mapping_reported) {
+			s->mapping_reported = rep;
+			if (o && o->mapping4)
+				o->mapping4(o->arg, rep == 2);
+		}
+	}
 	if (repost_ok && s->have_local_sdp && n >= 2 && n > s->pool_posted) {
 		s->pool_posted = fan_local_sdp(s);
 		sig_post(s->sig, (const uint8_t *)s->local_sdp,
@@ -1267,9 +1284,17 @@ static void pool_note(struct sess *s, const uint8_t b[4])
 	pthread_mutex_unlock(&s->trickle_lock);
 }
 
-static void probe_hit(void *arg, const uint8_t addr[4])
+static void mapping_note(struct sess *s, const uint8_t addr[4], uint16_t port)
+{
+	pthread_mutex_lock(&s->trickle_lock);
+	stun_mapping_add(&s->map4, addr, port);
+	pthread_mutex_unlock(&s->trickle_lock);
+}
+
+static void probe_hit(void *arg, const uint8_t addr[4], uint16_t port)
 {
 	pool_note(arg, addr);
+	mapping_note(arg, addr, port);
 }
 
 static void *stun_probe_thread(void *arg)
@@ -3834,6 +3859,7 @@ static int host_turnstile(struct sess *s)
 			s->trickle_sdp[0] = '\0';
 			s->trickle_dirty = 0;
 			s->npool4 = 0;
+			stun_mapping_reset(&s->map4);
 			pthread_mutex_unlock(&s->trickle_lock);
 			ts = TS_GATHER;
 			s->stun_rotations = 0;	/* fresh budget on the new network */
@@ -3841,6 +3867,7 @@ static int host_turnstile(struct sess *s)
 			s->have_srflx4 = 0;
 			s->pool_reported = 0;
 			s->pool_posted = 0;
+			s->mapping_reported = 0;
 			stun_probe_kick(s);
 			if (o && o->net_reset)
 				o->net_reset(o->arg);
@@ -4273,6 +4300,7 @@ int session_run(const struct session_cfg *cfg)
 			s.trickle_sdp[0] = '\0';
 			s.trickle_dirty = 0;
 			s.npool4 = 0;
+			stun_mapping_reset(&s.map4);
 			pthread_mutex_unlock(&s.trickle_lock);
 			st = ST_WAIT_DHT;
 			s.stun_rotations = 0;	/* fresh budget on the new network */
@@ -4280,6 +4308,7 @@ int session_run(const struct session_cfg *cfg)
 			s.have_srflx4 = 0;
 			s.pool_reported = 0;
 			s.pool_posted = 0;
+			s.mapping_reported = 0;
 			stun_probe_kick(&s);
 			if (o && o->net_reset)
 				o->net_reset(o->arg);
@@ -4527,9 +4556,11 @@ int session_run(const struct session_cfg *cfg)
 					s.have_srflx4 = 0;
 					pthread_mutex_lock(&s.trickle_lock);
 					s.npool4 = 0;
+					stun_mapping_reset(&s.map4);
 					pthread_mutex_unlock(&s.trickle_lock);
 					s.pool_reported = 0;
 					s.pool_posted = 0;
+					s.mapping_reported = 0;
 					stun_probe_kick(&s);
 					if (sig_rebuild(&s)) {
 						st = ST_FAIL;

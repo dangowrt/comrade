@@ -73,6 +73,8 @@ struct ui {
 
 	struct netrow net[12];
 	int nnet;
+	int mapping_known;
+	int mapping_dependent;
 	struct linkrow link[8];
 	int nlink;
 	struct rdvrow rdv[2];		/* fixed slots: [0] v4, [1] v6 */
@@ -215,8 +217,11 @@ static void line(const char *fmt, ...)
  * Colour + text for a path's classification. A direct global address is
  * routable but not proven reachable from a stranger -- a stateful firewall can
  * still drop inbound -- so it reads "GLOBAL", not "open". A srflx global is
- * behind NAT. Confirming reachability (open vs firewalled) needs an active
- * probe from a second vantage (RFC 5780), still to come.
+ * behind NAT; whether that NAT's mapping is cone or symmetric is now known
+ * from the STUN pool probe (see um_mapping4) and shown on the NETWORK header
+ * line rather than per-address here. Confirming reachability (open vs
+ * firewalled) is a different question and still needs an active probe from a
+ * second vantage (RFC 5780), still to come.
  */
 static void net_label(int scope, int via, const char **color, const char **text)
 {
@@ -432,7 +437,9 @@ static void draw(struct ui *u)
 	for (i = 0; i < u->nnet; i++)
 		if (u->net[i].via == NET_VIA_STUN)
 			ns = 2;
-	line(CYN "NETWORK" RST "  " YEL "%c" RST, net_flavor[ns][f]);
+	line(CYN "NETWORK" RST "  " YEL "%c" RST "%s", net_flavor[ns][f],
+	     u->mapping_known && u->mapping_dependent ?
+	     DIM "  (per-destination NAT mapping)" RST : "");
 	if (!u->nnet && !u->nlink)
 		line(DIM "  probing ..." RST);
 	for (i = 0; i < u->nnet; i++) {
@@ -789,6 +796,17 @@ static void um_escalate(struct ui *u, const char *why)
 	u->dirty = 1;
 }
 
+static void um_mapping4(struct ui *u, int dependent)
+{
+	u->mapping_known = 1;
+	u->mapping_dependent = dependent;
+	if (u->anim)
+		u->dirty = 1;
+	else
+		vlog(u, "local  NAT mapping is %s",
+		     dependent ? "per-destination" : "stable");
+}
+
 static void um_escalate_clear(struct ui *u)
 {
 	if (!u->anim) {
@@ -816,6 +834,7 @@ static void um_live(struct ui *u)
 static void um_reset(struct ui *u)
 {
 	u->nnet = 0;
+	u->mapping_known = 0;
 	u->npeer = 0;
 	u->established = 0;
 	if (u->anim)
@@ -827,6 +846,7 @@ static void um_reset(struct ui *u)
 static void um_net_reset(struct ui *u)
 {
 	u->nnet = 0;
+	u->mapping_known = 0;
 	if (u->anim)
 		u->dirty = 1;
 	else
@@ -839,6 +859,7 @@ static void cb_net(void *a, int f, int sc, int v, const char *ad)
 {
 	um_net(a, f, sc, v, ad);
 }
+static void cb_mapping4(void *a, int d) { um_mapping4(a, d); }
 static void cb_link(void *a, const char *n, int h4, int h6) { um_link(a, n, h4, h6); }
 static void cb_rdv(void *a, int f, const char *ad, int rd) { um_rdv(a, f, rd, ad); }
 static void cb_rdv_stage(void *a, int f, int st) { um_rdv_stage(a, f, st); }
@@ -882,6 +903,7 @@ void ui_bind(struct ui *u, struct session_obs *obs)
 	memset(obs, 0, sizeof(*obs));
 	obs->arg = u;
 	obs->net = cb_net;
+	obs->mapping4 = cb_mapping4;
 	obs->link = cb_link;
 	obs->rendezvous = cb_rdv;
 	obs->rdv_stage = cb_rdv_stage;
@@ -994,6 +1016,10 @@ static void em_net(void *a, int f, int sc, int v, const char *ad)
 {
 	emitf(a, "N %d %d %d %s\n", f, sc, v, ad);
 }
+static void em_mapping4(void *a, int d)
+{
+	emitf(a, "M %d\n", d);
+}
 static void em_link(void *a, const char *n, int h4, int h6)
 {
 	emitf(a, "I %d %d %s\n", h4, h6, n);
@@ -1069,6 +1095,7 @@ void ui_emitter(struct session_obs *obs, sock_t fd)
 	e->fd = fd;
 	obs->arg = e;
 	obs->net = em_net;
+	obs->mapping4 = em_mapping4;
 	obs->link = em_link;
 	obs->rendezvous = em_rdv;
 	obs->rdv_stage = em_rdv_stage;
@@ -1108,6 +1135,10 @@ static void feed(struct ui *u, char *ln)
 	case 'N':
 		if (sscanf(ln + 1, "%d %d %d %79[^\n]", &a, &b, &c, s) == 4)
 			um_net(u, a, b, c, s);
+		break;
+	case 'M':
+		if (sscanf(ln + 1, "%d", &a) == 1)
+			um_mapping4(u, a);
 		break;
 	case 'I':
 		if (sscanf(ln + 1, "%d %d %31[^\n]", &a, &b, s) == 3)

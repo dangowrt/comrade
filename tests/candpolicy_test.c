@@ -139,7 +139,7 @@ static void fan_check(void)
 	/* Every pool member is advertised once, at the reflexive port, ranked
 	 * below the observed candidate; the observed one is not repeated. */
 	strcpy(sdp, base);
-	cand_sdp_fan_v4(sdp, sizeof(sdp), pool, 3);
+	cand_sdp_fan_v4(sdp, sizeof(sdp), pool, 3, 0);
 	assert(strstr(sdp, "198.51.100.7 40002 typ srflx"));
 	assert(strstr(sdp, "192.0.2.33 40002 typ srflx"));
 	at = strstr(sdp, "203.0.113.9");
@@ -155,7 +155,7 @@ static void fan_check(void)
 	strcpy(sdp,
 	       "a=ice-ufrag:abcd\r\n"
 	       "a=candidate:1 1 UDP 2 192.168.5.164 40000 typ host\r\n");
-	cand_sdp_fan_v4(sdp, sizeof(sdp), pool, 3);
+	cand_sdp_fan_v4(sdp, sizeof(sdp), pool, 3, 0);
 	assert(!strstr(sdp, "198.51.100.7"));
 
 	/* Reflexive ports disagree: the mapping is per-destination in the
@@ -163,7 +163,7 @@ static void fan_check(void)
 	strcpy(sdp,
 	       "a=candidate:1 1 UDP 9 203.0.113.9 40002 typ srflx raddr 0.0.0.0 rport 0\r\n"
 	       "a=candidate:2 1 UDP 8 192.0.2.33 40007 typ srflx raddr 0.0.0.0 rport 0\r\n");
-	cand_sdp_fan_v4(sdp, sizeof(sdp), pool, 3);
+	cand_sdp_fan_v4(sdp, sizeof(sdp), pool, 3, 0);
 	assert(!strstr(sdp, "198.51.100.7"));
 
 	/* Two observed members at one port (a multi-homed STUN name): only
@@ -171,7 +171,7 @@ static void fan_check(void)
 	strcpy(sdp,
 	       "a=candidate:1 1 UDP 9 203.0.113.9 40002 typ srflx raddr 0.0.0.0 rport 0\r\n"
 	       "a=candidate:2 1 UDP 8 192.0.2.33 40002 typ srflx raddr 0.0.0.0 rport 0\r\n");
-	cand_sdp_fan_v4(sdp, sizeof(sdp), pool, 3);
+	cand_sdp_fan_v4(sdp, sizeof(sdp), pool, 3, 0);
 	assert(strstr(sdp, "198.51.100.7 40002 typ srflx"));
 	at = strstr(sdp, "192.0.2.33");
 	assert(at && !strstr(at + 1, "192.0.2.33"));
@@ -179,14 +179,48 @@ static void fan_check(void)
 	/* A description without a trailing newline still parses whole. */
 	strcpy(sdp,
 	       "a=candidate:1 1 UDP 9 203.0.113.9 40002 typ srflx raddr 0.0.0.0 rport 0");
-	cand_sdp_fan_v4(sdp, sizeof(sdp), pool, 3);
+	cand_sdp_fan_v4(sdp, sizeof(sdp), pool, 3, 0);
 	assert(strstr(sdp, "198.51.100.7 40002 typ srflx"));
 	assert(strstr(sdp, "192.0.2.33 40002 typ srflx"));
 
 	/* A buffer with no room for a whole variant line stays as it was. */
 	strcpy(sdp, base);
-	cand_sdp_fan_v4(sdp, strlen(base) + 40, pool, 3);
+	cand_sdp_fan_v4(sdp, strlen(base) + 40, pool, 3, 0);
 	assert(!strcmp(sdp, base));
+}
+
+/*
+ * A probe-proven dependent mapping bails before any candidate is even
+ * scanned -- unlike the reactive port-disagreement check, this also covers
+ * the single-candidate case, where nothing has an existing port to disagree
+ * with.
+ */
+static void mapping_dependent_check(void)
+{
+	uint8_t pool[3][4];
+	char sdp[1024];
+	static const char one[] =
+		"a=ice-ufrag:abcd\r\n"
+		"a=candidate:2 1 UDP 1678769919 203.0.113.9 40002 typ srflx raddr 0.0.0.0 rport 0\r\n";
+	static const char agree[] =
+		"a=candidate:1 1 UDP 9 203.0.113.9 40002 typ srflx raddr 0.0.0.0 rport 0\r\n"
+		"a=candidate:2 1 UDP 8 192.0.2.33 40002 typ srflx raddr 0.0.0.0 rport 0\r\n";
+
+	assert(inet_pton(AF_INET, "203.0.113.9", pool[0]) == 1);
+	assert(inet_pton(AF_INET, "198.51.100.7", pool[1]) == 1);
+	assert(inet_pton(AF_INET, "192.0.2.33", pool[2]) == 1);
+
+	/* One candidate can never reactively disagree with itself, so today
+	 * this would be fanned; the probe's own verdict must stop it. */
+	strcpy(sdp, one);
+	cand_sdp_fan_v4(sdp, sizeof(sdp), pool, 3, 1);
+	assert(!strcmp(sdp, one));
+
+	/* Two candidates that happen to agree would be fanned reactively
+	 * (see fan_check); the probe's verdict overrides that optimism. */
+	strcpy(sdp, agree);
+	cand_sdp_fan_v4(sdp, sizeof(sdp), pool, 3, 1);
+	assert(!strcmp(sdp, agree));
 }
 
 int main(void)
@@ -196,5 +230,6 @@ int main(void)
 	sdp_filter_check();
 	drop_self_check();
 	fan_check();
+	mapping_dependent_check();
 	return 0;
 }

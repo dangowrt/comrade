@@ -91,9 +91,53 @@ static void parse_check(void)
 				  &port) != 0);
 }
 
+static void mapping_check(void)
+{
+	struct stun_mapping m;
+	static const uint8_t a1[4] = { 203, 0, 113, 9 };
+	static const uint8_t a2[4] = { 198, 51, 100, 7 };
+
+	/* Fewer than two samples: unknown either way. */
+	stun_mapping_reset(&m);
+	assert(stun_mapping_result(&m) == STUN_MAPPING_UNKNOWN);
+	stun_mapping_add(&m, a1, 40000);
+	assert(stun_mapping_result(&m) == STUN_MAPPING_UNKNOWN);
+
+	/* Every server sees the same (address, port): independent. */
+	stun_mapping_reset(&m);
+	stun_mapping_add(&m, a1, 40000);
+	stun_mapping_add(&m, a1, 40000);
+	assert(stun_mapping_result(&m) == STUN_MAPPING_INDEPENDENT);
+
+	/* Same address, a different port: dependent. */
+	stun_mapping_reset(&m);
+	stun_mapping_add(&m, a1, 40000);
+	stun_mapping_add(&m, a1, 40001);
+	assert(stun_mapping_result(&m) == STUN_MAPPING_DEPENDENT);
+
+	/* A different address entirely (a carrier pool): dependent. */
+	stun_mapping_reset(&m);
+	stun_mapping_add(&m, a1, 40000);
+	stun_mapping_add(&m, a2, 40000);
+	assert(stun_mapping_result(&m) == STUN_MAPPING_DEPENDENT);
+
+	/* Once disagreement is seen, a later agreeing sample does not undo
+	 * it -- the verdict is sticky. */
+	stun_mapping_reset(&m);
+	stun_mapping_add(&m, a1, 40000);
+	stun_mapping_add(&m, a1, 40000);
+	stun_mapping_add(&m, a2, 40000);
+	assert(stun_mapping_result(&m) == STUN_MAPPING_DEPENDENT);
+
+	/* A reset drops all of that and starts over. */
+	stun_mapping_reset(&m);
+	assert(stun_mapping_result(&m) == STUN_MAPPING_UNKNOWN);
+}
+
 int main(void)
 {
 	build_check();
 	parse_check();
+	mapping_check();
 	return 0;
 }

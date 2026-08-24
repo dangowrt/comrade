@@ -46,9 +46,13 @@ void cand_sdp_drop_self(const char *in, const struct netmon_addr *local,
  * observed candidate, addresses already present are not repeated, and a
  * description whose reflexive candidates disagree on the port is left alone
  * -- the mapping is per-destination in the port too, and no variant can be
- * named.
+ * named. `mapping_dependent` lets a caller who already knows the answer
+ * (e.g. from a STUN probe that queried several servers) skip the fan
+ * proactively, before any candidate is even scanned -- useful with only one
+ * srflx candidate gathered so far, when the reactive disagreement check
+ * above has nothing yet to compare against.
  */
 void cand_sdp_fan_v4(char *sdp, size_t cap, const uint8_t (*pool)[4],
-		     size_t npool);
+		     size_t npool, int mapping_dependent);
 
 #endif

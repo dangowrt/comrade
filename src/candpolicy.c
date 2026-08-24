@@ -169,7 +169,7 @@ void cand_sdp_filter(const char *in, int family_filter,
 }
 
 void cand_sdp_fan_v4(char *sdp, size_t cap, const uint8_t (*pool)[4],
-		     size_t npool)
+		     size_t npool, int mapping_dependent)
 {
 	uint8_t seen[8][4];
 	const char *line = sdp;
@@ -177,6 +177,8 @@ void cand_sdp_fan_v4(char *sdp, size_t cap, const uint8_t (*pool)[4],
 	unsigned prio = 0;
 	int port = -1;
 
+	if (mapping_dependent)
+		return;
 	while (*line) {
 		const char *nl = strchr(line, '\n');
 		size_t len = nl ? (size_t)(nl - line + 1) : strlen(line);
