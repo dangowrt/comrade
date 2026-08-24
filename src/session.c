@@ -407,6 +407,10 @@ struct sess {
 	pthread_t probe_th;		/* the active pool probe (stunprobe) */
 	int probe_running;
 	volatile int probe_stop;
+	pthread_t probe6_th;		/* the v6 connectivity check (stunprobe) --
+					 * proof only, no pool/mapping use for v6 */
+	int probe6_running;
+	volatile int probe6_stop;
 	/*
 	 * RFC 4787 mapping classification built from the same probe's
 	 * responses (see stun_mapping_add) -- read and grown under
@@ -414,6 +418,16 @@ struct sess {
 	 */
 	struct stun_mapping map4;
 	int mapping_reported;		/* 0 not yet, 1 sent independent, 2 sent dependent */
+
+	/*
+	 * Global connectivity per family (NET_CONN_*): UP once something has
+	 * actually answered (a real STUN reply), PENDING while merely routed,
+	 * 0 otherwise. UP is sticky -- only a roam resets it -- so a momentary
+	 * hiccup never walks it back. next_conn_ms paces the PENDING/DOWN
+	 * recheck; a family already UP has nothing left to poll for.
+	 */
+	int net_conn4, net_conn6;
+	uint64_t next_conn_ms;
 
 	/*
 	 * Host admission registry, all touched only on the host main thread (no
@@ -1270,9 +1284,23 @@ static void on_local_sdp(void *arg, const char *sdp)
 	s->have_local_sdp = 1;
 }
 
-/* libjuice gather thread: a candidate is ready. Append it for the main loop,
- * and note the v4 facts the STUN watchdog runs on -- here rather than in the
- * observer report, which not every caller wires up. */
+/* A family's connectivity is proven: something actually answered. Sticky --
+ * only a roam resets it -- and drives sig's own DHT eagerness for that
+ * family directly, rather than a timing guess. */
+static void net_conn_up(struct sess *s, int family)
+{
+	const struct session_obs *o = s->cfg->obs;
+	int *conn = family == 6 ? &s->net_conn6 : &s->net_conn4;
+
+	if (*conn == NET_CONN_UP)
+		return;
+	*conn = NET_CONN_UP;
+	if (s->sig)
+		sig_set_family_up(s->sig, family, 1);
+	if (o && o->net_conn)
+		o->net_conn(o->arg, family, NET_CONN_UP);
+}
+
 /* One more public v4 the NAT has been seen mapping us to; from the gather
  * thread and the probe thread alike. */
 static void pool_note(struct sess *s, const uint8_t b[4])
@@ -1299,6 +1327,7 @@ static void probe_hit(void *arg, const uint8_t addr[4], uint16_t port)
 {
 	pool_note(arg, addr);
 	mapping_note(arg, addr, port);
+	net_conn_up(arg, 4);
 }
 
 static void *stun_probe_thread(void *arg)
@@ -1338,6 +1367,54 @@ static void stun_probe_kick(struct sess *s)
 		s->probe_running = 1;
 }
 
+static void probe6_hit(void *arg)
+{
+	net_conn_up(arg, 6);
+}
+
+static void *stun_probe6_thread(void *arg)
+{
+	struct sess *s = arg;
+	char *targets[STUN_PROBE_SERVERS];
+	uint8_t seed[STUN_PROBE_TXID_LEN];
+	int n = 0, i;
+
+	for (i = 0; i < s->stun_count && n < STUN_PROBE_SERVERS; i++)
+		targets[n++] = s->stun_servers[(s->ice_attempt + i) %
+					       s->stun_count];
+	random_bytes(seed, sizeof(seed));
+	stun_probe_check(targets, n, AF_INET6, STUN_PROBE_MS, seed,
+			 &s->probe6_stop, probe6_hit, s);
+	return NULL;
+}
+
+static void stun_probe6_halt(struct sess *s)
+{
+	if (!s->probe6_running)
+		return;
+	s->probe6_stop = 1;
+	pthread_join(s->probe6_th, NULL);
+	s->probe6_running = 0;
+}
+
+/* v6's own connectivity proof: the same pool of servers, tried over a v6
+ * socket, independent of whether ICE ever bothers to gather a v6 srflx
+ * candidate (it does not when a global host candidate already exists, so
+ * relying on that alone misses real NAT66/filtered hosts and, worse, the
+ * ordinary case of a global address that just goes unconfirmed). */
+static void stun_probe6_kick(struct sess *s)
+{
+	if (s->cfg->stun_host || !s->cfg->stun_auto || s->stun_count < 1)
+		return;
+	stun_probe6_halt(s);
+	s->probe6_stop = 0;
+	if (!pthread_create(&s->probe6_th, NULL, stun_probe6_thread, s))
+		s->probe6_running = 1;
+}
+
+/* libjuice gather thread: a candidate is ready. Append it for the main loop,
+ * and note the v4 facts the STUN watchdog runs on -- here rather than in the
+ * observer report, which not every caller wires up. */
 static void on_ice_candidate(void *arg, const char *cand)
 {
 	struct sess *s = ((struct conn *)arg)->sess;
@@ -1346,16 +1423,21 @@ static void on_ice_candidate(void *arg, const char *cand)
 	char addr[64], typ[16];
 
 	if (p && sscanf(p, "candidate:%*s %*d %*s %*u %63s %*d typ %15s",
-			addr, typ) == 2 && !strchr(addr, ':')) {
-		if (!strcmp(typ, "srflx")) {
+			addr, typ) == 2) {
+		if (strchr(addr, ':')) {
+			if (!strcmp(typ, "srflx"))
+				net_conn_up(s, 6);	/* a real v6 STUN reply */
+		} else if (!strcmp(typ, "srflx")) {
 			uint8_t b[4];
 
 			s->have_srflx4 = 1;
+			net_conn_up(s, 4);
 			if (inet_pton(AF_INET, addr, b) == 1)
 				pool_note(s, b);
 		} else if (!strcmp(typ, "host") &&
-			   addr_scope(addr) != NET_SCOPE_GLOBAL)
+			   addr_scope(addr) != NET_SCOPE_GLOBAL) {
 			s->have_priv4 = 1;
+		}
 	}
 	pthread_mutex_lock(&s->trickle_lock);
 	used = strlen(s->trickle_sdp);
@@ -3118,10 +3200,12 @@ static int fam_usable_addr(const struct netmon_addr *addrs, size_t naddrs,
 
 /*
  * This family's DHT attempt can no longer produce an ack worth waiting for:
- * the operator declined the DHT outright, or the attempt armed with the
- * current sig has had its grace and sig is no longer storing to locate this
- * family. A rebuild on a roam re-arms it, so a move onto a network that does
- * reach the DHT is given a fresh run.
+ * the operator declined the DHT outright, or its grace has passed with
+ * neither family ever captured -- sig itself never stops trying a family
+ * once the other one has proven the DHT reachable, so past that point this
+ * only settles a family that looks isolated from the start (a captive
+ * portal, UDP blocked outbound). A rebuild on a roam re-arms it, so a move
+ * onto a network that does reach the DHT is given a fresh run.
  */
 static int dht_attempt_concluded(struct sess *s, int family)
 {
@@ -3147,6 +3231,41 @@ static void gather_facts(struct sess *s, int family,
 	f->dht_acked = sig_dht_acked(s->sig, family);
 	f->dht_attempt_concluded = dht_attempt_concluded(s, family);
 	f->public_port_proven = 0;	/* no UPnP/NAT-PMP/PCP in the tree */
+}
+
+#define NET_CONN_POLL_MS 1000
+
+/*
+ * Recheck PENDING/0 for a family that has not proven itself UP yet: a route
+ * existing is not proof of anything, so it never overrides an earlier UP,
+ * only fills in while there is nothing stronger to report.
+ */
+static void net_conn_pump(struct sess *s)
+{
+	const struct session_obs *o = s->cfg->obs;
+	static const int famv[2] = { 4, 6 };
+	int i;
+
+	if (now_ms() < s->next_conn_ms)
+		return;
+	s->next_conn_ms = now_ms() + NET_CONN_POLL_MS;
+	for (i = 0; i < 2; i++) {
+		int family = famv[i];
+		int *conn = family == 6 ? &s->net_conn6 : &s->net_conn4;
+		int af = family == 6 ? AF_INET6 : AF_INET;
+		char buf[64];
+		int want;
+
+		if (*conn == NET_CONN_UP)
+			continue;
+		want = source_addr(af, buf, sizeof(buf)) == 0 ?
+		       NET_CONN_PENDING : 0;
+		if (want != *conn) {
+			*conn = want;
+			if (o && o->net_conn)
+				o->net_conn(o->arg, family, want);
+		}
+	}
 }
 
 /*
@@ -3827,6 +3946,7 @@ static int host_turnstile(struct sess *s)
 		int active = 0;
 
 		pump_once(s, 100);		/* the main thread owns sig + lan */
+		net_conn_pump(s);		/* recheck PENDING/0 families */
 		maybe_announce_rendezvous(s);	/* report the rendezvous */
 		token_pump(s);			/* mint and advertise the token */
 		rdv_keep_warm(s);
@@ -3872,7 +3992,11 @@ static int host_turnstile(struct sess *s)
 			s->pool_reported = 0;
 			s->pool_posted = 0;
 			s->mapping_reported = 0;
+			s->net_conn4 = 0;
+			s->net_conn6 = 0;
+			s->next_conn_ms = 0;	/* recheck PENDING/0 at once */
 			stun_probe_kick(s);
+			stun_probe6_kick(s);
 			if (o && o->net_reset)
 				o->net_reset(o->arg);
 		}
@@ -4246,6 +4370,7 @@ int session_run(const struct session_cfg *cfg)
 		s.ice_attempt = ((rb[0] << 8) | rb[1]) % s.stun_count;
 	}
 	stun_probe_kick(&s);
+	stun_probe6_kick(&s);
 	nat_log_level(cfg->log_level);	/* < 0 silences libjuice (see nat_log_level) */
 
 	conn_gen_ice(&s.c);
@@ -4274,6 +4399,7 @@ int session_run(const struct session_cfg *cfg)
 		const struct session_obs *o = cfg->obs;
 
 		pump_once(&s, 100);
+		net_conn_pump(&s);
 		maybe_announce_rendezvous(&s);
 		token_pump(&s);
 		/*
@@ -4316,7 +4442,11 @@ int session_run(const struct session_cfg *cfg)
 			s.pool_reported = 0;
 			s.pool_posted = 0;
 			s.mapping_reported = 0;
+			s.net_conn4 = 0;
+			s.net_conn6 = 0;
+			s.next_conn_ms = 0;	/* recheck PENDING/0 at once */
 			stun_probe_kick(&s);
+			stun_probe6_kick(&s);
 			if (o && o->net_reset)
 				o->net_reset(o->arg);
 		}
@@ -4568,7 +4698,11 @@ int session_run(const struct session_cfg *cfg)
 					s.pool_reported = 0;
 					s.pool_posted = 0;
 					s.mapping_reported = 0;
+					s.net_conn4 = 0;
+					s.net_conn6 = 0;
+					s.next_conn_ms = 0;	/* recheck PENDING/0 at once */
 					stun_probe_kick(&s);
+					stun_probe6_kick(&s);
 					if (o && o->net_reset)
 						o->net_reset(o->arg);
 					pthread_mutex_lock(&s.c.path_lock);
@@ -4618,6 +4752,7 @@ done:
 		lanlink_destroy(s.lan);
 	sig_destroy(s.sig);
 	stun_probe_halt(&s);
+	stun_probe6_halt(&s);
 	stunlist_free(s.stun_servers, s.stun_count);
 	pthread_mutex_destroy(&s.trickle_lock);
 	pthread_mutex_destroy(&s.c.status_lock);

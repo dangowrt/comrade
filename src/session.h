@@ -34,6 +34,16 @@ enum {					/* how a path was learnt, for obs.net */
 	NET_VIA_DIRECT,			/* locally gathered host candidate */
 	NET_VIA_STUN			/* server-reflexive, learnt via STUN */
 };
+/*
+ * A family's global connectivity, for obs.net_conn -- proof, not a guess.
+ * UP is sticky once earned: a family does not fall back to PENDING short of
+ * a network change, which resets it. Bits, not a plain enum, so a later
+ * verdict (NAT type, filtering) can be added alongside UP without another
+ * callback.
+ */
+#define NET_CONN_UP	  (1 << 0)	/* proven: a real STUN reply arrived */
+#define NET_CONN_PENDING (1 << 1)	/* a route exists; not yet proven */
+					/* 0: no route for this family at all */
 enum {					/* peer lifecycle for obs.peer */
 	SESSION_PEER_SEEN,		/* mailbox read: peer endpoints known */
 	SESSION_PEER_PUNCHING,		/* negotiating a path */
@@ -57,6 +67,8 @@ struct session_obs {
 	 * server (1) or the same way to all of them (0) -- known only once the
 	 * STUN pool probe has heard back from at least two servers. */
 	void (*mapping4)(void *arg, int dependent);
+	/* A family's connectivity verdict changed (NET_CONN_* or 0). */
+	void (*net_conn)(void *arg, int family, int status);
 	/* An up multicast interface being serviced, and the families it has. */
 	void (*link)(void *arg, const char *ifname, int have4, int have6);
 	/* A per-family rendezvous node: located (host) or seeded (client). */

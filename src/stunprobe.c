@@ -31,11 +31,13 @@ void stun_probe_build(uint8_t out[STUN_PROBE_REQ_LEN],
 	memcpy(out + 8, txid, STUN_PROBE_TXID_LEN);
 }
 
-int stun_probe_mapped4(const uint8_t *pkt, size_t len,
-		       const uint8_t seed[STUN_PROBE_TXID_LEN],
-		       uint8_t addr[4], uint16_t *port)
+/* Shared STUN response validation: success type, magic cookie, and our seed
+ * in the transaction id (all but its per-server last byte, which numbers
+ * whichever server answered). Returns the attribute block's length, or -1
+ * if any of that does not hold. */
+static int stun_reply_ok(const uint8_t *pkt, size_t len,
+			 const uint8_t seed[STUN_PROBE_TXID_LEN])
 {
-	size_t i = 20;
 	unsigned mlen;
 
 	if (len < 20)
@@ -49,6 +51,18 @@ int stun_probe_mapped4(const uint8_t *pkt, size_t len,
 	    pkt[6] != ((STUN_MAGIC >> 8) & 0xff) || pkt[7] != (STUN_MAGIC & 0xff))
 		return -1;
 	if (memcmp(pkt + 8, seed, STUN_PROBE_TXID_LEN - 1))
+		return -1;
+	return (int)mlen;
+}
+
+int stun_probe_mapped4(const uint8_t *pkt, size_t len,
+		       const uint8_t seed[STUN_PROBE_TXID_LEN],
+		       uint8_t addr[4], uint16_t *port)
+{
+	size_t i = 20;
+	int mlen = stun_reply_ok(pkt, len, seed);
+
+	if (mlen < 0)
 		return -1;
 
 	while (i + 4 <= 20 + (size_t)mlen) {
@@ -161,6 +175,128 @@ void stun_probe_run(char *const *servers, int nservers, int total_ms,
 			    !stun_probe_mapped4(buf, (size_t)r, seed, addr,
 						&port))
 				hit(arg, addr, port);
+		}
+	}
+	sock_close(fd);
+}
+
+/* Whether a validated reply (stun_reply_ok) also carries a mapped-address
+ * attribute of the wire-format family byte `want_fam` (0x01 v4, 0x02 v6).
+ * The address itself is not decoded: proof needs only that this family's
+ * server answered, nothing kept. */
+static int stun_reply_has_family(const uint8_t *pkt, size_t len,
+				 const uint8_t seed[STUN_PROBE_TXID_LEN],
+				 int want_fam)
+{
+	size_t i = 20;
+	int mlen = stun_reply_ok(pkt, len, seed);
+
+	if (mlen < 0)
+		return -1;
+	while (i + 4 <= 20 + (size_t)mlen) {
+		unsigned at = (pkt[i] << 8) | pkt[i + 1];
+		unsigned al = (pkt[i + 2] << 8) | pkt[i + 3];
+		const uint8_t *v = pkt + i + 4;
+
+		if (i + 4 + al > len)
+			return -1;
+		if ((at == STUN_ATTR_XOR_MAPPED || at == STUN_ATTR_MAPPED) &&
+		    al >= 4 && v[1] == want_fam)
+			return 0;
+		i += 4 + ((al + 3) & ~3u);
+	}
+	return -1;
+}
+
+/* "host:port" resolved to a target of `family`; 3478 with no or unparsable
+ * port. Unlike resolve4, keeps whatever sockaddr length getaddrinfo hands
+ * back, since a v6 target is a different size. */
+static int resolve_stun(const char *server, int family,
+			struct sockaddr_storage *out, socklen_t *outlen)
+{
+	struct addrinfo hints, *res;
+	const char *colon = strrchr(server, ':');
+	char host[128];
+	const char *port = "3478";
+	size_t hl = colon ? (size_t)(colon - server) : strlen(server);
+
+	if (hl >= sizeof(host))
+		return -1;
+	memcpy(host, server, hl);
+	host[hl] = '\0';
+	if (colon && colon[1])
+		port = colon + 1;
+
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = family;
+	hints.ai_socktype = SOCK_DGRAM;
+	if (getaddrinfo(host, port, &hints, &res) || !res)
+		return -1;
+	memcpy(out, res->ai_addr, (size_t)res->ai_addrlen);
+	*outlen = (socklen_t)res->ai_addrlen;
+	freeaddrinfo(res);
+	return 0;
+}
+
+void stun_probe_check(char *const *servers, int nservers, int family,
+		      int total_ms, uint8_t seed[STUN_PROBE_TXID_LEN],
+		      volatile int *stop, void (*hit)(void *arg), void *arg)
+{
+	struct sockaddr_storage dst[16];
+	socklen_t dlen[16];
+	int have[16];
+	uint64_t t0, next_send = 0;
+	sock_t fd;
+	int i, n = nservers;
+	int want_fam = family == AF_INET6 ? 0x02 : 0x01;
+
+	if (n > 16)
+		n = 16;
+	fd = socket(family, SOCK_DGRAM, 0);
+	if (!sock_valid(fd))
+		return;
+
+	memset(have, 0, sizeof(have));
+	for (i = 0; i < n; i++) {
+		if (stop && *stop)
+			break;
+		have[i] = resolve_stun(servers[i], family, &dst[i],
+				       &dlen[i]) == 0;
+	}
+
+	t0 = os_mono_ms();
+	while (!(stop && *stop) && os_mono_ms() - t0 < (uint64_t)total_ms) {
+		struct pollfd pf;
+		uint64_t now = os_mono_ms();
+
+		if (now >= next_send) {
+			for (i = 0; i < n; i++) {
+				uint8_t req[STUN_PROBE_REQ_LEN];
+
+				if (!have[i])
+					continue;
+				seed[STUN_PROBE_TXID_LEN - 1] = (uint8_t)i;
+				stun_probe_build(req, seed);
+				sendto(fd, (const char *)req, sizeof(req), 0,
+				       (struct sockaddr *)&dst[i], dlen[i]);
+			}
+			next_send = now + PROBE_RESEND_MS;
+		}
+
+		pf.fd = fd;
+		pf.events = POLLIN;
+		pf.revents = 0;
+		if (sock_poll(&pf, 1, PROBE_TICK_MS) > 0 &&
+		    (pf.revents & POLLIN)) {
+			uint8_t buf[512];
+			int r = recvfrom(fd, (char *)buf, sizeof(buf), 0,
+					 NULL, NULL);
+
+			if (r > 0 && !stun_reply_has_family(buf, (size_t)r,
+							    seed, want_fam)) {
+				hit(arg);
+				break;
+			}
 		}
 	}
 	sock_close(fd);

@@ -143,6 +143,13 @@ void sig_set_mcast_claims(struct sig *s, int on);
  */
 int sig_seed_node(struct sig *s, const struct sockaddr *sa, socklen_t len);
 int sig_locate(struct sig *s);
+/*
+ * Host: `family`'s connectivity is proven (a real STUN reply), or no longer
+ * is (a network change). While up, a still-missing family's rendezvous node
+ * is chased eagerly and indefinitely -- proof, not a timing guess, decides
+ * how hard to keep trying.
+ */
+void sig_set_family_up(struct sig *s, int family, int up);
 /* Host: adopt an already-known rendezvous node (from a persisted token) as the
  * located anchor and keep it warm with the direct store, instead of locating a
  * fresh one -- so the token stays stable across idle re-attempts. */
@@ -161,11 +168,13 @@ int sig_located(struct sig *s, int family, struct sockaddr *out,
 int sig_dht_acked(struct sig *s, int family);
 
 /*
- * Host: whether `family` is still inside the bounded run of stores that follows
- * the first family's capture, which is where a slower second DHT is given its
- * own chance to serve the value back. False for a family already captured, and
- * false before any capture at all -- there is no window yet, so a caller waiting
- * on an ack has only its own deadline to settle that family by.
+ * Host: still actively chasing `family`'s rendezvous node -- true once the
+ * other family has proven the DHT reachable at all, until this one is
+ * captured too, however long that takes: no fixed run length, since a slower
+ * DHT converging is not distinguishable in advance from one that never will.
+ * False for a family already captured, and false before any capture at all --
+ * a caller waiting on an ack has only its own deadline to settle that family
+ * by until then.
  */
 int sig_locating(struct sig *s, int family);
 

@@ -75,6 +75,7 @@ struct ui {
 	int nnet;
 	int mapping_known;
 	int mapping_dependent;
+	int conn4, conn6;		/* NET_CONN_* (0 = down) */
 	struct linkrow link[8];
 	int nlink;
 	struct rdvrow rdv[2];		/* fixed slots: [0] v4, [1] v6 */
@@ -237,6 +238,22 @@ static void net_label(int scope, int via, const char **color, const char **text)
 	} else {
 		*color = CYN;
 		*text = "GLOBAL";
+	}
+}
+
+/* A family's connectivity verdict, home-readable: UP is proven (a real
+ * reply arrived), PENDING is routed but unproven, DOWN is neither. */
+static void conn_label(int status, const char **color, const char **text)
+{
+	if (status & NET_CONN_UP) {
+		*color = BGR;
+		*text = "UP";
+	} else if (status & NET_CONN_PENDING) {
+		*color = YEL;
+		*text = "PENDING";
+	} else {
+		*color = DIM;
+		*text = "DOWN";
 	}
 }
 
@@ -405,6 +422,7 @@ static void draw_qr(struct ui *u)
 static void draw(struct ui *u)
 {
 	int i, f = u->spin & 3, ns = 0, rc;
+	const char *c4, *t4, *c6, *t6;
 
 	if (u->view == UI_VIEW_QR_RO && !u->have_token_ro)
 		u->view = UI_VIEW_QR_RW;
@@ -437,7 +455,11 @@ static void draw(struct ui *u)
 	for (i = 0; i < u->nnet; i++)
 		if (u->net[i].via == NET_VIA_STUN)
 			ns = 2;
-	line(CYN "NETWORK" RST "  " YEL "%c" RST "%s", net_flavor[ns][f],
+	conn_label(u->conn4, &c4, &t4);
+	conn_label(u->conn6, &c6, &t6);
+	line(CYN "NETWORK" RST "  " YEL "%c" RST
+	     "  " DIM "global v4" RST " %s%s" RST " " DIM "v6" RST " %s%s" RST "%s",
+	     net_flavor[ns][f], c4, t4, c6, t6,
 	     u->mapping_known && u->mapping_dependent ?
 	     DIM "  (per-destination NAT mapping)" RST : "");
 	if (!u->nnet && !u->nlink)
@@ -820,6 +842,20 @@ static void um_mapping4(struct ui *u, int dependent)
 		     dependent ? "per-destination" : "stable");
 }
 
+static void um_net_conn(struct ui *u, int family, int status)
+{
+	int *conn = family == 6 ? &u->conn6 : &u->conn4;
+	const char *word = status & NET_CONN_UP ? "up" :
+			    status & NET_CONN_PENDING ? "pending" : "down";
+
+	*conn = status;
+	if (u->anim)
+		u->dirty = 1;
+	else
+		vlog(u, "local  %s connectivity: %s",
+		     family == 6 ? "ipv6" : "ipv4", word);
+}
+
 static void um_escalate_clear(struct ui *u)
 {
 	if (!u->anim) {
@@ -848,6 +884,8 @@ static void um_reset(struct ui *u)
 {
 	u->nnet = 0;
 	u->mapping_known = 0;
+	u->conn4 = 0;
+	u->conn6 = 0;
 	u->npeer = 0;
 	u->established = 0;
 	if (u->anim)
@@ -860,6 +898,8 @@ static void um_net_reset(struct ui *u)
 {
 	u->nnet = 0;
 	u->mapping_known = 0;
+	u->conn4 = 0;
+	u->conn6 = 0;
 	if (u->anim)
 		u->dirty = 1;
 	else
@@ -873,6 +913,7 @@ static void cb_net(void *a, int f, int sc, int v, const char *ad)
 	um_net(a, f, sc, v, ad);
 }
 static void cb_mapping4(void *a, int d) { um_mapping4(a, d); }
+static void cb_net_conn(void *a, int f, int st) { um_net_conn(a, f, st); }
 static void cb_link(void *a, const char *n, int h4, int h6) { um_link(a, n, h4, h6); }
 static void cb_rdv(void *a, int f, const char *ad, int rd) { um_rdv(a, f, rd, ad); }
 static void cb_rdv_stage(void *a, int f, int st) { um_rdv_stage(a, f, st); }
@@ -917,6 +958,7 @@ void ui_bind(struct ui *u, struct session_obs *obs)
 	obs->arg = u;
 	obs->net = cb_net;
 	obs->mapping4 = cb_mapping4;
+	obs->net_conn = cb_net_conn;
 	obs->link = cb_link;
 	obs->rendezvous = cb_rdv;
 	obs->rdv_stage = cb_rdv_stage;
@@ -1033,6 +1075,10 @@ static void em_mapping4(void *a, int d)
 {
 	emitf(a, "M %d\n", d);
 }
+static void em_net_conn(void *a, int f, int st)
+{
+	emitf(a, "F %d %d\n", f, st);
+}
 static void em_link(void *a, const char *n, int h4, int h6)
 {
 	emitf(a, "I %d %d %s\n", h4, h6, n);
@@ -1109,6 +1155,7 @@ void ui_emitter(struct session_obs *obs, sock_t fd)
 	obs->arg = e;
 	obs->net = em_net;
 	obs->mapping4 = em_mapping4;
+	obs->net_conn = em_net_conn;
 	obs->link = em_link;
 	obs->rendezvous = em_rdv;
 	obs->rdv_stage = em_rdv_stage;
@@ -1152,6 +1199,10 @@ static void feed(struct ui *u, char *ln)
 	case 'M':
 		if (sscanf(ln + 1, "%d", &a) == 1)
 			um_mapping4(u, a);
+		break;
+	case 'F':
+		if (sscanf(ln + 1, "%d %d", &a, &b) == 2)
+			um_net_conn(u, a, b);
 		break;
 	case 'I':
 		if (sscanf(ln + 1, "%d %d %31[^\n]", &a, &b, s) == 3)

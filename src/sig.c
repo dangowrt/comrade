@@ -33,9 +33,10 @@
 #define SIG_DHT_GRACE_MS 2000
 #define SIG_DHT_OPEN_MS 1000		/* retry the DHT half this often while a
 					 * node cannot be created */
-#define SIG_LOCATE_BOTH_MS 20000	/* keep re-storing after the first family
-					 * is captured, so the second's DHT (once
-					 * converged) also gets the value to serve */
+#define SIG_DHT_PUT_SLOW_MS 20000	/* a still-missing family with no proven
+					 * connectivity yet is retried at this
+					 * slower pace instead of not at all --
+					 * see sig_set_family_up. */
 
 struct sig {
 	unsigned flags;
@@ -77,6 +78,7 @@ struct sig {
 	socklen_t rnode6_len;
 	int acked4, acked6;		/* a validated get had a node of this
 					 * family serve our own value back */
+	int up4, up6;			/* proven connectivity, see sig_set_family_up */
 	uint64_t first_locate_ms;	/* when the first family was captured */
 	int rdv_stage;			/* engine-wide progress: cold/warmup/store/get */
 
@@ -321,6 +323,14 @@ int sig_seed_node(struct sig *s, const struct sockaddr *sa, socklen_t len)
 	return bep44_pin_add(s->engine, NULL, sa, len);
 }
 
+void sig_set_family_up(struct sig *s, int family, int up)
+{
+	if (family == 6)
+		s->up6 = up;
+	else
+		s->up4 = up;
+}
+
 int sig_locate(struct sig *s)
 {
 	if (!(s->flags & SIG_DHT))
@@ -355,9 +365,12 @@ int sig_locating(struct sig *s, int family)
 
 	if (!(s->flags & SIG_DHT) || !s->is_host || !s->locate || rl)
 		return 0;
-	if (!s->first_locate_ms)
-		return 0;
-	return now_ms() - s->first_locate_ms < SIG_LOCATE_BOTH_MS;
+	/* Still actively pursued once the other family has proven the DHT
+	 * reachable at all: there is no fixed point past which a family that
+	 * has not answered yet is known to never will, so this stays true
+	 * (still PENDING, not settled to NONE) until it is captured or the
+	 * session ends. */
+	return s->first_locate_ms != 0;
 }
 
 int sig_reinforce(struct sig *s, int family, const struct sockaddr *sa,
@@ -380,7 +393,7 @@ int sig_reinforce(struct sig *s, int family, const struct sockaddr *sa,
 					 * never re-captures a different one. A
 					 * still-missing family is located as usual;
 					 * once none is missing, dht_pump reinforces. */
-	if (!s->first_locate_ms)	/* bound any locate of a missing family */
+	if (!s->first_locate_ms)	/* paces any locate of a missing family */
 		s->first_locate_ms = now_ms();
 	return 0;
 }
@@ -642,22 +655,26 @@ static void dht_pump(struct sig *s, uint64_t now)
 		 * (idiomatic and discoverable) and the validating get captures
 		 * one as the anchor. It repeats until that family is captured --
 		 * the v6 DHT converges later than v4, so an early store misses
-		 * its k-closest -- but stops a bounded time after the first
-		 * capture, so a single-family host does not chase a family it
-		 * cannot reach. An already-anchored family is never re-located.
+		 * its k-closest. It keeps retrying for as long as it takes rather
+		 * than giving up on a timing guess: eager for as long as a still-
+		 * missing family's own connectivity is proven up (sig_set_family_up),
+		 * slower otherwise, never stopping outright. An already-anchored
+		 * family is never re-located.
 		 */
-		int locating = (!s->rnode4_len || !s->rnode6_len) &&
-			       (!s->first_locate_ms ||
-				now - s->first_locate_ms < SIG_LOCATE_BOTH_MS);
+		int missing = !s->rnode4_len || !s->rnode6_len;
 
-		if (s->mb.have_mine && locating && !s->put_inflight) {
+		if (s->mb.have_mine && missing && !s->put_inflight) {
+			int eager = (!s->rnode4_len && s->up4) ||
+				    (!s->rnode6_len && s->up6);
+
 			s->put_inflight = 1;
 			if (s->rdv_stage < 2)
 				s->rdv_stage = 2;	/* placing the mailbox */
 			bep44_update(s->engine, s->keys.bep44_sk,
 				     s->keys.bep44_pk, SIG_SALT, sig_merge,
 				     s, on_host_put, s);
-			s->next_put_ms = now + SIG_DHT_PUT_MS;
+			s->next_put_ms = now +
+				(eager ? SIG_DHT_PUT_MS : SIG_DHT_PUT_SLOW_MS);
 		} else if (s->mb.have_mine && (s->rnode4_len || s->rnode6_len) &&
 			   s->mb.need_write) {
 			/*

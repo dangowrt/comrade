@@ -39,6 +39,20 @@ void stun_probe_run(char *const *servers, int nservers, int total_ms,
 		    stun_probe_hit *hit, void *arg);
 
 /*
+ * Ask up to `nservers` "host:port" STUN servers of `family` (AF_INET or
+ * AF_INET6) for a binding response, calling `hit` once real proof arrives --
+ * a validated reply to this exact request, nothing more kept: no mapped
+ * address, no pool. What connectivity proof needs is only that this family
+ * can reach a server and be answered; stun_probe_run is still where a v4
+ * mapped address and its NAT classification come from. Runs for at most
+ * `total_ms`, or until *stop goes nonzero, calling `hit` at most once.
+ * Blocking (resolution included) -- meant for a thread of its own.
+ */
+void stun_probe_check(char *const *servers, int nservers, int family,
+		      int total_ms, uint8_t seed[STUN_PROBE_TXID_LEN],
+		      volatile int *stop, void (*hit)(void *arg), void *arg);
+
+/*
  * RFC 4787 mapping-behaviour classification, built incrementally from the
  * (address, port) pairs a probe run's `hit` callback sees: every server
  * agreeing means an endpoint-independent (cone-family) mapping; any
