@@ -9,75 +9,23 @@
 
 #include "sig_mcast.h"
 
-#ifdef _WIN32
-
 /*
- * Link-local discovery is off on Windows for now.
- *
- * Nothing here is impossible -- Windows has IP_ADD_MEMBERSHIP and
- * IPV6_JOIN_GROUP, and GetAdaptersAddresses supplies the interface list that
- * netmon.c already walks. What it does not have is Linux's `struct ip_mreqn`,
- * whose imr_ifindex is how this module joins and sources per interface: on
- * Winsock the v4 join takes an interface *address*, so every interface's IPv4
- * address has to be collected and threaded through open4()/sig_mcast_send()
- * as well as its index. That is a real change to the module's shape, and it
- * cannot be tested here without a second machine on the segment.
- *
- * Returning NULL is a supported outcome: sig_create() drops SIG_MCAST and
- * engages the DHT immediately (see sig.c), which is the path a client on a
- * different network takes anyway. The cost on Windows is that two peers on one
- * LAN take the DHT/STUN route instead of the direct one.
+ * Interface enumeration is the only genuinely platform-specific part: getifaddrs
+ * on POSIX, GetAdaptersAddresses on Windows (already linked by netmon.c). Both
+ * fill the same table -- per interface, its v6 index, its primary v4 address and
+ * which families it carries -- and everything else (socket setup, the
+ * address-based v4 join and index-based v6 join, send, receive) is one sock_t /
+ * wsock body shared by both. The Windows branch cannot be exercised on Linux; it
+ * is validated on the Windows VM (W1-W4). sig_mcast_open returning NULL stays a
+ * supported fallback on every OS (sig.c drops SIG_MCAST).
  */
-struct sig_mcast *sig_mcast_open(void)
-{
-	return NULL;
-}
 
-void sig_mcast_close(struct sig_mcast *m)
-{
-	(void)m;
-}
-
-int sig_mcast_ifaces(struct sig_mcast *m, struct sig_mcast_if *out, int max)
-{
-	(void)m;
-	(void)out;
-	(void)max;
-	return 0;
-}
-
-int sig_mcast_send(struct sig_mcast *m, const char *salt,
-		   const uint8_t *data, size_t len)
-{
-	(void)m;
-	(void)salt;
-	(void)data;
-	(void)len;
-	return -1;
-}
-
-int sig_mcast_prepare(struct sig_mcast *m, struct pollfd *fds, int maxfds)
-{
-	(void)m;
-	(void)fds;
-	(void)maxfds;
-	return 0;
-}
-
-void sig_mcast_dispatch(struct sig_mcast *m, const struct pollfd *fds, int nfds,
-			sig_mcast_recv_cb *cb, void *arg)
-{
-	(void)m;
-	(void)fds;
-	(void)nfds;
-	(void)cb;
-	(void)arg;
-}
-
-#else /* !_WIN32 */
-
+#ifdef _WIN32
+#include <iphlpapi.h>
+#else
 #include <ifaddrs.h>
 #include <net/if.h>
+#endif
 
 #define MCAST_PORT 47654
 #define MCAST_V4 "224.0.0.224"
@@ -91,13 +39,75 @@ void sig_mcast_dispatch(struct sig_mcast *m, const struct pollfd *fds, int nfds,
 struct sig_mcast {
 	sock_t s4;
 	sock_t s6;
-	unsigned ifidx[MCAST_MAX_IF];
+	unsigned ifidx[MCAST_MAX_IF];		/* v6 interface index (join/source) */
 	struct in_addr ifaddr4[MCAST_MAX_IF];	/* primary v4 address, for the
 						 * address-based join / source */
+	char ifname[MCAST_MAX_IF][64];		/* Windows only: display name */
 	uint8_t ifhas4[MCAST_MAX_IF];	/* interface carries a v4 address */
 	uint8_t ifhas6[MCAST_MAX_IF];	/* interface carries a v6 address */
 	int nif;
 };
+
+#ifdef _WIN32
+
+static void collect_ifaces(struct sig_mcast *m)
+{
+	ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
+		      GAA_FLAG_SKIP_DNS_SERVER;
+	IP_ADAPTER_ADDRESSES *aa, *a;
+	ULONG size = 0;
+	int slot;
+
+	if (GetAdaptersAddresses(AF_UNSPEC, flags, NULL, NULL, &size) !=
+	    ERROR_BUFFER_OVERFLOW)
+		return;
+	aa = malloc(size);
+	if (!aa)
+		return;
+	if (GetAdaptersAddresses(AF_UNSPEC, flags, NULL, aa, &size) != NO_ERROR) {
+		free(aa);
+		return;
+	}
+	for (a = aa; a && m->nif < MCAST_MAX_IF; a = a->Next) {
+		IP_ADAPTER_UNICAST_ADDRESS *u;
+
+		if (a->OperStatus != IfOperStatusUp ||
+		    a->IfType == IF_TYPE_SOFTWARE_LOOPBACK ||
+		    (a->Flags & IP_ADAPTER_NO_MULTICAST))
+			continue;
+		slot = m->nif;
+		m->ifhas4[slot] = 0;
+		m->ifhas6[slot] = 0;
+		m->ifaddr4[slot].s_addr = 0;
+		for (u = a->FirstUnicastAddress; u; u = u->Next) {
+			SOCKADDR *sa = u->Address.lpSockaddr;
+
+			if (!sa)
+				continue;
+			if (sa->sa_family == AF_INET && !m->ifhas4[slot]) {
+				m->ifhas4[slot] = 1;
+				m->ifaddr4[slot] =
+					((struct sockaddr_in *)sa)->sin_addr;
+			} else if (sa->sa_family == AF_INET6) {
+				m->ifhas6[slot] = 1;
+			}
+		}
+		if (!m->ifhas4[slot] && !m->ifhas6[slot])
+			continue;
+		/* One index per adapter: the v6 index drives the v6 join and the
+		 * v6 source select; the v4 path is address-based, not index-based. */
+		m->ifidx[slot] = a->Ipv6IfIndex ? a->Ipv6IfIndex : a->IfIndex;
+		if (a->FriendlyName)
+			WideCharToMultiByte(CP_UTF8, 0, a->FriendlyName, -1,
+					    m->ifname[slot],
+					    (int)sizeof(m->ifname[slot]),
+					    NULL, NULL);
+		m->nif++;
+	}
+	free(aa);
+}
+
+#else /* !_WIN32 */
 
 static void collect_ifaces(struct sig_mcast *m)
 {
@@ -145,6 +155,8 @@ static void collect_ifaces(struct sig_mcast *m)
 	}
 	freeifaddrs(ifa);
 }
+
+#endif /* _WIN32 */
 
 static sock_t open4(struct sig_mcast *m)
 {
@@ -285,9 +297,13 @@ int sig_mcast_ifaces(struct sig_mcast *m, struct sig_mcast_if *out, int max)
 	int i, n = 0;
 
 	for (i = 0; i < m->nif && n < max; i++) {
+#ifdef _WIN32
+		snprintf(out[n].name, sizeof(out[n].name), "%.31s", m->ifname[i]);
+#else
 		if (!if_indextoname(m->ifidx[i], out[n].name))
 			snprintf(out[n].name, sizeof(out[n].name), "if%u",
 				 m->ifidx[i]);
+#endif
 		out[n].has4 = m->ifhas4[i];
 		out[n].has6 = m->ifhas6[i];
 		n++;
@@ -378,8 +394,8 @@ static void drain(sock_t s, sig_mcast_recv_cb *cb, void *arg)
 	for (;;) {
 		struct sockaddr_storage src;
 		socklen_t srclen = sizeof(src);
-		ssize_t rc = recvfrom(s, (char *)buf, sizeof(buf), 0,
-				      (struct sockaddr *)&src, &srclen);
+		int rc = recvfrom(s, (char *)buf, (int)sizeof(buf), 0,
+				  (struct sockaddr *)&src, &srclen);
 		size_t salt_len, payload;
 
 		if (rc <= MCAST_MAGIC_LEN + 1)
@@ -410,5 +426,3 @@ void sig_mcast_dispatch(struct sig_mcast *m, const struct pollfd *fds, int nfds,
 			drain(fds[i].fd, cb, arg);
 	}
 }
-
-#endif /* _WIN32 */
