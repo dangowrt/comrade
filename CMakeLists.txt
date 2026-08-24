@@ -281,6 +281,12 @@ target_link_libraries(comrade_conn PUBLIC comrade_compat)
 add_library(comrade_fwdspec STATIC src/fwdspec.c)
 target_include_directories(comrade_fwdspec PUBLIC src)
 
+# Per-family reachability: what this host knows about its own network, and what
+# stops being true when it moves. Deliberately links nothing -- no sockets, no
+# threads, no clock -- so it can be driven entirely from synthetic events.
+add_library(comrade_netstate STATIC src/netstate.c)
+target_include_directories(comrade_netstate PUBLIC src)
+
 add_library(comrade_statusbar STATIC src/statusbar.c)
 target_include_directories(comrade_statusbar PUBLIC src)
 target_link_libraries(comrade_statusbar PUBLIC comrade_conn comrade_compat)
@@ -650,6 +656,10 @@ if(BUILD_TESTING)
 	target_link_libraries(tokgen_test comrade_token)
 	add_test(NAME tokgen_test COMMAND tokgen_test)
 
+	add_executable(netstate_test tests/netstate_test.c)
+	target_link_libraries(netstate_test comrade_netstate)
+	add_test(NAME netstate_test COMMAND netstate_test)
+
 	add_executable(termfilter_test tests/termfilter_test.c)
 	target_link_libraries(termfilter_test comrade_termfilter)
 	add_test(NAME termfilter_test COMMAND termfilter_test)
@@ -885,7 +895,8 @@ endif()
 #
 if(BUILD_TESTING)
 	foreach(t IN ITEMS
-		token_test tokgen_test termfilter_test ctlproto_test netmon_test
+		token_test tokgen_test netstate_test termfilter_test
+		ctlproto_test netmon_test
 		candpolicy_test candpack_test mailbox_test roauth_test
 		stunprobe_test path_test bep44_test
 		bep44_pin_test sig_rebuild_test natstream_test stream_room_test
