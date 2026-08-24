@@ -78,6 +78,16 @@ struct sig {
 	socklen_t rnode6_len;
 	int acked4, acked6;		/* a validated get had a node of this
 					 * family serve our own value back */
+	/*
+	 * The node that served the last validated get, per family, waiting to be
+	 * read. Who answered is what says whether the rendezvous we hold is
+	 * still the rendezvous, so it is reported rather than acted on here:
+	 * keeping or replacing an anchor is a decision about the network we are
+	 * on, and that is not this module's to make.
+	 */
+	struct sockaddr_storage ack_node4, ack_node6;
+	socklen_t ack_node4_len, ack_node6_len;
+	int ack_new4, ack_new6;
 	int up4, up6;			/* proven connectivity, see sig_set_family_up */
 	uint64_t first_locate_ms;	/* when the first family was captured */
 	int rdv_stage;			/* engine-wide progress: cold/warmup/store/get */
@@ -359,6 +369,33 @@ int sig_dht_acked(struct sig *s, int family)
 	return family == 6 ? s->acked6 : s->acked4;
 }
 
+int sig_take_ack(struct sig *s, int family, struct sockaddr *out,
+		 socklen_t *out_len)
+{
+	int *have = family == 6 ? &s->ack_new6 : &s->ack_new4;
+	const struct sockaddr_storage *n = family == 6 ? &s->ack_node6 :
+							&s->ack_node4;
+	socklen_t nl = family == 6 ? s->ack_node6_len : s->ack_node4_len;
+
+	if (!*have || !nl || *out_len < nl)
+		return 0;
+	memcpy(out, n, nl);
+	*out_len = nl;
+	*have = 0;
+	return 1;
+}
+
+void sig_drop_anchor(struct sig *s, int family)
+{
+	socklen_t *rl = family == 6 ? &s->rnode6_len : &s->rnode4_len;
+
+	/* Nothing has answered here for long enough that this is presumed
+	 * gone. Letting go is what puts the family back in dht_pump's
+	 * `missing` set, so the convergent store and the lookup behind it run
+	 * again and find whatever serves the mailbox now. */
+	*rl = 0;
+}
+
 int sig_locating(struct sig *s, int family)
 {
 	socklen_t rl = family == 6 ? s->rnode6_len : s->rnode4_len;
@@ -487,6 +524,9 @@ static void on_dht_get(void *arg, const uint8_t *v, size_t v_len, int64_t seq,
 
 		if (node->sa_family == AF_INET6) {
 			s->acked6 = 1;
+			memcpy(&s->ack_node6, node, node_len);
+			s->ack_node6_len = node_len;
+			s->ack_new6 = 1;
 			if (s->locate && !s->rnode6_len) {
 				memcpy(&s->rnode6, node, node_len);
 				s->rnode6_len = node_len;
@@ -494,6 +534,9 @@ static void on_dht_get(void *arg, const uint8_t *v, size_t v_len, int64_t seq,
 			}
 		} else if (node->sa_family == AF_INET) {
 			s->acked4 = 1;
+			memcpy(&s->ack_node4, node, node_len);
+			s->ack_node4_len = node_len;
+			s->ack_new4 = 1;
 			if (s->locate && !s->rnode4_len) {
 				memcpy(&s->rnode4, node, node_len);
 				s->rnode4_len = node_len;

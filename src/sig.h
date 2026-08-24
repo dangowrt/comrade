@@ -168,6 +168,19 @@ int sig_located(struct sig *s, int family, struct sockaddr *out,
 int sig_dht_acked(struct sig *s, int family);
 
 /*
+ * The node that served a validated get for `family` since this was last
+ * asked, if one has. Who answered is what says whether the rendezvous we hold
+ * is still the rendezvous -- and whether this family reaches the DHT at all
+ * on the network we are on now, which is a round trip and so is proof.
+ */
+int sig_take_ack(struct sig *s, int family, struct sockaddr *out,
+		 socklen_t *out_len);
+
+/* Give up `family`'s rendezvous node, so the convergent store and lookup run
+ * again and settle on whatever serves the mailbox now. */
+void sig_drop_anchor(struct sig *s, int family);
+
+/*
  * Host: still actively chasing `family`'s rendezvous node -- true once the
  * other family has proven the DHT reachable at all, until this one is
  * captured too, however long that takes: no fixed run length, since a slower

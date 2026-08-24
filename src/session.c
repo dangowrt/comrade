@@ -3313,14 +3313,19 @@ static int dht_attempt_concluded(struct sess *s, int family)
 	return !sig_locating(s->sig, family);
 }
 
-/* The tokgen facts for `family`: the reachability model holds all but the one
- * that reaches into sig, which is pushed into it as it is learnt. */
+/*
+ * The tokgen facts for `family`: the reachability model holds all but the one
+ * that reaches into sig, which is pushed into it as it is learnt. dht_acked
+ * comes from the model rather than from sig directly, so it means "reached the
+ * rendezvous on the network we are on" rather than "reached it at some point
+ * since the last rebuild" -- the token should name a meeting point this host
+ * can still get to, and the two stop agreeing the moment one family moves.
+ */
 static void gather_facts(struct sess *s, int family, struct tokgen_facts *f)
 {
 	netstate_on_dht_concluded(&s->ns, family,
 				  dht_attempt_concluded(s, family));
 	netstate_facts(&s->ns, family, f);
-	f->dht_acked = f->dht_acked || sig_dht_acked(s->sig, family);
 }
 
 /* Answer an NSA_SAMPLE_SRC: what the kernel would source this family's
@@ -3336,6 +3341,33 @@ static void net_sample_src(struct sess *s, int family, uint32_t epoch)
 		len = 0;
 	netstate_on_src(&s->ns, family, epoch, len ? raw : NULL, len,
 			len ? text : NULL, now_ms());
+}
+
+/*
+ * A validated get is a round trip this host completed, so it proves the family
+ * that carried it -- and says whether the rendezvous we hold is the one still
+ * answering. It arrives long before a STUN reply on a network whose STUN
+ * servers are slow to resolve or slow to answer, which is the difference
+ * between a token that settles and a client that gives up waiting for one.
+ */
+static void ns_take_acks(struct sess *s, uint64_t now)
+{
+	static const int famv[2] = { 4, 6 };
+	int i;
+
+	if (!s->sig)
+		return;
+	for (i = 0; i < 2; i++) {
+		struct sockaddr_storage sa;
+		socklen_t sl = sizeof(sa);
+
+		memset(&sa, 0, sizeof(sa));
+		if (!sig_take_ack(s->sig, famv[i], (struct sockaddr *)&sa, &sl))
+			continue;
+		netstate_on_dht_ack(&s->ns, famv[i],
+				    netstate_epoch(&s->ns, famv[i]),
+				    (const uint8_t *)&sa, (int)sl, now);
+	}
 }
 
 /* Do what the model asked for, on the loop thread and nowhere else. */
@@ -3375,6 +3407,28 @@ static void net_apply(struct sess *s, const struct netstate_actions *a)
 			if (o && o->net_conn)
 				o->net_conn(o->arg, family, conn);
 		}
+		if (act & NSA_RDV_PIN) {
+			uint8_t node[NETSTATE_SA_MAX];
+			uint8_t nlen = 0;
+
+			if (s->sig && netstate_anchor(&s->ns, family, node,
+						      &nlen, NULL))
+				sig_reinforce(s->sig, family,
+					      (const struct sockaddr *)node,
+					      (socklen_t)nlen);
+		}
+		if (act & NSA_RDV_REVALIDATE) {
+			/* dht_pump already reads the mailbox back from the
+			 * pinned node every second; this only counts a round
+			 * that produced nothing, and an ack landing before the
+			 * next one clears the count again. */
+			netstate_on_rdv_attempt(&s->ns, family, a->epoch[i],
+						now_ms());
+		}
+		if (act & NSA_RDV_RELOCATE) {
+			if (s->sig)
+				sig_drop_anchor(s->sig, family);
+		}
 		if (act & NSA_EMIT_TOKEN)
 			s->next_tok_ms = 0;	/* re-mint on the next pass */
 	}
@@ -3412,6 +3466,7 @@ static void net_pump(struct sess *s, uint64_t now)
 				   fam_usable_addr(addrs, n, 6), now);
 		s->net_ch |= ch;
 	}
+	ns_take_acks(s, now);
 	ns_drain(s);
 	netstate_tick(&s->ns, now);
 	if (netstate_take_actions(&s->ns, &a))
