@@ -520,7 +520,8 @@ target_include_directories(comrade_session PUBLIC src)
 target_link_libraries(comrade_session PUBLIC
 	comrade_sig comrade_nat comrade_lanlink comrade_stream comrade_ssh
 	comrade_bridge comrade_token comrade_crypto comrade_stunlist
-	comrade_stunprobe comrade_conn comrade_path comrade_ctlproto comrade_dbg)
+	comrade_stunprobe comrade_conn comrade_path comrade_ctlproto comrade_dbg
+	comrade_netstate)
 
 # The view: the only module that draws to the terminal (MVC).
 # Token QR codes for the dashboard. qrcodegen.c is vendored from Project

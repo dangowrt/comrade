@@ -16,6 +16,7 @@
 #include "lanlink.h"
 #include "nat.h"
 #include "netmon.h"
+#include "netstate.h"
 #include "path.h"
 #include "session.h"
 #include "sig.h"
@@ -85,6 +86,23 @@ static int fam_idx(int family)
 {
 	return family == 6 ? 1 : 0;
 }
+
+/*
+ * Something a producer running off the loop thread observed. The STUN probes
+ * and libjuice's gather thread learn facts the reachability model wants, but
+ * writing it -- or the view behind it -- from there is what left the dashboard
+ * contradicting itself. They leave a fact here instead; the loop feeds it in.
+ */
+#define NS_FACTS_MAX 16
+enum {
+	NSF_ROUNDTRIP,			/* something answered us */
+	NSF_PROBE_DONE			/* a probe round ended, proving nothing */
+};
+struct ns_fact {
+	int kind;
+	int family;
+	uint32_t epoch;			/* which network it was learnt on */
+};
 /*
  * Backstop only, well above real-internet connect time: libjuice reaches its
  * own FAILED verdict after a full ICE negotiation, which drives retry; this
@@ -420,14 +438,25 @@ struct sess {
 	int mapping_reported;		/* 0 not yet, 1 sent independent, 2 sent dependent */
 
 	/*
-	 * Global connectivity per family (NET_CONN_*): UP once something has
-	 * actually answered (a real STUN reply), PENDING while merely routed,
-	 * 0 otherwise. UP is sticky -- only a roam resets it -- so a momentary
-	 * hiccup never walks it back. next_conn_ms paces the PENDING/DOWN
-	 * recheck; a family already UP has nothing left to poll for.
+	 * What each family currently knows about its own reachability, and the
+	 * epochs that say which network it knows it about. The producers below
+	 * run on threads that do not own this: they leave facts in `ns_fact`
+	 * under `ns_lock` and the loop feeds them in, so nothing outside the
+	 * loop writes the model or reaches the view.
 	 */
-	int net_conn4, net_conn6;
-	uint64_t next_conn_ms;
+	struct netstate ns;
+	unsigned net_ch;		/* families whose move the loop still owes
+					 * its own teardown for */
+	pthread_mutex_t ns_lock;
+	struct ns_fact ns_facts[NS_FACTS_MAX];
+	int ns_nfacts;
+	/*
+	 * The epoch each producer was started for, stamped by the loop before
+	 * it starts one, so what the producer reports can be told from what a
+	 * network we have since left reported.
+	 */
+	volatile uint32_t probe_epoch[2];
+	volatile uint32_t gather_epoch[2];
 
 	/*
 	 * Host admission registry, all touched only on the host main thread (no
@@ -1284,21 +1313,42 @@ static void on_local_sdp(void *arg, const char *sdp)
 	s->have_local_sdp = 1;
 }
 
-/* A family's connectivity is proven: something actually answered. Sticky --
- * only a roam resets it -- and drives sig's own DHT eagerness for that
- * family directly, rather than a timing guess. */
-static void net_conn_up(struct sess *s, int family)
+/*
+ * Leave a fact for the loop. Called from the STUN probe threads and libjuice's
+ * gather thread, none of which owns the reachability model, sig, or the view --
+ * so all any of them does is say what it saw, and which network it saw it on.
+ */
+static void ns_post(struct sess *s, int kind, int family, uint32_t epoch)
 {
-	const struct session_obs *o = s->cfg->obs;
-	int *conn = family == 6 ? &s->net_conn6 : &s->net_conn4;
+	pthread_mutex_lock(&s->ns_lock);
+	if (s->ns_nfacts < NS_FACTS_MAX) {
+		s->ns_facts[s->ns_nfacts].kind = kind;
+		s->ns_facts[s->ns_nfacts].family = family;
+		s->ns_facts[s->ns_nfacts].epoch = epoch;
+		s->ns_nfacts++;
+	}
+	pthread_mutex_unlock(&s->ns_lock);
+}
 
-	if (*conn == NET_CONN_UP)
-		return;
-	*conn = NET_CONN_UP;
-	if (s->sig)
-		sig_set_family_up(s->sig, family, 1);
-	if (o && o->net_conn)
-		o->net_conn(o->arg, family, NET_CONN_UP);
+/* Hand what the producers left to the model, on the loop thread. */
+static void ns_drain(struct sess *s)
+{
+	struct ns_fact f[NS_FACTS_MAX];
+	int n, i;
+
+	pthread_mutex_lock(&s->ns_lock);
+	n = s->ns_nfacts;
+	memcpy(f, s->ns_facts, sizeof(f[0]) * (size_t)n);
+	s->ns_nfacts = 0;
+	pthread_mutex_unlock(&s->ns_lock);
+
+	for (i = 0; i < n; i++) {
+		if (f[i].kind == NSF_ROUNDTRIP)
+			netstate_on_roundtrip(&s->ns, f[i].family, f[i].epoch);
+		else
+			netstate_on_probe_done(&s->ns, f[i].family, f[i].epoch,
+					       now_ms());
+	}
 }
 
 /* One more public v4 the NAT has been seen mapping us to; from the gather
@@ -1325,9 +1375,11 @@ static void mapping_note(struct sess *s, const uint8_t addr[4], uint16_t port)
 
 static void probe_hit(void *arg, const uint8_t addr[4], uint16_t port)
 {
-	pool_note(arg, addr);
-	mapping_note(arg, addr, port);
-	net_conn_up(arg, 4);
+	struct sess *s = arg;
+
+	pool_note(s, addr);
+	mapping_note(s, addr, port);
+	ns_post(s, NSF_ROUNDTRIP, 4, s->probe_epoch[0]);
 }
 
 static void *stun_probe_thread(void *arg)
@@ -1335,6 +1387,7 @@ static void *stun_probe_thread(void *arg)
 	struct sess *s = arg;
 	char *targets[STUN_PROBE_SERVERS];
 	uint8_t seed[STUN_PROBE_TXID_LEN];
+	uint32_t epoch = s->probe_epoch[0];
 	int n = 0, i;
 
 	for (i = 0; i < s->stun_count && n < STUN_PROBE_SERVERS; i++)
@@ -1343,6 +1396,7 @@ static void *stun_probe_thread(void *arg)
 	random_bytes(seed, sizeof(seed));
 	stun_probe_run(targets, n, STUN_PROBE_MS, seed, &s->probe_stop,
 		       probe_hit, s);
+	ns_post(s, NSF_PROBE_DONE, 4, epoch);
 	return NULL;
 }
 
@@ -1356,20 +1410,25 @@ static void stun_probe_halt(struct sess *s)
 }
 
 /* (Re)start the pool probe: at session start, and on each new network. An
- * operator-pinned server is theirs alone to talk to, so no probing then. */
-static void stun_probe_kick(struct sess *s)
+ * operator-pinned server is theirs alone to talk to, so no probing then.
+ * Non-zero once a round is actually out. */
+static int stun_probe_kick(struct sess *s)
 {
 	if (s->cfg->stun_host || !s->cfg->stun_auto || s->stun_count < 1)
-		return;
+		return 0;
 	stun_probe_halt(s);
 	s->probe_stop = 0;
-	if (!pthread_create(&s->probe_th, NULL, stun_probe_thread, s))
-		s->probe_running = 1;
+	if (pthread_create(&s->probe_th, NULL, stun_probe_thread, s))
+		return 0;
+	s->probe_running = 1;
+	return 1;
 }
 
 static void probe6_hit(void *arg)
 {
-	net_conn_up(arg, 6);
+	struct sess *s = arg;
+
+	ns_post(s, NSF_ROUNDTRIP, 6, s->probe_epoch[1]);
 }
 
 static void *stun_probe6_thread(void *arg)
@@ -1377,6 +1436,7 @@ static void *stun_probe6_thread(void *arg)
 	struct sess *s = arg;
 	char *targets[STUN_PROBE_SERVERS];
 	uint8_t seed[STUN_PROBE_TXID_LEN];
+	uint32_t epoch = s->probe_epoch[1];
 	int n = 0, i;
 
 	for (i = 0; i < s->stun_count && n < STUN_PROBE_SERVERS; i++)
@@ -1385,6 +1445,7 @@ static void *stun_probe6_thread(void *arg)
 	random_bytes(seed, sizeof(seed));
 	stun_probe_check(targets, n, AF_INET6, STUN_PROBE_MS, seed,
 			 &s->probe6_stop, probe6_hit, s);
+	ns_post(s, NSF_PROBE_DONE, 6, epoch);
 	return NULL;
 }
 
@@ -1402,14 +1463,16 @@ static void stun_probe6_halt(struct sess *s)
  * candidate (it does not when a global host candidate already exists, so
  * relying on that alone misses real NAT66/filtered hosts and, worse, the
  * ordinary case of a global address that just goes unconfirmed). */
-static void stun_probe6_kick(struct sess *s)
+static int stun_probe6_kick(struct sess *s)
 {
 	if (s->cfg->stun_host || !s->cfg->stun_auto || s->stun_count < 1)
-		return;
+		return 0;
 	stun_probe6_halt(s);
 	s->probe6_stop = 0;
-	if (!pthread_create(&s->probe6_th, NULL, stun_probe6_thread, s))
-		s->probe6_running = 1;
+	if (pthread_create(&s->probe6_th, NULL, stun_probe6_thread, s))
+		return 0;
+	s->probe6_running = 1;
+	return 1;
 }
 
 /* libjuice gather thread: a candidate is ready. Append it for the main loop,
@@ -1425,13 +1488,13 @@ static void on_ice_candidate(void *arg, const char *cand)
 	if (p && sscanf(p, "candidate:%*s %*d %*s %*u %63s %*d typ %15s",
 			addr, typ) == 2) {
 		if (strchr(addr, ':')) {
-			if (!strcmp(typ, "srflx"))
-				net_conn_up(s, 6);	/* a real v6 STUN reply */
+			if (!strcmp(typ, "srflx"))	/* a real v6 STUN reply */
+				ns_post(s, NSF_ROUNDTRIP, 6, s->gather_epoch[1]);
 		} else if (!strcmp(typ, "srflx")) {
 			uint8_t b[4];
 
 			s->have_srflx4 = 1;
-			net_conn_up(s, 4);
+			ns_post(s, NSF_ROUNDTRIP, 4, s->gather_epoch[0]);
 			if (inet_pton(AF_INET, addr, b) == 1)
 				pool_note(s, b);
 		} else if (!strcmp(typ, "host") &&
@@ -2301,8 +2364,13 @@ static int on_stream_output(void *arg, const uint8_t *data, size_t len)
  * triggers route and source-address selection, disclosing nothing. Used to
  * bind ICE to its real source so its host candidate matches what the peer
  * sees, which is what a no-STUN path needs.
+ *
+ * `raw`/`rawlen` optionally receive the address itself, so a caller comparing
+ * ours against a gathered candidate compares addresses rather than the two
+ * spellings of one.
  */
-static int source_addr(int family, char *out, size_t outlen)
+static int source_addr_raw(int family, char *out, size_t outlen, uint8_t *raw,
+			   int *rawlen)
 {
 	static const char *probe6 = "2001:db8::1";
 	static const char *probe4 = "192.0.2.1";
@@ -2337,15 +2405,31 @@ static int source_addr(int family, char *out, size_t outlen)
 	memset(&ss, 0, sizeof(ss));
 	if (getsockname(fd, (struct sockaddr *)&ss, &slen))
 		goto out;
-	if (family == AF_INET6)
-		rc = inet_ntop(AF_INET6, &((struct sockaddr_in6 *)&ss)->sin6_addr,
-			       out, outlen) ? 0 : -1;
-	else
-		rc = inet_ntop(AF_INET, &((struct sockaddr_in *)&ss)->sin_addr,
-			       out, outlen) ? 0 : -1;
+	if (family == AF_INET6) {
+		struct in6_addr *a6 = &((struct sockaddr_in6 *)&ss)->sin6_addr;
+
+		rc = inet_ntop(AF_INET6, a6, out, outlen) ? 0 : -1;
+		if (!rc && raw && rawlen) {
+			memcpy(raw, a6, 16);
+			*rawlen = 16;
+		}
+	} else {
+		struct in_addr *a4 = &((struct sockaddr_in *)&ss)->sin_addr;
+
+		rc = inet_ntop(AF_INET, a4, out, outlen) ? 0 : -1;
+		if (!rc && raw && rawlen) {
+			memcpy(raw, a4, 4);
+			*rawlen = 4;
+		}
+	}
 out:
 	sock_close(fd);
 	return rc;
+}
+
+static int source_addr(int family, char *out, size_t outlen)
+{
+	return source_addr_raw(family, out, outlen, NULL, NULL);
 }
 
 /* Fill a connection's ICE identity: a fresh ufrag/pwd and a random bind port.
@@ -2429,6 +2513,12 @@ static int nat_setup(struct conn *c)
 	cfg.arg = c;
 
 	s->remote_set = 0;
+	/* Stamp the round before the gather thread can report anything from it,
+	 * so a candidate arriving after the next move is recognisable as
+	 * belonging to the one before it. One agent gathers both families, but
+	 * they move apart, so each is stamped with its own. */
+	s->gather_epoch[0] = netstate_epoch(&s->ns, 4);
+	s->gather_epoch[1] = netstate_epoch(&s->ns, 6);
 	c->nat = nat_create(&cfg);
 	if (!c->nat || nat_gather(c->nat))
 		return -1;
@@ -3216,56 +3306,140 @@ static int dht_attempt_concluded(struct sess *s, int family)
 	return !sig_locating(s->sig, family);
 }
 
-/* Gather the tokgen facts for `family`, over an interface snapshot the caller
- * already holds. */
-static void gather_facts(struct sess *s, int family,
-			 const struct netmon_addr *addrs, size_t naddrs,
-			 struct tokgen_facts *f)
+/* The tokgen facts for `family`: the reachability model holds all but the one
+ * that reaches into sig, which is pushed into it as it is learnt. */
+static void gather_facts(struct sess *s, int family, struct tokgen_facts *f)
 {
-	int af = family == 6 ? AF_INET6 : AF_INET;
-	char buf[64];
-
-	memset(f, 0, sizeof(*f));
-	f->has_usable_addr = fam_usable_addr(addrs, naddrs, family);
-	f->has_default_route = source_addr(af, buf, sizeof(buf)) == 0;
-	f->dht_acked = sig_dht_acked(s->sig, family);
-	f->dht_attempt_concluded = dht_attempt_concluded(s, family);
-	f->public_port_proven = 0;	/* no UPnP/NAT-PMP/PCP in the tree */
+	netstate_on_dht_concluded(&s->ns, family,
+				  dht_attempt_concluded(s, family));
+	netstate_facts(&s->ns, family, f);
+	f->dht_acked = f->dht_acked || sig_dht_acked(s->sig, family);
 }
 
-#define NET_CONN_POLL_MS 1000
-
-/*
- * Recheck PENDING/0 for a family that has not proven itself UP yet: a route
- * existing is not proof of anything, so it never overrides an earlier UP,
- * only fills in while there is nothing stronger to report.
- */
-static void net_conn_pump(struct sess *s)
+/* Answer an NSA_SAMPLE_SRC: what the kernel would source this family's
+ * outbound traffic from, if anything. */
+static void net_sample_src(struct sess *s, int family, uint32_t epoch)
 {
-	const struct session_obs *o = s->cfg->obs;
+	int af = family == 6 ? AF_INET6 : AF_INET;
+	uint8_t raw[16];
+	char text[64];
+	int len = 0;
+
+	if (source_addr_raw(af, text, sizeof(text), raw, &len))
+		len = 0;
+	netstate_on_src(&s->ns, family, epoch, len ? raw : NULL, len,
+			len ? text : NULL, now_ms());
+}
+
+/* Do what the model asked for, on the loop thread and nowhere else. */
+static void net_apply(struct sess *s, const struct netstate_actions *a)
+{
 	static const int famv[2] = { 4, 6 };
+	const struct session_obs *o = s->cfg->obs;
 	int i;
 
-	if (now_ms() < s->next_conn_ms)
-		return;
-	s->next_conn_ms = now_ms() + NET_CONN_POLL_MS;
 	for (i = 0; i < 2; i++) {
+		unsigned act = a->f[i];
 		int family = famv[i];
-		int *conn = family == 6 ? &s->net_conn6 : &s->net_conn4;
-		int af = family == 6 ? AF_INET6 : AF_INET;
-		char buf[64];
-		int want;
 
-		if (*conn == NET_CONN_UP)
-			continue;
-		want = source_addr(af, buf, sizeof(buf)) == 0 ?
-		       NET_CONN_PENDING : 0;
-		if (want != *conn) {
-			*conn = want;
-			if (o && o->net_conn)
-				o->net_conn(o->arg, family, want);
+		if (act & NSA_SAMPLE_SRC)
+			net_sample_src(s, family, a->epoch[i]);
+		if (act & NSA_KICK_PROBE) {
+			int started;
+
+			s->probe_epoch[i] = a->epoch[i];
+			started = i ? stun_probe6_kick(s) : stun_probe_kick(s);
+			if (started)
+				netstate_on_probe_started(&s->ns, family,
+							  a->epoch[i], now_ms());
 		}
+		if (act & NSA_STOP_PROBE) {
+			if (i)
+				stun_probe6_halt(s);
+			else
+				stun_probe_halt(s);
+		}
+		if (act & NSA_EMIT_CONN) {
+			int conn = netstate_conn(&s->ns, family);
+
+			if (s->sig)
+				sig_set_family_up(s->sig, family,
+						  conn == NET_CONN_UP);
+			if (o && o->net_conn)
+				o->net_conn(o->arg, family, conn);
+		}
+		if (act & NSA_EMIT_TOKEN)
+			s->next_tok_ms = 0;	/* re-mint on the next pass */
 	}
+}
+
+/*
+ * The one place a network change is noticed and acted on. Runs at the top of
+ * both loops: sample the interfaces, tell the model which family moved, hand
+ * it what the producers left, and carry out what it asks for. The loops then
+ * take their own half of a move from net_changed -- an agent to rebuild, an
+ * offer to drop -- which is all that is left that differs between them.
+ */
+static void net_pump(struct sess *s, uint64_t now)
+{
+	const struct session_cfg *cfg = s->cfg;
+	struct netstate_actions a;
+	unsigned ch = 0;
+	int synth = 0;
+
+	if (cfg->test_roam_ms > 0 && now >= s->next_roam_ms &&
+	    (cfg->test_roam_max <= 0 || s->roams < cfg->test_roam_max)) {
+		s->next_roam_ms = now + (uint64_t)cfg->test_roam_ms;
+		s->roams++;
+		ch = NETMON_CH_V4 | NETMON_CH_V6 | NETMON_CH_IFACE;
+		synth = 1;
+	}
+	if (synth || now >= s->netmon.next_check_ms) {
+		struct netmon_addr addrs[NETMON_MAX_ADDRS];
+		uint8_t fp4[32], fp6[32], fpif[32];
+		size_t n = netmon_snapshot(addrs, NETMON_MAX_ADDRS);
+
+		netmon_fingerprint(fp4, fp6, fpif, addrs, n);
+		ch |= netmon_changed_fam_fp(&s->netmon, now, fp4, fp6, fpif);
+		netstate_on_netmon(&s->ns, ch, fam_usable_addr(addrs, n, 4),
+				   fam_usable_addr(addrs, n, 6), now);
+		s->net_ch |= ch;
+	}
+	ns_drain(s);
+	netstate_tick(&s->ns, now);
+	if (netstate_take_actions(&s->ns, &a))
+		net_apply(s, &a);
+}
+
+/*
+ * The half of a move that is the same wherever it is noticed: the offer and
+ * the candidates behind it describe a network that is gone, and the v4 STUN
+ * pool was measured on it. What differs between a host and a client -- which
+ * agent to tear down, which state to go back to -- stays with each loop.
+ */
+static void net_change_reset(struct sess *s)
+{
+	const struct session_obs *o = s->cfg->obs;
+
+	s->have_local_sdp = 0;
+	s->have_peer_sdp = 0;
+	s->remote_set = 0;
+	s->local_sdp[0] = '\0';
+	s->peer_sdp[0] = '\0';
+	pthread_mutex_lock(&s->trickle_lock);
+	s->trickle_sdp[0] = '\0';
+	s->trickle_dirty = 0;
+	s->npool4 = 0;
+	stun_mapping_reset(&s->map4);
+	pthread_mutex_unlock(&s->trickle_lock);
+	s->stun_rotations = 0;		/* fresh budget on the new network */
+	s->have_priv4 = 0;		/* and fresh v4 facts to run it on */
+	s->have_srflx4 = 0;
+	s->pool_reported = 0;
+	s->pool_posted = 0;
+	s->mapping_reported = 0;
+	if (o && o->net_reset)
+		o->net_reset(o->arg);
 }
 
 /*
@@ -3412,10 +3586,8 @@ static void token_pump(struct sess *s)
 	static const int famv[2] = { 4, 6 };
 	const struct session_obs *o = s->cfg->obs;
 	enum tok_advert adv[2] = { TOK_ADVERT_PENDING, TOK_ADVERT_PENDING };
-	struct netmon_addr addrs[NETMON_MAX_ADDRS];
 	struct tokgen_facts f4, f6;
 	struct tokgen_result verdict;
-	size_t naddrs;
 	int i;
 
 	if (!s->cfg->is_host || !s->cfg->on_token_state)
@@ -3429,9 +3601,8 @@ static void token_pump(struct sess *s)
 	 * t=0 report happens with no special case, and how a re-gather holds
 	 * the token steady instead of flapping it back to PENDING. */
 	if (s->have_local_sdp) {
-		naddrs = netmon_snapshot(addrs, NETMON_MAX_ADDRS);
-		gather_facts(s, 4, addrs, naddrs, &f4);
-		gather_facts(s, 6, addrs, naddrs, &f6);
+		gather_facts(s, 4, &f4);
+		gather_facts(s, 6, &f6);
 		if (tokgen_decide_host(&f4, &f6, &verdict) < 0) {
 			if (o && o->escalate && !s->noconn_warned &&
 			    now_ms() - s->start_ms > 3000) {
@@ -3825,22 +3996,17 @@ static int host_is_multiuser(const struct session_cfg *cfg)
 }
 
 /*
- * Has the local network moved? The interfaces are the answer; test_roam_ms
- * manufactures one on a period instead, so the rebuild below can be exercised
- * without a second network to walk between.
+ * Has the local network moved? net_pump has already noticed and told the
+ * reachability model which family it was; this is the loop collecting the part
+ * of a move only it can do -- an agent to rebuild, an offer to drop -- and
+ * clearing the debt as it takes it.
  */
 static int net_changed(struct sess *s)
 {
-	const struct session_cfg *cfg = s->cfg;
-	uint64_t now = now_ms();
+	unsigned ch = s->net_ch;
 
-	if (cfg->test_roam_ms > 0 && now >= s->next_roam_ms &&
-	    (cfg->test_roam_max <= 0 || s->roams < cfg->test_roam_max)) {
-		s->next_roam_ms = now + (uint64_t)cfg->test_roam_ms;
-		s->roams++;
-		return 1;
-	}
-	return netmon_changed(&s->netmon, now);
+	s->net_ch = 0;
+	return ch != 0;
 }
 
 /*
@@ -3946,7 +4112,7 @@ static int host_turnstile(struct sess *s)
 		int active = 0;
 
 		pump_once(s, 100);		/* the main thread owns sig + lan */
-		net_conn_pump(s);		/* recheck PENDING/0 families */
+		net_pump(s, now_ms());		/* notice a move, act on it */
 		maybe_announce_rendezvous(s);	/* report the rendezvous */
 		token_pump(s);			/* mint and advertise the token */
 		rdv_keep_warm(s);
@@ -3974,31 +4140,8 @@ static int host_turnstile(struct sess *s)
 						ws[i].c->bh_mute = 1;
 			if (sig_rebuild(s))
 				break;
-			s->have_local_sdp = 0;
-			s->have_peer_sdp = 0;
-			s->remote_set = 0;
-			s->local_sdp[0] = '\0';
-			s->peer_sdp[0] = '\0';
-			pthread_mutex_lock(&s->trickle_lock);
-			s->trickle_sdp[0] = '\0';
-			s->trickle_dirty = 0;
-			s->npool4 = 0;
-			stun_mapping_reset(&s->map4);
-			pthread_mutex_unlock(&s->trickle_lock);
+			net_change_reset(s);
 			ts = TS_GATHER;
-			s->stun_rotations = 0;	/* fresh budget on the new network */
-			s->have_priv4 = 0;	/* and fresh v4 facts to run it on */
-			s->have_srflx4 = 0;
-			s->pool_reported = 0;
-			s->pool_posted = 0;
-			s->mapping_reported = 0;
-			s->net_conn4 = 0;
-			s->net_conn6 = 0;
-			s->next_conn_ms = 0;	/* recheck PENDING/0 at once */
-			stun_probe_kick(s);
-			stun_probe6_kick(s);
-			if (o && o->net_reset)
-				o->net_reset(o->arg);
 		}
 
 		if (o) {			/* dashboard: local candidates */
@@ -4353,7 +4496,9 @@ int session_run(const struct session_cfg *cfg)
 	pthread_mutex_init(&s.c.stream_lock, NULL);
 	pthread_mutex_init(&s.c.path_lock, NULL);
 	path_table_init(&s.c.paths);
+	pthread_mutex_init(&s.ns_lock, NULL);
 	netmon_init(&s.netmon);
+	netstate_init(&s.ns, cfg->is_host, now_ms());
 	s.next_roam_ms = now_ms() + (uint64_t)cfg->test_roam_ms;
 	if (keys_derive(&s.keys, cfg->tok.rdv))
 		return 1;
@@ -4369,8 +4514,8 @@ int session_run(const struct session_cfg *cfg)
 		random_bytes(rb, 2);
 		s.ice_attempt = ((rb[0] << 8) | rb[1]) % s.stun_count;
 	}
-	stun_probe_kick(&s);
-	stun_probe6_kick(&s);
+	/* The probes are scheduled by the reachability model, which asks for the
+	 * first round on its first tick. */
 	nat_log_level(cfg->log_level);	/* < 0 silences libjuice (see nat_log_level) */
 
 	conn_gen_ice(&s.c);
@@ -4399,7 +4544,7 @@ int session_run(const struct session_cfg *cfg)
 		const struct session_obs *o = cfg->obs;
 
 		pump_once(&s, 100);
-		net_conn_pump(&s);
+		net_pump(&s, now_ms());
 		maybe_announce_rendezvous(&s);
 		token_pump(&s);
 		/*
@@ -4424,31 +4569,8 @@ int session_run(const struct session_cfg *cfg)
 			pthread_mutex_lock(&s.c.path_lock);
 			path_table_clear(&s.c.paths);
 			pthread_mutex_unlock(&s.c.path_lock);
-			s.have_local_sdp = 0;
-			s.have_peer_sdp = 0;
-			s.remote_set = 0;
-			s.local_sdp[0] = '\0';
-			s.peer_sdp[0] = '\0';
-			pthread_mutex_lock(&s.trickle_lock);
-			s.trickle_sdp[0] = '\0';
-			s.trickle_dirty = 0;
-			s.npool4 = 0;
-			stun_mapping_reset(&s.map4);
-			pthread_mutex_unlock(&s.trickle_lock);
+			net_change_reset(&s);
 			st = ST_WAIT_DHT;
-			s.stun_rotations = 0;	/* fresh budget on the new network */
-			s.have_priv4 = 0;	/* and fresh v4 facts to run it on */
-			s.have_srflx4 = 0;
-			s.pool_reported = 0;
-			s.pool_posted = 0;
-			s.mapping_reported = 0;
-			s.net_conn4 = 0;
-			s.net_conn6 = 0;
-			s.next_conn_ms = 0;	/* recheck PENDING/0 at once */
-			stun_probe_kick(&s);
-			stun_probe6_kick(&s);
-			if (o && o->net_reset)
-				o->net_reset(o->arg);
 		}
 		/*
 		 * No peer has answered yet and the pool server this attempt drew
@@ -4687,24 +4809,11 @@ int session_run(const struct session_cfg *cfg)
 				dbg_logf("session: rejoin (roam)");
 				deadline = now_ms() +
 					(uint64_t)cfg->connect_timeout_s * 1000;
+				/* Nothing has been watching the interfaces
+				 * while the link was up, so look now. */
+				net_pump(&s, now_ms());
 				if (net_changed(&s)) {
-					s.stun_rotations = 0;
-					s.have_priv4 = 0;
-					s.have_srflx4 = 0;
-					pthread_mutex_lock(&s.trickle_lock);
-					s.npool4 = 0;
-					stun_mapping_reset(&s.map4);
-					pthread_mutex_unlock(&s.trickle_lock);
-					s.pool_reported = 0;
-					s.pool_posted = 0;
-					s.mapping_reported = 0;
-					s.net_conn4 = 0;
-					s.net_conn6 = 0;
-					s.next_conn_ms = 0;	/* recheck PENDING/0 at once */
-					stun_probe_kick(&s);
-					stun_probe6_kick(&s);
-					if (o && o->net_reset)
-						o->net_reset(o->arg);
+					net_change_reset(&s);
 					pthread_mutex_lock(&s.c.path_lock);
 					path_table_clear(&s.c.paths);
 					pthread_mutex_unlock(&s.c.path_lock);

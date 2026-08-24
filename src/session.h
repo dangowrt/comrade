@@ -8,6 +8,7 @@
 #include <stdint.h>
 #include "wsock.h"
 
+#include "netstate.h"
 #include "token.h"
 
 struct fwdspec;
@@ -25,25 +26,8 @@ struct fwdspec;
  * whether -- it is drawn. A view (src/ui.c) subscribes; the e2e harness passes
  * none. Every field is optional; a NULL callback is simply skipped.
  */
-enum {					/* address scope for obs.net */
-	NET_SCOPE_LAN,			/* RFC1918 / ULA / link-local */
-	NET_SCOPE_CGNAT,		/* 100.64/10 carrier-grade NAT */
-	NET_SCOPE_GLOBAL		/* globally routable */
-};
-enum {					/* how a path was learnt, for obs.net */
-	NET_VIA_DIRECT,			/* locally gathered host candidate */
-	NET_VIA_STUN			/* server-reflexive, learnt via STUN */
-};
-/*
- * A family's global connectivity, for obs.net_conn -- proof, not a guess.
- * UP is sticky once earned: a family does not fall back to PENDING short of
- * a network change, which resets it. Bits, not a plain enum, so a later
- * verdict (NAT type, filtering) can be added alongside UP without another
- * callback.
- */
-#define NET_CONN_UP	  (1 << 0)	/* proven: a real STUN reply arrived */
-#define NET_CONN_PENDING (1 << 1)	/* a route exists; not yet proven */
-					/* 0: no route for this family at all */
+/* NET_SCOPE_*, NET_VIA_* and NET_CONN_* belong to the reachability model that
+ * decides them, and are shared with the view from there. */
 enum {					/* peer lifecycle for obs.peer */
 	SESSION_PEER_SEEN,		/* mailbox read: peer endpoints known */
 	SESSION_PEER_PUNCHING,		/* negotiating a path */
