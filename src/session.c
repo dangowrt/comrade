@@ -355,7 +355,6 @@ struct sess {
 	char trickle_sdp[NAT_SDP_MAX];
 	pthread_mutex_t trickle_lock;
 	volatile int trickle_dirty;
-	char src6[64];			/* address we source outbound global v6 from */
 	char peer_sdp[NAT_SDP_MAX];
 	volatile int have_peer_sdp;
 	int remote_set;
@@ -934,15 +933,24 @@ static void report_candidates(struct sess *s, const char *sdp)
 				 * NAT66 host presents to peers, so always surface it
 				 * -- it is exactly the "global v6" the dashboard must
 				 * show. For a *direct* global v6 only the address we
-				 * source outbound from matters (source_addr's connect
-				 * trick, as canon_v6 already enforces for the sent
-				 * SDP): libjuice also enumerates the stable/DHCPv6
-				 * address, which we neither source from nor listen on
-				 * for punching, so drop that one once we know our
-				 * source; otherwise show what was gathered. */
-				drop6 = fam == 6 && scope == NET_SCOPE_GLOBAL &&
-					via == NET_VIA_DIRECT && s->src6[0] &&
-					strcmp(addr, s->src6);
+				 * source outbound from matters (as canon_v6 already
+				 * enforces for the sent SDP): libjuice also enumerates
+				 * the stable/DHCPv6 address, which we neither source
+				 * from nor listen on for punching, so drop that one
+				 * once we know our source; otherwise show what was
+				 * gathered. The comparison is on the addresses, not on
+				 * the two spellings of one, and the source is the live
+				 * one -- a move invalidates it until the new link
+				 * answers, so it is never the previous network's. */
+				drop6 = 0;
+				if (fam == 6 && scope == NET_SCOPE_GLOBAL &&
+				    via == NET_VIA_DIRECT) {
+					uint8_t src[16], got[16];
+
+					if (netstate_src(&s->ns, 6, src) == 16 &&
+					    inet_pton(AF_INET6, addr, got) == 1)
+						drop6 = memcmp(got, src, 16) != 0;
+				}
 				if (!drop6)
 					o->net(o->arg, fam, scope, via, addr);
 			}
@@ -1309,7 +1317,8 @@ static void on_local_sdp(void *arg, const char *sdp)
 {
 	struct sess *s = ((struct conn *)arg)->sess;
 
-	canon_v6(sdp, s->src6, s->local_sdp, sizeof(s->local_sdp));
+	canon_v6(sdp, netstate_src_text(&s->ns, 6), s->local_sdp,
+		 sizeof(s->local_sdp));
 	s->have_local_sdp = 1;
 }
 
@@ -2479,8 +2488,6 @@ static int nat_setup(struct conn *c)
 	struct nat_config cfg;
 
 	memset(&cfg, 0, sizeof(cfg));
-	if (source_addr(AF_INET6, s->src6, sizeof(s->src6)))
-		s->src6[0] = '\0';		/* no global v6 source */
 	cfg.stun_host = s->cfg->stun_host;
 	cfg.stun_port = s->cfg->stun_port;
 	if (!cfg.stun_host && s->cfg->stun_auto && s->stun_count > 0) {
