@@ -844,9 +844,22 @@ static void client_lan_recv(void *arg, const struct sockaddr *src,
 static void on_direct_peer(void *arg, const struct sockaddr *peer, socklen_t len)
 {
 	struct conn *c = arg;
+	struct sockaddr_in6 np;
 
-	if (lanlink_map_peer(peer, len, &c->lan_peer))
+	if (lanlink_map_peer(peer, len, &np))
 		return;
+	/*
+	 * Prefer a non-link-local endpoint. A host on several interfaces announces
+	 * from each, so its link-local IPv6 source can arrive last and overwrite a
+	 * usable v4 or loopback endpoint (such as the one preloaded from the token);
+	 * but a link-local lanlink target needs a zone id that does not reliably
+	 * survive the announcement path, so it often cannot be reached. Never
+	 * downgrade a usable endpoint to a link-local one; a non-link-local wins.
+	 */
+	if (c->have_lan_peer && IN6_IS_ADDR_LINKLOCAL(&np.sin6_addr) &&
+	    !IN6_IS_ADDR_LINKLOCAL(&c->lan_peer.sin6_addr))
+		return;
+	c->lan_peer = np;
 	c->have_lan_peer = 1;
 	fmt_sockaddr(peer, len, c->direct_addr, sizeof(c->direct_addr));
 	/*

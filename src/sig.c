@@ -415,7 +415,8 @@ static int addr_is_lan_scope(const struct sockaddr *sa)
 		const struct sockaddr_in6 *s6 = (const struct sockaddr_in6 *)sa;
 		const uint8_t *b = s6->sin6_addr.s6_addr;
 
-		if (IN6_IS_ADDR_LINKLOCAL(&s6->sin6_addr))
+		if (IN6_IS_ADDR_LINKLOCAL(&s6->sin6_addr) ||
+		    IN6_IS_ADDR_LOOPBACK(&s6->sin6_addr))	/* ::1 same-host */
 			return 1;
 		return (b[0] & 0xfe) == 0xfc;			/* fc00::/7 ULA */
 	}
@@ -597,7 +598,16 @@ static void mcast_pump(struct sig *s, uint64_t now)
 {
 	char ms[2];
 
-	if (!s->mb.have_mine || !s->mcast_mine_len || now < s->next_mcast_ms)
+	/*
+	 * Gate on the sealed announcement, not on have_mine. A same-segment client
+	 * withdraws its DHT mailbox answer (clearing have_mine) the instant it
+	 * learns the peer over lanlink, to stop a double-serve -- but the host
+	 * learns that client from exactly this multicast announcement, so stopping
+	 * it on withdraw would race the host's admission (which may not have
+	 * processed the announcement yet). Keep announcing; a host deduplicates a
+	 * claimant it has already admitted.
+	 */
+	if (!s->mcast_mine_len || now < s->next_mcast_ms)
 		return;
 	ms[0] = my_slot(s);
 	ms[1] = '\0';

@@ -71,8 +71,8 @@ static void collect_ifaces(struct sig_mcast *m)
 	for (a = aa; a && m->nif < MCAST_MAX_IF; a = a->Next) {
 		IP_ADAPTER_UNICAST_ADDRESS *u;
 
+		/* Loopback kept for same-host linking (see the POSIX branch). */
 		if (a->OperStatus != IfOperStatusUp ||
-		    a->IfType == IF_TYPE_SOFTWARE_LOOPBACK ||
 		    (a->Flags & IP_ADAPTER_NO_MULTICAST))
 			continue;
 		slot = m->nif;
@@ -126,8 +126,12 @@ static void collect_ifaces(struct sig_mcast *m)
 	for (p = ifa; p; p = p->ifa_next) {
 		if (!p->ifa_addr)
 			continue;
-		if (!(p->ifa_flags & IFF_UP) || !(p->ifa_flags & IFF_MULTICAST) ||
-		    (p->ifa_flags & IFF_LOOPBACK))
+		/* Loopback is kept, not skipped: two comrade instances on one host
+		 * must link over multicast however (or whether) the box is connected
+		 * externally, and the loopback interface always delivers a multicast
+		 * datagram to local joiners even when the only physical interface
+		 * cannot send one (a NAT/SLIRP guest, a sandboxed CI host). */
+		if (!(p->ifa_flags & IFF_UP) || !(p->ifa_flags & IFF_MULTICAST))
 			continue;
 		fam = p->ifa_addr->sa_family;
 		if (fam != AF_INET && fam != AF_INET6)
