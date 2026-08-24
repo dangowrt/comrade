@@ -424,6 +424,8 @@ static int addr_is_lan_scope(const struct sockaddr *sa)
 		const struct sockaddr_in *s4 = (const struct sockaddr_in *)sa;
 		const uint8_t *b = (const uint8_t *)&s4->sin_addr;
 
+		if (b[0] == 127)				/* 127/8 same-host */
+			return 1;
 		if (b[0] == 10)					/* 10.0.0.0/8 */
 			return 1;
 		if (b[0] == 172 && b[1] >= 16 && b[1] <= 31)	/* 172.16.0.0/12 */
