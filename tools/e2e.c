@@ -117,6 +117,16 @@ static int inspect_token(const char *s)
 	return 0;
 }
 
+static void mcast_probe_cb(void *arg, const char *salt, const uint8_t *data,
+			   size_t len, const struct sockaddr *src, socklen_t srclen)
+{
+	(void)salt;
+	(void)src;
+	(void)srclen;
+	if (len == 8 && !memcmp(data, "PROBE-OK", 8))
+		*(int *)arg = 1;
+}
+
 int main(int argc, char **argv)
 {
 	struct session_cfg cfg;
@@ -132,11 +142,26 @@ int main(int argc, char **argv)
 	 * multicast interface exists, 77 (ctest SKIP) if not. */
 	if (argc >= 2 && !strcmp(argv[1], "mcast-probe")) {
 		struct sig_mcast *m = sig_mcast_open();
+		struct pollfd fds[8];
+		int got = 0, t, nf;
 
 		if (!m)
 			return 77;
+		/*
+		 * A socket opening is not enough: some sandboxed hosts (certain
+		 * macOS CI runners) open a multicast socket but deliver nothing.
+		 * Send a probe datagram and confirm it loops back before the LAN
+		 * e2e tests rely on multicast; SKIP (77) where it does not actually
+		 * work, exactly as the DHT tests skip without internet.
+		 */
+		for (t = 0; t < 20 && !got; t++) {
+			sig_mcast_send(m, "P", (const uint8_t *)"PROBE-OK", 8);
+			nf = sig_mcast_prepare(m, fds, 8);
+			sock_poll(fds, (nfds_t)nf, 100);
+			sig_mcast_dispatch(m, fds, nf, mcast_probe_cb, &got);
+		}
 		sig_mcast_close(m);
-		return 0;
+		return got ? 0 : 77;
 	}
 
 	memset(&cfg, 0, sizeof(cfg));
