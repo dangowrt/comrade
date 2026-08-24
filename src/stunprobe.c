@@ -2,6 +2,7 @@
 /* Copyright (C) 2026 Daniel Golle <daniel@makrotopia.org> */
 
 #include "wsock.h"
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -92,15 +93,95 @@ int stun_probe_mapped4(const uint8_t *pkt, size_t len,
 	return -1;
 }
 
+/*
+ * Addresses already resolved for a STUN server, kept for the life of the
+ * process.
+ *
+ * Moving does not move the servers, and the resolver is routinely the last
+ * thing to answer again after a move -- so a probe run on the new link would
+ * otherwise sit through a DNS timeout per name before sending anything, and
+ * often send nothing at all because nothing resolved. Having done this once,
+ * it can go straight out and be answered in the time one lookup would have
+ * taken to fail.
+ *
+ * Entries are keyed on the name as written, so a list replaced by `comrade
+ * stun-update` simply misses and resolves afresh; a server that keeps its name
+ * and changes its address is not noticed until the process restarts, which is
+ * a fair trade for a probe that asks several servers at once and needs only
+ * one of them to answer.
+ */
+#define STUN_CACHE_MAX 64
+
+struct stun_cache_entry {
+	char name[128];
+	int family;
+	struct sockaddr_storage sa;
+	socklen_t len;
+};
+
+static struct stun_cache_entry stun_cache[STUN_CACHE_MAX];
+static int stun_cache_n;
+static pthread_mutex_t stun_cache_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int cache_get(const char *name, int family,
+		     struct sockaddr_storage *out, socklen_t *outlen)
+{
+	int i, hit = 0;
+
+	pthread_mutex_lock(&stun_cache_lock);
+	for (i = 0; i < stun_cache_n; i++) {
+		if (stun_cache[i].family != family ||
+		    strcmp(stun_cache[i].name, name))
+			continue;
+		memcpy(out, &stun_cache[i].sa, sizeof(*out));
+		*outlen = stun_cache[i].len;
+		hit = 1;
+		break;
+	}
+	pthread_mutex_unlock(&stun_cache_lock);
+	return hit;
+}
+
+static void cache_put(const char *name, int family,
+		      const struct sockaddr_storage *sa, socklen_t len)
+{
+	struct stun_cache_entry *e;
+	int i;
+
+	if (strlen(name) >= sizeof(e->name))
+		return;
+	pthread_mutex_lock(&stun_cache_lock);
+	for (i = 0; i < stun_cache_n; i++)
+		if (stun_cache[i].family == family &&
+		    !strcmp(stun_cache[i].name, name))
+			break;
+	if (i == stun_cache_n && stun_cache_n < STUN_CACHE_MAX)
+		stun_cache_n++;
+	if (i < STUN_CACHE_MAX) {
+		e = &stun_cache[i];
+		strcpy(e->name, name);
+		e->family = family;
+		memcpy(&e->sa, sa, sizeof(e->sa));
+		e->len = len;
+	}
+	pthread_mutex_unlock(&stun_cache_lock);
+}
+
 /* "host:port" resolved to a v4 target; 3478 with no or unparsable port. */
 static int resolve4(const char *server, struct sockaddr_in *out)
 {
 	struct addrinfo hints, *res;
+	struct sockaddr_storage ss;
+	socklen_t sl = sizeof(ss);
 	const char *colon = strrchr(server, ':');
 	char host[128];
 	const char *port = "3478";
 	size_t hl = colon ? (size_t)(colon - server) : strlen(server);
 
+	if (cache_get(server, AF_INET, &ss, &sl)) {
+		memcpy(out, &ss, sizeof(*out));
+		return 0;
+	}
 	if (hl >= sizeof(host))
 		return -1;
 	memcpy(host, server, hl);
@@ -115,6 +196,8 @@ static int resolve4(const char *server, struct sockaddr_in *out)
 		return -1;
 	memcpy(out, res->ai_addr, sizeof(*out));
 	freeaddrinfo(res);
+	memcpy(&ss, out, sizeof(*out));
+	cache_put(server, AF_INET, &ss, (socklen_t)sizeof(*out));
 	return 0;
 }
 
@@ -126,7 +209,7 @@ void stun_probe_run(char *const *servers, int nservers, int total_ms,
 	int have[16];
 	uint64_t t0, next_send = 0;
 	sock_t fd;
-	int i, n = nservers;
+	int i, n = nservers, nres = 0;
 
 	if (n > 16)
 		n = 16;
@@ -135,19 +218,28 @@ void stun_probe_run(char *const *servers, int nservers, int total_ms,
 		return;
 
 	memset(have, 0, sizeof(have));
-	for (i = 0; i < n; i++) {
-		if (stop && *stop)
-			break;
-		have[i] = resolve4(servers[i], &dst[i]) == 0;
-	}
-
 	t0 = os_mono_ms();
 	while (!(stop && *stop) && os_mono_ms() - t0 < (uint64_t)total_ms) {
 		struct pollfd pf;
 		uint64_t now = os_mono_ms();
 
+		/*
+		 * One name per pass, so the first server is asked as soon as it
+		 * is known rather than after every other name has been looked
+		 * up. getaddrinfo has no timeout and the resolver is often the
+		 * last thing to come back after a move, so resolving the whole
+		 * list up front let one dead or slow name hold up every server
+		 * behind it -- and the answer we want is usually the first one.
+		 */
+		if (nres < n) {
+			have[nres] = resolve4(servers[nres], &dst[nres]) == 0;
+			nres++;
+			next_send = 0;		/* ask the new one at once */
+			now = os_mono_ms();
+		}
+
 		if (now >= next_send) {
-			for (i = 0; i < n; i++) {
+			for (i = 0; i < nres; i++) {
 				uint8_t req[STUN_PROBE_REQ_LEN];
 
 				if (!have[i])
@@ -220,6 +312,9 @@ static int resolve_stun(const char *server, int family,
 	const char *port = "3478";
 	size_t hl = colon ? (size_t)(colon - server) : strlen(server);
 
+	*outlen = sizeof(*out);
+	if (cache_get(server, family, out, outlen))
+		return 0;
 	if (hl >= sizeof(host))
 		return -1;
 	memcpy(host, server, hl);
@@ -235,6 +330,7 @@ static int resolve_stun(const char *server, int family,
 	memcpy(out, res->ai_addr, (size_t)res->ai_addrlen);
 	*outlen = (socklen_t)res->ai_addrlen;
 	freeaddrinfo(res);
+	cache_put(server, family, out, *outlen);
 	return 0;
 }
 
@@ -247,7 +343,7 @@ void stun_probe_check(char *const *servers, int nservers, int family,
 	int have[16];
 	uint64_t t0, next_send = 0;
 	sock_t fd;
-	int i, n = nservers;
+	int i, n = nservers, nres = 0;
 	int want_fam = family == AF_INET6 ? 0x02 : 0x01;
 
 	if (n > 16)
@@ -257,20 +353,23 @@ void stun_probe_check(char *const *servers, int nservers, int family,
 		return;
 
 	memset(have, 0, sizeof(have));
-	for (i = 0; i < n; i++) {
-		if (stop && *stop)
-			break;
-		have[i] = resolve_stun(servers[i], family, &dst[i],
-				       &dlen[i]) == 0;
-	}
-
 	t0 = os_mono_ms();
 	while (!(stop && *stop) && os_mono_ms() - t0 < (uint64_t)total_ms) {
 		struct pollfd pf;
 		uint64_t now = os_mono_ms();
 
+		/* One name per pass; see stun_probe_run for why the list is not
+		 * resolved up front. */
+		if (nres < n) {
+			have[nres] = resolve_stun(servers[nres], family,
+						  &dst[nres], &dlen[nres]) == 0;
+			nres++;
+			next_send = 0;
+			now = os_mono_ms();
+		}
+
 		if (now >= next_send) {
-			for (i = 0; i < n; i++) {
+			for (i = 0; i < nres; i++) {
 				uint8_t req[STUN_PROBE_REQ_LEN];
 
 				if (!have[i])
