@@ -4291,6 +4291,9 @@ int session_run(const struct session_cfg *cfg)
 				s.c.nat = NULL;
 			}
 			conn_gen_ice(&s.c);
+			pthread_mutex_lock(&s.c.path_lock);
+			path_table_clear(&s.c.paths);
+			pthread_mutex_unlock(&s.c.path_lock);
 			s.have_local_sdp = 0;
 			s.have_peer_sdp = 0;
 			s.remote_set = 0;
@@ -4562,6 +4565,11 @@ int session_run(const struct session_cfg *cfg)
 					s.pool_posted = 0;
 					s.mapping_reported = 0;
 					stun_probe_kick(&s);
+					if (o && o->net_reset)
+						o->net_reset(o->arg);
+					pthread_mutex_lock(&s.c.path_lock);
+					path_table_clear(&s.c.paths);
+					pthread_mutex_unlock(&s.c.path_lock);
 					if (sig_rebuild(&s)) {
 						st = ST_FAIL;
 						break;
