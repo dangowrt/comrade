@@ -631,6 +631,7 @@ static int conn_holds_ep(struct conn *c, const struct path_ep *ep, int exact)
 struct path_pick {
 	int kind;			/* -1 when no path can carry one */
 	int blackholed;			/* the test hook has taken this one away */
+	int qualified;			/* something has actually answered on it */
 	struct sockaddr_in6 remote;
 	struct nat_agent *agent;
 	char label[PATH_LABEL_MAX];
@@ -705,6 +706,7 @@ static int conn_pick(struct conn *c, struct path_pick *out)
 		out->kind = (int)p->kind;
 		out->remote = p->remote;
 		out->agent = p->agent;
+		out->qualified = p->qualified;
 		out->blackholed = path_blackholed(c, out->kind, &p->remote);
 		snprintf(out->label, sizeof(out->label), "%s", p->label);
 		if (sel != prev) {
@@ -721,13 +723,15 @@ static int conn_pick(struct conn *c, struct path_pick *out)
 }
 
 /* The endpoint the session is on right now, printable (view). Empty for an ICE
- * path whose agent has not yet reported the pair it nominated. */
+ * path whose agent has not yet reported the pair it nominated, or for any
+ * path -- an advertised candidate included -- nothing has actually answered
+ * on yet: a claim is not evidence. */
 static void conn_path_label(struct conn *c, char *out, size_t n)
 {
 	struct path_pick pick;
 
 	out[0] = '\0';
-	if (!conn_pick(c, &pick))
+	if (!conn_pick(c, &pick) && pick.qualified)
 		snprintf(out, n, "%s", pick.label);
 }
 
