@@ -426,75 +426,77 @@ static void draw_qr(struct ui *u)
 	u->dirty = 0;
 }
 
-/* "12s ago", or "never" for a step that has not happened. */
-static const char *ago(int secs, char *buf, size_t n)
+/*
+ * The mailbox as a picture, left to right: us, the item out in the DHT, them.
+ *
+ * Six frames of animation each, because a still glyph cannot tell "waiting"
+ * from "stuck" and that is most of what an operator wants to know while a
+ * join is not happening. The letter crawls out while we are storing, the box
+ * throbs while the node is being proven, and settles once it is not.
+ *
+ * The raw numbers moved to --headless, where a test or a supervisor can read
+ * them; here they only crowded out the one thing worth seeing at a glance.
+ */
+static const char mb_out[2][4] = {
+	{ '.', '.', '.', '.' },			/* nothing to post */
+	{ 'o', 'o', 'o', 'o' },			/* something to post */
+};
+static const char *mb_arrow[4] = { "-   ", "--  ", "--- ", "----" };
+static const char *mb_box_proving[4] = { "[o]", "[O]", "[0]", "[O]" };
+
+/* The item, once it is out there: empty, held, or held and proven. */
+static const char *mb_box(const struct session_mailbox *m, int f)
 {
-	if (secs < 0)
-		return "never";
-	snprintf(buf, n, "%ds ago", secs);
-	return buf;
+	if (!m->mine_stored)
+		return "[ ]";
+	if (m->rdv_proven)
+		return "[#]";
+	if (m->rdv_holding)
+		return mb_box_proving[f];
+	return "[o]";
 }
 
-static void draw_mailbox(struct ui *u)
+static void draw_mailbox_art(const struct session_mailbox *m, int f)
+{
+	const char *arrow = m->mine_stored ? "----" : mb_arrow[f];
+	const char *back = m->peer_seen ? "<---" : "    ";
+	char us = mb_out[m->have_mine ? 1 : 0][f];
+	char them = m->peer_seen ? 'o' : '.';
+	const char *what;
+
+	if (!m->engaged)
+		what = "waiting for the DHT";
+	else if (!m->have_mine)
+		what = "nothing to post yet";
+	else if (!m->mine_stored)
+		what = "posting ours";
+	else if (m->peer_seen)
+		what = "theirs is here";
+	else if (m->rdv_proven)
+		what = "posted; waiting for theirs";
+	else if (m->rdv_holding)
+		what = "posted; proving the node";
+	else
+		what = "posted";
+
+	line("  " CYN "(%c)" RST DIM "%s" RST "%s%s" RST DIM "%s" RST
+	     CYN "(%c)" RST DIM "   %s" RST,
+	     us, arrow, m->rdv_proven ? BGR : m->mine_stored ? CYN : DIM,
+	     mb_box(m, f), back, them, what);
+}
+
+static void draw_mailbox(struct ui *u, int f)
 {
 	const struct session_mailbox *m = &u->mb;
-	const char *ours = u->role == UI_ROLE_HOST ? "offer" : "answer";
-	const char *theirs = u->role == UI_ROLE_HOST ? "answer" : "offer";
-	char g[24], p[24];
-	const char *slot;
 
-	line(CYN "MAILBOX" RST DIM "  the rendezvous both ends meet in" RST);
-	if (!u->have_mb || !m->engaged) {
-		line(DIM "  waiting for the DHT ..." RST);
+	line(CYN "MAILBOX" RST DIM "  where the two ends leave things for "
+	     "each other" RST);
+	if (!u->have_mb) {
+		line(DIM "  ( )----[ ]    ( )   starting up" RST);
 		line("");
 		return;
 	}
-	/* Ours: what we have put up there, and whether it took. */
-	if (m->mine_stored)
-		line("  " DIM "%-8s" RST BGR "%-16s" RST DIM "written %s, seq %lld" RST,
-		     ours, "stored", ago(m->age_put_s, p, sizeof(p)),
-		     (long long)m->seq);
-	else if (m->have_mine)
-		line("  " DIM "%-8s" RST YEL "%-16s" RST DIM "last try %s" RST,
-		     ours, "not stored yet", ago(m->age_put_s, p, sizeof(p)));
-	else
-		line("  " DIM "%-8s%-16s" RST, ours, "nothing yet");
-
-	/* Theirs: what a stalled join is nearly always waiting on. */
-	if (m->peer_seen)
-		line("  " DIM "%-8s" RST BGR "%-16s" RST DIM "read %s" RST,
-		     theirs, "present", ago(m->age_get_s, g, sizeof(g)));
-	else
-		line("  " DIM "%-8s" RST YEL "%-16s" RST DIM "read %s" RST,
-		     theirs, "not there yet", ago(m->age_get_s, g, sizeof(g)));
-
-	/* Only a client competes for the answer slot; a host reads its state
-	 * from the answer being present at all, which is the line above. */
-	if (u->role != UI_ROLE_HOST) {
-		switch (m->claim) {
-		case SESSION_CLAIM_FREE:  slot = "free to claim"; break;
-		case SESSION_CLAIM_HELD:  slot = "our claim is in it"; break;
-		case SESSION_CLAIM_BUSY:  slot = "another client holds it"; break;
-		default:                  slot = "not read yet"; break;
-		}
-		line("  " DIM "%-8s%-16s" RST, "claim", slot);
-	}
-	/*
-	 * The step the invite is actually waiting on. Storing the item takes a
-	 * second or two; a node has to keep answering for a good deal longer
-	 * before a token points a stranger at it, and without saying so the
-	 * gap between "stored" and an invite looks like nothing happening.
-	 */
-	if (m->rdv_proven)
-		line("  " DIM "%-8s" RST BGR "%-16s" RST DIM
-		     "a token can name it" RST, "node", "proven");
-	else if (m->rdv_holding)
-		line("  " DIM "%-8s" RST YEL "%-16s" RST DIM
-		     "answering; not yet steady enough to publish" RST,
-		     "node", "proving");
-	else
-		line("  " DIM "%-8s%-16s" RST, "node", "none yet");
-	line("  " DIM "%-8s%d read, %d written" RST, "so far", m->gets, m->puts);
+	draw_mailbox_art(m, f);
 	line("");
 }
 
@@ -584,7 +586,7 @@ static void draw(struct ui *u)
 		line("  " RED "! %s" RST, u->escalate);
 	line("");
 
-	draw_mailbox(u);
+	draw_mailbox(u, f);
 
 	if (u->role == UI_ROLE_HOST) {
 		line(CYN "INVITE" RST);
