@@ -3560,6 +3560,27 @@ static void net_pump(struct sess *s, uint64_t now)
 }
 
 /*
+ * Which interfaces are being serviced, and what each carries. Re-run whenever
+ * the set changes: a cable going in adds an interface that was not there when
+ * the session started, and enumerating once meant the dashboard went on
+ * describing a machine that no longer existed until it was restarted.
+ */
+static void report_links(struct sess *s)
+{
+	const struct session_obs *o = s->cfg->obs;
+	struct sig_mcast_if ifs[16];
+	int ni, k;
+
+	if (!s->lan || !s->sig || !o || !o->link)
+		return;
+	ni = sig_link_ifaces(s->sig, ifs, 16);
+	if (o->link_reset)
+		o->link_reset(o->arg);
+	for (k = 0; k < ni; k++)
+		o->link(o->arg, ifs[k].name, ifs[k].has4, ifs[k].has6);
+}
+
+/*
  * The half of a move that is the same wherever it is noticed: the offer and
  * the candidates behind it describe a network that is gone, and the v4 STUN
  * pool was measured on it. What differs between a host and a client -- which
@@ -4212,6 +4233,10 @@ static int sig_rebuild(struct sess *s)
 		return -1;
 	}
 	s->next_rdv_warm_ms = now_ms();
+	/* The interfaces the fresh signaller services are the ones that exist
+	 * now, which is not what the last enumeration described: a cable that
+	 * went in or out is exactly what a move can be. */
+	report_links(s);
 	dbg_logf("sig: rebuilt on the new network");
 	return 0;
 }
@@ -4605,14 +4630,7 @@ static int sig_setup(struct sess *s)
 	if (sig_arm(s))
 		return -1;
 	if (s->lan) {
-		if (cfg->obs && cfg->obs->link) {
-			struct sig_mcast_if ifs[16];
-			int ni = sig_link_ifaces(s->sig, ifs, 16), k;
-
-			for (k = 0; k < ni; k++)
-				cfg->obs->link(cfg->obs->arg, ifs[k].name,
-					       ifs[k].has4, ifs[k].has6);
-		}
+		report_links(s);
 		if (!cfg->is_host)
 			client_direct_connect(s);
 	}

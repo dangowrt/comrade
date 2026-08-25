@@ -53,8 +53,12 @@ struct session_obs {
 	void (*mapping4)(void *arg, int dependent);
 	/* A family's connectivity verdict changed (NET_CONN_* or 0). */
 	void (*net_conn)(void *arg, int family, int status);
-	/* An up multicast interface being serviced, and the families it has. */
+	/* An up multicast interface being serviced, and the families it has.
+	 * The set is re-sent whenever it changes, preceded by link_reset. */
 	void (*link)(void *arg, const char *ifname, int have4, int have6);
+	/* Forget the interfaces: a cable going in or out changes which exist,
+	 * and what is listed has to be the machine as it is now. */
+	void (*link_reset)(void *arg);
 	/* A per-family rendezvous node: located (host) or seeded (client). */
 	void (*rendezvous)(void *arg, int family, const char *addr, int ready);
 	/* A family's rendezvous progress advanced (RDV_*); drives the spinner. */

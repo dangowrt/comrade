@@ -341,16 +341,22 @@ static void token_class_line(struct ui *u, const char *pre)
 	int r6 = u->tok_st6 == TOKEN_STATE_RENDEZVOUS ||
 		 u->tok_st6 == TOKEN_STATE_DIRECT;
 
+	/*
+	 * Green is the best this network can do, not the best there is: a host
+	 * with only v4 to offer has finished, and saying so in the colour that
+	 * means "still working on it" reads as a fault that will clear. Yellow
+	 * is for the states that really are still moving.
+	 */
 	if (r4 && r6)
 		line("%s" BGR "reachable over IPv4 and IPv6" RST, pre);
 	else if (r4 && u->tok_st6 == TOKEN_STATE_PENDING)
-		line("%s" BGR "IPv4 ready" RST DIM
+		line("%s" YEL "IPv4 ready" RST DIM
 		     " -- locating IPv6 ..." RST, pre);
 	else if (r6 && u->tok_st4 == TOKEN_STATE_PENDING)
-		line("%s" BGR "IPv6 ready" RST DIM
+		line("%s" YEL "IPv6 ready" RST DIM
 		     " -- locating IPv4 ..." RST, pre);
 	else if (r4)
-		line("%s" YEL "IPv4 only" RST, pre);
+		line("%s" BGR "IPv4 only" RST, pre);
 	else if (r6)
 		line("%s" RED "! IPv6 only" RST DIM
 		     " -- IPv4-only peers cannot connect" RST, pre);
@@ -688,6 +694,13 @@ static void um_net(struct ui *u, int family, int scope, int via, const char *add
 		     addr, scope_word(scope, via));
 }
 
+static void um_link_reset(struct ui *u)
+{
+	u->nlink = 0;
+	if (u->anim)
+		u->dirty = 1;
+}
+
 static void um_link(struct ui *u, const char *name, int has4, int has6)
 {
 	int i;
@@ -950,6 +963,7 @@ static void cb_net(void *a, int f, int sc, int v, const char *ad)
 static void cb_mapping4(void *a, int d) { um_mapping4(a, d); }
 static void cb_net_conn(void *a, int f, int st) { um_net_conn(a, f, st); }
 static void cb_link(void *a, const char *n, int h4, int h6) { um_link(a, n, h4, h6); }
+static void cb_link_reset(void *a) { um_link_reset(a); }
 static void cb_rdv(void *a, int f, const char *ad, int rd) { um_rdv(a, f, rd, ad); }
 static void cb_rdv_stage(void *a, int f, int st) { um_rdv_stage(a, f, st); }
 static void cb_token(void *a, const char *t) { um_token(a, t); }
@@ -995,6 +1009,7 @@ void ui_bind(struct ui *u, struct session_obs *obs)
 	obs->mapping4 = cb_mapping4;
 	obs->net_conn = cb_net_conn;
 	obs->link = cb_link;
+	obs->link_reset = cb_link_reset;
 	obs->rendezvous = cb_rdv;
 	obs->rdv_stage = cb_rdv_stage;
 	obs->token = cb_token;
@@ -1146,6 +1161,10 @@ static void em_reset(void *a)
 {
 	emitf(a, "X\n");
 }
+static void em_link_reset(void *a)
+{
+	emitf(a, "J\n");
+}
 static void em_net_reset(void *a, int f)
 {
 	emitf(a, "Y %d\n", f);
@@ -1199,6 +1218,7 @@ void ui_emitter(struct session_obs *obs, sock_t fd)
 	obs->peer = em_peer;
 	obs->peer_ro = em_peer_ro;
 	obs->reset = em_reset;
+	obs->link_reset = em_link_reset;
 	obs->net_reset = em_net_reset;
 	obs->escalate = em_esc;
 	obs->escalate_clear = em_esc_clear;
@@ -1277,6 +1297,9 @@ static void feed(struct ui *u, char *ln)
 		break;
 	case 'L':
 		um_live(u);
+		break;
+	case 'J':
+		um_link_reset(u);
 		break;
 	case 'X':
 		um_reset(u);
