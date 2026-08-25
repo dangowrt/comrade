@@ -3314,6 +3314,12 @@ static void update_expect(struct sess *s)
 	const char *p = s->local_sdp;
 	char addr[64];
 
+	/* Recomputed, not accumulated: a host that moves to a network without
+	 * one of them would otherwise go on saying it expects that family for
+	 * the rest of the session, and keep reporting it as still being looked
+	 * for. The candidates are re-gathered on every move, so this follows. */
+	s->expect4 = 0;
+	s->expect6 = 0;
 	while ((p = strstr(p, "a=candidate:")) != NULL) {
 		if (sscanf(p, "a=candidate:%*s %*d %*s %*u %63s", addr) == 1) {
 			if (!strchr(addr, ':'))
