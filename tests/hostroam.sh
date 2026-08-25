@@ -3,14 +3,21 @@
 # and its old transport goes silent (--roam-hard) exactly as a move onto
 # another network. The healthy client must resume in place -- re-claim under
 # its session identity against the rotated offer and be grafted into the
-# worker the host still runs. Over the DHT, so it SKIPs (77) unless
-# COMRADE_E2E_NET=1.
+# worker the host still runs. Over a private DHT this script starts
+# (tests/swarm.sh); COMRADE_E2E_NET=1 uses the real one.
 E2E="${1:?path to comrade-e2e}"
-[ "$COMRADE_E2E_NET" = 1 ] || exit 77
+SEED="${2:?path to comrade-dhtseed}"
+
+. "$(dirname "$0")/swarm.sh"
+
+# A private DHT of our own, unless asked to use the real one.
+if [ "${COMRADE_E2E_NET:-0}" != 1 ]; then
+	swarm_start "$SEED" || exit 1
+fi
 
 tmp="$(mktemp -d)"
 hostpid=""
-trap 'kill "$hostpid" 2>/dev/null; rm -rf "$tmp"' EXIT
+trap 'kill "$hostpid" 2>/dev/null; swarm_stop; rm -rf "$tmp"' EXIT
 
 COMRADE_DEBUG="$tmp/host.dbg" "$E2E" host --serve 1 --timeout 300 \
 	--roam-ms 30000 --roams 1 --roam-hard \

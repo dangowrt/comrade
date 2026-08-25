@@ -769,6 +769,9 @@ endif()
 if(COMRADE_BUILD_TOOLS)
 	add_executable(comrade-sigprobe tools/sigprobe.c)
 	target_link_libraries(comrade-sigprobe comrade_dht comrade_token)
+	# One node of the private DHT the network tests run against.
+	add_executable(comrade-dhtseed tools/dhtseed.c)
+	target_link_libraries(comrade-dhtseed comrade_dht)
 
 	add_executable(comrade-rdvbench tools/rdvbench.c)
 	target_link_libraries(comrade-rdvbench comrade_dht comrade_token)
@@ -786,7 +789,8 @@ if(COMRADE_BUILD_TOOLS)
 	if(BUILD_TESTING AND UNIX)
 		add_test(NAME multiuser_e2e
 			COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/multiuser.sh
-				$<TARGET_FILE:comrade-e2e> 2)
+				$<TARGET_FILE:comrade-e2e>
+				$<TARGET_FILE:comrade-dhtseed> 2)
 		set_tests_properties(multiuser_e2e PROPERTIES
 			SKIP_RETURN_CODE 77 TIMEOUT 300)
 
@@ -813,7 +817,8 @@ if(COMRADE_BUILD_TOOLS)
 		# DHT, so SKIPs (77) unless COMRADE_E2E_NET=1.
 		add_test(NAME lan_mixed_e2e
 			COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/lan_mixed.sh
-				$<TARGET_FILE:comrade-e2e>)
+				$<TARGET_FILE:comrade-e2e>
+				$<TARGET_FILE:comrade-dhtseed>)
 		set_tests_properties(lan_mixed_e2e PROPERTIES
 			SKIP_RETURN_CODE 77 TIMEOUT 300)
 
@@ -823,7 +828,8 @@ if(COMRADE_BUILD_TOOLS)
 		# COMRADE_E2E_NET=1. Passes only when release-on-pickup works.
 		add_test(NAME turnstile_stuck_e2e
 			COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/turnstile_stuck.sh
-				$<TARGET_FILE:comrade-e2e>)
+				$<TARGET_FILE:comrade-e2e>
+				$<TARGET_FILE:comrade-dhtseed>)
 		set_tests_properties(turnstile_stuck_e2e PROPERTIES
 			SKIP_RETURN_CODE 77 TIMEOUT 300)
 
@@ -851,7 +857,8 @@ if(COMRADE_BUILD_TOOLS)
 		# rendezvous is the DHT, so SKIPs (77) unless COMRADE_E2E_NET=1.
 		add_test(NAME roam_client_e2e
 			COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/roam_client.sh
-				$<TARGET_FILE:comrade-e2e>)
+				$<TARGET_FILE:comrade-e2e>
+				$<TARGET_FILE:comrade-dhtseed>)
 		set_tests_properties(roam_client_e2e PROPERTIES
 			SKIP_RETURN_CODE 77 TIMEOUT 300)
 
@@ -871,7 +878,8 @@ if(COMRADE_BUILD_TOOLS)
 		# DHT, so SKIPs (77) unless COMRADE_E2E_NET=1.
 		add_test(NAME resume_e2e
 			COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/resume.sh
-				$<TARGET_FILE:comrade-e2e>)
+				$<TARGET_FILE:comrade-e2e>
+				$<TARGET_FILE:comrade-dhtseed>)
 		set_tests_properties(resume_e2e PROPERTIES
 			SKIP_RETURN_CODE 77 TIMEOUT 300)
 
@@ -880,7 +888,8 @@ if(COMRADE_BUILD_TOOLS)
 		# rotated offer. DHT rendezvous, so SKIPs without the net gate.
 		add_test(NAME hostroam_e2e
 			COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/hostroam.sh
-				$<TARGET_FILE:comrade-e2e>)
+				$<TARGET_FILE:comrade-e2e>
+				$<TARGET_FILE:comrade-dhtseed>)
 		set_tests_properties(hostroam_e2e PROPERTIES
 			SKIP_RETURN_CODE 77 TIMEOUT 300)
 

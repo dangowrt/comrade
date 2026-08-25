@@ -28,10 +28,13 @@
 set -u
 
 E2E="${1:?path to comrade-e2e}"
+SEED="${2:?path to comrade-dhtseed}"
 
+. "$(dirname "$0")/swarm.sh"
+
+# A private DHT of our own, unless asked to use the real one.
 if [ "${COMRADE_E2E_NET:-0}" != 1 ]; then
-	echo "skipped: set COMRADE_E2E_NET=1 to run (needs live mainline DHT)"
-	exit 77
+	swarm_start "$SEED" || exit 1
 fi
 
 # grep -c says nothing at all when the log does not exist yet, which is not 0.
@@ -41,7 +44,7 @@ rebuilds() {
 }
 
 tmp=$(mktemp -d)
-cleanup() { kill "$hpid" $cpid 2>/dev/null; rm -rf "$tmp"; }
+cleanup() { kill "$hpid" $cpid 2>/dev/null; swarm_stop; rm -rf "$tmp"; }
 trap cleanup EXIT INT TERM
 cpid=""
 ROAMS=3

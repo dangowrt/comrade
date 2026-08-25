@@ -3,14 +3,21 @@
 # re-claims under its session-stable identity, the host grafts the punch into
 # the worker it already runs, and the SSH session above never ends. Staged
 # with --blackhole-all (both directions muted) and a lift, over the DHT --
-# the rendezvous that needs no shared segment -- so it SKIPs (77) unless
-# COMRADE_E2E_NET=1.
+# the rendezvous that needs no shared segment. It meets through a private DHT
+# this script starts (tests/swarm.sh); COMRADE_E2E_NET=1 uses the real one.
 E2E="${1:?path to comrade-e2e}"
-[ "$COMRADE_E2E_NET" = 1 ] || exit 77
+SEED="${2:?path to comrade-dhtseed}"
+
+. "$(dirname "$0")/swarm.sh"
+
+# A private DHT of our own, unless asked to use the real one.
+if [ "${COMRADE_E2E_NET:-0}" != 1 ]; then
+	swarm_start "$SEED" || exit 1
+fi
 
 tmp="$(mktemp -d)"
 hostpid=""
-trap 'kill "$hostpid" 2>/dev/null; rm -rf "$tmp"' EXIT
+trap 'kill "$hostpid" 2>/dev/null; swarm_stop; rm -rf "$tmp"' EXIT
 
 COMRADE_DEBUG="$tmp/host.dbg" "$E2E" host --serve 1 --timeout 300 \
 	> "$tmp/host.out" 2> "$tmp/host.err" &

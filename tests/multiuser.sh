@@ -5,23 +5,26 @@
 # (mailbox_test) cannot reach: several real ICE punches and KCP streams against
 # one host at once.
 #
-# It needs LIVE mainline-DHT connectivity and is not deterministic offline, so
-# it is SKIPPED (exit 77, ctest SKIP_RETURN_CODE) unless COMRADE_E2E_NET=1. The
-# offline suite proves the turnstile's race-freedom at the unit level instead.
+# The peers meet through a private DHT this script starts (tests/swarm.sh), so
+# what it measures is comrade and not how busy the public one was. Set
+# COMRADE_E2E_NET=1 to point it at the real mainline DHT instead, which is a
+# question worth asking deliberately and not on every build.
 #
-# Usage: multiuser.sh <path-to-comrade-e2e> [N]
+# Usage: multiuser.sh <path-to-comrade-e2e> <path-to-comrade-dhtseed> [N]
 set -u
 
 E2E="${1:?path to comrade-e2e}"
-N="${2:-2}"
+SEED="${2:?path to comrade-dhtseed}"
+N="${3:-2}"
+
+. "$(dirname "$0")/swarm.sh"
 
 if [ "${COMRADE_E2E_NET:-0}" != 1 ]; then
-	echo "skipped: set COMRADE_E2E_NET=1 to run (needs live mainline DHT)"
-	exit 77
+	swarm_start "$SEED" || exit 1
 fi
 
 tmp=$(mktemp -d)
-cleanup() { kill "$hpid" $cpids 2>/dev/null; rm -rf "$tmp"; }
+cleanup() { kill "$hpid" $cpids 2>/dev/null; swarm_stop; rm -rf "$tmp"; }
 trap cleanup EXIT INT TERM
 cpids=""
 

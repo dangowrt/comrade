@@ -46,6 +46,56 @@ static const struct {
 };
 
 /*
+ * Where to bootstrap from, when it should not be the public mainline DHT:
+ * COMRADE_DHT_BOOTSTRAP=host:port[,host:port...] replaces the routers above.
+ *
+ * This exists for the tests. Driving them through the real DHT made their
+ * outcome depend on how busy and how reachable the internet was at that
+ * moment, so a run that went red said nothing about the code -- the same tree
+ * passed and failed within the hour, and failed on a different test each time.
+ * Pointed at a private swarm they answer about comrade instead, which is the
+ * only thing a test is for. Whether the real DHT converges is a question for
+ * a deliberate run against it, not for every build.
+ */
+#define BOOTSTRAP_MAX 8
+
+static struct {
+	char host[128];
+	char port[8];
+} bootstrap_env[BOOTSTRAP_MAX];
+static int bootstrap_env_n;		/* 0 = use the routers above */
+
+/* Parsed once, before the resolver thread that reads it is started. */
+static void bootstrap_env_load(void)
+{
+	const char *e = getenv("COMRADE_DHT_BOOTSTRAP");
+	const char *p;
+
+	bootstrap_env_n = 0;
+	if (!e || !*e)
+		return;
+	for (p = e; *p && bootstrap_env_n < BOOTSTRAP_MAX; ) {
+		const char *comma = strchr(p, ',');
+		size_t len = comma ? (size_t)(comma - p) : strlen(p);
+		const char *colon = memchr(p, ':', len);
+		size_t hl = colon ? (size_t)(colon - p) : len;
+
+		if (hl && hl < sizeof(bootstrap_env[0].host)) {
+			memcpy(bootstrap_env[bootstrap_env_n].host, p, hl);
+			bootstrap_env[bootstrap_env_n].host[hl] = '\0';
+			snprintf(bootstrap_env[bootstrap_env_n].port,
+				 sizeof(bootstrap_env[0].port), "%.*s",
+				 colon ? (int)(len - hl - 1) : 4,
+				 colon ? colon + 1 : "6881");
+			bootstrap_env_n++;
+		}
+		if (!comma)
+			break;
+		p = comma + 1;
+	}
+}
+
+/*
  * The bootstrap routers are resolved on a side thread: getaddrinfo can block
  * for many seconds on a slow uplink, and doing it inline would freeze the whole
  * client (a black screen) before anything is drawn. The thread only resolves;
@@ -167,14 +217,19 @@ static void *resolver_fn(void *arg)
 	struct resolver *r = arg;
 	size_t i;
 
-	for (i = 0; i < sizeof(bootstrap_hosts) / sizeof(bootstrap_hosts[0]); i++) {
+	for (i = 0; i < (bootstrap_env_n ? (size_t)bootstrap_env_n :
+			sizeof(bootstrap_hosts) / sizeof(bootstrap_hosts[0]));
+	     i++) {
+		const char *host = bootstrap_env_n ? bootstrap_env[i].host :
+						     bootstrap_hosts[i].host;
+		const char *port = bootstrap_env_n ? bootstrap_env[i].port :
+						     bootstrap_hosts[i].port;
 		struct addrinfo hints, *res, *ai;
 
 		memset(&hints, 0, sizeof(hints));
 		hints.ai_socktype = SOCK_DGRAM;
 		hints.ai_family = AF_UNSPEC;
-		if (getaddrinfo(bootstrap_hosts[i].host, bootstrap_hosts[i].port,
-				&hints, &res))
+		if (getaddrinfo(host, port, &hints, &res))
 			continue;
 		for (ai = res; ai; ai = ai->ai_next) {
 			if (ai->ai_family == AF_INET6) {
@@ -445,6 +500,7 @@ static struct dhtnode *dhtnode_create_impl(int do_bootstrap)
 	if (do_bootstrap) {
 		/* Resolve the routers off-thread so getaddrinfo cannot stall the
 		 * client's startup; the main loop pings them once they are ready. */
+		bootstrap_env_load();	/* before the thread that reads it */
 		n->boot = resolver_new();
 		if (n->boot) {
 			n->boot->refs++;	/* the thread's own reference */
@@ -530,6 +586,19 @@ struct bep44_engine *dhtnode_engine(struct dhtnode *n)
 unsigned dhtnode_netgen(struct dhtnode *n)
 {
 	return n->netgen;
+}
+
+uint16_t dhtnode_port(struct dhtnode *n, int family)
+{
+	struct sockaddr_storage ss;
+	socklen_t sl = sizeof(ss);
+	sock_t s = family == 6 ? n->s6 : n->s4;
+
+	if (!sock_valid(s) || getsockname(s, (struct sockaddr *)&ss, &sl))
+		return 0;
+	if (ss.ss_family == AF_INET6)
+		return ntohs(((struct sockaddr_in6 *)&ss)->sin6_port);
+	return ntohs(((struct sockaddr_in *)&ss)->sin_port);
 }
 
 int dhtnode_ready(struct dhtnode *n)

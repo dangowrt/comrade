@@ -4,6 +4,8 @@
 #ifndef COMRADE_DHTNODE_H
 #define COMRADE_DHTNODE_H
 
+#include <stdint.h>
+
 #include "wsock.h"
 
 struct bep44_engine;
@@ -39,6 +41,10 @@ int dhtnode_prepare(struct dhtnode *n, struct pollfd *fds, int maxfds,
 		    int *timeout_ms);
 void dhtnode_dispatch(struct dhtnode *n, const struct pollfd *fds, int nfds);
 int dhtnode_ready(struct dhtnode *n);
+/* The UDP port this node bound for `family` (4 or 6), 0 if it has none. The
+ * port is ephemeral, so a private swarm has to be told where its members
+ * actually are. */
+uint16_t dhtnode_port(struct dhtnode *n, int family);
 unsigned dhtnode_netgen(struct dhtnode *n);
 
 #endif
