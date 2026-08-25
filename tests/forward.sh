@@ -10,11 +10,10 @@
 #   2. a --forward-only host, client asks for no shell (-N) -- the pump runs
 #      with no child at all
 #
-# The third arrangement, an ordinary host with a -N client, is the one that
-# does not work: the host waits in do_shell_request() for a shell request that
-# a -N client never sends, so it never reaches the pump and neither forwarding
-# nor the control channel is ever served. It is deliberately not asserted here
-# yet; add it with the fix.
+#   3. an ordinary host serving a shell, client asks for none (-N) -- the
+#      host must serve the forwarding and the control channel anyway, which
+#      it could not while it waited for a shell request before serving
+#      anything
 #
 # Usage: forward.sh <path-to-comrade> <path-to-comrade-dhtseed>
 set -u
@@ -138,6 +137,31 @@ if [ "$(probe "$LPORT")" = ok ]; then
 	echo "host -N, client --forward-only: ok"
 else
 	echo "host -N, client --forward-only: FAILED"
+	rc=1
+fi
+
+kill "$cpid" "$hpid" 2>/dev/null
+"$CR" stop --id fwdtest >/dev/null 2>&1
+wait "$cpid" 2>/dev/null
+sleep 2
+
+# ---- 4: an ordinary shell-serving host, and a client that wants no shell ---
+# The host must not make serving anything wait on a shell request: a client is
+# entitled to ask for none, and its control channel and forwards are due to it
+# either way.
+LPORT=$((LPORT + 1))
+"$CR" --headless --id fwdtest --expire 200 --no-multicast \
+	>"$tmp/h4.json" 2>"$tmp/h4.err" &
+hpid=$!
+wait_token "$tmp/h4.json" || { echo "host published no token"; exit 1; }
+
+"$CR" "$tok" --no-multicast -N -L "$LPORT:127.0.0.1:$TPORT" -v \
+	>"$tmp/c4.out" 2>&1 &
+cpid=$!
+if [ "$(probe "$LPORT")" = ok ]; then
+	echo "shell-serving host, client with no shell: ok"
+else
+	echo "shell-serving host, client with no shell: FAILED"
 	rc=1
 fi
 

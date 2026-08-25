@@ -164,47 +164,6 @@ static ssh_channel do_channel(ssh_session s)
 	}
 }
 
-/* Wait for a shell/exec request; accept pty requests along the way. Reports
- * whether the client asked for a pty and, if so, the terminal size it asked
- * for so the child's pty can match it (see spawn). */
-static int do_shell_request(ssh_session s, int *want_pty, int *rows, int *cols,
-			    char *term, size_t termlen)
-{
-	*want_pty = 0;
-	for (;;) {
-		ssh_message m = ssh_message_get(s);
-		int type, subtype;
-
-		if (!m)
-			return -1;
-		type = ssh_message_type(m);
-		subtype = ssh_message_subtype(m);
-		if (type == SSH_REQUEST_CHANNEL) {
-			if (subtype == SSH_CHANNEL_REQUEST_PTY) {
-				const char *t =
-					ssh_message_channel_request_pty_term(m);
-
-				*want_pty = 1;
-				*cols = ssh_message_channel_request_pty_width(m);
-				*rows = ssh_message_channel_request_pty_height(m);
-				if (safe_term(t))
-					snprintf(term, termlen, "%s", t);
-				ssh_message_channel_request_reply_success(m);
-				ssh_message_free(m);
-				continue;
-			}
-			if (subtype == SSH_CHANNEL_REQUEST_SHELL ||
-			    subtype == SSH_CHANNEL_REQUEST_EXEC) {
-				ssh_message_channel_request_reply_success(m);
-				ssh_message_free(m);
-				return 0;
-			}
-		}
-		ssh_message_reply_default(m);
-		ssh_message_free(m);
-	}
-}
-
 /* Apply a client window-change to the child pty so tmux reflows. The client
  * has already subtracted its reserved status row, and its terminal-size answer
  * to tmux is corrected on the client side too, so tmux stays one row short. */
@@ -226,8 +185,19 @@ static void apply_winch(struct cpty *child, ssh_message m)
 struct pump_ctx {
 	ssh_session s;
 	ssh_event event;
-	struct cpty *child;		/* the shell pty, for window-change;
-					 * NULL in forward-only */
+	ssh_channel chan;		/* the session channel */
+	const struct sshd_opts *o;
+	int read_only;			/* which command this guest gets */
+	int allow_shell;		/* a --forward-only host serves none */
+	int session_added;		/* the session is in the event itself */
+	struct cpty *child;		/* the shell pty, once one is asked for;
+					 * NULL until then, and for good where
+					 * no shell is ever requested */
+	ssh_connector c_in;		/* channel -> child, once spawned */
+	ssh_connector c_out;		/* child -> channel */
+	int want_pty;			/* what the pty request asked for */
+	int rows, cols;
+	char term[64];
 	sock_t ctl_fd;			/* control-plane socket, 0 if none */
 	ssh_channel ctl_chan;		/* the accepted control channel */
 	ssh_connector ctl_in;		/* ctl_fd -> channel */
@@ -263,6 +233,43 @@ static int ctl_bridge_up(struct pump_ctx *c)
  * it to ctl_fd; reply to everything else so nothing stalls. Non-blocking (the
  * session is in non-blocking mode), so it returns once the queue is empty.
  */
+/*
+ * A shell was asked for, so become a shell session: spawn the command and
+ * bridge it to the channel. Until this happens -- and where it never does,
+ * because the client asked for no shell -- the pump is already running and
+ * serving the control channel and forwarding, which is the whole point.
+ */
+static int spawn_shell(struct pump_ctx *c)
+{
+	const char *cmd = (c->read_only && c->o->command_ro) ?
+			  c->o->command_ro : c->o->command;
+
+	c->child = cpty_spawn(cmd, c->o->use_pty || c->want_pty, c->rows,
+			      c->cols, c->term);
+	if (!c->child) {
+		dbg_logf("sshd: cpty_spawn failed");
+		return -1;
+	}
+	c->c_in = ssh_connector_new(c->s);
+	c->c_out = ssh_connector_new(c->s);
+	if (!c->c_in || !c->c_out)
+		return -1;
+	ssh_connector_set_out_fd(c->c_in, cpty_in(c->child));
+	ssh_connector_set_in_channel(c->c_in, c->chan, SSH_CONNECTOR_STDOUT);
+	ssh_connector_set_in_fd(c->c_out, cpty_out(c->child));
+	ssh_connector_set_out_channel(c->c_out, c->chan, SSH_CONNECTOR_STDOUT);
+	/* The connectors carry the session's socket from here; leaving it
+	 * registered as well would put one fd in the event twice. */
+	if (c->session_added) {
+		ssh_event_remove_session(c->event, c->s);
+		c->session_added = 0;
+	}
+	ssh_event_add_connector(c->event, c->c_in);
+	ssh_event_add_connector(c->event, c->c_out);
+	dbg_logf("sshd: shell requested -- cpty_spawn ok");
+	return 0;
+}
+
 static void drain_messages(struct pump_ctx *c)
 {
 	ssh_message m;
@@ -276,6 +283,41 @@ static void drain_messages(struct pump_ctx *c)
 		    !c->ctl_chan) {
 			c->ctl_chan =
 				ssh_message_channel_request_open_reply_accept(m);
+			ssh_message_free(m);
+			continue;
+		}
+		/*
+		 * The shell handshake, served from inside the pump rather than
+		 * waited for ahead of it. Waiting meant a client that asked
+		 * for no shell -- -N, which is a request and not a fault --
+		 * was never served at all: the wait replied "no" to its
+		 * control channel and its forwarding and went on waiting for a
+		 * request that was never coming.
+		 */
+		if (type == SSH_REQUEST_CHANNEL && c->allow_shell && !c->child &&
+		    ssh_message_channel_request_channel(m) == c->chan &&
+		    sub == SSH_CHANNEL_REQUEST_PTY) {
+			const char *t = ssh_message_channel_request_pty_term(m);
+
+			c->want_pty = 1;
+			c->cols = ssh_message_channel_request_pty_width(m);
+			c->rows = ssh_message_channel_request_pty_height(m);
+			if (safe_term(t))
+				snprintf(c->term, sizeof(c->term), "%s", t);
+			ssh_message_channel_request_reply_success(m);
+			ssh_message_free(m);
+			continue;
+		}
+		if (type == SSH_REQUEST_CHANNEL && c->allow_shell && !c->child &&
+		    ssh_message_channel_request_channel(m) == c->chan &&
+		    (sub == SSH_CHANNEL_REQUEST_SHELL ||
+		     sub == SSH_CHANNEL_REQUEST_EXEC)) {
+			if (spawn_shell(c)) {
+				ssh_message_reply_default(m);
+				ssh_message_free(m);
+				continue;
+			}
+			ssh_message_channel_request_reply_success(m);
 			ssh_message_free(m);
 			continue;
 		}
@@ -342,17 +384,29 @@ static int on_end_fd(socket_t fd, int revents, void *userdata)
  * ends, not after a poll interval). A few extra polls flush the command's final
  * output first; then we return and the caller closes the channel to the client.
  */
-static void pump(ssh_session s, ssh_channel chan, struct cpty *child,
-		 const struct sshd_opts *o)
+/*
+ * Serve one authenticated session: the control channel, port forwarding, and
+ * a shell if the client asks for one. Returns the child's exit status, or 0
+ * where there was no child to have one.
+ *
+ * It starts with no child on purpose. Whether a shell is coming is the
+ * client's to say and some clients say no, so the loop runs from the moment
+ * the channel opens and becomes a shell session later if asked -- rather than
+ * standing in front of everything else waiting to find out.
+ */
+static int pump(ssh_session s, ssh_channel chan, const struct sshd_opts *o,
+		int read_only, int allow_shell)
 {
 	sock_t end_fd = o->end_fd;
 	struct pump_ctx c;
-	ssh_connector c_in = NULL, c_out = NULL;	/* shell channel <-> child */
-	int ending = 0, drain = 0;
+	int ending = 0, drain = 0, exit_code = 0;
 
 	memset(&c, 0, sizeof(c));
 	c.s = s;
-	c.child = child;
+	c.chan = chan;
+	c.o = o;
+	c.read_only = read_only;
+	c.allow_shell = allow_shell;
 	c.ctl_fd = o->ctl_fd;
 	c.fwd_refused = o->fwd_refused_out;
 	c.event = ssh_event_new();
@@ -362,25 +416,14 @@ static void pump(ssh_session s, ssh_channel chan, struct cpty *child,
 	}
 	if (!c.event)
 		goto out;
-	/* The shell channel <-> child connectors, only when there is a child:
-	 * forward-only keeps the primary channel as an inert keepalive. Those
-	 * connectors are also what put the session's socket in the event, so
-	 * with no child the session is added directly or dopoll would never
-	 * see an incoming packet (a forwarding request, a ctl open). */
-	if (child) {
-		c_in = ssh_connector_new(s);
-		c_out = ssh_connector_new(s);
-		if (!c_in || !c_out)
-			goto out;
-		ssh_connector_set_out_fd(c_in, cpty_in(child));
-		ssh_connector_set_in_channel(c_in, chan, SSH_CONNECTOR_STDOUT);
-		ssh_connector_set_in_fd(c_out, cpty_out(child));
-		ssh_connector_set_out_channel(c_out, chan, SSH_CONNECTOR_STDOUT);
-		ssh_event_add_connector(c.event, c_in);
-		ssh_event_add_connector(c.event, c_out);
-	} else {
-		ssh_event_add_session(c.event, s);
-	}
+	/*
+	 * Nothing bridges the session's socket into the event until a shell is
+	 * spawned and its connectors do, so the session goes in directly or
+	 * dopoll would never see an incoming packet -- a forwarding request, a
+	 * ctl open, or the shell request itself.
+	 */
+	ssh_event_add_session(c.event, s);
+	c.session_added = 1;
 	if (sock_isset(end_fd))
 		ssh_event_add_fd(c.event, end_fd,
 				 POLLIN | POLLHUP | POLLERR | POLLNVAL,
@@ -396,7 +439,7 @@ static void pump(ssh_session s, ssh_channel chan, struct cpty *child,
 		sshfwd_tick(c.fwd);
 		if (!ending && c.end_hit)
 			ending = 1;
-		if (!ending && child && cpty_exited(child))
+		if (!ending && c.child && cpty_exited(c.child))
 			ending = 1;
 		if (ending && ++drain >= 3)
 			break;
@@ -406,11 +449,11 @@ static void pump(ssh_session s, ssh_channel chan, struct cpty *child,
 	c.fwd = NULL;
 	if (sock_isset(end_fd))
 		ssh_event_remove_fd(c.event, end_fd);
-	if (c_in)
-		ssh_event_remove_connector(c.event, c_in);
-	if (c_out)
-		ssh_event_remove_connector(c.event, c_out);
-	if (!child)
+	if (c.c_in)
+		ssh_event_remove_connector(c.event, c.c_in);
+	if (c.c_out)
+		ssh_event_remove_connector(c.event, c.c_out);
+	if (c.session_added)
 		ssh_event_remove_session(c.event, s);
 	if (c.ctl_in) {
 		ssh_event_remove_connector(c.event, c.ctl_in);
@@ -419,10 +462,12 @@ static void pump(ssh_session s, ssh_channel chan, struct cpty *child,
 	if (c.ctl_chan && ssh_channel_is_open(c.ctl_chan))
 		ssh_channel_close(c.ctl_chan);
 out:
-	if (c_in)
-		ssh_connector_free(c_in);
-	if (c_out)
-		ssh_connector_free(c_out);
+	if (c.child)
+		exit_code = cpty_close(c.child);
+	if (c.c_in)
+		ssh_connector_free(c.c_in);
+	if (c.c_out)
+		ssh_connector_free(c.c_out);
 	if (c.ctl_in)
 		ssh_connector_free(c.ctl_in);
 	if (c.ctl_out)
@@ -431,24 +476,20 @@ out:
 		ssh_channel_free(c.ctl_chan);
 	if (c.event)
 		ssh_event_free(c.event);
+	return exit_code;
 }
 
 int sshd_serve_fd(sock_t fd, const struct sshd_opts *o)
 {
 	char password[64];
 	char password_ro[64];
-	const char *cmd;
 	int read_only = 0;
 	ssh_bind bind = NULL;
 	ssh_session s = NULL;
 	ssh_channel chan = NULL;
-	struct cpty *child = NULL;
-	int want_pty = 0;
 	int gave_fd = 0;
 	int rc = -1;
 	int exit_code = 0;
-	int rows = 0, cols = 0;
-	char term[64];
 	struct sshd_opts eff;
 
 	if (!o || !o->hostkey)
@@ -506,41 +547,23 @@ int sshd_serve_fd(sock_t fd, const struct sshd_opts *o)
 	 */
 	if (o->forward_only) {
 		dbg_logf("sshd: forward-only, no shell -- entering pump");
-		pump(s, chan, NULL, &eff);
+		exit_code = pump(s, chan, &eff, read_only, 0);
 		rc = 0;
 		goto out;
 	}
 
-	dbg_logf("sshd: channel open ok, shell request");
-	term[0] = '\0';
-	if (do_shell_request(s, &want_pty, &rows, &cols, term, sizeof(term))) {
-		dbg_logf("sshd: shell request failed/aborted");
-		goto out;
-	}
-	dbg_logf("sshd: shell request ok want_pty=%d rows=%d cols=%d term=%s",
-		 want_pty, rows, cols, term);
-
-	/* Size the terminal from the client's request so the remote command
-	 * (tmux) uses exactly the rows it asked for. The client reserves its own
-	 * bottom status row by requesting one row fewer; honouring that here is
-	 * what keeps tmux off that row. */
-	cmd = (read_only && o->command_ro) ? o->command_ro : o->command;
-	child = cpty_spawn(cmd, o->use_pty || want_pty, rows, cols, term);
-	if (!child) {
-		dbg_logf("sshd: cpty_spawn failed");
-		goto out;
-	}
-	dbg_logf("sshd: cpty_spawn ok, entering pump");
-
-	/* Live resizes arrive as window-change requests; the pump applies them
-	 * to the pty. A second channel requesting the comrade-ctl subsystem is
-	 * bridged to o->ctl_fd, and client port forwards are served unless
-	 * declined by o->no_fwd or the read-only grade (all in drain_messages). */
-	pump(s, chan, child, &eff);
+	/*
+	 * Everything from here is the pump's: the shell request if one comes,
+	 * live resizes, the comrade-ctl subsystem bridged to o->ctl_fd, and
+	 * port forwarding unless declined by o->no_fwd or the read-only grade.
+	 * The terminal is sized from the client's own pty request, so a client
+	 * reserving its bottom status row by asking for one row fewer gets what
+	 * it asked for.
+	 */
+	dbg_logf("sshd: channel open ok, entering pump");
+	exit_code = pump(s, chan, &eff, read_only, 1);
 	rc = 0;
 out:
-	if (child)
-		exit_code = cpty_close(child);
 	if (chan) {
 		if (ssh_channel_is_open(chan)) {
 			/*
