@@ -405,8 +405,6 @@ struct sess {
 
 	char **stun_servers;		/* rotated across ICE retries (host:port) */
 	int stun_count;
-	int probe_slice4;		/* which slice of the server list the next
-					 * pool round asks */
 	char stun_host[128];		/* the current attempt's host, split out */
 	/*
 	 * Distinct public v4 addresses this network's NAT has been seen mapping
@@ -1419,21 +1417,17 @@ static void probe_hit(void *arg, const uint8_t addr[4], uint16_t port)
 static void *stun_probe_thread(void *arg)
 {
 	struct sess *s = arg;
-	char *targets[STUN_PROBE_SERVERS];
 	uint8_t seed[STUN_PROBE_TXID_LEN];
 	uint32_t epoch = s->probe_epoch[0];
-	int base = s->ice_attempt + s->probe_slice4 * STUN_PROBE_SERVERS;
-	int n = 0, i;
 
-	/* A NAT that maps per destination presents a different public address
-	 * to each server, so the pool is only as wide as the set of servers
-	 * asked. Successive rounds take the next slice of the list rather than
-	 * asking the same handful again. */
-	for (i = 0; i < s->stun_count && n < STUN_PROBE_SERVERS; i++)
-		targets[n++] = s->stun_servers[(base + i) % s->stun_count];
+	/* The whole list, every round. A NAT that maps per destination shows a
+	 * different public address to each server it is asked through, and how
+	 * many that is belongs to the carrier -- so asking a subset leaves a
+	 * number of our own egress addresses undiscovered that nothing here can
+	 * predict. */
 	random_bytes(seed, sizeof(seed));
-	stun_probe_run(targets, n, STUN_PROBE_MS, seed, &s->probe_stop,
-		       probe_hit, s);
+	stun_probe_run(s->stun_servers, s->stun_count, STUN_PROBE_MS, seed,
+		       &s->probe_stop, probe_hit, s);
 	ns_post(s, NSF_PROBE_DONE, 4, epoch);
 	return NULL;
 }
@@ -1471,7 +1465,6 @@ static int stun_probe_kick(struct sess *s)
 	s->probe_stop = 0;
 	if (pthread_create(&s->probe_th, NULL, stun_probe_thread, s))
 		return 0;
-	s->probe_slice4++;
 	s->probe_running = 1;
 	return 1;
 }

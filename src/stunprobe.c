@@ -4,6 +4,7 @@
 #include "wsock.h"
 #include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "oscompat.h"
@@ -121,7 +122,7 @@ int stun_probe_mapped4(const uint8_t *pkt, size_t len,
  * Keyed on the name, so a server that changes address is not noticed until
  * restart -- a fair trade for a probe that asks several at once.
  */
-#define STUN_CACHE_MAX 64
+#define STUN_CACHE_MAX 256	/* names times the addresses each carries */
 
 struct stun_cache_entry {
 	char name[128];
@@ -133,6 +134,23 @@ struct stun_cache_entry {
 static struct stun_cache_entry stun_cache[STUN_CACHE_MAX];
 static int stun_cache_n;
 static pthread_mutex_t stun_cache_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Every address held for `name`, in insertion order; how many were written. */
+static int cache_get_all(const char *name, int family,
+			 struct sockaddr_in *out, int max)
+{
+	int i, n = 0;
+
+	pthread_mutex_lock(&stun_cache_lock);
+	for (i = 0; i < stun_cache_n && n < max; i++) {
+		if (stun_cache[i].family != family ||
+		    strcmp(stun_cache[i].name, name))
+			continue;
+		memcpy(&out[n++], &stun_cache[i].sa, sizeof(out[0]));
+	}
+	pthread_mutex_unlock(&stun_cache_lock);
+	return n;
+}
 
 static int cache_get(const char *name, int family,
 		     struct sockaddr_storage *out, socklen_t *outlen)
@@ -162,9 +180,12 @@ static void cache_put(const char *name, int family,
 	if (strlen(name) >= sizeof(e->name))
 		return;
 	pthread_mutex_lock(&stun_cache_lock);
+	/* One row per address, so a name with several keeps them all. */
 	for (i = 0; i < stun_cache_n; i++)
 		if (stun_cache[i].family == family &&
-		    !strcmp(stun_cache[i].name, name))
+		    !strcmp(stun_cache[i].name, name) &&
+		    stun_cache[i].len == len &&
+		    !memcmp(&stun_cache[i].sa, sa, (size_t)len))
 			break;
 	if (i == stun_cache_n && stun_cache_n < STUN_CACHE_MAX)
 		stun_cache_n++;
@@ -179,22 +200,30 @@ static void cache_put(const char *name, int family,
 }
 
 /* "host:port" resolved to a v4 target; 3478 with no or unparsable port. */
-static int resolve4(const char *server, struct sockaddr_in *out)
+
+/*
+ * Every IPv4 address `server` names, not just the first. A name behind several
+ * A records is several destinations, and a NAT that maps per destination may
+ * hand out a different public address for each -- so taking one record would
+ * hide egress addresses exactly as asking one server would.
+ */
+#define PROBE_ADDRS_PER_NAME 8
+
+static int resolve4_all(const char *server, struct sockaddr_in *out, int max)
 {
-	struct addrinfo hints, *res;
+	struct addrinfo hints, *res, *ai;
 	struct sockaddr_storage ss;
-	socklen_t sl = sizeof(ss);
 	const char *colon = strrchr(server, ':');
 	char host[128];
 	const char *port = "3478";
 	size_t hl = colon ? (size_t)(colon - server) : strlen(server);
+	int n, i;
 
-	if (cache_get(server, AF_INET, &ss, &sl)) {
-		memcpy(out, &ss, sizeof(*out));
-		return 0;
-	}
+	n = cache_get_all(server, AF_INET, out, max);
+	if (n)
+		return n;
 	if (hl >= sizeof(host))
-		return -1;
+		return 0;
 	memcpy(host, server, hl);
 	host[hl] = '\0';
 	if (colon && colon[1])
@@ -204,31 +233,69 @@ static int resolve4(const char *server, struct sockaddr_in *out)
 	hints.ai_family = AF_INET;
 	hints.ai_socktype = SOCK_DGRAM;
 	if (getaddrinfo(host, port, &hints, &res) || !res)
-		return -1;
-	memcpy(out, res->ai_addr, sizeof(*out));
+		return 0;
+	for (ai = res; ai && n < max; ai = ai->ai_next) {
+		if (ai->ai_family != AF_INET ||
+		    ai->ai_addrlen < (socklen_t)sizeof(out[0]))
+			continue;
+		for (i = 0; i < n; i++)	/* getaddrinfo may repeat one */
+			if (!memcmp(&out[i], ai->ai_addr, sizeof(out[0])))
+				break;
+		if (i < n)
+			continue;
+		memcpy(&out[n], ai->ai_addr, sizeof(out[0]));
+		memset(&ss, 0, sizeof(ss));
+		memcpy(&ss, ai->ai_addr, sizeof(out[0]));
+		cache_put(server, AF_INET, &ss, (socklen_t)sizeof(out[0]));
+		n++;
+	}
 	freeaddrinfo(res);
-	memcpy(&ss, out, sizeof(*out));
-	cache_put(server, AF_INET, &ss, (socklen_t)sizeof(*out));
-	return 0;
+	return n;
 }
 
+/* Ask one server, naming it in the transaction id's last byte (which the
+ * reply check ignores, so any server's answer still validates). */
+static void probe_ask(sock_t fd, uint8_t seed[STUN_PROBE_TXID_LEN], int i,
+		      const struct sockaddr_in *dst)
+{
+	uint8_t req[STUN_PROBE_REQ_LEN];
+
+	seed[STUN_PROBE_TXID_LEN - 1] = (uint8_t)i;
+	stun_probe_build(req, seed);
+	sendto(fd, (const char *)req, sizeof(req), 0,
+	       (const struct sockaddr *)dst, sizeof(*dst));
+}
+
+/*
+ * Ask every server in the list, all of them in flight at once on one socket.
+ * How many public addresses a NAT that maps per destination will show is a
+ * property of the carrier, not something a fixed fan-out can be chosen to
+ * cover, so there is no fan-out to choose: the answer is as complete as the
+ * list.
+ */
 void stun_probe_run(char *const *servers, int nservers, int total_ms,
 		    uint8_t seed[STUN_PROBE_TXID_LEN], volatile int *stop,
 		    stun_probe_hit *hit, void *arg)
 {
-	struct sockaddr_in dst[16];
-	int have[16];
+	struct sockaddr_in *dst;
 	uint64_t t0, next_send = 0;
 	sock_t fd;
-	int i, n = nservers, nres = 0;
+	int i, n = nservers, nres = 0, ndst = 0, max;
 
-	if (n > 16)
-		n = 16;
-	fd = socket(AF_INET, SOCK_DGRAM, 0);
-	if (!sock_valid(fd))
+	if (n <= 0)
 		return;
+	max = n * PROBE_ADDRS_PER_NAME;
+	if (max > 255)			/* the txid byte that names the target */
+		max = 255;
+	dst = calloc((size_t)max, sizeof(*dst));
+	if (!dst)
+		return;
+	fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (!sock_valid(fd)) {
+		free(dst);
+		return;
+	}
 
-	memset(have, 0, sizeof(have));
 	t0 = os_mono_ms();
 	while (!(stop && *stop) && os_mono_ms() - t0 < (uint64_t)total_ms) {
 		struct pollfd pf;
@@ -236,33 +303,28 @@ void stun_probe_run(char *const *servers, int nservers, int total_ms,
 
 		/* One name per pass: getaddrinfo has no timeout, so resolving
 		 * the list up front let one slow name hold up every server
-		 * behind it. */
-		if (nres < n) {
-			have[nres] = resolve4(servers[nres], &dst[nres]) == 0;
-			nres++;
-			next_send = 0;		/* ask the new one at once */
+		 * behind it. Each address it yields is asked as it arrives,
+		 * rather than re-asking every target whenever one resolves. */
+		if (nres < n && ndst < max) {
+			int got = resolve4_all(servers[nres++], &dst[ndst],
+					       max - ndst);
+
+			for (i = 0; i < got; i++)
+				probe_ask(fd, seed, ndst + i, &dst[ndst + i]);
+			ndst += got;
 			now = os_mono_ms();
 		}
 
 		if (now >= next_send) {
-			for (i = 0; i < nres; i++) {
-				uint8_t req[STUN_PROBE_REQ_LEN];
-
-				if (!have[i])
-					continue;
-				seed[STUN_PROBE_TXID_LEN - 1] = (uint8_t)i;
-				stun_probe_build(req, seed);
-				sendto(fd, (const char *)req, sizeof(req), 0,
-				       (struct sockaddr *)&dst[i],
-				       sizeof(dst[i]));
-			}
+			for (i = 0; i < ndst; i++)
+				probe_ask(fd, seed, i, &dst[i]);
 			next_send = now + PROBE_RESEND_MS;
 		}
 
 		pf.fd = fd;
 		pf.events = POLLIN;
 		pf.revents = 0;
-		if (sock_poll(&pf, 1, PROBE_TICK_MS) > 0 &&
+		if (sock_poll(&pf, 1, nres < n ? 0 : PROBE_TICK_MS) > 0 &&
 		    (pf.revents & POLLIN)) {
 			uint8_t buf[512], addr[4];
 			uint16_t port;
@@ -276,10 +338,11 @@ void stun_probe_run(char *const *servers, int nservers, int total_ms,
 		}
 	}
 	sock_close(fd);
+	free(dst);
 }
 
 /* "host:port" resolved to a target of `family`; 3478 with no or unparsable
- * port. Unlike resolve4, keeps whatever sockaddr length getaddrinfo hands
+ * port. Unlike resolve4_all, keeps whatever sockaddr length getaddrinfo hands
  * back, since a v6 target is a different size. */
 static int resolve_stun(const char *server, int family,
 			struct sockaddr_storage *out, socklen_t *outlen)
