@@ -33,6 +33,25 @@
 #define SIG_DHT_GRACE_MS 2000
 #define SIG_DHT_OPEN_MS 1000		/* retry the DHT half this often while a
 					 * node cannot be created */
+/*
+ * The convergent fallback, on both ends.
+ *
+ * A rendezvous node in a token is an accelerator, not the only way in: it
+ * turns meeting into one round trip instead of a lookup. A token that names
+ * none of them -- minted before the host had found any -- or names one that
+ * has since gone must still work, or the invite someone copied an hour ago is
+ * worthless. So the mailbox is also reached the ordinary way, by converging on
+ * the key, whenever the direct route has not produced the peer.
+ *
+ * Both ends need it. A client that finds the value this way writes its answer
+ * to the nodes that served it, and those are only read back if the host also
+ * looks past the handful it pinned.
+ */
+#define SIG_DHT_WIDE_GET_MS 4000	/* while the peer's slot is still unseen */
+#define SIG_DHT_WIDE_IDLE_MS 20000	/* once it has been, as a safety net */
+#define SIG_DHT_WIDE_PUT_MS 45000	/* keep the value on whoever is closest
+					 * now, not only where it first landed */
+
 #define SIG_DHT_PUT_SLOW_MS 20000	/* a still-missing family with no proven
 					 * connectivity yet is retried at this
 					 * slower pace instead of not at all --
@@ -91,6 +110,8 @@ struct sig {
 	int relocate4, relocate6;	/* search for a replacement, while still
 					 * serving the one we hold */
 	int up4, up6;			/* proven connectivity, see sig_set_family_up */
+	uint64_t next_wide_get_ms;
+	uint64_t next_wide_put_ms;
 	int anchor_seen4, anchor_seen6;	/* the node we hold answered a get since
 					 * this was last taken; sticky, because
 					 * another holder answering after it must
@@ -734,6 +755,21 @@ static void dht_pump(struct sig *s, uint64_t now)
 				 on_dht_get, s);
 		s->next_get_ms = now + SIG_DHT_GET_MS;
 	}
+	/*
+	 * And the same read the ordinary way. Eagerly until the peer's slot has
+	 * been seen -- which is the case a token with no rendezvous node, or a
+	 * dead one, leaves us in -- then rarely, so a peer that wrote its answer
+	 * to a node we never pinned is still found. The nodes that answer are
+	 * retained, so the direct route takes over as soon as there is one.
+	 */
+	if (now >= s->next_wide_get_ms) {
+		const uint8_t *slot;
+
+		bep44_get(s->engine, s->keys.bep44_pk, SIG_SALT, on_dht_get, s);
+		s->next_wide_get_ms = now + (mailbox_peer_slot(&s->mb, &slot) ?
+					     SIG_DHT_WIDE_IDLE_MS :
+					     SIG_DHT_WIDE_GET_MS);
+	}
 	if (now < s->next_put_ms)
 		return;
 	if (s->is_host) {
@@ -764,6 +800,20 @@ static void dht_pump(struct sig *s, uint64_t now)
 				     s, on_host_put, s);
 			s->next_put_ms = now +
 				(eager ? SIG_DHT_PUT_MS : SIG_DHT_PUT_SLOW_MS);
+		} else if (s->mb.have_mine && now >= s->next_wide_put_ms) {
+			/*
+			 * The value where the key says it belongs, not only
+			 * where it first landed. Which nodes are closest drifts
+			 * as the DHT churns, and a client that has to converge
+			 * -- an old token, or one that never named a node --
+			 * finds whoever is closest now, so the value has to be
+			 * there and not merely on the handful we pinned once.
+			 */
+			bep44_update(s->engine, s->keys.bep44_sk,
+				     s->keys.bep44_pk, SIG_SALT, sig_merge,
+				     s, NULL, NULL);
+			s->next_wide_put_ms = now + SIG_DHT_WIDE_PUT_MS;
+			s->next_put_ms = now + SIG_DHT_PUT_MS;
 		} else if (s->mb.have_mine && (s->rnode4_len || s->rnode6_len) &&
 			   s->mb.need_write) {
 			/*
