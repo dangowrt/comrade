@@ -1051,12 +1051,21 @@ static int fan_local_sdp(struct sess *s)
 
 /*
  * Members the probe found since the last pass: put them on the dashboard the
- * moment they are known, and -- where the caller says a posted description may
- * be replaced -- widen it with them and post again. The peer treats the
- * re-post as a candidate trickle for the agent it already primed, so a punch
- * in flight only gains targets.
+ * moment they are known, widen the posted description with them and post
+ * again. The peer treats the re-post as a candidate trickle for the agent it
+ * already primed (on_peer_offer feeds a repeat straight in), so a punch in
+ * flight only gains targets, and a claimant that has not read the mailbox yet
+ * finds the wider set waiting.
+ *
+ * Whenever the pool grows, not only while nobody has answered. How long a
+ * carrier takes to show all of its egress addresses is not ours to know, so
+ * the ones that arrive late are exactly the ones a peer would otherwise never
+ * be told about -- and being unable to punch to the address the NAT picked
+ * for that peer is how a link fails outright. Only our own slot is written
+ * (sig_post, not sig_rotate), so the turnstile's answer slot is untouched and
+ * the credentials do not change.
  */
-static void pool_pump(struct sess *s, int repost_ok)
+static void pool_pump(struct sess *s)
 {
 	const struct session_obs *o = s->cfg->obs;
 	uint8_t pool[POOL4_MAX][4];
@@ -1086,7 +1095,7 @@ static void pool_pump(struct sess *s, int repost_ok)
 				o->mapping4(o->arg, rep == 2);
 		}
 	}
-	if (repost_ok && s->have_local_sdp && n >= 2 && n > s->pool_posted) {
+	if (s->have_local_sdp && n >= 2 && n > s->pool_posted) {
 		s->pool_posted = fan_local_sdp(s);
 		sig_post(s->sig, (const uint8_t *)s->local_sdp,
 			 strlen(s->local_sdp));
@@ -4407,7 +4416,7 @@ static int host_turnstile(struct sess *s)
 		 * the listener rotates, exactly as when an answer cannot be
 		 * taken up.
 		 */
-		pool_pump(s, ts == TS_WAIT_CLAIM && !s->have_peer_sdp);
+		pool_pump(s);
 		if (ts == TS_WAIT_CLAIM && listen && !s->have_peer_sdp &&
 		    stun_stall(s)) {
 			s->ice_attempt++;
@@ -4747,7 +4756,7 @@ int session_run(const struct session_cfg *cfg)
 			s.stun_rotations++;
 			st = client_regather(&s) ? ST_FAIL : ST_GATHER;
 		}
-		pool_pump(&s, st == ST_SIGNAL || st == ST_WAIT_ICE);
+		pool_pump(&s);
 		if (now_ms() >= s.c.next_status_ms) {
 			publish_status(&s.c,
 				       st == ST_WAIT_ICE ? CONN_PUNCHING :
