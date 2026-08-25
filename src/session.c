@@ -87,12 +87,8 @@ static int fam_idx(int family)
 	return family == 6 ? 1 : 0;
 }
 
-/*
- * Something a producer running off the loop thread observed. The STUN probes
- * and libjuice's gather thread learn facts the reachability model wants, but
- * writing it -- or the view behind it -- from there is what left the dashboard
- * contradicting itself. They leave a fact here instead; the loop feeds it in.
- */
+/* Something a producer off the loop thread saw. It leaves it here rather than
+ * writing the model or the view, which it does not own. */
 #define NS_FACTS_MAX 16
 enum {
 	NSF_ROUNDTRIP,			/* something answered us */
@@ -1458,15 +1454,11 @@ static void stun_probe_reap(struct sess *s)
 }
 
 /*
- * Start a pool probe. An operator-pinned server is theirs alone to talk to, so
- * no probing then. Non-zero once a round is actually out.
- *
- * A round already in flight is asked to stop and NOT waited for: this runs on
- * the loop that drives the whole session, and a probe can be inside a name
- * lookup with no timeout of its own. Waiting here is what made a move take
- * twenty seconds to be noticed. The round that was already out belongs to the
- * network we have left and its answers are dropped on arrival, so there is
- * nothing to wait for -- the model asks again once it has been reaped.
+ * Start a pool probe; an operator-pinned server is theirs alone to talk to.
+ * Non-zero once a round is out. A round in flight is asked to stop and never
+ * waited for: this is the loop that drives the session, and a probe can be
+ * inside a name lookup with no timeout. Its answers are dropped on arrival
+ * anyway, so there is nothing to wait for.
  */
 static int stun_probe_kick(struct sess *s)
 {
@@ -1483,14 +1475,9 @@ static int stun_probe_kick(struct sess *s)
 	return 1;
 }
 
-/*
- * v6's proof, and the address that carried it. The dedicated probe is often
- * the only thing that speaks v6 to a server -- ICE does not gather a v6 srflx
- * when a global host candidate already exists -- so without reporting what it
- * saw, the dashboard could say the family was up while showing nothing that
- * was up. It goes in as a candidate like any other, and the model decides
- * whether it belongs on the dashboard.
- */
+/* v6's proof and the address that carried it. Often the only v6 address
+ * anything sees: ICE gathers no v6 srflx when a global host candidate
+ * already exists. */
 static void probe6_hit(void *arg, const uint8_t addr[16], uint16_t port)
 {
 	struct sess *s = arg;
@@ -3384,14 +3371,9 @@ static int dht_attempt_concluded(struct sess *s, int family)
 	return !sig_locating(s->sig, family);
 }
 
-/*
- * The tokgen facts for `family`: the reachability model holds all but the one
- * that reaches into sig, which is pushed into it as it is learnt. dht_acked
- * comes from the model rather than from sig directly, so it means "reached the
- * rendezvous on the network we are on" rather than "reached it at some point
- * since the last rebuild" -- the token should name a meeting point this host
- * can still get to, and the two stop agreeing the moment one family moves.
- */
+/* The tokgen facts: the model holds all but the one reaching into sig. Its
+ * dht_acked means "reached on the network we are on", not "reached since the
+ * last rebuild". */
 static void gather_facts(struct sess *s, int family, struct tokgen_facts *f)
 {
 	netstate_on_dht_concluded(&s->ns, family,
@@ -3414,13 +3396,8 @@ static void net_sample_src(struct sess *s, int family, uint32_t epoch)
 			len ? text : NULL, now_ms());
 }
 
-/*
- * A validated get is a round trip this host completed, so it proves the family
- * that carried it -- and says whether the rendezvous we hold is the one still
- * answering. It arrives long before a STUN reply on a network whose STUN
- * servers are slow to resolve or slow to answer, which is the difference
- * between a token that settles and a client that gives up waiting for one.
- */
+/* A validated get is a round trip we completed, so it proves the family and
+ * says whether the rendezvous we hold is the one still answering. */
 static void ns_take_acks(struct sess *s, uint64_t now)
 {
 	static const int famv[2] = { 4, 6 };
@@ -3520,13 +3497,8 @@ static void net_apply(struct sess *s, const struct netstate_actions *a)
 	}
 }
 
-/*
- * The one place a network change is noticed and acted on. Runs at the top of
- * both loops: sample the interfaces, tell the model which family moved, hand
- * it what the producers left, and carry out what it asks for. The loops then
- * take their own half of a move from net_changed -- an agent to rebuild, an
- * offer to drop -- which is all that is left that differs between them.
- */
+/* The one place a network change is noticed and acted on, at the top of both
+ * loops. What is left for each is taken from net_changed. */
 static void net_pump(struct sess *s, uint64_t now)
 {
 	const struct session_cfg *cfg = s->cfg;
@@ -3559,12 +3531,8 @@ static void net_pump(struct sess *s, uint64_t now)
 		net_apply(s, &a);
 }
 
-/*
- * Which interfaces are being serviced, and what each carries. Re-run whenever
- * the set changes: a cable going in adds an interface that was not there when
- * the session started, and enumerating once meant the dashboard went on
- * describing a machine that no longer existed until it was restarted.
- */
+/* Which interfaces are serviced, and what each carries. Re-run on a rebuild:
+ * a cable going in adds one that was not there at startup. */
 static void report_links(struct sess *s)
 {
 	const struct session_obs *o = s->cfg->obs;
@@ -3580,12 +3548,8 @@ static void report_links(struct sess *s)
 		o->link(o->arg, ifs[k].name, ifs[k].has4, ifs[k].has6);
 }
 
-/*
- * The half of a move that is the same wherever it is noticed: the offer and
- * the candidates behind it describe a network that is gone, and the v4 STUN
- * pool was measured on it. What differs between a host and a client -- which
- * agent to tear down, which state to go back to -- stays with each loop.
- */
+/* The half of a move that is the same wherever it is noticed. What differs --
+ * which agent to tear down, which state to return to -- stays with each loop. */
 static void net_change_reset(struct sess *s)
 {
 	s->have_local_sdp = 0;

@@ -56,13 +56,9 @@ static int stun_reply_ok(const uint8_t *pkt, size_t len,
 	return (int)mlen;
 }
 
-/*
- * The mapped address a validated reply carries for the wire-format family byte
- * `want_fam` (0x01 v4, 0x02 v6): four bytes of `addr` for v4, sixteen for v6.
- * XOR-MAPPED-ADDRESS is preferred and MAPPED-ADDRESS accepted; the v6 mask is
- * the magic cookie followed by the reply's own transaction id, per RFC 5389
- * 15.2, which is why it is read from the packet rather than from the seed.
- */
+/* The mapped address for wire family `want_fam` (0x01 v4, 0x02 v6). The v6
+ * mask is the magic cookie plus the reply's own transaction id (RFC 5389
+ * 15.2), hence read from the packet rather than the seed. */
 int stun_probe_mapped_fam(const uint8_t *pkt, size_t len,
 			  const uint8_t seed[STUN_PROBE_TXID_LEN], int want_fam,
 			  uint8_t addr[16], uint16_t *port)
@@ -117,21 +113,13 @@ int stun_probe_mapped4(const uint8_t *pkt, size_t len,
 }
 
 /*
- * Addresses already resolved for a STUN server, kept for the life of the
- * process.
+ * Resolved STUN addresses, kept for the life of the process. Moving does not
+ * move the servers, and the resolver is routinely the last thing to answer
+ * after a move, so a probe that has run once goes straight out instead of
+ * sitting through a DNS timeout per name.
  *
- * Moving does not move the servers, and the resolver is routinely the last
- * thing to answer again after a move -- so a probe run on the new link would
- * otherwise sit through a DNS timeout per name before sending anything, and
- * often send nothing at all because nothing resolved. Having done this once,
- * it can go straight out and be answered in the time one lookup would have
- * taken to fail.
- *
- * Entries are keyed on the name as written, so a list replaced by `comrade
- * stun-update` simply misses and resolves afresh; a server that keeps its name
- * and changes its address is not noticed until the process restarts, which is
- * a fair trade for a probe that asks several servers at once and needs only
- * one of them to answer.
+ * Keyed on the name, so a server that changes address is not noticed until
+ * restart -- a fair trade for a probe that asks several at once.
  */
 #define STUN_CACHE_MAX 64
 
@@ -246,14 +234,9 @@ void stun_probe_run(char *const *servers, int nservers, int total_ms,
 		struct pollfd pf;
 		uint64_t now = os_mono_ms();
 
-		/*
-		 * One name per pass, so the first server is asked as soon as it
-		 * is known rather than after every other name has been looked
-		 * up. getaddrinfo has no timeout and the resolver is often the
-		 * last thing to come back after a move, so resolving the whole
-		 * list up front let one dead or slow name hold up every server
-		 * behind it -- and the answer we want is usually the first one.
-		 */
+		/* One name per pass: getaddrinfo has no timeout, so resolving
+		 * the list up front let one slow name hold up every server
+		 * behind it. */
 		if (nres < n) {
 			have[nres] = resolve4(servers[nres], &dst[nres]) == 0;
 			nres++;

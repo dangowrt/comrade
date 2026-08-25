@@ -16,14 +16,8 @@ static void raise_act(struct netstate *ns, int i, unsigned bits)
 }
 
 /*
- * A family's verdict, in order:
- *
- * (A) No usable address: nothing to be reachable over, whatever else we hold.
- * (B) A round trip completed in the epoch we are still in: proven. This is the
- *     only arm that reaches UP, which is what stops a rendezvous node or a
- *     token carried across a move from speaking for a network it was never on.
- * (C) A route exists: something might work, and nothing has yet.
- * (D) Otherwise there is not even a way out.
+ * (A) no usable address; (B) a round trip completed in the epoch we are still
+ * in -- the only way to UP; (C) a route exists; (D) not even that.
  */
 static int conn_of(const struct netstate_fam *f)
 {
@@ -66,20 +60,15 @@ static void facts_moved(struct netstate *ns, int i)
 }
 
 /*
- * Which of this family's addresses belong on the dashboard. Recomputed over
- * the whole set rather than decided as each arrives, because whether a global
- * v6 is ours to show turns on the source address, which is routinely learnt
- * after the addresses are: a row settled at the moment it arrived could never
- * be taken back.
+ * Which of this family's addresses belong on the dashboard, recomputed over
+ * the whole set: whether a global v6 is ours to show turns on the source
+ * address, routinely learnt after the addresses are.
  *
- * With a source known, exactly one globally scoped v6 we gathered ourselves is
- * shown -- the one we source from. The others are the stable and DHCPv6
- * addresses the ICE agent also enumerates, which we neither listen on nor
- * punch from, and which are a tracking handle besides. With no source known
- * nothing is held back: a gathered address beats none, and it is never
- * advertised on that basis, since rewriting the offer needs a source too. A
- * server-reflexive v6 is always shown -- behind NAT66 it is the only address a
- * peer could use.
+ * With a source known, one globally scoped v6 we gathered is shown -- the one
+ * we source from; the rest are the stable and DHCPv6 addresses ICE also
+ * enumerates, which we neither listen on nor punch from. With none known
+ * nothing is held back. A server-reflexive v6 is always shown: behind NAT66 it
+ * is the only address a peer could use.
  */
 static int recompute_rows(struct netstate_fam *f)
 {

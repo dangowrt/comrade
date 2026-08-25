@@ -11,38 +11,20 @@
 #include "tokgen.h"
 
 /*
- * What this host currently knows about its own reachability, decided
- * independently for each address family.
+ * What this host knows about its own reachability, per address family.
  *
- * Every question this answers -- is v6 up, which address do we source from,
- * which rendezvous node is ours, what should the token advertise, which local
- * addresses should be shown -- used to be answered from facts scattered across
- * the session, gathered at different instants and never invalidated together.
- * A laptop that moves collects a second set of answers without discarding the
- * first, and then contradicts itself: a family reported UP on a network that
- * has none, a source address from the previous access point rewritten into the
- * offer, a rendezvous node shown as validated that nothing has spoken to since
- * the move.
+ * A fact is about the network it was learnt on and no other: each family
+ * carries an epoch, and an asynchronous fact stamped with a superseded one is
+ * dropped. Only a round trip completed in the current epoch marks a family
+ * reachable -- not a rendezvous node carried across a move, not a token minted
+ * before it, not a route that merely exists.
  *
- * So the module is built around one idea: a fact is about the network it was
- * learnt on, and about no other. Each family carries an EPOCH, bumped when
- * that family's addresses move. Every asynchronous fact is stamped with the
- * epoch it was learnt under and is dropped on arrival once superseded. There
- * is no other way to mark a family reachable: not a rendezvous node carried
- * across the move, not a token minted before it, not a route that merely
- * exists. Only a round trip that completed HERE.
+ * Pure: no sockets, no threads, no clock (now_ms is passed in, as netmon and
+ * path do). What the outside world must do is returned as an action rather
+ * than performed, so this cannot block a loop or reach past the controller
+ * into the view. Addresses cross as bytes plus the caller's own text.
  *
- * It is a PURE function of the events it is given: no sockets, no threads, no
- * clock of its own -- `now_ms` is passed in, as netmon and path already do.
- * Everything the outside world must do is RETURNED as an action for the caller
- * to perform, never performed here, so this module cannot block a loop and
- * cannot reach past the controller into the view. Addresses cross the boundary
- * as raw bytes plus the text the caller already printed; nothing here parses or
- * formats an address, and the whole module links to nothing.
- *
- * Threading: every call happens on the one thread that owns sig, the same
- * contract sig.h states. The STUN probe threads and libjuice's gather thread do
- * not call in; they hand facts to the controller, which calls in from its loop.
+ * Called only on the thread that owns sig, as sig.h requires.
  */
 
 enum {					/* address scope for a local address */
@@ -54,12 +36,7 @@ enum {					/* how a local address was learnt */
 	NET_VIA_DIRECT,			/* locally gathered host candidate */
 	NET_VIA_STUN			/* server-reflexive, learnt via STUN */
 };
-/*
- * A family's global connectivity -- proof, not a guess. UP is earned by a
- * completed round trip and held only for as long as the epoch it was earned in
- * is current. Bits, not a plain enum, so a later verdict (NAT type, filtering)
- * can be added alongside UP.
- */
+/* Bits, not an enum, so a later verdict (NAT type, filtering) can join UP. */
 #define NET_CONN_UP	  (1 << 0)	/* proven: something answered us here */
 #define NET_CONN_PENDING (1 << 1)	/* a route exists; not yet proven */
 					/* 0: no route for this family at all */
@@ -68,46 +45,27 @@ enum {					/* how a local address was learnt */
 #define NETSTATE_SA_MAX 128		/* a sockaddr, opaque to this module */
 #define NETSTATE_ROWS_MAX 12		/* local addresses held per family */
 
-/*
- * A family with no source address yet is asked again quickly, because the
- * usual reason is that DHCPv6 or an RA has not finished on a link we have just
- * joined, and that resolves in seconds. Once it has settled the question is
- * still asked, slowly and forever: RFC 4941 temporary addresses rotate and the
- * kernel changes its mind about which to source from without any interface
- * event -- both addresses stay assigned, so nothing else would ever notice.
- */
+/* Quickly while there is no source (an RA or DHCPv6 still finishing), then
+ * slowly but forever: an RFC 4941 address rotating changes what the kernel
+ * sources from with no interface event to notice. */
 #define NETSTATE_SRC_FAST_MS 500
 #define NETSTATE_SRC_FAST_TRIES 30	/* ~15s, past any RA/DHCPv6 settle */
 #define NETSTATE_SRC_SLOW_MS 5000
 
-/*
- * How many re-validation ATTEMPTS an anchor may fail before it is presumed
- * gone. Attempts rather than elapsed time: the loop this runs on can stall for
- * seconds behind a slow resolver, and a clock would condemn a node that is
- * answering perfectly well for our own slowness.
- */
+/* Failed attempts, not elapsed time: this loop can stall for seconds, and a
+ * clock would condemn a node that is answering for our own slowness. */
 #define NETSTATE_ANCHOR_MISSES 3
 #define NETSTATE_RDV_MS 2000		/* between re-validation attempts */
 
-/*
- * A family with nothing proven yet is asked again promptly for a few rounds,
- * because the usual reasons to have missed -- a packet lost, a link still
- * settling, a server that did not answer -- all clear in seconds. After that
- * it keeps asking, slowly and without ever stopping: a network that filters
- * STUN outright will never answer however long we wait, but one that is merely
- * slow, or that starts working later, is indistinguishable from it in advance.
- * Giving up outright is the one answer that cannot be corrected. A move
- * restarts the prompt rounds, since the next network may be nothing like the
- * last.
- */
+/* Prompt for a few rounds, then slowly but never not at all: a filtering
+ * network cannot be told from a slow one in advance, and giving up is the one
+ * answer that cannot be corrected. A move restarts the prompt rounds. */
 #define NETSTATE_PROBE_ROUNDS 5
 #define NETSTATE_PROBE_MS 4000		/* between the prompt rounds */
 #define NETSTATE_PROBE_SLOW_MS 30000	/* and forever after, at this pace */
 
-/* What the caller must do. Idempotent bits rather than a queue: a caller that
- * is busy when a second move lands finds them raised again on its next drain,
- * stamped with the newer epoch, so the latest always wins and nothing is ever
- * skipped for being late. */
+/* What the caller must do. Idempotent bits rather than a queue, so a second
+ * move landing mid-work re-raises them with the newer epoch. */
 #define NSA_SAMPLE_SRC	   (1u << 0)	/* ask the kernel for this family's
 					 * outbound source, feed the answer back */
 #define NSA_KICK_PROBE	   (1u << 1)	/* start this family's STUN check */
