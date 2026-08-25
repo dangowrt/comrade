@@ -940,12 +940,10 @@ static void um_net_reset(struct ui *u, int family)
 		u->prev[u->nprev++] = u->net[i];
 	}
 	u->nnet = keep;
-	if (family != 6) {
-		u->mapping_known = 0;	/* measured on the v4 network that left */
-		u->conn4 = 0;
-	}
-	if (family != 4)
-		u->conn6 = 0;
+	/* Rows only. This is also how a redraw is asked for, so touching the
+	 * connectivity verdict here would clear one the controller still holds
+	 * and will not repeat -- it is sent when it changes, and a redraw is
+	 * not a change. A move reports its own verdict. */
 	if (u->anim)
 		u->dirty = 1;
 	else if (!family)
