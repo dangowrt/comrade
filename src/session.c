@@ -108,6 +108,29 @@ struct ns_fact {
 #define ICE_ATTEMPT_MS 90000
 
 /*
+ * The same for a host's punch at a claimant joining afresh, where the wait
+ * costs somebody else. That punch holds the claimant's identity, and every
+ * further claim from it is refused as already in flight -- so a client that
+ * dies mid-punch, or gives up and comes back, is turned away for as long as
+ * this lasts.
+ *
+ * Only the punch. Both ends stamp it where they set the peer's description, so
+ * the mailbox exchange before it -- an offer being stored, a claim being
+ * noticed, a convergent lookup for a token that named no node -- is outside
+ * this and stays unbounded, as it must: how long the DHT takes is not ours to
+ * predict. Once both hold each other's candidates the scale is a human one,
+ * and a terminal session whose round trip nears ten seconds is unusable
+ * however patient we are.
+ *
+ * A resumption is not this case and keeps the backstop above. The claimant is
+ * a client already admitted, coming back after a move, so it is not competing
+ * for admission with anyone -- and it is rebuilding its signalling and
+ * re-gathering as it comes, which is exactly the slow, unpredictable path this
+ * must not cut short.
+ */
+#define HOST_PUNCH_MS 15000
+
+/*
  * If, this long after start, we still hold only a private/CGNAT IPv4 and STUN
  * has not returned a public one, the STUN pool is probably stale or unreachable
  * -- warn once and point at `comrade stun-update`.
@@ -4138,7 +4161,8 @@ static void punch_scan(struct sess *s, struct worker *ws, struct conn **punching
 				s->punch_ufrag[i][0] = '\0';
 				conn_free(c);		/* table full */
 			}
-		} else if (now_ms() - punch_start[i] > ICE_ATTEMPT_MS ||
+		} else if (now_ms() - punch_start[i] > (punch_resume[i] ?
+						ICE_ATTEMPT_MS : HOST_PUNCH_MS) ||
 			   (!punch_stuck[i] && nat_failed(c->nat))) {
 			dbg_logf("host: punch %s -> drop",
 				 punch_stuck[i] ? "wedged (test)" : "failed");
