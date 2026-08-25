@@ -185,14 +185,19 @@ void netstate_on_roundtrip(struct netstate *ns, int family, uint32_t epoch);
 
 /*
  * A validated DHT get was served back by `node`. Proves the family, and
- * confirms the anchor -- or replaces it, but only once the held one has been
+ * confirms the anchor -- or, on a host, replaces it once the held one has been
  * presumed gone, so a working rendezvous never changes underneath a token.
+ *
+ * A client's anchor is never chosen this way. Whoever answers, the rendezvous
+ * is the node the host named: it is the only one whose copy of the mailbox the
+ * host keeps current, and the only one it has undertaken to keep answering.
  */
 void netstate_on_dht_ack(struct netstate *ns, int family, uint32_t epoch,
 			 const uint8_t *node, int len, uint64_t now);
 
-/* An anchor handed to us (a token slot, or the peer's): taken only where we
- * hold none, and never confirmed by the taking. */
+/* An anchor handed to us (a token slot, or the peer's over the control
+ * channel): authoritative, so it displaces whatever is held, and is never
+ * confirmed by the handing over -- it was minted on another network. */
 void netstate_on_rdv_offered(struct netstate *ns, int family,
 			     const uint8_t *node, int len);
 

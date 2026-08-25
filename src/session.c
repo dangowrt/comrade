@@ -1121,11 +1121,19 @@ static int seed_node_for(struct sess *s, int family, struct sockaddr_storage *sa
 	uint8_t node[NETSTATE_SA_MAX], nlen = 0;
 	int i = fam_idx(family);
 
-	/* The one place that never loses it. s->rdv[] is filled on a cadence
-	 * and the token slot only once a family has been published, so either
-	 * can be empty at a rebuild -- and a rendezvous that goes missing there
-	 * is one somebody has already been handed. */
-	if (netstate_anchor(&s->ns, family, node, &nlen, NULL) && nlen) {
+	/*
+	 * A host discovered its own node, so the model holds the truest copy:
+	 * s->rdv[] is filled on a cadence and the token slot only once a family
+	 * has been published, so either can be empty at a rebuild, and a
+	 * rendezvous that goes missing there is one somebody has already been
+	 * handed.
+	 *
+	 * A client discovered nothing. Its rendezvous is whatever the host last
+	 * said, so the announcement it was given outranks anything it has
+	 * observed -- that is how it follows a host that has moved.
+	 */
+	if (s->cfg->is_host && netstate_anchor(&s->ns, family, node, &nlen,
+					       NULL) && nlen) {
 		memcpy(sa, node, nlen);
 		*len = nlen;
 		return 0;
@@ -1133,6 +1141,12 @@ static int seed_node_for(struct sess *s, int family, struct sockaddr_storage *sa
 	if (s->rdv[i].have) {
 		*sa = s->rdv[i].sa;
 		*len = s->rdv[i].len;
+		return 0;
+	}
+	if (!s->cfg->is_host &&
+	    netstate_anchor(&s->ns, family, node, &nlen, NULL) && nlen) {
+		memcpy(sa, node, nlen);
+		*len = nlen;
 		return 0;
 	}
 	if (family == 6 && token_family_state(t, 6) == TOKEN_STATE_RENDEZVOUS) {

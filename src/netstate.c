@@ -271,9 +271,19 @@ void netstate_on_dht_ack(struct netstate *ns, int family, uint32_t epoch,
 		}
 		return;
 	}
-	/* A different node. One that moves under a token already in somebody's
-	 * clipboard is worse than one briefly unconfirmed, so ours stays until
-	 * it has been asked enough times and failed. */
+	/*
+	 * A different node. A client does not get to pick: the rendezvous is
+	 * whichever node the host named, and only the host keeps that one's copy
+	 * of the mailbox current. Another node holding the key may well answer --
+	 * the convergent store put it on several -- but with a copy that stopped
+	 * being refreshed, so following it reads an offer that never changes
+	 * again.
+	 */
+	if (!ns->is_host)
+		return;
+	/* A node that moves under a token already in somebody's clipboard is
+	 * worse than one briefly unconfirmed, so ours stays until it has been
+	 * asked enough times and failed. */
 	if (f->anchor_len) {
 		/* Someone else is serving the mailbox and ours is not. That is
 		 * the only evidence that counts against it -- and the node
@@ -300,12 +310,16 @@ void netstate_on_rdv_offered(struct netstate *ns, int family,
 	int i = fam_idx(family);
 	struct netstate_fam *f = &ns->f[i];
 
-	if (f->anchor_len || !node || len <= 0 ||
-	    (size_t)len > sizeof(f->anchor))
+	if (!node || len <= 0 || (size_t)len > sizeof(f->anchor))
 		return;
+	if (f->anchor_len == (uint8_t)len &&
+	    !memcmp(f->anchor, node, (size_t)len))
+		return;
+	memset(f->anchor, 0, sizeof(f->anchor));
 	memcpy(f->anchor, node, (size_t)len);
 	f->anchor_len = (uint8_t)len;
 	f->anchor_confirmed = 0;
+	f->anchor_acks = 0;
 	f->anchor_misses = 0;
 	f->anchor_quiet = 0;
 	raise_act(ns, i, NSA_RDV_PIN | NSA_EMIT_RDV);

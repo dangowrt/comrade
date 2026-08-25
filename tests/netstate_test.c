@@ -401,9 +401,9 @@ static void latest_change_wins(void)
 	assert(!strcmp(netstate_src_text(&ns, 4), "new"));
 }
 
-/* R1: host and client differ over what to do with a token and nothing else.
- * Any future host-only special case fails here rather than in a roaming
- * laptop's dashboard. */
+/* R1: over a node both roles were handed, host and client differ about the
+ * token and nothing else. Any further host-only special case fails here rather
+ * than in a roaming laptop's dashboard. */
 static void host_and_client_agree_except_on_the_token(void)
 {
 	struct netstate h, c;
@@ -419,6 +419,7 @@ static void host_and_client_agree_except_on_the_token(void)
 
 		give_src(ns, 4, 10);
 		give_src(ns, 6, 20);
+		netstate_on_rdv_offered(ns, 6, node, 16);
 		netstate_on_dht_ack(ns, 6, netstate_epoch(ns, 6), node, 16, t);
 		netstate_on_netmon(ns, NETMON_CH_V6, 1, 0, t);
 		netstate_on_dht_concluded(ns, 4, 1);
@@ -436,6 +437,48 @@ static void host_and_client_agree_except_on_the_token(void)
 	}
 	for (i = 0; i < 2; i++)
 		assert((h.pend[i] & ~(unsigned)NSA_EMIT_TOKEN) == c.pend[i]);
+}
+
+/*
+ * The second and last divergence: who gets to choose the rendezvous. A host
+ * discovers its own, so a node answering in place of the one it holds is
+ * evidence. A client was told which node to use, and only that node's copy of
+ * the mailbox is kept current by the host -- so another holder answering is a
+ * stale copy, and following it reads an offer that never changes again.
+ */
+static void only_a_host_picks_its_own_rendezvous(void)
+{
+	struct netstate h, c;
+	uint8_t a[16], b[16], got[NETSTATE_SA_MAX];
+	uint8_t glen;
+	int i, k;
+
+	start(&h, 1);
+	start(&c, 0);
+	fill(a, 16, 70);
+	fill(b, 16, 90);
+
+	for (k = 0; k < 2; k++) {
+		struct netstate *ns = k ? &c : &h;
+
+		give_src(ns, 6, 20);
+		netstate_on_rdv_offered(ns, 6, a, 16);
+		qualify(ns, 6, a);
+		drain(ns);
+		for (i = 0; i < NETSTATE_ANCHOR_MISSES * 4; i++)
+			netstate_on_dht_ack(ns, 6, netstate_epoch(ns, 6), b, 16,
+					    t);
+	}
+	assert(netstate_anchor(&h, 6, got, &glen, NULL));
+	assert(!memcmp(got, b, 16));		/* the host moved to it */
+	assert(netstate_anchor(&c, 6, got, &glen, NULL));
+	assert(!memcmp(got, a, 16));		/* the client stayed put */
+
+	/* What does move a client is being told: the host announcing a node
+	 * over the control channel outranks anything either has observed. */
+	netstate_on_rdv_offered(&c, 6, b, 16);
+	assert(netstate_anchor(&c, 6, got, &glen, NULL));
+	assert(!memcmp(got, b, 16));
 }
 
 /* Run one round if the model asks for one; whether it did. */
@@ -798,6 +841,7 @@ int main(void)
 	quiet_says_nothing_until_the_family_is_up();
 	latest_change_wins();
 	host_and_client_agree_except_on_the_token();
+	only_a_host_picks_its_own_rendezvous();
 	probe_slows_but_never_stops();
 	no_address_no_probe_no_pending();
 	row_merge_direct_beats_stun();
