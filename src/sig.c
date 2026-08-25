@@ -47,6 +47,9 @@
  * to the nodes that served it, and those are only read back if the host also
  * looks past the handful it pinned.
  */
+/* Reads older than the one we hold, before we believe the item restarted. */
+#define SIG_SEQ_REGRESS_MAX 3
+
 #define SIG_DHT_WIDE_GET_MS 4000	/* while the peer's slot is still unseen */
 #define SIG_DHT_WIDE_IDLE_MS 20000	/* once it has been, as a safety net */
 #define SIG_DHT_WIDE_PUT_MS 45000	/* keep the value on whoever is closest
@@ -110,6 +113,7 @@ struct sig {
 	int relocate4, relocate6;	/* search for a replacement, while still
 					 * serving the one we hold */
 	int up4, up6;			/* proven connectivity, see sig_set_family_up */
+	int seq_regress;		/* consecutive reads older than what we hold */
 	uint64_t next_wide_get_ms;
 	uint64_t next_wide_put_ms;
 	int anchor_seen4, anchor_seen6;	/* the node we hold answered a get since
@@ -535,6 +539,21 @@ static void on_dht_get(void *arg, const uint8_t *v, size_t v_len, int64_t seq,
 
 	if (!v)
 		return;
+	/*
+	 * Two reads are in flight at once -- the direct one and the convergent
+	 * one -- and they answer from different nodes, so an older container can
+	 * land after a newer one. Taking it would put a superseded claim back in
+	 * front of the turnstile and walk cur_seq backwards, which the next
+	 * compare-and-swap then loses on.
+	 *
+	 * A lower seq that keeps coming back is not a straggler though: if the
+	 * item aged out everywhere our own next store begins again at one. So
+	 * hold out for a few, then believe it.
+	 */
+	if (s->cur_seq && seq < s->cur_seq &&
+	    ++s->seq_regress < SIG_SEQ_REGRESS_MAX)
+		return;
+	s->seq_regress = 0;
 	mailbox_parse(&s->mb, v, v_len);
 	s->cur_seq = seq;
 
