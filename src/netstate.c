@@ -393,6 +393,14 @@ void netstate_tick(struct netstate *ns, uint64_t now)
 	}
 }
 
+void netstate_resync(struct netstate *ns)
+{
+	int i;
+
+	for (i = 0; i < 2; i++)
+		raise_act(ns, i, NSA_EMIT_ROWS | NSA_EMIT_CONN | NSA_EMIT_RDV);
+}
+
 int netstate_take_actions(struct netstate *ns, struct netstate_actions *out)
 {
 	int i, any = 0;

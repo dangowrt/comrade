@@ -3240,6 +3240,8 @@ static int client_regather(struct sess *s)
 
 	if (o && o->reset)
 		o->reset(o->arg);
+	netstate_resync(&s->ns);	/* the reset above cleared rows and the
+					 * verdict; neither has actually moved */
 	s->established_fired = 0;
 	conn_drop_ice_path(&s->c);
 	if (s->c.nat)

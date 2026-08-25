@@ -205,6 +205,14 @@ void netstate_on_dht_concluded(struct netstate *ns, int family, int concluded);
 
 void netstate_tick(struct netstate *ns, uint64_t now);
 
+/*
+ * Re-raise everything the view is told, without changing a fact. The emits are
+ * deltas, so a caller that clears the dashboard by another route -- abandoning
+ * an ICE attempt, say -- would otherwise leave it blank until something
+ * happens to move, which for a settled network is never.
+ */
+void netstate_resync(struct netstate *ns);
+
 /* Take the actions owed, clearing them. Non-zero if any were. */
 int netstate_take_actions(struct netstate *ns, struct netstate_actions *out);
 
