@@ -479,6 +479,21 @@ static void draw_mailbox(struct ui *u)
 		}
 		line("  " DIM "%-8s%-16s" RST, "claim", slot);
 	}
+	/*
+	 * The step the invite is actually waiting on. Storing the item takes a
+	 * second or two; a node has to keep answering for a good deal longer
+	 * before a token points a stranger at it, and without saying so the
+	 * gap between "stored" and an invite looks like nothing happening.
+	 */
+	if (m->rdv_proven)
+		line("  " DIM "%-8s" RST BGR "%-16s" RST DIM
+		     "a token can name it" RST, "node", "proven");
+	else if (m->rdv_holding)
+		line("  " DIM "%-8s" RST YEL "%-16s" RST DIM
+		     "answering; not yet steady enough to publish" RST,
+		     "node", "proving");
+	else
+		line("  " DIM "%-8s%-16s" RST, "node", "none yet");
 	line("  " DIM "%-8s%d read, %d written" RST, "so far", m->gets, m->puts);
 	line("");
 }
@@ -1223,9 +1238,10 @@ static void em_rdv_stage(void *a, int f, int st)
 /* The mailbox, as one line: eleven small integers in a fixed order. */
 static void em_mailbox(void *a, const struct session_mailbox *m)
 {
-	emitf(a, "B %d %d %d %d %d %lld %d %d %d %d %d\n", m->engaged, m->stage,
-	      m->have_mine, m->mine_stored, m->peer_seen, (long long)m->seq,
-	      m->gets, m->puts, m->claim, m->age_get_s, m->age_put_s);
+	emitf(a, "B %d %d %d %d %d %lld %d %d %d %d %d %d %d\n", m->engaged,
+	      m->stage, m->have_mine, m->mine_stored, m->peer_seen,
+	      (long long)m->seq, m->gets, m->puts, m->claim, m->age_get_s,
+	      m->age_put_s, m->rdv_holding, m->rdv_proven);
 }
 static void em_token(void *a, const char *t)
 {
@@ -1363,10 +1379,11 @@ static void feed(struct ui *u, char *ln)
 		long long sq = -1;
 
 		memset(&m, 0, sizeof(m));
-		if (sscanf(ln + 1, "%d %d %d %d %d %lld %d %d %d %d %d",
+		if (sscanf(ln + 1, "%d %d %d %d %d %lld %d %d %d %d %d %d %d",
 			   &m.engaged, &m.stage, &m.have_mine, &m.mine_stored,
 			   &m.peer_seen, &sq, &m.gets, &m.puts, &m.claim,
-			   &m.age_get_s, &m.age_put_s) == 11) {
+			   &m.age_get_s, &m.age_put_s, &m.rdv_holding,
+			   &m.rdv_proven) == 13) {
 			m.seq = sq;
 			um_mailbox(u, &m);
 		}

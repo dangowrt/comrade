@@ -3646,9 +3646,11 @@ static void net_change_reset(struct sess *s)
 static void report_mailbox(struct sess *s)
 {
 	const struct session_obs *o = s->cfg->obs;
+	static const int famv[2] = { 4, 6 };
 	struct session_mailbox m;
 	struct sig_mailbox sm;
 	uint64_t now = now_ms();
+	int i;
 
 	if (!o || !o->mailbox || !s->sig)
 		return;
@@ -3665,6 +3667,16 @@ static void report_mailbox(struct sess *s)
 	m.claim = sm.claim;
 	m.age_get_s = sm.last_get_ms ? (int)((now - sm.last_get_ms) / 1000) : -1;
 	m.age_put_s = sm.last_put_ms ? (int)((now - sm.last_put_ms) / 1000) : -1;
+	for (i = 0; i < 2; i++) {
+		int proven = 0;
+
+		if (!netstate_anchor(&s->ns, famv[i], NULL, NULL, &proven))
+			continue;
+		if (proven)
+			m.rdv_proven = 1;
+		else
+			m.rdv_holding = 1;
+	}
 	if (s->mb_told_any && !memcmp(&m, &s->mb_told, sizeof(m)))
 		return;
 	s->mb_told = m;

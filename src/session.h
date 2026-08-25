@@ -56,6 +56,15 @@ struct session_mailbox {
 	int gets;			/* validated reads */
 	int puts;			/* stores that found a home */
 	int claim;			/* SESSION_CLAIM_* */
+	/*
+	 * The item being stored and a node being worth naming are two claims
+	 * about two things, and they are minutes apart in the worst case. A
+	 * store is proven the moment a read hands it back; a node has to keep
+	 * answering for a while before a token points anyone at it, and until
+	 * it does the invite cannot name it.
+	 */
+	int rdv_holding;		/* a node answered, still being proven */
+	int rdv_proven;			/* one has, and the token can name it */
 	int age_get_s;			/* since the last read, -1 = never */
 	int age_put_s;
 };
