@@ -21,6 +21,8 @@ struct mv_peer {
 };
 
 struct mview {
+	struct session_mailbox mb;	/* the last mailbox state seen */
+	int have_mb;
 	char id[64];
 	char state_path[512];
 	char tmux_sock[512];
@@ -167,6 +169,69 @@ static void det_token(const struct mview *m, FILE *out, int a)
 		fputs(",\"token_ro\":", out);
 		showfmt_json_str(out, m->token_ro);
 	}
+}
+
+/*
+ * The mailbox, on every transition. A supervisor or a test watching a host
+ * that is not being joined has the same question an operator has -- did our
+ * slot reach the DHT, has the peer's appeared, is the node worth naming yet --
+ * and the terminal is where the answer used to be, which is no use to either.
+ */
+static void det_mailbox(const struct mview *m, FILE *out, int a)
+{
+	const struct session_mailbox *b = &m->mb;
+	static const char *claims[] = { "unknown", "free", "held", "busy" };
+	static const char *stages[] = { "cold", "warmup", "store", "get",
+					"ready" };
+	const char *node = b->rdv_proven ? "proven" :
+			   b->rdv_holding ? "proving" : "none";
+	int st = b->stage < 0 ? 0 : b->stage > 4 ? 4 : b->stage;
+
+	(void)a;
+	fprintf(out, ",\"mailbox\":{\"engaged\":%s,\"dht\":\"%s\","
+		"\"ours\":\"%s\","
+		"\"peer\":\"%s\",\"node\":\"%s\","
+		"\"proving\":%s,\"proven\":%s,\"seq\":%lld,"
+		"\"reads\":%d,\"writes\":%d,\"claim\":\"%s\","
+		"\"read_age_s\":%d,\"write_age_s\":%d}",
+		b->engaged ? "true" : "false", stages[st],
+		b->mine_stored ? "stored" : b->have_mine ? "unstored" : "none",
+		b->peer_seen ? "present" : "absent", node,
+		b->rdv_holding ? "true" : "false",
+		b->rdv_proven ? "true" : "false", (long long)b->seq,
+		b->gets, b->puts, claims[b->claim & 3],
+		b->age_get_s, b->age_put_s);
+}
+
+static void mv_mailbox(void *arg, const struct session_mailbox *b)
+{
+	struct mview *m = arg;
+	struct session_mailbox now = *b, was = m->mb;
+	int changed = !m->have_mb || memcmp(&was, &now, sizeof(now));
+
+	/*
+	 * Two audiences. The state document is a snapshot, so it carries the
+	 * counters and ages and is rewritten whenever any of them move. The
+	 * event stream is a log, so it gets a line when the mailbox actually
+	 * reached a new state -- our slot stored, the peer's appeared, a node
+	 * proven -- and counting reads is not that.
+	 */
+	now.age_get_s = was.age_get_s = 0;
+	now.age_put_s = was.age_put_s = 0;
+	now.gets = was.gets = 0;
+	now.puts = was.puts = 0;
+	now.seq = was.seq = 0;		/* a re-store is upkeep, not a new state */
+	if (!changed)
+		return;
+	m->mb = *b;
+	if (m->have_mb && !memcmp(&was, &now, sizeof(now))) {
+		m->have_mb = 1;
+		mv_write(m);		/* the snapshot moved, the state did not */
+		return;
+	}
+	m->have_mb = 1;
+	mv_write(m);
+	mv_event(m, "mailbox", det_mailbox, 0);
 }
 
 static void det_peer(const struct mview *m, FILE *out, int i)
@@ -326,6 +391,7 @@ void mview_bind(struct mview *m, struct session_obs *obs)
 	obs->peer_fwd_refused = mv_peer_fwd_refused;
 	obs->escalate = mv_escalate;
 	obs->escalate_clear = mv_escalate_clear;
+	obs->mailbox = mv_mailbox;
 }
 
 void mview_error(struct mview *m, const char *err)
