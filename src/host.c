@@ -850,6 +850,9 @@ static int tmux_start(const char *sock)
 	return 0;
 }
 
+static int read_tokens(const char *id, char *tok, size_t tn,
+		       char *ro, size_t rn);
+
 static int start_new(int ui_mode, int no_mcast, int no_dht, int no_fwd)
 {
 	struct svc v;
@@ -934,10 +937,65 @@ static int start_new(int ui_mode, int no_mcast, int no_dht, int no_fwd)
 	return 1;
 }
 
+/*
+ * The foreground for a session this process did not start. It has no event
+ * stream to render -- that pipe belongs to whoever forked the service -- so
+ * the dashboard carries the invite from the state directory and waits on the
+ * keyboard, with the connection status coming from attach()'s own status line
+ * once inside.
+ *
+ * It exists because of the one rule this path must not break: a live session
+ * is always either on screen as the shared terminal or as the dashboard, never
+ * neither. Looping straight back into tmux left no way out of the session, and
+ * exiting on a detach left it running with nothing to show it -- which is the
+ * same as forgetting it. So a detach lands here, and the only way past the
+ * dashboard is to end the session.
+ */
+static int reattach(const char *id, int ui_mode)
+{
+	char tok[TOKEN_STR_LEN + 1], ro[TOKEN_STR_LEN + 1];
+	struct session_obs obs;
+	struct ui *u;
+	int quiet[2], enter, rc = 0;
+
+	if (pipe(quiet))
+		return 1;
+	u = ui_create(UI_ROLE_HOST, ui_mode);
+	if (!u) {
+		close(quiet[0]);
+		close(quiet[1]);
+		return 1;
+	}
+	memset(&obs, 0, sizeof(obs));
+	ui_bind(u, &obs);
+	if (!read_tokens(id, tok, sizeof(tok), ro, sizeof(ro))) {
+		if (obs.token)
+			obs.token(obs.arg, tok);
+		if (ro[0] && obs.token_ro)
+			obs.token_ro(obs.arg, ro);
+	}
+	for (;;) {
+		enter = ui_host_wait(u, quiet[0]);
+		if (enter != 1)
+			break;
+		rc = attach(id);
+		if (rc != 2)
+			break;
+	}
+	ui_destroy(u);
+	close(quiet[0]);
+	close(quiet[1]);
+	if (enter < 0) {		/* the dashboard is left by ending it */
+		host_stop(id);
+		fprintf(stderr, "comrade: session ended.\n");
+		return 0;
+	}
+	return rc;
+}
+
 int host_run(int ui_mode, int no_mcast, int no_dht, int no_fwd)
 {
 	char id[ID_LEN + 1];
-	int rc;
 
 	sweep_stale();
 	if (find_live(id)) {
@@ -950,19 +1008,7 @@ int host_run(int ui_mode, int no_mcast, int no_dht, int no_fwd)
 				no_mcast ? " --no-multicast" : "",
 				no_dht ? " --no-dht" : "",
 				no_fwd ? " --no-forwarding" : "");
-		/* A detach (2) leaves the service running and returns here.
-		 * Re-attaching on the spot is the one thing it cannot mean:
-		 * there is no dashboard on this path -- the events pipe belongs
-		 * to the foreground that started the service -- so hand the
-		 * terminal back and let `comrade` be run again. */
-		rc = attach(id);
-		if (rc == 2) {
-			fprintf(stderr, "comrade: detached -- the session is "
-				"still running (`comrade` to go back in, "
-				"`comrade stop` to end it)\n");
-			return 0;
-		}
-		return rc;
+		return reattach(id, ui_mode);
 	}
 	return start_new(ui_mode, no_mcast, no_dht, no_fwd);
 }

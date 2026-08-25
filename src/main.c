@@ -116,6 +116,15 @@ static int session_connect(const char *arg, int ui_mode, int no_mcast,
 		fprintf(stderr, "comrade: could not connect to the session\n");
 		return 1;
 	}
+	/*
+	 * Detaching is meant to feel like detaching from a local tmux: the
+	 * terminal comes back and the session carries on without us. Say so and
+	 * name the way in again, because unlike a local tmux there is no
+	 * `tmux ls` to find it with -- the token is the only handle, and it has
+	 * just scrolled away with the session.
+	 */
+	fprintf(stderr, "comrade: left the shared session "
+		"(comrade %s   to rejoin)\n", arg);
 	return 0;
 }
 
