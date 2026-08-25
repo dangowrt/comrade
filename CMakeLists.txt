@@ -837,6 +837,15 @@ if(COMRADE_BUILD_TOOLS)
 		set_tests_properties(roam_lan_e2e PROPERTIES
 			SKIP_RETURN_CODE 77 TIMEOUT 180)
 
+		# One family moving is not the other one moving: a v6-only
+		# renumbering must leave v4's facts standing. Offline, same
+		# multicast requirement.
+		add_test(NAME roam_fam_e2e
+			COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/roam_fam.sh
+				$<TARGET_FILE:comrade-e2e>)
+		set_tests_properties(roam_fam_e2e PROPERTIES
+			SKIP_RETURN_CODE 77 TIMEOUT 150)
+
 		# The client half of the same handler: a client that rebuilds
 		# while still looking must still join over what it rebuilt. Its
 		# rendezvous is the DHT, so SKIPs (77) unless COMRADE_E2E_NET=1.
@@ -881,7 +890,8 @@ if(COMRADE_BUILD_TOOLS)
 		# however ctest is invoked.
 		set_tests_properties(multiuser_e2e isolated_lan_e2e
 			lan_concurrent_e2e lan_mixed_e2e turnstile_stuck_e2e
-			roam_lan_e2e roam_client_e2e path_switch_e2e resume_e2e
+			roam_lan_e2e roam_fam_e2e roam_client_e2e
+			path_switch_e2e resume_e2e
 			hostroam_e2e
 			PROPERTIES RESOURCE_LOCK comrade_net)
 	endif()

@@ -201,6 +201,9 @@ struct session_cfg {
 					 * connecting needs the moves to end, or
 					 * the period races its own connect
 					 * attempt and nothing ever completes */
+	/* Which families a synthetic roam reports as moved (NETMON_CH_*);
+	 * 0 means all of them, as a real move between networks usually is. */
+	unsigned test_roam_mask;
 	int test_roam_hard;		/* a roam also silences every live
 					 * worker's transport, as a real move off
 					 * the network does; the resume graft

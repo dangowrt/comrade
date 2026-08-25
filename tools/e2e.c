@@ -166,6 +166,7 @@ int main(int argc, char **argv)
 			"       %s client <TOKEN>          [--stun ...]      [opts]\n"
 			"  opts: [--stun-port p] [--timeout s] [--log N]\n"
 			"        [--mcast] [--no-dht] [--roam-ms N] [--roams N] [--roam-hard]\n"
+		"        [--roam-fam 4|6|iface]\n"
 			"        [--blackhole-ms N]\n",
 			argv[0], argv[0]);
 		return 2;
@@ -193,7 +194,13 @@ int main(int argc, char **argv)
 			cfg.test_roam_ms = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--roams") && i + 1 < argc)
 			cfg.test_roam_max = atoi(argv[++i]);
-		else if (!strcmp(argv[i], "--roam-hard"))
+		else if (!strcmp(argv[i], "--roam-fam") && i + 1 < argc) {
+			const char *f = argv[++i];
+
+			cfg.test_roam_mask = !strcmp(f, "4") ? NETMON_CH_V4 :
+					     !strcmp(f, "6") ? NETMON_CH_V6 :
+					     NETMON_CH_IFACE;
+		} else if (!strcmp(argv[i], "--roam-hard"))
 			cfg.test_roam_hard = 1;
 		else if (!strcmp(argv[i], "--blackhole-ms") && i + 1 < argc)
 			cfg.test_blackhole_ms = atoi(argv[++i]);

@@ -3510,7 +3510,8 @@ static void net_pump(struct sess *s, uint64_t now)
 	    (cfg->test_roam_max <= 0 || s->roams < cfg->test_roam_max)) {
 		s->next_roam_ms = now + (uint64_t)cfg->test_roam_ms;
 		s->roams++;
-		ch = NETMON_CH_V4 | NETMON_CH_V6 | NETMON_CH_IFACE;
+		ch = cfg->test_roam_mask ? cfg->test_roam_mask :
+		     (NETMON_CH_V4 | NETMON_CH_V6 | NETMON_CH_IFACE);
 		synth = 1;
 	}
 	if (synth || now >= s->netmon.next_check_ms) {
@@ -3522,6 +3523,10 @@ static void net_pump(struct sess *s, uint64_t now)
 		ch |= netmon_changed_fam_fp(&s->netmon, now, fp4, fp6, fpif);
 		netstate_on_netmon(&s->ns, ch, fam_usable_addr(addrs, n, 4),
 				   fam_usable_addr(addrs, n, 6), now);
+		if (ch)
+			dbg_logf("net: change v4=%d v6=%d iface=%d",
+				 !!(ch & NETMON_CH_V4), !!(ch & NETMON_CH_V6),
+				 !!(ch & NETMON_CH_IFACE));
 		s->net_ch |= ch;
 	}
 	ns_take_acks(s, now);
