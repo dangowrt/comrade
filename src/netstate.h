@@ -66,6 +66,19 @@ enum {					/* how a local address was learnt */
 #define NETSTATE_ANCHOR_MISSES 3
 #define NETSTATE_RDV_MS 2000		/* between re-validation attempts */
 
+/*
+ * Rounds a held node may leave unanswered, on a network this family has
+ * proven, before an alternative is searched for alongside it.
+ *
+ * Silence alone says nothing -- it is equally the network. But the direct get
+ * only ever asks the nodes already held, so if nothing is searched for, no
+ * other node can answer, and the one piece of evidence that could replace a
+ * dead node can never arrive. Searching is free and reversible: the held node
+ * stays pinned, served and named by the token throughout, and only a different
+ * node actually answering replaces it.
+ */
+#define NETSTATE_ANCHOR_QUIET 5
+
 /* Prompt for a few rounds, then slowly but never not at all: a filtering
  * network cannot be told from a slow one in advance, and giving up is the one
  * answer that cannot be corrected. A move restarts the prompt rounds. */
@@ -85,9 +98,8 @@ enum {					/* how a local address was learnt */
 #define NSA_EMIT_RDV	   (1u << 5)	/* re-report the anchor and whether it
 					 * is confirmed */
 #define NSA_RDV_PIN	   (1u << 6)	/* pin the anchor now held */
-#define NSA_RDV_REVALIDATE (1u << 7)	/* a direct round trip to it */
-#define NSA_RDV_RELOCATE   (1u << 8)	/* presumed gone: search for a fresh one */
-#define NSA_EMIT_TOKEN	   (1u << 9)	/* host only: the advert changed */
+#define NSA_RDV_RELOCATE   (1u << 7)	/* quiet: look for one alongside it */
+#define NSA_EMIT_TOKEN	   (1u << 8)	/* host only: the advert changed */
 
 /* One local address, and whether it should be shown. Held rather than emitted
  * as it arrives, because whether a global v6 is ours to show is not knowable
@@ -127,6 +139,7 @@ struct netstate_fam {
 	int anchor_confirmed;		/* adopting a node never confirms it */
 	int anchor_acks;		/* separate answers from it, this epoch */
 	int anchor_misses;		/* answers from somewhere else instead */
+	int anchor_quiet;		/* rounds it left unanswered, while up */
 	uint64_t anchor_next_ms;
 
 	int has_addr;

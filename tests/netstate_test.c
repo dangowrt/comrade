@@ -114,7 +114,7 @@ static void preserved_anchor_is_not_proof(void)
 	assert(netstate_conn(&ns, 6) != NET_CONN_UP);
 	netstate_facts(&ns, 6, &fx);
 	assert(!fx.dht_acked);
-	assert(drain(&ns).f[1] & NSA_RDV_REVALIDATE);
+	assert(drain(&ns).f[1] & NSA_RDV_PIN);
 
 	/* and it earns its way back */
 	qualify(&ns, 6, node);
@@ -301,6 +301,76 @@ static void only_another_answer_condemns(void)
 	assert(netstate_anchor(&ns, 6, got, &glen, &confirmed));
 	assert(!memcmp(got, a, 16));
 	assert(!confirmed);
+}
+
+/*
+ * Silence must still start a search, or a genuinely dead node is permanent:
+ * the direct get asks only the nodes already held, so unless something goes
+ * looking, the different answer that is the sole grounds for replacing it can
+ * never arrive. The search does not unseat it -- that still takes a different
+ * node answering.
+ */
+static void quiet_searches_without_giving_up(void)
+{
+	struct netstate ns;
+	uint8_t a[16], b[16], got[NETSTATE_SA_MAX];
+	uint8_t glen;
+	int confirmed, i;
+
+	start(&ns, 1);
+	fill(a, 16, 70);
+	fill(b, 16, 90);
+	give_src(&ns, 6, 20);
+	qualify(&ns, 6, a);
+	drain(&ns);
+
+	for (i = 0; i < NETSTATE_ANCHOR_QUIET; i++) {
+		t += NETSTATE_RDV_MS;
+		netstate_tick(&ns, t);
+	}
+	assert(drain(&ns).f[1] & NSA_RDV_RELOCATE);
+	assert(netstate_anchor(&ns, 6, got, &glen, &confirmed) && confirmed);
+	assert(!memcmp(got, a, 16));		/* still ours, still in the token */
+
+	/* Answering again ends it: the counter is about this node, not the clock. */
+	netstate_on_dht_ack(&ns, 6, netstate_epoch(&ns, 6), a, 16, t);
+	drain(&ns);
+	for (i = 0; i < NETSTATE_ANCHOR_QUIET - 1; i++) {
+		t += NETSTATE_RDV_MS;
+		netstate_tick(&ns, t);
+	}
+	assert(!(drain(&ns).f[1] & NSA_RDV_RELOCATE));
+
+	/* What the search is for: another node can now be heard, and only that
+	 * replaces it -- after the same run of answers as ever. */
+	for (i = 0; i < NETSTATE_ANCHOR_MISSES; i++)
+		netstate_on_dht_ack(&ns, 6, netstate_epoch(&ns, 6), b, 16, t);
+	assert(netstate_anchor(&ns, 6, got, &glen, &confirmed));
+	assert(!memcmp(got, b, 16));
+	assert(!confirmed);			/* and it qualifies from scratch */
+}
+
+/* A family that has not proven this network is not entitled to an opinion
+ * about the node: the silence is as likely ours, which is the whole reason a
+ * bootstrapping DHT used to condemn its own rendezvous. */
+static void quiet_says_nothing_until_the_family_is_up(void)
+{
+	struct netstate ns;
+	uint8_t a[16];
+	int i;
+
+	start(&ns, 1);
+	fill(a, 16, 70);
+	give_src(&ns, 6, 20);
+	netstate_on_rdv_offered(&ns, 6, a, 16);
+	drain(&ns);
+	assert(netstate_conn(&ns, 6) != NET_CONN_UP);
+
+	for (i = 0; i < NETSTATE_ANCHOR_QUIET * 4; i++) {
+		t += NETSTATE_RDV_MS;
+		netstate_tick(&ns, t);
+		assert(!(drain(&ns).f[1] & NSA_RDV_RELOCATE));
+	}
 }
 
 /* R5: two moves in quick succession, with the caller busy in between. The
@@ -724,6 +794,8 @@ int main(void)
 	src_is_never_stale_on_the_wire();
 	anchor_changes_only_on_replacement();
 	only_another_answer_condemns();
+	quiet_searches_without_giving_up();
+	quiet_says_nothing_until_the_family_is_up();
 	latest_change_wins();
 	host_and_client_agree_except_on_the_token();
 	probe_slows_but_never_stops();

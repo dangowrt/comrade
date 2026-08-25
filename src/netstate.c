@@ -127,6 +127,7 @@ void netstate_on_netmon(struct netstate *ns, unsigned changed, int have4,
 		f->anchor_confirmed = 0;
 		f->anchor_acks = 0;
 		f->anchor_misses = 0;
+		f->anchor_quiet = 0;
 		f->anchor_next_ms = now;
 
 		f->dht_acked = 0;
@@ -143,8 +144,7 @@ void netstate_on_netmon(struct netstate *ns, unsigned changed, int have4,
 		raise_act(ns, i, NSA_SAMPLE_SRC | NSA_KICK_PROBE |
 			  NSA_EMIT_ROWS | NSA_EMIT_CONN);
 		if (f->anchor_len)
-			raise_act(ns, i, NSA_RDV_PIN | NSA_RDV_REVALIDATE |
-				  NSA_EMIT_RDV);
+			raise_act(ns, i, NSA_RDV_PIN | NSA_EMIT_RDV);
 		facts_moved(ns, i);
 	}
 	ns->primed = 1;
@@ -260,6 +260,7 @@ void netstate_on_dht_ack(struct netstate *ns, int family, uint32_t epoch,
 	if (f->anchor_len && f->anchor_len == (uint8_t)len &&
 	    !memcmp(f->anchor, node, (size_t)len)) {
 		f->anchor_misses = 0;
+		f->anchor_quiet = 0;
 		if (f->anchor_acks < NETSTATE_ANCHOR_QUALIFY)
 			f->anchor_acks++;
 		if (!f->anchor_confirmed &&
@@ -289,6 +290,7 @@ void netstate_on_dht_ack(struct netstate *ns, int family, uint32_t epoch,
 					 * enough to put in front of anyone */
 	f->anchor_acks = 1;
 	f->anchor_misses = 0;
+	f->anchor_quiet = 0;
 	raise_act(ns, i, NSA_RDV_PIN | NSA_EMIT_RDV);
 }
 
@@ -305,7 +307,8 @@ void netstate_on_rdv_offered(struct netstate *ns, int family,
 	f->anchor_len = (uint8_t)len;
 	f->anchor_confirmed = 0;
 	f->anchor_misses = 0;
-	raise_act(ns, i, NSA_RDV_PIN | NSA_RDV_REVALIDATE | NSA_EMIT_RDV);
+	f->anchor_quiet = 0;
+	raise_act(ns, i, NSA_RDV_PIN | NSA_EMIT_RDV);
 }
 
 void netstate_on_candidate(struct netstate *ns, int family, uint32_t epoch,
@@ -378,11 +381,14 @@ void netstate_tick(struct netstate *ns, uint64_t now)
 			raise_act(ns, i, NSA_KICK_PROBE);
 			f->probe_next_ms = now + probe_gap(f);
 		}
-		/* Confirmed or not: one that stops answering after it was
-		 * confirmed has to be noticed too. */
+		/* Only on a network this family has proven: elsewhere the
+		 * silence is as likely ours. Searching does not unseat the
+		 * node -- it is what lets a different one answer at all. */
 		if (f->anchor_len && now >= f->anchor_next_ms) {
-			raise_act(ns, i, NSA_RDV_REVALIDATE);
 			f->anchor_next_ms = now + NETSTATE_RDV_MS;
+			if (f->conn == NET_CONN_UP &&
+			    ++f->anchor_quiet >= NETSTATE_ANCHOR_QUIET)
+				raise_act(ns, i, NSA_RDV_RELOCATE);
 		}
 	}
 }
