@@ -892,19 +892,16 @@ static void conn_offer_path(struct conn *c, const struct sockaddr *sa,
 }
 
 /*
- * Publish each local ICE candidate to the observer, classified by scope (LAN /
- * CGNAT / global) and how it was learnt (direct host candidate, or srflx via
- * STUN). Re-run as candidates trickle in -- srflx arrive a round-trip after the
- * host ones -- and let the view de-duplicate, so STUN paths and the NAT verdict
- * they imply appear the moment they are known.
+ * Hand each local ICE candidate to the reachability model, classified by scope
+ * (LAN / CGNAT / global) and how it was learnt (direct host candidate, or
+ * srflx via STUN). Re-run as candidates trickle in -- srflx arrive a
+ * round-trip after the host ones -- and the model de-duplicates, decides which
+ * belong on the dashboard, and asks for them to be drawn when that changes.
  */
 static void report_candidates(struct sess *s, const char *sdp)
 {
-	const struct session_obs *o = s->cfg->obs;
 	const char *p = sdp;
 
-	if (!o || !o->net)
-		return;
 	/* Match "candidate:" so both a full sdp ("a=candidate:...") and a lone
 	 * trickled line ("[a=]candidate:...") are handled. */
 	while ((p = strstr(p, "candidate:")) != NULL) {
@@ -921,7 +918,8 @@ static void report_candidates(struct sess *s, const char *sdp)
 				via = -1;
 			if (via >= 0) {
 				int scope = addr_scope(addr);
-				int drop6;
+				uint8_t raw[16];
+				int len;
 
 				fam = strchr(addr, ':') ? 6 : 4;
 				if (fam == 4 && via == NET_VIA_STUN)
@@ -929,30 +927,18 @@ static void report_candidates(struct sess *s, const char *sdp)
 				else if (fam == 4 && via == NET_VIA_DIRECT &&
 					 scope != NET_SCOPE_GLOBAL)
 					s->have_priv4 = 1;
-				/* A STUN-reflexive global v6 is the public address a
-				 * NAT66 host presents to peers, so always surface it
-				 * -- it is exactly the "global v6" the dashboard must
-				 * show. For a *direct* global v6 only the address we
-				 * source outbound from matters (as canon_v6 already
-				 * enforces for the sent SDP): libjuice also enumerates
-				 * the stable/DHCPv6 address, which we neither source
-				 * from nor listen on for punching, so drop that one
-				 * once we know our source; otherwise show what was
-				 * gathered. The comparison is on the addresses, not on
-				 * the two spellings of one, and the source is the live
-				 * one -- a move invalidates it until the new link
-				 * answers, so it is never the previous network's. */
-				drop6 = 0;
-				if (fam == 6 && scope == NET_SCOPE_GLOBAL &&
-				    via == NET_VIA_DIRECT) {
-					uint8_t src[16], got[16];
-
-					if (netstate_src(&s->ns, 6, src) == 16 &&
-					    inet_pton(AF_INET6, addr, got) == 1)
-						drop6 = memcmp(got, src, 16) != 0;
-				}
-				if (!drop6)
-					o->net(o->arg, fam, scope, via, addr);
+				len = fam == 6 ? 16 : 4;
+				/* Held rather than shown: whether a global v6
+				 * is ours to show turns on the source address,
+				 * which is routinely learnt after the
+				 * addresses are. */
+				if (inet_pton(fam == 6 ? AF_INET6 : AF_INET,
+					      addr, raw) == 1)
+					netstate_on_candidate(&s->ns, fam,
+							      netstate_epoch(&s->ns,
+									     fam),
+							      scope, via, raw,
+							      len, addr);
 			}
 		}
 		p += 10;
@@ -1100,14 +1086,14 @@ static void pool_pump(struct sess *s, int repost_ok)
 		memcpy(pool[i], s->pool4[i], 4);
 	st = stun_mapping_result(&s->map4);
 	pthread_mutex_unlock(&s->trickle_lock);
-	if (o && o->net) {
-		for (i = s->pool_reported; i < n; i++) {
-			char ip[64];
+	for (i = s->pool_reported; i < n; i++) {
+		char ip[64];
 
-			if (inet_ntop(AF_INET, pool[i], ip, sizeof(ip)))
-				o->net(o->arg, 4, addr_scope(ip),
-				       NET_VIA_STUN, ip);
-		}
+		if (inet_ntop(AF_INET, pool[i], ip, sizeof(ip)))
+			netstate_on_candidate(&s->ns, 4,
+					      netstate_epoch(&s->ns, 4),
+					      addr_scope(ip), NET_VIA_STUN,
+					      pool[i], 4, ip);
 	}
 	s->pool_reported = n;
 	if (st != STUN_MAPPING_UNKNOWN) {
@@ -3398,6 +3384,21 @@ static void net_apply(struct sess *s, const struct netstate_actions *a)
 			else
 				stun_probe_halt(s);
 		}
+		if (act & NSA_EMIT_ROWS && o && o->net_reset && o->net) {
+			const struct netstate_row *rows;
+			int n = netstate_rows(&s->ns, family, &rows), k;
+
+			/* Rebuilt rather than added to: which of them belong on
+			 * the dashboard is recomputed whenever the source
+			 * address moves, and a row shown before that was known
+			 * has to be able to go away again. Only this family's
+			 * are touched. */
+			o->net_reset(o->arg, family);
+			for (k = 0; k < n; k++)
+				if (rows[k].shown)
+					o->net(o->arg, family, rows[k].scope,
+					       rows[k].via, rows[k].text);
+		}
 		if (act & NSA_EMIT_CONN) {
 			int conn = netstate_conn(&s->ns, family);
 
@@ -3481,8 +3482,6 @@ static void net_pump(struct sess *s, uint64_t now)
  */
 static void net_change_reset(struct sess *s)
 {
-	const struct session_obs *o = s->cfg->obs;
-
 	s->have_local_sdp = 0;
 	s->have_peer_sdp = 0;
 	s->remote_set = 0;
@@ -3500,8 +3499,9 @@ static void net_change_reset(struct sess *s)
 	s->pool_reported = 0;
 	s->pool_posted = 0;
 	s->mapping_reported = 0;
-	if (o && o->net_reset)
-		o->net_reset(o->arg);
+	/* The rows are not flushed here: each family's own move clears and
+	 * redraws its own, so a v6 prefix arriving late cannot take the v4
+	 * rows that have just been gathered down with it. */
 }
 
 /*

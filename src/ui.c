@@ -73,6 +73,10 @@ struct ui {
 
 	struct netrow net[12];
 	int nnet;
+	/* What a per-family redraw just took down, so the log can tell an
+	 * address that has appeared from one that was only redrawn. */
+	struct netrow prev[12];
+	int nprev;
 	int mapping_known;
 	int mapping_dependent;
 	int conn4, conn6;		/* NET_CONN_* (0 = down) */
@@ -636,6 +640,19 @@ static const char *scope_word(int scope, int via)
 	return via == NET_VIA_STUN ? "global-nat" : "global";
 }
 
+/* Was this exact row on the dashboard before the redraw that is replacing it? */
+static int net_was_shown(struct ui *u, int family, int scope, int via,
+			 const char *addr)
+{
+	int i;
+
+	for (i = 0; i < u->nprev; i++)
+		if (u->prev[i].family == family && u->prev[i].scope == scope &&
+		    u->prev[i].via == via && !strcmp(u->prev[i].addr, addr))
+			return 1;
+	return 0;
+}
+
 static void um_net(struct ui *u, int family, int scope, int via, const char *addr)
 {
 	int i;
@@ -666,7 +683,7 @@ static void um_net(struct ui *u, int family, int scope, int via, const char *add
 	u->nnet++;
 	if (u->anim)
 		u->dirty = 1;
-	else
+	else if (!net_was_shown(u, family, scope, via, addr))
 		vlog(u, "net    %s %-40s %s", family == 6 ? "ipv6" : "ipv4",
 		     addr, scope_word(scope, via));
 }
@@ -894,16 +911,34 @@ static void um_reset(struct ui *u)
 		vlog(u, "local  reconnecting -- candidates flushed");
 }
 
-static void um_net_reset(struct ui *u)
+/* Drop one family's local addresses, or both when `family` is 0. Per family
+ * because the two move apart: a v6 prefix arriving seconds after DHCPv4 must
+ * not take the v4 rows that have just been gathered down with it. */
+static void um_net_reset(struct ui *u, int family)
 {
-	u->nnet = 0;
-	u->mapping_known = 0;
-	u->conn4 = 0;
-	u->conn6 = 0;
+	int i, keep = 0;
+
+	u->nprev = 0;
+	for (i = 0; i < u->nnet; i++) {
+		if (family && u->net[i].family != family) {
+			u->net[keep++] = u->net[i];
+			continue;
+		}
+		u->prev[u->nprev++] = u->net[i];
+	}
+	u->nnet = keep;
+	if (family != 6) {
+		u->mapping_known = 0;	/* measured on the v4 network that left */
+		u->conn4 = 0;
+	}
+	if (family != 4)
+		u->conn6 = 0;
 	if (u->anim)
 		u->dirty = 1;
-	else
+	else if (!family)
 		vlog(u, "local  network changed -- candidates flushed");
+	/* A per-family redraw says nothing on its own: what it means is
+	 * whichever rows come back changed, which um_net reports. */
 }
 
 /* ---- observer callbacks (client inline; also reused by the foreground) ---- */
@@ -922,7 +957,7 @@ static void cb_token_ro(void *a, const char *t) { um_token_ro(a, t); }
 static void cb_peer(void *a, int id, int s, const char *ad) { um_peer(a, id, s, ad); }
 static void cb_peer_ro(void *a, int id) { um_peer_ro(a, id); }
 static void cb_reset(void *a) { um_reset(a); }
-static void cb_net_reset(void *a) { um_net_reset(a); }
+static void cb_net_reset(void *a, int f) { um_net_reset(a, f); }
 static void cb_esc(void *a, const char *w) { um_escalate(a, w); }
 static void cb_esc_clear(void *a) { um_escalate_clear(a); }
 static void cb_tick(void *a)
@@ -1111,9 +1146,9 @@ static void em_reset(void *a)
 {
 	emitf(a, "X\n");
 }
-static void em_net_reset(void *a)
+static void em_net_reset(void *a, int f)
 {
-	emitf(a, "Y\n");
+	emitf(a, "Y %d\n", f);
 }
 static void em_esc(void *a, const char *w)
 {
@@ -1247,7 +1282,8 @@ static void feed(struct ui *u, char *ln)
 		um_reset(u);
 		break;
 	case 'Y':
-		um_net_reset(u);
+		if (sscanf(ln + 1, "%d", &a) == 1)
+			um_net_reset(u, a);
 		break;
 	default:
 		break;

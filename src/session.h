@@ -84,7 +84,7 @@ struct session_obs {
 	 * established-link drop): drop the stale local-candidate rows so the
 	 * dashboard shows only the current interfaces, while leaving any peer
 	 * rows in place (a multi-user host keeps its live clients listed). */
-	void (*net_reset)(void *arg);
+	void (*net_reset)(void *arg, int family);
 	/* The client had to fall back from a seeded node to a full DHT warm. */
 	void (*escalate)(void *arg, const char *why);
 	/* The condition the last escalation warned about has resolved. */
