@@ -90,12 +90,19 @@ enum {					/* how a local address was learnt */
 #define NETSTATE_RDV_MS 2000		/* between re-validation attempts */
 
 /*
- * A family that cannot be proven settles instead of probing forever: a network
- * that filters STUN outright will never answer, and the spend is not free.
- * A move refills the budget, because the next network may not filter.
+ * A family with nothing proven yet is asked again promptly for a few rounds,
+ * because the usual reasons to have missed -- a packet lost, a link still
+ * settling, a server that did not answer -- all clear in seconds. After that
+ * it keeps asking, slowly and without ever stopping: a network that filters
+ * STUN outright will never answer however long we wait, but one that is merely
+ * slow, or that starts working later, is indistinguishable from it in advance.
+ * Giving up outright is the one answer that cannot be corrected. A move
+ * restarts the prompt rounds, since the next network may be nothing like the
+ * last.
  */
 #define NETSTATE_PROBE_ROUNDS 5
-#define NETSTATE_PROBE_MS 4000		/* between attempts */
+#define NETSTATE_PROBE_MS 4000		/* between the prompt rounds */
+#define NETSTATE_PROBE_SLOW_MS 30000	/* and forever after, at this pace */
 
 /* What the caller must do. Idempotent bits rather than a queue: a caller that
  * is busy when a second move lands finds them raised again on its next drain,

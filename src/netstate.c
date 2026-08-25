@@ -49,6 +49,15 @@ static void sync_conn(struct netstate *ns, int i)
 		raise_act(ns, i, NSA_STOP_PROBE);
 }
 
+/* How long before this family may be probed again: prompt while the reasons to
+ * have missed are the kind that clear in seconds, unhurried once they are not,
+ * and never long enough to count as having stopped. */
+static uint64_t probe_gap(const struct netstate_fam *f)
+{
+	return f->probe_rounds < NETSTATE_PROBE_ROUNDS ? NETSTATE_PROBE_MS :
+							 NETSTATE_PROBE_SLOW_MS;
+}
+
 /* One of the four facts tokgen decides on has moved. */
 static void facts_moved(struct netstate *ns, int i)
 {
@@ -231,7 +240,7 @@ void netstate_on_probe_started(struct netstate *ns, int family, uint32_t epoch,
 		return;
 	f->probe_running = 1;
 	f->probe_rounds++;
-	f->probe_next_ms = now + NETSTATE_PROBE_MS;
+	f->probe_next_ms = now + probe_gap(f);
 }
 
 void netstate_on_probe_done(struct netstate *ns, int family, uint32_t epoch,
@@ -243,7 +252,10 @@ void netstate_on_probe_done(struct netstate *ns, int family, uint32_t epoch,
 	if (epoch != f->epoch)
 		return;
 	f->probe_running = 0;
-	f->probe_next_ms = now + NETSTATE_PROBE_MS;
+	/* A round that ended having proven nothing is not a reason to wait out
+	 * the whole gap again: the gap paces starts, and this one has started. */
+	if (f->probe_next_ms > now + probe_gap(f))
+		f->probe_next_ms = now + probe_gap(f);
 }
 
 void netstate_on_roundtrip(struct netstate *ns, int family, uint32_t epoch)
@@ -407,10 +419,9 @@ void netstate_tick(struct netstate *ns, uint64_t now)
 				 NETSTATE_SRC_FAST_MS : NETSTATE_SRC_SLOW_MS);
 		}
 		if (f->has_addr && f->conn != NET_CONN_UP && !f->probe_running &&
-		    f->probe_rounds < NETSTATE_PROBE_ROUNDS &&
 		    now >= f->probe_next_ms) {
 			raise_act(ns, i, NSA_KICK_PROBE);
-			f->probe_next_ms = now + NETSTATE_PROBE_MS;
+			f->probe_next_ms = now + probe_gap(f);
 		}
 		/* Confirmed or not: a node that stops answering after it was
 		 * confirmed has to be noticed too, and only a round that goes

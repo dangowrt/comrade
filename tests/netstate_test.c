@@ -344,34 +344,56 @@ static void host_and_client_agree_except_on_the_token(void)
 		assert((h.pend[i] & ~(unsigned)NSA_EMIT_TOKEN) == c.pend[i]);
 }
 
-/* B2, and its limit: a family that cannot be proven is retried, but a network
- * that filters STUN outright will never answer and the spend is not free. */
-static void probe_is_bounded_and_epoch_scoped(void)
+/* Run one round if the model asks for one; whether it did. */
+static int probe_round(struct netstate *ns, int fam)
+{
+	int k = fam == 6 ? 1 : 0;
+
+	netstate_tick(ns, t);
+	if (!(drain(ns).f[k] & NSA_KICK_PROBE))
+		return 0;
+	netstate_on_probe_started(ns, fam, netstate_epoch(ns, fam), t);
+	netstate_on_probe_done(ns, fam, netstate_epoch(ns, fam), t);
+	return 1;
+}
+
+/*
+ * B2: a family that has not been proven keeps being asked. Promptly at first,
+ * because the usual reasons to have missed clear in seconds -- then slowly,
+ * but never not at all. Giving up outright is the one answer that cannot be
+ * corrected when the network turns out to work after all.
+ */
+static void probe_slows_but_never_stops(void)
 {
 	struct netstate ns;
-	int i, kicks = 0;
+	int i;
 
 	start(&ns, 1);
-	for (i = 0; i < NETSTATE_PROBE_ROUNDS * 4; i++) {
-		netstate_tick(&ns, t);
-		if (drain(&ns).f[1] & NSA_KICK_PROBE) {
-			kicks++;
-			netstate_on_probe_started(&ns, 6,
-						  netstate_epoch(&ns, 6), t);
-			netstate_on_probe_done(&ns, 6,
-					       netstate_epoch(&ns, 6), t);
-		}
+	for (i = 0; i < NETSTATE_PROBE_ROUNDS; i++) {
+		assert(probe_round(&ns, 6));	/* one per prompt gap */
 		t += NETSTATE_PROBE_MS;
 	}
-	assert(kicks == NETSTATE_PROBE_ROUNDS);
+	/* the prompt ones are spent: another prompt gap buys nothing */
+	assert(!probe_round(&ns, 6));
 
-	/* a move is a fresh network, and may not filter */
+	for (i = 0; i < 5; i++) {		/* but it has not stopped */
+		t += NETSTATE_PROBE_SLOW_MS;
+		assert(probe_round(&ns, 6));
+	}
+
+	/* a move is a fresh network, and may not filter: prompt again */
 	netstate_on_netmon(&ns, NETMON_CH_V6, 1, 1, t);
 	assert(drain(&ns).f[1] & NSA_KICK_PROBE);
+	netstate_on_probe_started(&ns, 6, netstate_epoch(&ns, 6), t);
+	netstate_on_probe_done(&ns, 6, netstate_epoch(&ns, 6), t);
+	t += NETSTATE_PROBE_MS;
+	assert(probe_round(&ns, 6));
 
 	/* and proof ends it */
 	netstate_on_roundtrip(&ns, 6, netstate_epoch(&ns, 6));
 	assert(drain(&ns).f[1] & NSA_STOP_PROBE);
+	t += NETSTATE_PROBE_SLOW_MS;
+	assert(!probe_round(&ns, 6));		/* nothing left to prove */
 }
 
 static void no_address_no_probe_no_pending(void)
@@ -669,7 +691,7 @@ int main(void)
 	attempts_not_milliseconds();
 	latest_change_wins();
 	host_and_client_agree_except_on_the_token();
-	probe_is_bounded_and_epoch_scoped();
+	probe_slows_but_never_stops();
 	no_address_no_probe_no_pending();
 	row_merge_direct_beats_stun();
 	family_independence_lattice();

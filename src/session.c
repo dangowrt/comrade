@@ -1325,6 +1325,9 @@ static void ns_post(struct sess *s, int kind, int family, uint32_t epoch)
 	pthread_mutex_unlock(&s->ns_lock);
 }
 
+static void stun_probe_reap(struct sess *s);
+static void stun_probe6_reap(struct sess *s);
+
 /* Hand what the producers left to the model, on the loop thread. */
 static void ns_drain(struct sess *s)
 {
@@ -1338,11 +1341,20 @@ static void ns_drain(struct sess *s)
 	pthread_mutex_unlock(&s->ns_lock);
 
 	for (i = 0; i < n; i++) {
-		if (f[i].kind == NSF_ROUNDTRIP)
+		if (f[i].kind == NSF_ROUNDTRIP) {
 			netstate_on_roundtrip(&s->ns, f[i].family, f[i].epoch);
+			continue;
+		}
+		/* Said as the round's last act, so reaping it does not wait --
+		 * and until it is reaped nothing else may start for that
+		 * family, which is what keeps one round in flight at a time
+		 * without the loop ever blocking on one. */
+		if (f[i].family == 6)
+			stun_probe6_reap(s);
 		else
-			netstate_on_probe_done(&s->ns, f[i].family, f[i].epoch,
-					       now_ms());
+			stun_probe_reap(s);
+		netstate_on_probe_done(&s->ns, f[i].family, f[i].epoch,
+				       now_ms());
 	}
 }
 
@@ -1395,23 +1407,43 @@ static void *stun_probe_thread(void *arg)
 	return NULL;
 }
 
+/* Ask the round in flight to wind up. It notices on its next pass -- within a
+ * poll tick -- and is reaped where it says so. */
 static void stun_probe_halt(struct sess *s)
+{
+	if (s->probe_running)
+		s->probe_stop = 1;
+}
+
+/* Reap a round that has said it is finishing; it posted that as its last act,
+ * so this does not wait. */
+static void stun_probe_reap(struct sess *s)
 {
 	if (!s->probe_running)
 		return;
-	s->probe_stop = 1;
 	pthread_join(s->probe_th, NULL);
 	s->probe_running = 0;
 }
 
-/* (Re)start the pool probe: at session start, and on each new network. An
- * operator-pinned server is theirs alone to talk to, so no probing then.
- * Non-zero once a round is actually out. */
+/*
+ * Start a pool probe. An operator-pinned server is theirs alone to talk to, so
+ * no probing then. Non-zero once a round is actually out.
+ *
+ * A round already in flight is asked to stop and NOT waited for: this runs on
+ * the loop that drives the whole session, and a probe can be inside a name
+ * lookup with no timeout of its own. Waiting here is what made a move take
+ * twenty seconds to be noticed. The round that was already out belongs to the
+ * network we have left and its answers are dropped on arrival, so there is
+ * nothing to wait for -- the model asks again once it has been reaped.
+ */
 static int stun_probe_kick(struct sess *s)
 {
 	if (s->cfg->stun_host || !s->cfg->stun_auto || s->stun_count < 1)
 		return 0;
-	stun_probe_halt(s);
+	if (s->probe_running) {
+		s->probe_stop = 1;
+		return 0;
+	}
 	s->probe_stop = 0;
 	if (pthread_create(&s->probe_th, NULL, stun_probe_thread, s))
 		return 0;
@@ -1446,9 +1478,14 @@ static void *stun_probe6_thread(void *arg)
 
 static void stun_probe6_halt(struct sess *s)
 {
+	if (s->probe6_running)
+		s->probe6_stop = 1;
+}
+
+static void stun_probe6_reap(struct sess *s)
+{
 	if (!s->probe6_running)
 		return;
-	s->probe6_stop = 1;
 	pthread_join(s->probe6_th, NULL);
 	s->probe6_running = 0;
 }
@@ -1457,12 +1494,16 @@ static void stun_probe6_halt(struct sess *s)
  * socket, independent of whether ICE ever bothers to gather a v6 srflx
  * candidate (it does not when a global host candidate already exists, so
  * relying on that alone misses real NAT66/filtered hosts and, worse, the
- * ordinary case of a global address that just goes unconfirmed). */
+ * ordinary case of a global address that just goes unconfirmed). Never waits
+ * on a round in flight -- see stun_probe_kick. */
 static int stun_probe6_kick(struct sess *s)
 {
 	if (s->cfg->stun_host || !s->cfg->stun_auto || s->stun_count < 1)
 		return 0;
-	stun_probe6_halt(s);
+	if (s->probe6_running) {
+		s->probe6_stop = 1;
+		return 0;
+	}
 	s->probe6_stop = 0;
 	if (pthread_create(&s->probe6_th, NULL, stun_probe6_thread, s))
 		return 0;
@@ -4922,8 +4963,12 @@ done:
 	if (s.lan)
 		lanlink_destroy(s.lan);
 	sig_destroy(s.sig);
-	stun_probe_halt(&s);
-	stun_probe6_halt(&s);
+	/* Teardown, and the one place waiting is right: the session these
+	 * threads write into is about to go away with this frame. */
+	s.probe_stop = 1;
+	s.probe6_stop = 1;
+	stun_probe_reap(&s);
+	stun_probe6_reap(&s);
 	stunlist_free(s.stun_servers, s.stun_count);
 	pthread_mutex_destroy(&s.trickle_lock);
 	pthread_mutex_destroy(&s.c.status_lock);
