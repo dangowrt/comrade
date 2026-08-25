@@ -179,6 +179,18 @@ int sig_take_ack(struct sig *s, int family, struct sockaddr *out,
 /* Whether the DHT is up enough to have asked anything. */
 int sig_dht_ready(struct sig *s);
 
+/*
+ * Whether the node we hold for `family` has itself served a validated get
+ * since this was last asked, and clear the record.
+ *
+ * Who answered *instead* is not information about it. The convergent store
+ * places the value on every k-close node, so several hold it and whichever is
+ * quickest replies -- reading another holder's reply as our node falling
+ * silent condemns a perfectly live rendezvous, and does so within seconds of
+ * the store that created the alternatives.
+ */
+int sig_take_anchor_seen(struct sig *s, int family);
+
 /* Look for a replacement for `family`'s rendezvous node while continuing to
  * serve the one we hold; sig_reinforce with a new one ends the search. */
 void sig_search_again(struct sig *s, int family);

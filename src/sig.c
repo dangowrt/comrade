@@ -91,6 +91,10 @@ struct sig {
 	int relocate4, relocate6;	/* search for a replacement, while still
 					 * serving the one we hold */
 	int up4, up6;			/* proven connectivity, see sig_set_family_up */
+	int anchor_seen4, anchor_seen6;	/* the node we hold answered a get since
+					 * this was last taken; sticky, because
+					 * another holder answering after it must
+					 * not erase that it did */
 	uint64_t first_locate_ms;	/* when the first family was captured */
 	int rdv_stage;			/* engine-wide progress: cold/warmup/store/get */
 
@@ -392,6 +396,15 @@ int sig_take_ack(struct sig *s, int family, struct sockaddr *out,
 	return 1;
 }
 
+int sig_take_anchor_seen(struct sig *s, int family)
+{
+	int *seen = family == 6 ? &s->anchor_seen6 : &s->anchor_seen4;
+	int was = *seen;
+
+	*seen = 0;
+	return was;
+}
+
 void sig_search_again(struct sig *s, int family)
 {
 	/* The node we hold keeps being served while this runs: a rendezvous
@@ -431,6 +444,12 @@ int sig_reinforce(struct sig *s, int family, const struct sockaddr *sa,
 		return -1;
 	if (bep44_pin_add(s->engine, NULL, sa, len))
 		return -1;
+	if (*rl != len || memcmp(r, sa, len)) {
+		if (family == 6)
+			s->anchor_seen6 = 0;
+		else
+			s->anchor_seen4 = 0;
+	}
 	memcpy(r, sa, len);		/* adopt it as the located rendezvous, ... */
 	*rl = len;
 	if (family == 6)
@@ -532,6 +551,21 @@ static void on_dht_get(void *arg, const uint8_t *v, size_t v_len, int64_t seq,
 	 */
 	if (node && node_len && (size_t)node_len <= sizeof(s->rnode4)) {
 		int captured = 0;
+		socklen_t rl = node->sa_family == AF_INET6 ? s->rnode6_len :
+							     s->rnode4_len;
+		const void *r = node->sa_family == AF_INET6 ?
+				(const void *)&s->rnode6 :
+				(const void *)&s->rnode4;
+
+		/* It answered for itself. Nothing here is said about any other
+		 * node: the convergent store puts the value on every k-close
+		 * node, so several hold it and whichever is quickest replies. */
+		if (rl == node_len && !memcmp(r, node, node_len)) {
+			if (node->sa_family == AF_INET6)
+				s->anchor_seen6 = 1;
+			else
+				s->anchor_seen4 = 1;
+		}
 
 		if (node->sa_family == AF_INET6) {
 			s->acked6 = 1;

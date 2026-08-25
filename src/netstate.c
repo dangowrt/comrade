@@ -124,7 +124,7 @@ void netstate_on_netmon(struct netstate *ns, unsigned changed, int have4,
 
 		f->anchor_confirmed = 0;
 		f->anchor_acks = 0;
-		f->anchor_misses = 0;
+		f->anchor_first_ms = 0;
 		f->anchor_quiet = 0;
 		f->anchor_next_ms = now;
 
@@ -257,17 +257,12 @@ void netstate_on_dht_ack(struct netstate *ns, int family, uint32_t epoch,
 	f->anchor_next_ms = now + NETSTATE_RDV_MS;
 	if (f->anchor_len && f->anchor_len == (uint8_t)len &&
 	    !memcmp(f->anchor, node, (size_t)len)) {
-		f->anchor_misses = 0;
 		f->anchor_quiet = 0;
+		if (!f->anchor_acks)
+			f->anchor_first_ms = now;
 		if (f->anchor_acks < NETSTATE_ANCHOR_QUALIFY)
 			f->anchor_acks++;
-		if (!f->anchor_confirmed &&
-		    f->anchor_acks >= NETSTATE_ANCHOR_QUALIFY) {
-			f->anchor_confirmed = 1;
-			raise_act(ns, i, NSA_EMIT_RDV);
-			facts_moved(ns, i);
-		}
-		return;
+		return;			/* the tick confirms, once it has lasted */
 	}
 	/*
 	 * A different node. A client does not get to pick: the rendezvous is
@@ -279,27 +274,40 @@ void netstate_on_dht_ack(struct netstate *ns, int family, uint32_t epoch,
 	 */
 	if (!ns->is_host)
 		return;
-	/* A node that moves under a token already in somebody's clipboard is
-	 * worse than one briefly unconfirmed, so ours stays until it has been
-	 * asked enough times and failed. */
-	if (f->anchor_len) {
-		/* Someone else is serving the mailbox and ours is not. That is
-		 * the only evidence that counts against it -- and the node
-		 * saying so is the replacement, so the two conditions for
-		 * giving one up are met together or not at all. */
-		f->anchor_misses++;
-		if (f->anchor_misses < NETSTATE_ANCHOR_MISSES)
-			return;
-	}
+	/*
+	 * This says nothing whatever about the node we hold. Several nodes hold
+	 * the value by design and the quickest answers, so treating another
+	 * holder's reply as ours falling silent walks the rendezvous from one
+	 * live node to the next within a minute of starting -- retracting a
+	 * token that had already been copied, which is the one failure this must
+	 * never cause. Only the node's own silence, counted where it can be seen
+	 * (netstate_on_anchor_seen), may unseat it.
+	 */
+	if (f->anchor_len && f->anchor_quiet < NETSTATE_ANCHOR_GONE)
+		return;
 	memset(f->anchor, 0, sizeof(f->anchor));
 	memcpy(f->anchor, node, (size_t)len);
 	f->anchor_len = (uint8_t)len;
 	f->anchor_confirmed = 0;	/* it has answered once; that is not yet
 					 * enough to put in front of anyone */
 	f->anchor_acks = 1;
-	f->anchor_misses = 0;
+	f->anchor_first_ms = now;
 	f->anchor_quiet = 0;
 	raise_act(ns, i, NSA_RDV_PIN | NSA_EMIT_RDV);
+}
+
+void netstate_on_anchor_seen(struct netstate *ns, int family, uint64_t now)
+{
+	int i = fam_idx(family);
+	struct netstate_fam *f = &ns->f[i];
+
+	if (!f->anchor_len)
+		return;
+	f->anchor_quiet = 0;
+	if (!f->anchor_acks)
+		f->anchor_first_ms = now;
+	if (f->anchor_acks < NETSTATE_ANCHOR_QUALIFY)
+		f->anchor_acks++;
 }
 
 void netstate_on_rdv_offered(struct netstate *ns, int family,
@@ -318,7 +326,7 @@ void netstate_on_rdv_offered(struct netstate *ns, int family,
 	f->anchor_len = (uint8_t)len;
 	f->anchor_confirmed = 0;
 	f->anchor_acks = 0;
-	f->anchor_misses = 0;
+	f->anchor_first_ms = 0;
 	f->anchor_quiet = 0;
 	raise_act(ns, i, NSA_RDV_PIN | NSA_EMIT_RDV);
 }
@@ -405,6 +413,13 @@ void netstate_tick(struct netstate *ns, uint64_t now)
 			if (f->conn == NET_CONN_UP &&
 			    ++f->anchor_quiet >= NETSTATE_ANCHOR_QUIET)
 				raise_act(ns, i, NSA_RDV_RELOCATE);
+		}
+		if (f->anchor_len && !f->anchor_confirmed &&
+		    f->anchor_acks >= NETSTATE_ANCHOR_QUALIFY &&
+		    now - f->anchor_first_ms >= NETSTATE_ANCHOR_PROVE_MS) {
+			f->anchor_confirmed = 1;
+			raise_act(ns, i, NSA_EMIT_RDV);
+			facts_moved(ns, i);
 		}
 	}
 }

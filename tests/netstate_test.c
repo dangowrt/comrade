@@ -45,13 +45,28 @@ static void start(struct netstate *ns, int is_host)
 	drain(ns);
 }
 
-/* A node enters a token only after answering NETSTATE_ANCHOR_QUALIFY times. */
+/* A node enters a token only after answering steadily for long enough. */
 static void qualify(struct netstate *ns, int fam, const uint8_t *node)
 {
 	int i;
 
-	for (i = 0; i < NETSTATE_ANCHOR_QUALIFY; i++)
+	for (i = 0; i < NETSTATE_ANCHOR_QUALIFY; i++) {
 		netstate_on_dht_ack(ns, fam, netstate_epoch(ns, fam), node, 16, t);
+		t += NETSTATE_ANCHOR_PROVE_MS / NETSTATE_ANCHOR_QUALIFY + 1;
+	}
+	netstate_on_dht_ack(ns, fam, netstate_epoch(ns, fam), node, 16, t);
+	netstate_tick(ns, t);
+}
+
+/* `n` rounds in which the held node did not answer, on a network that is up. */
+static void quiet_rounds(struct netstate *ns, int n)
+{
+	int i;
+
+	for (i = 0; i < n; i++) {
+		t += NETSTATE_RDV_MS;
+		netstate_tick(ns, t);
+	}
 }
 
 static void give_src(struct netstate *ns, int fam, uint8_t seed)
@@ -243,27 +258,26 @@ static void anchor_changes_only_on_replacement(void)
 	qualify(&ns, 6, a);
 	drain(&ns);
 
-	/* one answer from elsewhere displaces nothing */
+	/*
+	 * Answers from elsewhere -- however many, however long a run of them.
+	 * The convergent store puts the value on every k-close node, so the
+	 * others hold it too and the quickest replies; reading that as ours
+	 * having died walked the rendezvous across three live nodes inside two
+	 * minutes of starting, retracting a token already copied.
+	 */
+	for (i = 0; i < NETSTATE_ANCHOR_GONE * 3; i++)
+		netstate_on_dht_ack(&ns, 6, netstate_epoch(&ns, 6), b, 16, t);
+	assert(netstate_anchor(&ns, 6, got, &glen, &confirmed));
+	assert(!memcmp(got, a, 16));
+	assert(confirmed);		/* and it never stopped being the one */
+
+	/*
+	 * A node can genuinely die, and then its own silence says so -- minutes
+	 * of it, on a network we can otherwise reach. Only then does another
+	 * node take its place, and qualify from scratch like any other.
+	 */
+	quiet_rounds(&ns, NETSTATE_ANCHOR_GONE);
 	netstate_on_dht_ack(&ns, 6, netstate_epoch(&ns, 6), b, 16, t);
-	assert(netstate_anchor(&ns, 6, got, &glen, &confirmed));
-	assert(!memcmp(got, a, 16));
-
-	/* nor does a run of them, while ours keeps answering in between */
-	netstate_on_dht_ack(&ns, 6, netstate_epoch(&ns, 6), a, 16, t);
-	for (i = 0; i < NETSTATE_ANCHOR_MISSES - 1; i++)
-		netstate_on_dht_ack(&ns, 6, netstate_epoch(&ns, 6), b, 16, t);
-	netstate_on_dht_ack(&ns, 6, netstate_epoch(&ns, 6), a, 16, t);
-	for (i = 0; i < NETSTATE_ANCHOR_MISSES - 1; i++)
-		netstate_on_dht_ack(&ns, 6, netstate_epoch(&ns, 6), b, 16, t);
-	assert(netstate_anchor(&ns, 6, got, &glen, &confirmed));
-	assert(!memcmp(got, a, 16));
-
-	/* a node can genuinely die, so an unbroken run does replace it -- and
-	 * the node that gave them is the replacement, which then has to
-	 * qualify like any other before it reaches a token */
-	netstate_on_dht_ack(&ns, 6, netstate_epoch(&ns, 6), a, 16, t);
-	for (i = 0; i < NETSTATE_ANCHOR_MISSES; i++)
-		netstate_on_dht_ack(&ns, 6, netstate_epoch(&ns, 6), b, 16, t);
 	assert(netstate_anchor(&ns, 6, got, &glen, &confirmed));
 	assert(!memcmp(got, b, 16));
 	assert(!confirmed);
@@ -341,10 +355,10 @@ static void quiet_searches_without_giving_up(void)
 	}
 	assert(!(drain(&ns).f[1] & NSA_RDV_RELOCATE));
 
-	/* What the search is for: another node can now be heard, and only that
-	 * replaces it -- after the same run of answers as ever. */
-	for (i = 0; i < NETSTATE_ANCHOR_MISSES; i++)
-		netstate_on_dht_ack(&ns, 6, netstate_epoch(&ns, 6), b, 16, t);
+	/* What the search is for. It still takes its own long silence to be
+	 * replaced -- another node being heard is not what unseats it. */
+	quiet_rounds(&ns, NETSTATE_ANCHOR_GONE);
+	netstate_on_dht_ack(&ns, 6, netstate_epoch(&ns, 6), b, 16, t);
 	assert(netstate_anchor(&ns, 6, got, &glen, &confirmed));
 	assert(!memcmp(got, b, 16));
 	assert(!confirmed);			/* and it qualifies from scratch */
@@ -465,7 +479,8 @@ static void only_a_host_picks_its_own_rendezvous(void)
 		netstate_on_rdv_offered(ns, 6, a, 16);
 		qualify(ns, 6, a);
 		drain(ns);
-		for (i = 0; i < NETSTATE_ANCHOR_MISSES * 4; i++)
+		quiet_rounds(ns, NETSTATE_ANCHOR_GONE);
+		for (i = 0; i < 4; i++)
 			netstate_on_dht_ack(ns, 6, netstate_epoch(ns, 6), b, 16,
 					    t);
 	}

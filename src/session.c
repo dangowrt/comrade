@@ -3430,6 +3430,12 @@ static void ns_take_acks(struct sess *s, uint64_t now)
 		struct sockaddr_storage sa;
 		socklen_t sl = sizeof(sa);
 
+		/* Taken first and separately: a get answered by the node we
+		 * hold and then by another holder would otherwise be read as
+		 * ours having gone quiet, which is how a live rendezvous used
+		 * to be given up seconds after being chosen. */
+		if (sig_take_anchor_seen(s->sig, famv[i]))
+			netstate_on_anchor_seen(&s->ns, famv[i], now);
 		memset(&sa, 0, sizeof(sa));
 		if (!sig_take_ack(s->sig, famv[i], (struct sockaddr *)&sa, &sl))
 			continue;

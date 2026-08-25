@@ -63,8 +63,17 @@ enum {					/* how a local address was learnt */
  * everyone who was given the old one, and is worst exactly during a move.
  */
 #define NETSTATE_ANCHOR_QUALIFY 3
-#define NETSTATE_ANCHOR_MISSES 3
 #define NETSTATE_RDV_MS 2000		/* between re-validation attempts */
+
+/*
+ * How long a node must go on answering before its address is put in a token.
+ * Counting answers alone passes a node in a few seconds, which is long enough
+ * to say it replied and far too short to say it is dependable. Making the
+ * operator wait costs them a moment before the invite is complete; publishing
+ * a node that then has to be taken back costs whoever they already sent it to
+ * a session that simply does not connect.
+ */
+#define NETSTATE_ANCHOR_PROVE_MS 20000
 
 /*
  * Rounds a held node may leave unanswered, on a network this family has
@@ -78,6 +87,17 @@ enum {					/* how a local address was learnt */
  * node actually answering replaces it.
  */
 #define NETSTATE_ANCHOR_QUIET 5
+
+/*
+ * And how many before it may actually be replaced. Far more, because the two
+ * are different claims: that it is worth looking for an alternative, and that
+ * this one is gone. A rendezvous chosen a minute ago and answering ever since
+ * has not died; something else is quicker, or a round went astray. Give up on
+ * it only after minutes of its own silence on a network we can otherwise
+ * reach, since the cost of being wrong is a token already in someone's hands
+ * that no longer leads anywhere.
+ */
+#define NETSTATE_ANCHOR_GONE 90
 
 /* Prompt for a few rounds, then slowly but never not at all: a filtering
  * network cannot be told from a slow one in advance, and giving up is the one
@@ -137,8 +157,8 @@ struct netstate_fam {
 	uint8_t anchor_len;
 	int anchor_confirmed;		/* adopting a node never confirms it */
 	int anchor_acks;		/* separate answers from it, this epoch */
-	int anchor_misses;		/* answers from somewhere else instead */
 	int anchor_quiet;		/* rounds it left unanswered, while up */
+	uint64_t anchor_first_ms;	/* when its run of answers began */
 	uint64_t anchor_next_ms;
 
 	int has_addr;
@@ -193,6 +213,10 @@ void netstate_on_roundtrip(struct netstate *ns, int family, uint32_t epoch);
  */
 void netstate_on_dht_ack(struct netstate *ns, int family, uint32_t epoch,
 			 const uint8_t *node, int len, uint64_t now);
+
+/* The node we hold answered for itself (sig_take_anchor_seen). The only thing
+ * that keeps it, and the only thing whose absence may eventually unseat it. */
+void netstate_on_anchor_seen(struct netstate *ns, int family, uint64_t now);
 
 /* An anchor handed to us (a token slot, or the peer's over the control
  * channel): authoritative, so it displaces whatever is held, and is never
