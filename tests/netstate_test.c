@@ -526,11 +526,17 @@ static void probe_slows_but_never_stops(void)
 	t += NETSTATE_PROBE_MS;
 	assert(probe_round(&ns, 6));
 
-	/* and proof ends it */
+	/*
+	 * And proof does NOT end it. A round answers two questions: whether the
+	 * family is reachable, which the first reply settles, and which public
+	 * addresses this NAT maps us to, which takes every server it asks. A
+	 * host behind a per-destination CGNAT that stopped here would advertise
+	 * one egress address of the several it actually has.
+	 */
 	netstate_on_roundtrip(&ns, 6, netstate_epoch(&ns, 6));
-	assert(drain(&ns).f[1] & NSA_STOP_PROBE);
+	drain(&ns);
 	t += NETSTATE_PROBE_SLOW_MS;
-	assert(!probe_round(&ns, 6));		/* nothing left to prove */
+	assert(probe_round(&ns, 6));
 }
 
 static void no_address_no_probe_no_pending(void)

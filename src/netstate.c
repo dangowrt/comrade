@@ -33,8 +33,6 @@ static void sync_conn(struct netstate *ns, int i)
 		return;
 	f->conn = want;
 	raise_act(ns, i, NSA_EMIT_CONN);
-	if (want == NET_CONN_UP)
-		raise_act(ns, i, NSA_STOP_PROBE);
 }
 
 static uint64_t probe_gap(const struct netstate_fam *f)
@@ -390,7 +388,11 @@ void netstate_tick(struct netstate *ns, uint64_t now)
 				(f->src_tries < NETSTATE_SRC_FAST_TRIES ?
 				 NETSTATE_SRC_FAST_MS : NETSTATE_SRC_SLOW_MS);
 		}
-		if (f->has_addr && f->conn != NET_CONN_UP && !f->probe_running &&
+		/* Reachability is one of two things a round answers. The other
+		 * is which public addresses this NAT maps us to, which takes
+		 * every server it asks and is not settled by the first reply,
+		 * so being proven up is no reason to stop asking. */
+		if (f->has_addr && !f->probe_running &&
 		    now >= f->probe_next_ms) {
 			raise_act(ns, i, NSA_KICK_PROBE);
 			f->probe_next_ms = now + probe_gap(f);

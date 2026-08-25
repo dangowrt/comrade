@@ -405,6 +405,8 @@ struct sess {
 
 	char **stun_servers;		/* rotated across ICE retries (host:port) */
 	int stun_count;
+	int probe_slice4;		/* which slice of the server list the next
+					 * pool round asks */
 	char stun_host[128];		/* the current attempt's host, split out */
 	/*
 	 * Distinct public v4 addresses this network's NAT has been seen mapping
@@ -1420,11 +1422,15 @@ static void *stun_probe_thread(void *arg)
 	char *targets[STUN_PROBE_SERVERS];
 	uint8_t seed[STUN_PROBE_TXID_LEN];
 	uint32_t epoch = s->probe_epoch[0];
+	int base = s->ice_attempt + s->probe_slice4 * STUN_PROBE_SERVERS;
 	int n = 0, i;
 
+	/* A NAT that maps per destination presents a different public address
+	 * to each server, so the pool is only as wide as the set of servers
+	 * asked. Successive rounds take the next slice of the list rather than
+	 * asking the same handful again. */
 	for (i = 0; i < s->stun_count && n < STUN_PROBE_SERVERS; i++)
-		targets[n++] = s->stun_servers[(s->ice_attempt + i) %
-					       s->stun_count];
+		targets[n++] = s->stun_servers[(base + i) % s->stun_count];
 	random_bytes(seed, sizeof(seed));
 	stun_probe_run(targets, n, STUN_PROBE_MS, seed, &s->probe_stop,
 		       probe_hit, s);
@@ -1465,6 +1471,7 @@ static int stun_probe_kick(struct sess *s)
 	s->probe_stop = 0;
 	if (pthread_create(&s->probe_th, NULL, stun_probe_thread, s))
 		return 0;
+	s->probe_slice4++;
 	s->probe_running = 1;
 	return 1;
 }
@@ -3453,12 +3460,6 @@ static void net_apply(struct sess *s, const struct netstate_actions *a)
 				netstate_on_probe_started(&s->ns, family,
 							  a->epoch[i], now_ms());
 		}
-		if (act & NSA_STOP_PROBE) {
-			if (i)
-				stun_probe6_halt(s);
-			else
-				stun_probe_halt(s);
-		}
 		if (act & NSA_EMIT_ROWS && o && o->net_reset && o->net) {
 			const struct netstate_row *rows;
 			int n = netstate_rows(&s->ns, family, &rows), k;
@@ -5035,8 +5036,8 @@ done:
 	sig_destroy(s.sig);
 	/* Teardown, and the one place waiting is right: the session these
 	 * threads write into is about to go away with this frame. */
-	s.probe_stop = 1;
-	s.probe6_stop = 1;
+	stun_probe_halt(&s);
+	stun_probe6_halt(&s);
 	stun_probe_reap(&s);
 	stun_probe6_reap(&s);
 	stunlist_free(s.stun_servers, s.stun_count);

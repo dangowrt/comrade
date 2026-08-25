@@ -91,15 +91,14 @@ enum {					/* how a local address was learnt */
 #define NSA_SAMPLE_SRC	   (1u << 0)	/* ask the kernel for this family's
 					 * outbound source, feed the answer back */
 #define NSA_KICK_PROBE	   (1u << 1)	/* start this family's STUN check */
-#define NSA_STOP_PROBE	   (1u << 2)	/* proven: stop spending packets */
-#define NSA_EMIT_ROWS	   (1u << 3)	/* clear THIS family's rows in the view
+#define NSA_EMIT_ROWS	   (1u << 2)	/* clear THIS family's rows in the view
 					 * and re-emit netstate_rows() */
-#define NSA_EMIT_CONN	   (1u << 4)	/* publish netstate_conn() */
-#define NSA_EMIT_RDV	   (1u << 5)	/* re-report the anchor and whether it
+#define NSA_EMIT_CONN	   (1u << 3)	/* publish netstate_conn() */
+#define NSA_EMIT_RDV	   (1u << 4)	/* re-report the anchor and whether it
 					 * is confirmed */
-#define NSA_RDV_PIN	   (1u << 6)	/* pin the anchor now held */
-#define NSA_RDV_RELOCATE   (1u << 7)	/* quiet: look for one alongside it */
-#define NSA_EMIT_TOKEN	   (1u << 8)	/* host only: the advert changed */
+#define NSA_RDV_PIN	   (1u << 5)	/* pin the anchor now held */
+#define NSA_RDV_RELOCATE   (1u << 6)	/* quiet: look for one alongside it */
+#define NSA_EMIT_TOKEN	   (1u << 7)	/* host only: the advert changed */
 
 /* One local address, and whether it should be shown. Held rather than emitted
  * as it arrives, because whether a global v6 is ours to show is not knowable
