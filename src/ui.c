@@ -18,6 +18,7 @@
 #include <time.h>
 
 #include "base64.h"
+#include "conn.h"		/* enum conn_state: the peer link scale */
 #include "dbg.h"
 #include "oscompat.h"
 #include "qr.h"
@@ -54,7 +55,14 @@ static void ui_on_signal(int n) { (void)n; ui_abort_flag = 1; }
 struct netrow { int family; int scope; int via; char addr[80]; };
 struct linkrow { char name[32]; int has4, has6; };
 struct rdvrow { int family; int ready; char addr[80]; };
-struct peerrow { int id; int state; int read_only; char addr[80]; };
+struct peerrow {
+	int id;
+	int state;			/* SESSION_PEER_* -- how far it got */
+	int link;			/* enum conn_state -- how it is now */
+	int rtt_ms;
+	int read_only;
+	char addr[80];
+};
 
 /* What the host foreground shows: the dashboard, or one token full-screen
  * as a QR code. Q cycles, ESC returns. */
@@ -489,8 +497,7 @@ static void draw_mailbox(struct ui *u, int f)
 {
 	const struct session_mailbox *m = &u->mb;
 
-	line(CYN "MAILBOX" RST DIM "  where the two ends leave things for "
-	     "each other" RST);
+	line(CYN "MAILBOX" RST);
 	if (!u->have_mb) {
 		line(DIM "  ( )----[ ]    ( )   starting up" RST);
 		line("");
@@ -498,6 +505,28 @@ static void draw_mailbox(struct ui *u, int f)
 	}
 	draw_mailbox_art(m, f);
 	line("");
+}
+
+/*
+ * A peer's link, coloured by what is actually known about it. Grey is not a
+ * lesser green: it says nothing has been heard on this network, which is where
+ * a move leaves every peer until traffic proves one again.
+ */
+static const char *link_word(const struct peerrow *p)
+{
+	switch (p->link) {
+	case CONN_LIVE:		return BGR "live    " RST;
+	case CONN_LAGGED:	return YEL "lagged  " RST;
+	case CONN_LOST:		return RED "gone    " RST;
+	case CONN_PUNCHING:	return YEL "punching" RST;
+	case CONN_GATHERING:	return CYN "gather  " RST;
+	case CONN_UNKNOWN:	return DIM "unknown " RST;
+	default:
+		/* Nothing reported for this peer yet, so say how far it got
+		 * rather than claiming to know how its link is doing. */
+		return p->state == SESSION_PEER_PUNCHING ?
+		       YEL "punching" RST : CYN "seen    " RST;
+	}
 }
 
 static void draw(struct ui *u)
@@ -586,8 +615,6 @@ static void draw(struct ui *u)
 		line("  " RED "! %s" RST, u->escalate);
 	line("");
 
-	draw_mailbox(u, f);
-
 	if (u->role == UI_ROLE_HOST) {
 		line(CYN "INVITE" RST);
 		if (u->have_token) {
@@ -601,20 +628,21 @@ static void draw(struct ui *u)
 			line(DIM "  locating a rendezvous node ..." RST);
 		}
 		line("");
+		draw_mailbox(u, f);
 
 		line(CYN "PEERS" RST);
 		if (!u->npeer)
 			line(DIM "  none yet -- you can enter and wait" RST);
 		for (i = 0; i < u->npeer; i++) {
 			struct peerrow *p = &u->peer[i];
-			const char *st = p->state == SESSION_PEER_LIVE ?
-					 BGR "live    " RST :
-					 p->state == SESSION_PEER_PUNCHING ?
-					 YEL "punching" RST : CYN "seen    " RST;
+			char rtt[24];
 
-			line("  " BGR "#%d" RST " %s  " CYN "%s" RST "%s",
-			     i + 1, st, p->addr[0] && p->addr[0] != '-' ?
-			     p->addr : "",
+			rtt[0] = '\0';
+			if (p->link == CONN_LIVE && p->rtt_ms > 0)
+				snprintf(rtt, sizeof(rtt), "  %dms", p->rtt_ms);
+			line("  " BGR "#%d" RST " %s  " CYN "%s" RST DIM "%s" RST
+			     "%s", i + 1, link_word(p), p->addr[0] &&
+			     p->addr[0] != '-' ? p->addr : "", rtt,
 			     p->read_only ? "  " YEL "view-only" RST : "");
 		}
 		line("");
@@ -631,6 +659,7 @@ static void draw(struct ui *u)
 		const char *pa = u->npeer && u->peer[0].addr[0] &&
 				 u->peer[0].addr[0] != '-' ? u->peer[0].addr : NULL;
 
+		draw_mailbox(u, f);
 		if (u->established && pa)
 			line(BGR "  link up via " RST CYN "%s" RST BGR
 			     " -- entering ..." RST, pa);
@@ -840,6 +869,29 @@ static void um_mailbox(struct ui *u, const struct session_mailbox *m)
 		     m->peer_seen ? ", peer slot present" : ", no peer slot",
 		     m->claim == SESSION_CLAIM_BUSY ? ", answer slot taken" : "",
 		     (long long)m->seq, m->gets, m->puts);
+}
+
+static void um_peer_link(struct ui *u, int id, int state, int rtt_ms)
+{
+	int i;
+
+	for (i = 0; i < u->npeer; i++) {
+		if (u->peer[i].id != id)
+			continue;
+		if (u->peer[i].link == state && u->peer[i].rtt_ms == rtt_ms)
+			return;
+		u->peer[i].link = state;
+		u->peer[i].rtt_ms = rtt_ms;
+		if (u->anim)
+			u->dirty = 1;
+		else
+			vlog(u, "peer   #%d link %s", id + 1,
+			     state == CONN_LIVE ? "live" :
+			     state == CONN_LAGGED ? "lagged" :
+			     state == CONN_LOST ? "gone" :
+			     state == CONN_UNKNOWN ? "unknown" : "connecting");
+		return;
+	}
 }
 
 static void um_rdv_stage(struct ui *u, int family, int stage)
@@ -1061,6 +1113,10 @@ static void cb_mailbox(void *a, const struct session_mailbox *m)
 {
 	um_mailbox(a, m);
 }
+static void cb_peer_link(void *a, int id, int st, int rtt)
+{
+	um_peer_link(a, id, st, rtt);
+}
 static void cb_token(void *a, const char *t) { um_token(a, t); }
 static void cb_token_ro(void *a, const char *t) { um_token_ro(a, t); }
 static void cb_peer(void *a, int id, int s, const char *ad) { um_peer(a, id, s, ad); }
@@ -1108,6 +1164,7 @@ void ui_bind(struct ui *u, struct session_obs *obs)
 	obs->rendezvous = cb_rdv;
 	obs->rdv_stage = cb_rdv_stage;
 	obs->mailbox = cb_mailbox;
+	obs->peer_link = cb_peer_link;
 	obs->token = cb_token;
 	obs->token_ro = cb_token_ro;
 	obs->peer = cb_peer;
@@ -1245,6 +1302,10 @@ static void em_mailbox(void *a, const struct session_mailbox *m)
 	      (long long)m->seq, m->gets, m->puts, m->claim, m->age_get_s,
 	      m->age_put_s, m->rdv_holding, m->rdv_proven);
 }
+static void em_peer_link(void *a, int id, int st, int rtt)
+{
+	emitf(a, "K %d %d %d\n", id, st, rtt);
+}
 static void em_token(void *a, const char *t)
 {
 	emitf(a, "T %s\n", t);
@@ -1318,6 +1379,7 @@ void ui_emitter(struct session_obs *obs, sock_t fd)
 	obs->rendezvous = em_rdv;
 	obs->rdv_stage = em_rdv_stage;
 	obs->mailbox = em_mailbox;
+	obs->peer_link = em_peer_link;
 	obs->token = em_token;
 	obs->token_ro = em_token_ro;
 	obs->peer = em_peer;
@@ -1408,6 +1470,13 @@ static void feed(struct ui *u, char *ln)
 		if (sscanf(ln + 1, "%d", &a) == 1)
 			um_peer_ro(u, a);
 		break;
+	case 'K': {
+		int st, rtt;
+
+		if (sscanf(ln + 1, "%d %d %d", &a, &st, &rtt) == 3)
+			um_peer_link(u, a, st, rtt);
+		break;
+	}
 	case 'E':
 		if (sscanf(ln + 1, " %159[^\n]", s) == 1)
 			um_escalate(u, s);

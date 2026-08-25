@@ -322,6 +322,10 @@ struct conn {
 	 * SSH/KCP stream, it measures end-to-end liveness -- a pong stops arriving
 	 * once the link has truly stalled, which is exactly the signal we want. */
 	pthread_mutex_t hb_lock;
+	int link_told, rtt_told, link_told_any;	/* last reported to the view */
+	unsigned live_gen;		/* the network generation this link was
+					 * last proven on; older means we have
+					 * no evidence about it here */
 	uint64_t hb_last_pong;		/* when a pong last came back */
 	uint64_t hb_last_heard;		/* when anything last arrived from the
 					 * peer (fed by the receive threads) */
@@ -456,6 +460,8 @@ struct sess {
 	 * trickle_lock alongside pool4.
 	 */
 	struct stun_mapping map4;
+	unsigned netgen;		/* bumped by any move; a path proven on an
+					 * earlier one proves nothing here */
 	int mapping_reported;		/* 0 not yet, 1 sent independent, 2 sent dependent */
 	struct session_mailbox mb_told;	/* the last mailbox state sent to the view */
 	int mb_told_any;
@@ -1698,6 +1704,9 @@ static void ctl_dispatch(void *arg, int type, const uint8_t *pl, size_t plen)
 		c->hb_last_pong = now;
 		c->hb_rtt = (int)(now - ctl_get_u64(pl));
 		c->hb_pong_seen = 1;
+		/* Traffic arriving is the only thing that proves a path on the
+		 * network we are on now. */
+		c->live_gen = c->sess->netgen;
 		pthread_mutex_unlock(&c->hb_lock);
 	} else if (type == CTLM_RDV && plen >= CTL_RDV_PLEN) {
 		struct sockaddr_storage sa;
@@ -3590,10 +3599,12 @@ static void net_pump(struct sess *s, uint64_t now)
 		ch |= netmon_changed_fam_fp(&s->netmon, now, fp4, fp6, fpif);
 		netstate_on_netmon(&s->ns, ch, fam_usable_addr(addrs, n, 4),
 				   fam_usable_addr(addrs, n, 6), now);
-		if (ch)
+		if (ch) {
+			s->netgen++;	/* every path is unproven again */
 			dbg_logf("net: change v4=%d v6=%d iface=%d",
 				 !!(ch & NETMON_CH_V4), !!(ch & NETMON_CH_V6),
 				 !!(ch & NETMON_CH_IFACE));
+		}
 		s->net_ch |= ch;
 	}
 	ns_take_acks(s, now);
@@ -3642,6 +3653,44 @@ static void net_change_reset(struct sess *s)
 	s->pool_posted = 0;
 	s->mapping_reported = 0;
 	/* Rows are not flushed here: each family redraws its own. */
+}
+
+/*
+ * A peer's link, on the same scale the status bar uses.
+ *
+ * The distinctions are about evidence, not about hope. Traffic arriving is the
+ * only thing that proves a path, and it proves it for the network it arrived
+ * on -- so a move puts every peer back to unknown rather than leaving the last
+ * network's verdict on screen, where it reads as a working link that simply is
+ * not there. Between live and lost sits a stretch where the last thing heard
+ * is old enough to notice and not old enough to give up on; showing that as
+ * live is how a link that stopped looks fine until it is suddenly gone.
+ */
+#define LINK_LAG_MS 1200
+
+static int conn_link_state(const struct sess *s, struct conn *c)
+{
+	uint64_t now = now_ms(), last;
+	unsigned gen;
+	int seen, lost;
+
+	pthread_mutex_lock(&c->hb_lock);
+	last = c->hb_last_pong;
+	seen = c->hb_pong_seen;
+	gen = c->live_gen;
+	lost = c->lost_since_ms != 0;
+	pthread_mutex_unlock(&c->hb_lock);
+
+	if (!seen)
+		return c->nat && nat_connected(c->nat) ? CONN_PUNCHING :
+							 CONN_CONNECTING;
+	if (lost && now - last >= HB_LOST_MS)
+		return CONN_LOST;
+	if (gen != s->netgen)
+		return CONN_UNKNOWN;	/* proven, but somewhere else */
+	if (now - last >= LINK_LAG_MS)
+		return CONN_LAGGED;
+	return CONN_LIVE;
 }
 
 /*
@@ -4013,6 +4062,34 @@ struct worker {
 	volatile int done;
 	int used;
 };
+
+/* Each served peer's link, whenever one moves. */
+static void report_peer_links(struct sess *s, struct worker *ws)
+{
+	const struct session_obs *o = s->cfg->obs;
+	int i;
+
+	if (!o || !o->peer_link)
+		return;
+	for (i = 0; i < HOST_MAX_WORKERS; i++) {
+		struct conn *c = ws[i].used ? ws[i].c : NULL;
+		int st, rtt;
+
+		if (!c)
+			continue;
+		st = conn_link_state(s, c);
+		pthread_mutex_lock(&c->hb_lock);
+		rtt = c->hb_rtt;
+		pthread_mutex_unlock(&c->hb_lock);
+		if (c->link_told_any && c->link_told == st &&
+		    c->rtt_told == rtt)
+			continue;
+		c->link_told = st;
+		c->rtt_told = rtt;
+		c->link_told_any = 1;
+		o->peer_link(o->arg, c->dash_id, st, rtt);
+	}
+}
 
 /* A worker runs one connected client's session on the shared command (tmux
  * attach), without driving sig -- that stays with the host's main thread. */
@@ -4568,6 +4645,7 @@ static int host_turnstile(struct sess *s)
 		/* Advance in-flight punches (connect -> worker, wedged -> freed),
 		 * concurrently with the listener below. An in-flight punch keeps the
 		 * host non-idle. */
+		report_peer_links(s, ws);
 		punch_scan(s, ws, punching, punch_resume, punch_start,
 			   punch_stuck, &dash_seq);
 		for (i = 0; i < HOST_MAX_WORKERS; i++)

@@ -157,6 +157,13 @@ struct session_obs {
 	void (*peer_path)(void *arg, int id, const char *addr, int carrying,
 			  int rtt_ms);
 	void (*peer_path_reset)(void *arg, int id);
+	/*
+	 * Peer `id`'s link, on the same scale the local status bar uses
+	 * (enum conn_state), with its smoothed round trip in ms (0 unknown).
+	 * A move puts every peer back to unknown: what proved a path was
+	 * traffic arriving on the network we have left.
+	 */
+	void (*peer_link)(void *arg, int id, int state, int rtt_ms);
 	/* Periodic heartbeat, ~10/s: advance spinners, repaint. */
 	void (*tick)(void *arg);
 };

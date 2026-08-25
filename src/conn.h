@@ -12,12 +12,30 @@
  * struct is also serialised to a small tmpfs file for the operator to read.
  */
 
+/*
+ * Appended to, never reordered: the struct below is serialised to a file that
+ * an operator process reads, and a zeroed one has to keep meaning "connecting".
+ */
 enum conn_state {
 	CONN_CONNECTING,
 	CONN_GATHERING,
 	CONN_PUNCHING,
 	CONN_LIVE,
-	CONN_LOST
+	CONN_LOST,
+	/*
+	 * Answering, but not lately. Between live and lost there is a stretch
+	 * where the last thing heard is old enough to notice and not old
+	 * enough to give up on, and calling that live is how a link that has
+	 * quietly stopped looks fine right up until it is declared gone.
+	 */
+	CONN_LAGGED,
+	/*
+	 * Nothing has been heard on this network yet. Not a claim that the
+	 * peer is unreachable -- a claim that we have no evidence either way,
+	 * which is what a move leaves us with: every path was proven somewhere
+	 * else, and only traffic arriving here can prove one again.
+	 */
+	CONN_UNKNOWN
 };
 
 struct conn_status {
