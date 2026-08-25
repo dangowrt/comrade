@@ -96,12 +96,15 @@ static int fam_idx(int family)
 #define NS_FACTS_MAX 16
 enum {
 	NSF_ROUNDTRIP,			/* something answered us */
-	NSF_PROBE_DONE			/* a probe round ended, proving nothing */
+	NSF_PROBE_DONE,			/* a probe round ended, proving nothing */
+	NSF_ADDR			/* and the address it said we are seen as */
 };
 struct ns_fact {
 	int kind;
 	int family;
 	uint32_t epoch;			/* which network it was learnt on */
+	uint8_t addr[16];		/* NSF_ADDR: as bytes, and as printed */
+	char text[64];
 };
 /*
  * Backstop only, well above real-internet connect time: libjuice reaches its
@@ -1317,10 +1320,31 @@ static void ns_post(struct sess *s, int kind, int family, uint32_t epoch)
 {
 	pthread_mutex_lock(&s->ns_lock);
 	if (s->ns_nfacts < NS_FACTS_MAX) {
-		s->ns_facts[s->ns_nfacts].kind = kind;
-		s->ns_facts[s->ns_nfacts].family = family;
-		s->ns_facts[s->ns_nfacts].epoch = epoch;
-		s->ns_nfacts++;
+		struct ns_fact *f = &s->ns_facts[s->ns_nfacts++];
+
+		memset(f, 0, sizeof(*f));
+		f->kind = kind;
+		f->family = family;
+		f->epoch = epoch;
+	}
+	pthread_mutex_unlock(&s->ns_lock);
+}
+
+/* An address a producer was told we are seen as. Classified on the loop
+ * thread, where everything else about it is decided. */
+static void ns_post_addr(struct sess *s, int family, uint32_t epoch,
+			 const uint8_t *addr, const char *text)
+{
+	pthread_mutex_lock(&s->ns_lock);
+	if (s->ns_nfacts < NS_FACTS_MAX) {
+		struct ns_fact *f = &s->ns_facts[s->ns_nfacts++];
+
+		memset(f, 0, sizeof(*f));
+		f->kind = NSF_ADDR;
+		f->family = family;
+		f->epoch = epoch;
+		memcpy(f->addr, addr, family == 6 ? 16 : 4);
+		strncpy(f->text, text, sizeof(f->text) - 1);
 	}
 	pthread_mutex_unlock(&s->ns_lock);
 }
@@ -1343,6 +1367,14 @@ static void ns_drain(struct sess *s)
 	for (i = 0; i < n; i++) {
 		if (f[i].kind == NSF_ROUNDTRIP) {
 			netstate_on_roundtrip(&s->ns, f[i].family, f[i].epoch);
+			continue;
+		}
+		if (f[i].kind == NSF_ADDR) {
+			netstate_on_candidate(&s->ns, f[i].family, f[i].epoch,
+					      addr_scope(f[i].text),
+					      NET_VIA_STUN, f[i].addr,
+					      f[i].family == 6 ? 16 : 4,
+					      f[i].text);
 			continue;
 		}
 		/* Said as the round's last act, so reaping it does not wait --
@@ -1451,11 +1483,23 @@ static int stun_probe_kick(struct sess *s)
 	return 1;
 }
 
-static void probe6_hit(void *arg)
+/*
+ * v6's proof, and the address that carried it. The dedicated probe is often
+ * the only thing that speaks v6 to a server -- ICE does not gather a v6 srflx
+ * when a global host candidate already exists -- so without reporting what it
+ * saw, the dashboard could say the family was up while showing nothing that
+ * was up. It goes in as a candidate like any other, and the model decides
+ * whether it belongs on the dashboard.
+ */
+static void probe6_hit(void *arg, const uint8_t addr[16], uint16_t port)
 {
 	struct sess *s = arg;
+	char ip[64];
 
+	(void)port;
 	ns_post(s, NSF_ROUNDTRIP, 6, s->probe_epoch[1]);
+	if (inet_ntop(AF_INET6, addr, ip, sizeof(ip)))
+		ns_post_addr(s, 6, s->probe_epoch[1], addr, ip);
 }
 
 static void *stun_probe6_thread(void *arg)

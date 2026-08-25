@@ -134,10 +134,86 @@ static void mapping_check(void)
 	assert(stun_mapping_result(&m) == STUN_MAPPING_UNKNOWN);
 }
 
+
+/*
+ * A v6 binding success response for 2001:db8::1234:5678, txid seed[0..10]||7.
+ * RFC 5389 15.2 masks a v6 address with the magic cookie followed by the
+ * transaction id, so the second half is unmaskable without the reply itself --
+ * which is the part easiest to get wrong, hence this.
+ */
+static size_t mkresp6(uint8_t *out, int xored)
+{
+	static const uint8_t ip6[16] = {
+		0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0,
+		0, 0, 0, 0, 0x12, 0x34, 0x56, 0x78
+	};
+	static const uint8_t magic[4] = { 0x21, 0x12, 0xa4, 0x42 };
+	uint8_t txid[STUN_PROBE_TXID_LEN];
+	size_t o = 0;
+	int i;
+
+	memcpy(txid, seed, STUN_PROBE_TXID_LEN - 1);
+	txid[STUN_PROBE_TXID_LEN - 1] = 7;
+
+	out[o++] = 0x01; out[o++] = 0x01;		/* success */
+	out[o++] = 0x00; out[o++] = 0x18;		/* one attribute, 24 bytes */
+	memcpy(out + o, magic, 4);
+	o += 4;
+	memcpy(out + o, txid, STUN_PROBE_TXID_LEN);
+	o += STUN_PROBE_TXID_LEN;
+	out[o++] = (uint8_t)((xored ? 0x0020 : 0x0001) >> 8);
+	out[o++] = (uint8_t)(xored ? 0x20 : 0x01);
+	out[o++] = 0x00; out[o++] = 0x14;		/* 20 bytes of value */
+	out[o++] = 0x00;
+	out[o++] = 0x02;				/* family v6 */
+	if (xored) {
+		out[o++] = (0x54321 >> 8 & 0xff) ^ 0x21;
+		out[o++] = (0x54321 & 0xff) ^ 0x12;
+		for (i = 0; i < 4; i++)
+			out[o++] = ip6[i] ^ magic[i];
+		for (i = 4; i < 16; i++)
+			out[o++] = ip6[i] ^ txid[i - 4];
+	} else {
+		out[o++] = 0x54321 >> 8 & 0xff;
+		out[o++] = 0x54321 & 0xff;
+		for (i = 0; i < 16; i++)
+			out[o++] = ip6[i];
+	}
+	return o;
+}
+
+/* The v6 half of the same decoder: what the dedicated v6 probe reports, and
+ * often the only v6 address anything sees -- ICE gathers no v6 srflx when a
+ * global host candidate already exists. */
+static void parse6_check(void)
+{
+	static const uint8_t want[16] = {
+		0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0,
+		0, 0, 0, 0, 0x12, 0x34, 0x56, 0x78
+	};
+	uint8_t resp[96], addr[16];
+	uint16_t port;
+	size_t n;
+
+	n = mkresp6(resp, 1);
+	assert(stun_probe_mapped_fam(resp, n, seed, 0x02, addr, &port) == 0);
+	assert(!memcmp(addr, want, 16));
+	assert(port == (0x54321 & 0xffff));
+
+	n = mkresp6(resp, 0);
+	assert(stun_probe_mapped_fam(resp, n, seed, 0x02, addr, &port) == 0);
+	assert(!memcmp(addr, want, 16));
+
+	/* asking for the wrong family finds nothing */
+	n = mkresp6(resp, 1);
+	assert(stun_probe_mapped_fam(resp, n, seed, 0x01, addr, &port) != 0);
+}
+
 int main(void)
 {
 	build_check();
 	parse_check();
+	parse6_check();
 	mapping_check();
 	return 0;
 }

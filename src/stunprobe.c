@@ -56,11 +56,18 @@ static int stun_reply_ok(const uint8_t *pkt, size_t len,
 	return (int)mlen;
 }
 
-int stun_probe_mapped4(const uint8_t *pkt, size_t len,
-		       const uint8_t seed[STUN_PROBE_TXID_LEN],
-		       uint8_t addr[4], uint16_t *port)
+/*
+ * The mapped address a validated reply carries for the wire-format family byte
+ * `want_fam` (0x01 v4, 0x02 v6): four bytes of `addr` for v4, sixteen for v6.
+ * XOR-MAPPED-ADDRESS is preferred and MAPPED-ADDRESS accepted; the v6 mask is
+ * the magic cookie followed by the reply's own transaction id, per RFC 5389
+ * 15.2, which is why it is read from the packet rather than from the seed.
+ */
+int stun_probe_mapped_fam(const uint8_t *pkt, size_t len,
+			  const uint8_t seed[STUN_PROBE_TXID_LEN], int want_fam,
+			  uint8_t addr[16], uint16_t *port)
 {
-	size_t i = 20;
+	size_t i = 20, alen = want_fam == 0x02 ? 16 : 4;
 	int mlen = stun_reply_ok(pkt, len, seed);
 
 	if (mlen < 0)
@@ -74,23 +81,39 @@ int stun_probe_mapped4(const uint8_t *pkt, size_t len,
 		if (i + 4 + al > len)
 			return -1;
 		if ((at == STUN_ATTR_XOR_MAPPED || at == STUN_ATTR_MAPPED) &&
-		    al >= 8 && v[1] == 0x01) {
+		    al >= 4 + alen && v[1] == want_fam) {
 			if (at == STUN_ATTR_XOR_MAPPED) {
+				size_t k;
+
 				*port = (uint16_t)(((v[2] << 8) | v[3]) ^
 						   (STUN_MAGIC >> 16));
 				addr[0] = v[4] ^ (STUN_MAGIC >> 24);
 				addr[1] = v[5] ^ ((STUN_MAGIC >> 16) & 0xff);
 				addr[2] = v[6] ^ ((STUN_MAGIC >> 8) & 0xff);
 				addr[3] = v[7] ^ (STUN_MAGIC & 0xff);
+				for (k = 4; k < alen; k++)
+					addr[k] = v[4 + k] ^ pkt[4 + k];
 			} else {
 				*port = (uint16_t)((v[2] << 8) | v[3]);
-				memcpy(addr, v + 4, 4);
+				memcpy(addr, v + 4, alen);
 			}
 			return 0;
 		}
 		i += 4 + ((al + 3) & ~3u);
 	}
 	return -1;
+}
+
+int stun_probe_mapped4(const uint8_t *pkt, size_t len,
+		       const uint8_t seed[STUN_PROBE_TXID_LEN],
+		       uint8_t addr[4], uint16_t *port)
+{
+	uint8_t a[16];
+
+	if (stun_probe_mapped_fam(pkt, len, seed, 0x01, a, port))
+		return -1;
+	memcpy(addr, a, 4);
+	return 0;
 }
 
 /*
@@ -272,34 +295,6 @@ void stun_probe_run(char *const *servers, int nservers, int total_ms,
 	sock_close(fd);
 }
 
-/* Whether a validated reply (stun_reply_ok) also carries a mapped-address
- * attribute of the wire-format family byte `want_fam` (0x01 v4, 0x02 v6).
- * The address itself is not decoded: proof needs only that this family's
- * server answered, nothing kept. */
-static int stun_reply_has_family(const uint8_t *pkt, size_t len,
-				 const uint8_t seed[STUN_PROBE_TXID_LEN],
-				 int want_fam)
-{
-	size_t i = 20;
-	int mlen = stun_reply_ok(pkt, len, seed);
-
-	if (mlen < 0)
-		return -1;
-	while (i + 4 <= 20 + (size_t)mlen) {
-		unsigned at = (pkt[i] << 8) | pkt[i + 1];
-		unsigned al = (pkt[i + 2] << 8) | pkt[i + 3];
-		const uint8_t *v = pkt + i + 4;
-
-		if (i + 4 + al > len)
-			return -1;
-		if ((at == STUN_ATTR_XOR_MAPPED || at == STUN_ATTR_MAPPED) &&
-		    al >= 4 && v[1] == want_fam)
-			return 0;
-		i += 4 + ((al + 3) & ~3u);
-	}
-	return -1;
-}
-
 /* "host:port" resolved to a target of `family`; 3478 with no or unparsable
  * port. Unlike resolve4, keeps whatever sockaddr length getaddrinfo hands
  * back, since a v6 target is a different size. */
@@ -336,7 +331,7 @@ static int resolve_stun(const char *server, int family,
 
 void stun_probe_check(char *const *servers, int nservers, int family,
 		      int total_ms, uint8_t seed[STUN_PROBE_TXID_LEN],
-		      volatile int *stop, void (*hit)(void *arg), void *arg)
+		      volatile int *stop, stun_probe_check_hit *hit, void *arg)
 {
 	struct sockaddr_storage dst[16];
 	socklen_t dlen[16];
@@ -387,13 +382,15 @@ void stun_probe_check(char *const *servers, int nservers, int family,
 		pf.revents = 0;
 		if (sock_poll(&pf, 1, PROBE_TICK_MS) > 0 &&
 		    (pf.revents & POLLIN)) {
-			uint8_t buf[512];
+			uint8_t buf[512], addr[16];
+			uint16_t port;
 			int r = recvfrom(fd, (char *)buf, sizeof(buf), 0,
 					 NULL, NULL);
 
-			if (r > 0 && !stun_reply_has_family(buf, (size_t)r,
-							    seed, want_fam)) {
-				hit(arg);
+			if (r > 0 && !stun_probe_mapped_fam(buf, (size_t)r,
+							    seed, want_fam,
+							    addr, &port)) {
+				hit(arg, addr, port);
 				break;
 			}
 		}
