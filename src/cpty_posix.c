@@ -32,6 +32,8 @@ struct cpty {
 	int in;				/* write toward the child */
 	int out;			/* read from the child */
 	int pty;			/* in == out == the pty master */
+	int reaped;			/* cpty_exited took its status */
+	int status;
 };
 
 struct cpty *cpty_spawn(const char *command, int use_pty, int rows, int cols,
@@ -143,12 +145,19 @@ void cpty_resize(struct cpty *p, int rows, int cols)
 	ioctl(p->in, TIOCSWINSZ, &ws);
 }
 
-int cpty_exited(const struct cpty *p)
+int cpty_exited(struct cpty *p)
 {
+	int status = 0;
+
 	if (!p || p->pid <= 0)
 		return 1;
-	/* WNOWAIT leaves the child for cpty_close() to reap. */
-	return waitpid(p->pid, NULL, WNOHANG | WNOWAIT) == p->pid;
+	if (p->reaped)
+		return 1;
+	if (waitpid(p->pid, &status, WNOHANG) != p->pid)
+		return 0;
+	p->reaped = 1;
+	p->status = WIFEXITED(status) ? WEXITSTATUS(status) : 0;
+	return 1;
 }
 
 int cpty_close(struct cpty *p)
@@ -161,7 +170,9 @@ int cpty_close(struct cpty *p)
 		close(p->in);
 	if (p->out >= 0 && p->out != p->in)
 		close(p->out);
-	if (p->pid > 0) {
+	if (p->reaped) {
+		status = p->status;
+	} else if (p->pid > 0) {
 		kill(p->pid, SIGHUP);
 		waitpid(p->pid, &status, 0);
 		status = WIFEXITED(status) ? WEXITSTATUS(status) : 0;

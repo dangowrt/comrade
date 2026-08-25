@@ -332,7 +332,7 @@ void cpty_resize(struct cpty *p, int rows, int cols)
 	pc_resize(p->pc, sz);
 }
 
-int cpty_exited(const struct cpty *p)
+int cpty_exited(struct cpty *p)
 {
 	if (!p || !p->proc)
 		return 1;

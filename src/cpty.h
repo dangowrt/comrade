@@ -55,9 +55,14 @@ sock_t cpty_out(const struct cpty *p);
 /* Terminal resize (SSH window-change): TIOCSWINSZ / ResizePseudoConsole. */
 void cpty_resize(struct cpty *p, int rows, int cols);
 
-/* Has the child exited? Non-blocking, and does not reap: waitpid(WNOWAIT) /
- * WaitForSingleObject(0). This is the SIGCHLD the port does not have. */
-int cpty_exited(const struct cpty *p);
+/* Has the child exited? Non-blocking: waitpid(WNOHANG) /
+ * WaitForSingleObject(0). This is the SIGCHLD the port does not have.
+ *
+ * On POSIX the child IS reaped here, and its status kept for cpty_close.
+ * Asking without reaping would want WNOWAIT, which waitpid does not accept
+ * -- it belongs to waitid, and waitpid answers EINVAL to it, so the question
+ * came back "still running" however long the child had been dead. */
+int cpty_exited(struct cpty *p);
 
 /* Stop the child if it is still running, reap it, release everything, and
  * return its exit status (0 if unknown). */
