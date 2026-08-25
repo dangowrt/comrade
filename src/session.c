@@ -909,8 +909,19 @@ static void conn_offer_path(struct conn *c, const struct sockaddr *sa,
 		dbg_logf("path advertised: %s", added);
 }
 
-/* Hand each local ICE candidate to the model, classified by scope and how it
- * was learnt. Re-run as they trickle in; the model de-duplicates. */
+/*
+ * Hand each local ICE candidate to the model, classified by scope and how it
+ * was learnt. Re-run as they trickle in; the model de-duplicates.
+ *
+ * Stamped with the epoch the agent that gathered it was built under, never
+ * the one current when the line is finally read -- they are routinely
+ * different. A description gathered before a move is still in the trickle
+ * buffer when the move lands, and stamping it with the network we are on now
+ * makes it a fact about a place it was never seen: a public v6 learnt through
+ * STUN on the last network survives onto one with no global v6 at all. The
+ * round trips from this same agent already carry gather_epoch, so this was the
+ * one thing left disagreeing with them.
+ */
 static void report_candidates(struct sess *s, const char *sdp)
 {
 	const char *p = sdp;
@@ -944,8 +955,7 @@ static void report_candidates(struct sess *s, const char *sdp)
 				if (inet_pton(fam == 6 ? AF_INET6 : AF_INET,
 					      addr, raw) == 1)
 					netstate_on_candidate(&s->ns, fam,
-							      netstate_epoch(&s->ns,
-									     fam),
+							      s->gather_epoch[fam_idx(fam)],
 							      scope, via, raw,
 							      len, addr);
 			}
