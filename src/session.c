@@ -87,8 +87,6 @@ static int fam_idx(int family)
 	return family == 6 ? 1 : 0;
 }
 
-/* Something a producer off the loop thread saw. It leaves it here rather than
- * writing the model or the view, which it does not own. */
 #define NS_FACTS_MAX 16
 enum {
 	NSF_ROUNDTRIP,			/* something answered us */
@@ -436,11 +434,9 @@ struct sess {
 	int mapping_reported;		/* 0 not yet, 1 sent independent, 2 sent dependent */
 
 	/*
-	 * What each family currently knows about its own reachability, and the
-	 * epochs that say which network it knows it about. The producers below
-	 * run on threads that do not own this: they leave facts in `ns_fact`
-	 * under `ns_lock` and the loop feeds them in, so nothing outside the
-	 * loop writes the model or reaches the view.
+	 * Reachability per family. Producers off this thread leave facts under
+	 * ns_lock; the loop feeds them in, so nothing outside it writes the
+	 * model or reaches the view.
 	 */
 	struct netstate ns;
 	unsigned net_ch;		/* families whose move the loop still owes
@@ -448,11 +444,7 @@ struct sess {
 	pthread_mutex_t ns_lock;
 	struct ns_fact ns_facts[NS_FACTS_MAX];
 	int ns_nfacts;
-	/*
-	 * The epoch each producer was started for, stamped by the loop before
-	 * it starts one, so what the producer reports can be told from what a
-	 * network we have since left reported.
-	 */
+	/* The epoch each producer was started for, stamped before it starts. */
 	volatile uint32_t probe_epoch[2];
 	volatile uint32_t gather_epoch[2];
 
@@ -890,13 +882,8 @@ static void conn_offer_path(struct conn *c, const struct sockaddr *sa,
 		dbg_logf("path advertised: %s", added);
 }
 
-/*
- * Hand each local ICE candidate to the reachability model, classified by scope
- * (LAN / CGNAT / global) and how it was learnt (direct host candidate, or
- * srflx via STUN). Re-run as candidates trickle in -- srflx arrive a
- * round-trip after the host ones -- and the model de-duplicates, decides which
- * belong on the dashboard, and asks for them to be drawn when that changes.
- */
+/* Hand each local ICE candidate to the model, classified by scope and how it
+ * was learnt. Re-run as they trickle in; the model de-duplicates. */
 static void report_candidates(struct sess *s, const char *sdp)
 {
 	const char *p = sdp;
@@ -927,10 +914,6 @@ static void report_candidates(struct sess *s, const char *sdp)
 					 scope != NET_SCOPE_GLOBAL)
 					s->have_priv4 = 1;
 				len = fam == 6 ? 16 : 4;
-				/* Held rather than shown: whether a global v6
-				 * is ours to show turns on the source address,
-				 * which is routinely learnt after the
-				 * addresses are. */
 				if (inet_pton(fam == 6 ? AF_INET6 : AF_INET,
 					      addr, raw) == 1)
 					netstate_on_candidate(&s->ns, fam,
@@ -1307,11 +1290,8 @@ static void on_local_sdp(void *arg, const char *sdp)
 	s->have_local_sdp = 1;
 }
 
-/*
- * Leave a fact for the loop. Called from the STUN probe threads and libjuice's
- * gather thread, none of which owns the reachability model, sig, or the view --
- * so all any of them does is say what it saw, and which network it saw it on.
- */
+/* Leave a fact for the loop: called from threads that own none of the model,
+ * sig or the view. */
 static void ns_post(struct sess *s, int kind, int family, uint32_t epoch)
 {
 	pthread_mutex_lock(&s->ns_lock);
@@ -1326,8 +1306,6 @@ static void ns_post(struct sess *s, int kind, int family, uint32_t epoch)
 	pthread_mutex_unlock(&s->ns_lock);
 }
 
-/* An address a producer was told we are seen as. Classified on the loop
- * thread, where everything else about it is decided. */
 static void ns_post_addr(struct sess *s, int family, uint32_t epoch,
 			 const uint8_t *addr, const char *text)
 {
@@ -1348,7 +1326,6 @@ static void ns_post_addr(struct sess *s, int family, uint32_t epoch,
 static void stun_probe_reap(struct sess *s);
 static void stun_probe6_reap(struct sess *s);
 
-/* Hand what the producers left to the model, on the loop thread. */
 static void ns_drain(struct sess *s)
 {
 	struct ns_fact f[NS_FACTS_MAX];
@@ -1373,10 +1350,7 @@ static void ns_drain(struct sess *s)
 					      f[i].text);
 			continue;
 		}
-		/* Said as the round's last act, so reaping it does not wait --
-		 * and until it is reaped nothing else may start for that
-		 * family, which is what keeps one round in flight at a time
-		 * without the loop ever blocking on one. */
+		/* Said as the round's last act, so this does not wait. */
 		if (f[i].family == 6)
 			stun_probe6_reap(s);
 		else
@@ -1435,16 +1409,13 @@ static void *stun_probe_thread(void *arg)
 	return NULL;
 }
 
-/* Ask the round in flight to wind up. It notices on its next pass -- within a
- * poll tick -- and is reaped where it says so. */
+/* Ask the round in flight to wind up; it is reaped where it says so. */
 static void stun_probe_halt(struct sess *s)
 {
 	if (s->probe_running)
 		s->probe_stop = 1;
 }
 
-/* Reap a round that has said it is finishing; it posted that as its last act,
- * so this does not wait. */
 static void stun_probe_reap(struct sess *s)
 {
 	if (!s->probe_running)
@@ -2432,9 +2403,8 @@ static int on_stream_output(void *arg, const uint8_t *data, size_t len)
  * bind ICE to its real source so its host candidate matches what the peer
  * sees, which is what a no-STUN path needs.
  *
- * `raw`/`rawlen` optionally receive the address itself, so a caller comparing
- * ours against a gathered candidate compares addresses rather than the two
- * spellings of one.
+ * raw/rawlen optionally receive the address, so a caller compares addresses
+ * rather than the two spellings of one.
  */
 static int source_addr_raw(int family, char *out, size_t outlen, uint8_t *raw,
 			   int *rawlen)
@@ -2578,10 +2548,8 @@ static int nat_setup(struct conn *c)
 	cfg.arg = c;
 
 	s->remote_set = 0;
-	/* Stamp the round before the gather thread can report anything from it,
-	 * so a candidate arriving after the next move is recognisable as
-	 * belonging to the one before it. One agent gathers both families, but
-	 * they move apart, so each is stamped with its own. */
+	/* Stamp before the gather thread can report from it. One agent gathers
+	 * both families, but they move apart, so each gets its own. */
 	s->gather_epoch[0] = netstate_epoch(&s->ns, 4);
 	s->gather_epoch[1] = netstate_epoch(&s->ns, 6);
 	c->nat = nat_create(&cfg);
@@ -3314,10 +3282,8 @@ static void update_expect(struct sess *s)
 	const char *p = s->local_sdp;
 	char addr[64];
 
-	/* Recomputed, not accumulated: a host that moves to a network without
-	 * one of them would otherwise go on saying it expects that family for
-	 * the rest of the session, and keep reporting it as still being looked
-	 * for. The candidates are re-gathered on every move, so this follows. */
+	/* Recomputed, not accumulated: otherwise a family lost in a move is
+	 * expected, and reported as still being looked for, forever. */
 	s->expect4 = 0;
 	s->expect6 = 0;
 	while ((p = strstr(p, "a=candidate:")) != NULL) {
@@ -3377,9 +3343,7 @@ static int dht_attempt_concluded(struct sess *s, int family)
 	return !sig_locating(s->sig, family);
 }
 
-/* The tokgen facts: the model holds all but the one reaching into sig. Its
- * dht_acked means "reached on the network we are on", not "reached since the
- * last rebuild". */
+/* The tokgen facts: the model holds all but the one reaching into sig. */
 static void gather_facts(struct sess *s, int family, struct tokgen_facts *f)
 {
 	netstate_on_dht_concluded(&s->ns, family,
@@ -3387,8 +3351,6 @@ static void gather_facts(struct sess *s, int family, struct tokgen_facts *f)
 	netstate_facts(&s->ns, family, f);
 }
 
-/* Answer an NSA_SAMPLE_SRC: what the kernel would source this family's
- * outbound traffic from, if anything. */
 static void net_sample_src(struct sess *s, int family, uint32_t epoch)
 {
 	int af = family == 6 ? AF_INET6 : AF_INET;
@@ -3402,8 +3364,8 @@ static void net_sample_src(struct sess *s, int family, uint32_t epoch)
 			len ? text : NULL, now_ms());
 }
 
-/* A validated get is a round trip we completed, so it proves the family and
- * says whether the rendezvous we hold is the one still answering. */
+/* A validated get proves the family, and says whether the rendezvous we hold
+ * is the one still answering. */
 static void ns_take_acks(struct sess *s, uint64_t now)
 {
 	static const int famv[2] = { 4, 6 };
@@ -3424,7 +3386,6 @@ static void ns_take_acks(struct sess *s, uint64_t now)
 	}
 }
 
-/* Do what the model asked for, on the loop thread and nowhere else. */
 static void net_apply(struct sess *s, const struct netstate_actions *a)
 {
 	static const int famv[2] = { 4, 6 };
@@ -3456,11 +3417,8 @@ static void net_apply(struct sess *s, const struct netstate_actions *a)
 			const struct netstate_row *rows;
 			int n = netstate_rows(&s->ns, family, &rows), k;
 
-			/* Rebuilt rather than added to: which of them belong on
-			 * the dashboard is recomputed whenever the source
-			 * address moves, and a row shown before that was known
-			 * has to be able to go away again. Only this family's
-			 * are touched. */
+			/* Rebuilt, not added to: a row shown before the source
+			 * was known has to be able to go away again. */
 			o->net_reset(o->arg, family);
 			for (k = 0; k < n; k++)
 				if (rows[k].shown)
@@ -3487,10 +3445,8 @@ static void net_apply(struct sess *s, const struct netstate_actions *a)
 					      (socklen_t)nlen);
 		}
 		if (act & NSA_RDV_REVALIDATE) {
-			/* dht_pump already reads the mailbox back from the
-			 * pinned node every second; this only counts a round
-			 * that produced nothing, and an ack landing before the
-			 * next one clears the count again. */
+			/* dht_pump already reads it back every second; this
+			 * counts a round that produced nothing. */
 			netstate_on_rdv_attempt(&s->ns, family, a->epoch[i],
 						now_ms());
 		}
@@ -3542,8 +3498,8 @@ static void net_pump(struct sess *s, uint64_t now)
 		net_apply(s, &a);
 }
 
-/* Which interfaces are serviced, and what each carries. Re-run on a rebuild:
- * a cable going in adds one that was not there at startup. */
+/* Re-run on a rebuild: a cable going in adds one that was not there at
+ * startup. */
 static void report_links(struct sess *s)
 {
 	const struct session_obs *o = s->cfg->obs;
@@ -3580,9 +3536,7 @@ static void net_change_reset(struct sess *s)
 	s->pool_reported = 0;
 	s->pool_posted = 0;
 	s->mapping_reported = 0;
-	/* The rows are not flushed here: each family's own move clears and
-	 * redraws its own, so a v6 prefix arriving late cannot take the v4
-	 * rows that have just been gathered down with it. */
+	/* Rows are not flushed here: each family redraws its own. */
 }
 
 /*
@@ -4139,10 +4093,8 @@ static int host_is_multiuser(const struct session_cfg *cfg)
 }
 
 /*
- * Has the local network moved? net_pump has already noticed and told the
- * reachability model which family it was; this is the loop collecting the part
- * of a move only it can do -- an agent to rebuild, an offer to drop -- and
- * clearing the debt as it takes it.
+ * net_pump has already noticed and told the model which family moved; this is
+ * the loop collecting the part only it can do, and clearing the debt.
  */
 static int net_changed(struct sess *s)
 {
@@ -4208,9 +4160,6 @@ static int sig_rebuild(struct sess *s)
 		return -1;
 	}
 	s->next_rdv_warm_ms = now_ms();
-	/* The interfaces the fresh signaller services are the ones that exist
-	 * now, which is not what the last enumeration described: a cable that
-	 * went in or out is exactly what a move can be. */
 	report_links(s);
 	dbg_logf("sig: rebuilt on the new network");
 	return 0;

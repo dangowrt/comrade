@@ -15,10 +15,6 @@ static void raise_act(struct netstate *ns, int i, unsigned bits)
 	ns->pend[i] |= bits;
 }
 
-/*
- * (A) no usable address; (B) a round trip completed in the epoch we are still
- * in -- the only way to UP; (C) a route exists; (D) not even that.
- */
 static int conn_of(const struct netstate_fam *f)
 {
 	if (!f->has_addr)
@@ -28,8 +24,6 @@ static int conn_of(const struct netstate_fam *f)
 	return f->routed ? NET_CONN_PENDING : 0;
 }
 
-/* Republish the verdict if it moved, and stop probing once there is nothing
- * left to prove. */
 static void sync_conn(struct netstate *ns, int i)
 {
 	struct netstate_fam *f = &ns->f[i];
@@ -43,16 +37,12 @@ static void sync_conn(struct netstate *ns, int i)
 		raise_act(ns, i, NSA_STOP_PROBE);
 }
 
-/* How long before this family may be probed again: prompt while the reasons to
- * have missed are the kind that clear in seconds, unhurried once they are not,
- * and never long enough to count as having stopped. */
 static uint64_t probe_gap(const struct netstate_fam *f)
 {
 	return f->probe_rounds < NETSTATE_PROBE_ROUNDS ? NETSTATE_PROBE_MS :
 							 NETSTATE_PROBE_SLOW_MS;
 }
 
-/* One of the four facts tokgen decides on has moved. */
 static void facts_moved(struct netstate *ns, int i)
 {
 	if (ns->is_host)
@@ -97,9 +87,8 @@ void netstate_init(struct netstate *ns, int is_host, uint64_t now)
 	memset(ns, 0, sizeof(*ns));
 	ns->is_host = is_host;
 	for (i = 0; i < 2; i++) {
-		/* Epochs start at one, so a fact stamped zero -- a caller that
-		 * forgot to carry one -- is from no network we have been on. */
-		ns->f[i].epoch = 1;
+		ns->f[i].epoch = 1;	/* so a fact stamped zero is from no
+					 * network we have been on */
 		ns->f[i].src_next_ms = now;
 		ns->f[i].probe_next_ms = now;
 		ns->f[i].anchor_next_ms = now;
@@ -118,10 +107,6 @@ void netstate_on_netmon(struct netstate *ns, unsigned changed, int have4,
 		unsigned bit = i ? NETMON_CH_V6 : NETMON_CH_V4;
 
 		if (!(changed & bit)) {
-			/* The snapshot that primes netmon reports no change,
-			 * so take the addresses from it once. Afterwards a
-			 * family's has_addr can only differ when its own bit is
-			 * set, which is what makes this safe to skip. */
 			if (!ns->primed && f->has_addr != have[i]) {
 				f->has_addr = have[i];
 				sync_conn(ns, i);
@@ -133,16 +118,12 @@ void netstate_on_netmon(struct netstate *ns, unsigned changed, int have4,
 		f->epoch++;
 		f->has_addr = have[i];
 
-		/* The address we hold is kept but stops being current: a move
-		 * must not leave the previous network's address on the wire,
-		 * and must still be able to tell "unchanged across the move"
-		 * from "not up yet" when the next sample lands. */
+		/* src is kept but stops being current: "unchanged across the
+		 * move" has to stay distinguishable from "not up yet". */
 		f->routed = 0;
 		f->src_tries = 0;
 		f->src_next_ms = now;
 
-		/* Held, but no longer confirmed: adopting a node is not the
-		 * same as having spoken to it here. */
 		f->anchor_confirmed = 0;
 		f->anchor_misses = 0;
 		f->anchor_next_ms = now;
@@ -179,9 +160,8 @@ void netstate_on_src(struct netstate *ns, int family, uint32_t epoch,
 		return;
 
 	if (len <= 0 || !addr) {
-		/* No route yet is a fact about routing, not a reason to forget
-		 * the address we hold: on a link we have just joined this is
-		 * usually only that DHCPv6 or an RA has not finished. */
+		/* No route yet is not a reason to forget the address we hold:
+		 * usually an RA or DHCPv6 that has not finished. */
 		f->src_tries++;
 		f->src_next_ms = now +
 			(f->src_tries < NETSTATE_SRC_FAST_TRIES ?
@@ -241,8 +221,6 @@ void netstate_on_probe_done(struct netstate *ns, int family, uint32_t epoch,
 	if (epoch != f->epoch)
 		return;
 	f->probe_running = 0;
-	/* A round that ended having proven nothing is not a reason to wait out
-	 * the whole gap again: the gap paces starts, and this one has started. */
 	if (f->probe_next_ms > now + probe_gap(f))
 		f->probe_next_ms = now + probe_gap(f);
 }
@@ -287,13 +265,9 @@ void netstate_on_dht_ack(struct netstate *ns, int family, uint32_t epoch,
 		}
 		return;
 	}
-	/*
-	 * A different node. While the one we hold is still answering -- or has
-	 * simply not been given enough tries to say otherwise -- it stays: a
-	 * rendezvous that moves under a token already in somebody's clipboard
-	 * is worse than one that is briefly unconfirmed, and a move is exactly
-	 * when it is most needed.
-	 */
+	/* A different node. One that moves under a token already in somebody's
+	 * clipboard is worse than one briefly unconfirmed, so ours stays until
+	 * it has been asked enough times and failed. */
 	if (f->anchor_len && f->anchor_misses < NETSTATE_ANCHOR_MISSES)
 		return;
 	memset(f->anchor, 0, sizeof(f->anchor));
@@ -320,8 +294,6 @@ void netstate_on_rdv_attempt(struct netstate *ns, int family, uint32_t epoch,
 		f->anchor_confirmed = 0;
 		raise_act(ns, i, NSA_EMIT_RDV);
 	}
-	/* Presumed gone, but still the best we have: it is replaced when a
-	 * validated answer from somewhere else arrives, not before. */
 	raise_act(ns, i, NSA_RDV_RELOCATE);
 }
 
@@ -373,8 +345,7 @@ void netstate_on_candidate(struct netstate *ns, int family, uint32_t epoch,
 			r->text[sizeof(r->text) - 1] = '\0';
 		}
 	} else if (r->via == NET_VIA_STUN && via == NET_VIA_DIRECT) {
-		/* The same address reached us both ways, so nothing translated
-		 * it: one row, and not the one marked NAT. */
+		/* Reached us both ways, so nothing translated it. */
 		r->via = NET_VIA_DIRECT;
 	} else {
 		return;
@@ -412,9 +383,8 @@ void netstate_tick(struct netstate *ns, uint64_t now)
 			raise_act(ns, i, NSA_KICK_PROBE);
 			f->probe_next_ms = now + probe_gap(f);
 		}
-		/* Confirmed or not: a node that stops answering after it was
-		 * confirmed has to be noticed too, and only a round that goes
-		 * out and comes back empty can notice it. */
+		/* Confirmed or not: one that stops answering after it was
+		 * confirmed has to be noticed too. */
 		if (f->anchor_len && now >= f->anchor_next_ms) {
 			raise_act(ns, i, NSA_RDV_REVALIDATE);
 			f->anchor_next_ms = now + NETSTATE_RDV_MS;

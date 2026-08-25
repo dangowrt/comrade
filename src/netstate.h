@@ -93,25 +93,20 @@ struct netstate_row {
 };
 
 struct netstate_fam {
-	uint32_t epoch;			/* which network these facts are about */
+	uint32_t epoch;
 
-	uint8_t src[16];		/* what the kernel sources outbound
-					 * global traffic of this family from */
+	uint8_t src[16];
 	uint8_t src_len;		/* 0 = none held, else 4 or 16 */
 	char src_text[NETSTATE_ADDR_MAX];
-	uint32_t src_epoch;		/* offered to callers only while this
-					 * equals epoch, so a move cannot leave
-					 * the previous network's address on the
-					 * wire, while "survived the move" stays
-					 * distinguishable from "not up yet" */
+	uint32_t src_epoch;		/* src is offered only while this is
+					 * current, so a move cannot leave the
+					 * old address on the wire */
 	uint64_t src_next_ms;
-	int src_tries;			/* consecutive empty samples this epoch */
-	int routed;			/* the last sample found a route: what
-					 * PENDING rests on, and never UP */
+	int src_tries;
+	int routed;
 
-	int conn;			/* NET_CONN_*, as last published */
-	uint32_t up_epoch;		/* the epoch a round trip completed in;
-					 * UP holds only while it is current */
+	int conn;			/* NET_CONN_* */
+	uint32_t up_epoch;
 
 	int probe_running;
 	uint32_t probe_epoch;
@@ -120,19 +115,13 @@ struct netstate_fam {
 
 	uint8_t anchor[NETSTATE_SA_MAX];	/* opaque sockaddr bytes */
 	uint8_t anchor_len;
-	int anchor_confirmed;		/* a round trip to THIS node completed in
-					 * the current epoch. Adopting a node
-					 * never confirms it */
+	int anchor_confirmed;		/* adopting a node never confirms it */
 	int anchor_misses;
 	uint64_t anchor_next_ms;
 
-	int has_addr;			/* a usable address exists, from the
-					 * same snapshot that set the epoch */
-	int dht_acked;			/* a validated get was served back by a
-					 * node of this family, this epoch */
-	int concluded;			/* the DHT attempt has run its course;
-					 * pushed in, since the rule reaches
-					 * into sig */
+	int has_addr;
+	int dht_acked;
+	int concluded;			/* pushed in: the rule reaches into sig */
 
 	struct netstate_row rows[NETSTATE_ROWS_MAX];
 	int nrows;
@@ -140,34 +129,25 @@ struct netstate_fam {
 
 struct netstate {
 	struct netstate_fam f[2];	/* [0] v4, [1] v6 */
-	int is_host;			/* the only fork: whether a changed
-					 * advert raises NSA_EMIT_TOKEN */
-	int primed;			/* the first snapshot has been seen, so
-					 * has_addr is known rather than assumed
-					 * absent -- netmon reports no change on
-					 * the call that primes it */
-	unsigned pend[2];		/* actions owed, per family */
+	int is_host;			/* the only fork: NSA_EMIT_TOKEN */
+	int primed;			/* netmon reports no change on the call
+					 * that primes it, so take that one */
+	unsigned pend[2];
 };
 
 struct netstate_actions {
-	unsigned f[2];			/* what is owed, per family */
-	uint32_t epoch[2];		/* stamp whatever you start with this,
-					 * and hand it back with the result */
+	unsigned f[2];
+	uint32_t epoch[2];		/* stamp what you start, hand it back */
 };
 
 void netstate_init(struct netstate *ns, int is_host, uint64_t now);
 
-/*
- * The interface snapshot moved. `changed` is netmon's mask; a family whose bit
- * is clear keeps every fact it holds, untouched. have4/have6 come from the
- * SAME snapshot, so a family's epoch and its has_usable_addr fact can never
- * disagree.
- */
+/* A family whose bit is clear keeps every fact it holds. have4/have6 must come
+ * from the same snapshot as `changed`. */
 void netstate_on_netmon(struct netstate *ns, unsigned changed, int have4,
 			int have6, uint64_t now);
 
-/* The answer to NSA_SAMPLE_SRC. len 0 means the kernel had no route -- a fact
- * about routing, and not a reason to forget the address we hold. */
+/* len 0 means no route -- not a reason to forget the address we hold. */
 void netstate_on_src(struct netstate *ns, int family, uint32_t epoch,
 		     const uint8_t *addr, int len, const char *text,
 		     uint64_t now);
@@ -192,45 +172,38 @@ void netstate_on_dht_ack(struct netstate *ns, int family, uint32_t epoch,
 void netstate_on_rdv_attempt(struct netstate *ns, int family, uint32_t epoch,
 			     uint64_t now);
 
-/* An anchor handed to us rather than earned -- a token's slot, or the peer's
- * over the control channel. Taken only where we hold none, and never confirmed
- * by the act of taking it. */
+/* An anchor handed to us (a token slot, or the peer's): taken only where we
+ * hold none, and never confirmed by the taking. */
 void netstate_on_rdv_offered(struct netstate *ns, int family,
 			     const uint8_t *node, int len);
 
-/* A local address the agent gathered. Whether it is shown is decided here, now
- * and again whenever the source address changes. */
+
 void netstate_on_candidate(struct netstate *ns, int family, uint32_t epoch,
 			   int scope, int via, const uint8_t *addr, int len,
 			   const char *text);
 
-/* The caller's own "an ack is no longer coming" rule, which reaches into sig. */
 void netstate_on_dht_concluded(struct netstate *ns, int family, int concluded);
 
-/* Raise whatever has fallen due. */
 void netstate_tick(struct netstate *ns, uint64_t now);
 
-/* Take the actions owed, clearing them. Non-zero if anything was owed. */
+/* Take the actions owed, clearing them. Non-zero if any were. */
 int netstate_take_actions(struct netstate *ns, struct netstate_actions *out);
 
 int netstate_conn(const struct netstate *ns, int family);
 uint32_t netstate_epoch(const struct netstate *ns, int family);
 
-/* The LIVE source address: empty while what we hold belongs to an older epoch,
- * so a caller rewriting an offer can never name the network we have left. */
+/* Empty while what we hold belongs to an older epoch. */
 const char *netstate_src_text(const struct netstate *ns, int family);
 int netstate_src(const struct netstate *ns, int family, uint8_t *out16);
 
-/* This family's rows, shown and hidden alike; emit the ones marked shown. */
+/* Shown and hidden alike; emit the ones marked shown. */
 int netstate_rows(const struct netstate *ns, int family,
 		  const struct netstate_row **out);
 
 void netstate_facts(const struct netstate *ns, int family,
 		    struct tokgen_facts *out);
 
-/* The anchor, and whether a round trip in THIS epoch confirmed it. A caller
- * that reports "ready" on a non-zero return without reading *confirmed has
- * written the bug this module exists to make impossible. */
+/* The anchor, and whether a round trip in this epoch confirmed it. */
 int netstate_anchor(const struct netstate *ns, int family, uint8_t *out,
 		    uint8_t *out_len, int *confirmed);
 

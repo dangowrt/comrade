@@ -11,16 +11,10 @@
 #define NETMON_POLL_MS 2000
 
 /*
- * What moved, as a bitmask. The families are tracked apart because they move
- * apart: a residential ISP renumbers its v6 prefix on its own schedule, and
- * DHCPv4 and DHCPv6/RA do not land in the same instant even when a laptop
- * joins one network. A caller told only "something changed" has to discard
- * everything it knows about both families, which throws away v4 facts it just
- * finished gathering.
- *
- * NETMON_CH_IFACE covers the interfaces themselves rather than their
- * addresses: it is raised when one appears or goes away, and when one gains or
- * loses a family. Note netmon_snapshot walks addresses, so an interface
+ * What moved. The families are tracked apart because they move apart: a v6
+ * prefix is renumbered on its own schedule, and DHCPv4 and DHCPv6/RA do not
+ * land together. NETMON_CH_IFACE is raised when an interface appears, goes
+ * away, or gains or loses a family; netmon_snapshot walks addresses, so one
  * carrying none is invisible here.
  */
 #define NETMON_CH_V4	(1u << 0)
@@ -46,8 +40,7 @@ struct netmon {
 };
 
 void netmon_init(struct netmon *m);
-/* Whether anything at all moved -- what a caller with nothing to keep per
- * family (the DHT node, whose socket is shared) needs. */
+/* Whether anything moved: for a caller with no per-family state to keep. */
 int netmon_changed(struct netmon *m, uint64_t now_ms);
 unsigned netmon_changed_fam(struct netmon *m, uint64_t now_ms);
 /*

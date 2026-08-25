@@ -73,8 +73,8 @@ struct ui {
 
 	struct netrow net[12];
 	int nnet;
-	/* What a per-family redraw just took down, so the log can tell an
-	 * address that has appeared from one that was only redrawn. */
+	/* What a redraw took down, so the log can tell a new address from a
+	 * redrawn one. */
 	struct netrow prev[12];
 	int nprev;
 	int mapping_known;
@@ -341,12 +341,7 @@ static void token_class_line(struct ui *u, const char *pre)
 	int r6 = u->tok_st6 == TOKEN_STATE_RENDEZVOUS ||
 		 u->tok_st6 == TOKEN_STATE_DIRECT;
 
-	/*
-	 * Green is the best this network can do, not the best there is: a host
-	 * with only v4 to offer has finished, and saying so in the colour that
-	 * means "still working on it" reads as a fault that will clear. Yellow
-	 * is for the states that really are still moving.
-	 */
+	/* Green is the best this network can do, not the best there is. */
 	if (r4 && r6)
 		line("%s" BGR "reachable over IPv4 and IPv6" RST, pre);
 	else if (r4 && u->tok_st6 == TOKEN_STATE_PENDING)
@@ -924,9 +919,7 @@ static void um_reset(struct ui *u)
 		vlog(u, "local  reconnecting -- candidates flushed");
 }
 
-/* Drop one family's local addresses, or both when `family` is 0. Per family
- * because the two move apart: a v6 prefix arriving seconds after DHCPv4 must
- * not take the v4 rows that have just been gathered down with it. */
+/* Drop one family's local addresses, or both when `family` is 0. */
 static void um_net_reset(struct ui *u, int family)
 {
 	int i, keep = 0;
@@ -940,16 +933,12 @@ static void um_net_reset(struct ui *u, int family)
 		u->prev[u->nprev++] = u->net[i];
 	}
 	u->nnet = keep;
-	/* Rows only. This is also how a redraw is asked for, so touching the
-	 * connectivity verdict here would clear one the controller still holds
-	 * and will not repeat -- it is sent when it changes, and a redraw is
-	 * not a change. A move reports its own verdict. */
+	/* Rows only: this is also how a redraw is asked for, and the verdict is
+	 * sent when it changes, so clearing it here would strand it. */
 	if (u->anim)
 		u->dirty = 1;
 	else if (!family)
 		vlog(u, "local  network changed -- candidates flushed");
-	/* A per-family redraw says nothing on its own: what it means is
-	 * whichever rows come back changed, which um_net reports. */
 }
 
 /* ---- observer callbacks (client inline; also reused by the foreground) ---- */
