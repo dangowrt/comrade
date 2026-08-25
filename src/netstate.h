@@ -52,8 +52,17 @@ enum {					/* how a local address was learnt */
 #define NETSTATE_SRC_FAST_TRIES 30	/* ~15s, past any RA/DHCPv6 settle */
 #define NETSTATE_SRC_SLOW_MS 5000
 
-/* Failed attempts, not elapsed time: this loop can stall for seconds, and a
- * clock would condemn a node that is answering for our own slowness. */
+/*
+ * How many separate answers a node must give before it goes into a token, and
+ * how many answers from somewhere else it takes to give it up again.
+ *
+ * The asymmetry is the point. A token is shared by hand and lives in somebody
+ * else's clipboard, so a rendezvous that turns out to be flaky cannot be
+ * recalled -- whoever holds it is already pointed at it. Time spent qualifying
+ * one before publishing costs only us; cycling through nodes afterwards costs
+ * everyone who was given the old one, and is worst exactly during a move.
+ */
+#define NETSTATE_ANCHOR_QUALIFY 3
 #define NETSTATE_ANCHOR_MISSES 3
 #define NETSTATE_RDV_MS 2000		/* between re-validation attempts */
 
@@ -116,7 +125,8 @@ struct netstate_fam {
 	uint8_t anchor[NETSTATE_SA_MAX];	/* opaque sockaddr bytes */
 	uint8_t anchor_len;
 	int anchor_confirmed;		/* adopting a node never confirms it */
-	int anchor_misses;
+	int anchor_acks;		/* separate answers from it, this epoch */
+	int anchor_misses;		/* answers from somewhere else instead */
 	uint64_t anchor_next_ms;
 
 	int has_addr;
@@ -167,10 +177,6 @@ void netstate_on_roundtrip(struct netstate *ns, int family, uint32_t epoch);
  */
 void netstate_on_dht_ack(struct netstate *ns, int family, uint32_t epoch,
 			 const uint8_t *node, int len, uint64_t now);
-
-/* An NSA_RDV_REVALIDATE round produced nothing: one attempt, not one tick. */
-void netstate_on_rdv_attempt(struct netstate *ns, int family, uint32_t epoch,
-			     uint64_t now);
 
 /* An anchor handed to us (a token slot, or the peer's): taken only where we
  * hold none, and never confirmed by the taking. */

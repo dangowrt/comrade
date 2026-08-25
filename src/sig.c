@@ -88,6 +88,8 @@ struct sig {
 	struct sockaddr_storage ack_node4, ack_node6;
 	socklen_t ack_node4_len, ack_node6_len;
 	int ack_new4, ack_new6;
+	int relocate4, relocate6;	/* search for a replacement, while still
+					 * serving the one we hold */
 	int up4, up6;			/* proven connectivity, see sig_set_family_up */
 	uint64_t first_locate_ms;	/* when the first family was captured */
 	int rdv_stage;			/* engine-wide progress: cold/warmup/store/get */
@@ -390,15 +392,15 @@ int sig_take_ack(struct sig *s, int family, struct sockaddr *out,
 	return 1;
 }
 
-void sig_drop_anchor(struct sig *s, int family)
+void sig_search_again(struct sig *s, int family)
 {
-	socklen_t *rl = family == 6 ? &s->rnode6_len : &s->rnode4_len;
-
-	/* Nothing has answered here for long enough that this is presumed
-	 * gone. Letting go is what puts the family back in dht_pump's
-	 * `missing` set, so the convergent store and the lookup behind it run
-	 * again and find whatever serves the mailbox now. */
-	*rl = 0;
+	/* The node we hold keeps being served while this runs: a rendezvous
+	 * that vanishes is worse than a stale one, and the caller swaps it only
+	 * once a different node has actually answered. */
+	if (family == 6)
+		s->relocate6 = 1;
+	else
+		s->relocate4 = 1;
 }
 
 int sig_locating(struct sig *s, int family)
@@ -431,6 +433,10 @@ int sig_reinforce(struct sig *s, int family, const struct sockaddr *sa,
 		return -1;
 	memcpy(r, sa, len);		/* adopt it as the located rendezvous, ... */
 	*rl = len;
+	if (family == 6)
+		s->relocate6 = 0;
+	else
+		s->relocate4 = 0;
 	s->locate = 1;			/* ... so sig_located returns it and the get
 					 * never re-captures a different one. A
 					 * still-missing family is located as usual;
@@ -709,11 +715,12 @@ static void dht_pump(struct sig *s, uint64_t now)
 		 * slower otherwise, never stopping outright. An already-anchored
 		 * family is never re-located.
 		 */
-		int missing = !s->rnode4_len || !s->rnode6_len;
+		int missing = !s->rnode4_len || !s->rnode6_len ||
+			      s->relocate4 || s->relocate6;
 
 		if (s->mb.have_mine && missing && !s->put_inflight) {
-			int eager = (!s->rnode4_len && s->up4) ||
-				    (!s->rnode6_len && s->up6);
+			int eager = ((!s->rnode4_len || s->relocate4) && s->up4) ||
+				    ((!s->rnode6_len || s->relocate6) && s->up6);
 
 			s->put_inflight = 1;
 			if (s->rdv_stage < 2)

@@ -1118,8 +1118,18 @@ static int seed_node_for(struct sess *s, int family, struct sockaddr_storage *sa
 			 socklen_t *len)
 {
 	const struct token *t = &s->cfg->tok;
+	uint8_t node[NETSTATE_SA_MAX], nlen = 0;
 	int i = fam_idx(family);
 
+	/* The one place that never loses it. s->rdv[] is filled on a cadence
+	 * and the token slot only once a family has been published, so either
+	 * can be empty at a rebuild -- and a rendezvous that goes missing there
+	 * is one somebody has already been handed. */
+	if (netstate_anchor(&s->ns, family, node, &nlen, NULL) && nlen) {
+		memcpy(sa, node, nlen);
+		*len = nlen;
+		return 0;
+	}
 	if (s->rdv[i].have) {
 		*sa = s->rdv[i].sa;
 		*len = s->rdv[i].len;
@@ -3449,21 +3459,13 @@ static void net_apply(struct sess *s, const struct netstate_actions *a)
 					      (const struct sockaddr *)node,
 					      (socklen_t)nlen);
 		}
-		if (act & NSA_RDV_REVALIDATE) {
-			/* Only where a round could actually have gone out: a
-			 * rebuilt node is bootstrapping and asks nothing for
-			 * seconds, and counting that would condemn the anchor
-			 * for our own silence. */
-			if (s->sig && sig_dht_ready(s->sig))
-				netstate_on_rdv_attempt(&s->ns, family,
-							a->epoch[i], now_ms());
-		}
 		if (act & NSA_RDV_RELOCATE) {
 			if (s->sig)
-				sig_drop_anchor(s->sig, family);
+				sig_search_again(s->sig, family);
 		}
-		if (act & NSA_EMIT_TOKEN)
-			s->next_tok_ms = 0;	/* re-mint on the next pass */
+		/* NSA_EMIT_TOKEN is advisory: token_pump recomputes on its own
+		 * cadence, which is what stops a token churning through the
+		 * transient states a move passes through. */
 	}
 }
 
@@ -3737,6 +3739,14 @@ static void token_pump(struct sess *s)
 			st = s->tok_state[i];
 			carried_ep(&s->cfg->tok, famv[i], a, &port);
 		}
+		/* Re-proving the node the token already names is not a reason
+		 * to take it back: while we still hold it, a family only ever
+		 * moves to a different rendezvous or to a settled verdict. */
+		if (st == TOKEN_STATE_PENDING &&
+		    s->tok_state[i] == TOKEN_STATE_RENDEZVOUS &&
+		    netstate_anchor(&s->ns, famv[i], NULL, NULL, NULL))
+			st = advert_state(s, famv[i], TOK_ADVERT_RENDEZVOUS,
+					  a, &port);
 		if (s->tok_told[i] && st == s->tok_state[i])
 			continue;
 		s->tok_state[i] = st;
@@ -4128,6 +4138,12 @@ static int sig_arm(struct sess *s)
 	s->dht_since_ms = now_ms();	/* a rebuild is a fresh attempt, and a
 					 * fresh grace, on the new network */
 	sig_subscribe(s->sig, on_peer_offer, s);
+	/* A fresh signaller knows nothing, and what it drives its convergence
+	 * eagerness from is only ever published when it changes -- so a family
+	 * that came through the move still proven would sit in the slow tier
+	 * for the rest of the session, and never find its rendezvous. */
+	sig_set_family_up(s->sig, 4, netstate_conn(&s->ns, 4) == NET_CONN_UP);
+	sig_set_family_up(s->sig, 6, netstate_conn(&s->ns, 6) == NET_CONN_UP);
 	if (s->lan) {
 		sig_set_direct_port(s->sig, lanlink_port(s->lan));
 		if (host_is_multiuser(cfg)) {

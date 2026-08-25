@@ -179,9 +179,9 @@ int sig_take_ack(struct sig *s, int family, struct sockaddr *out,
 /* Whether the DHT is up enough to have asked anything. */
 int sig_dht_ready(struct sig *s);
 
-/* Give up `family`'s rendezvous node, so the convergent store and lookup run
- * again and settle on whatever serves the mailbox now. */
-void sig_drop_anchor(struct sig *s, int family);
+/* Look for a replacement for `family`'s rendezvous node while continuing to
+ * serve the one we hold; sig_reinforce with a new one ends the search. */
+void sig_search_again(struct sig *s, int family);
 
 /*
  * Host: still actively chasing `family`'s rendezvous node -- true once the

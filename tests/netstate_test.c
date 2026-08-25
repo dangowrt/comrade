@@ -45,6 +45,15 @@ static void start(struct netstate *ns, int is_host)
 	drain(ns);
 }
 
+/* A node enters a token only after answering NETSTATE_ANCHOR_QUALIFY times. */
+static void qualify(struct netstate *ns, int fam, const uint8_t *node)
+{
+	int i;
+
+	for (i = 0; i < NETSTATE_ANCHOR_QUALIFY; i++)
+		netstate_on_dht_ack(ns, fam, netstate_epoch(ns, fam), node, 16, t);
+}
+
 static void give_src(struct netstate *ns, int fam, uint8_t seed)
 {
 	uint8_t a[16];
@@ -92,7 +101,7 @@ static void preserved_anchor_is_not_proof(void)
 	start(&ns, 1);
 	fill(node, 16, 70);
 	give_src(&ns, 6, 20);
-	netstate_on_dht_ack(&ns, 6, netstate_epoch(&ns, 6), node, 16, t);
+	qualify(&ns, 6, node);
 	assert(netstate_conn(&ns, 6) == NET_CONN_UP);
 	assert(netstate_anchor(&ns, 6, got, &glen, &confirmed) && confirmed);
 	drain(&ns);
@@ -108,7 +117,7 @@ static void preserved_anchor_is_not_proof(void)
 	assert(drain(&ns).f[1] & NSA_RDV_REVALIDATE);
 
 	/* and it earns its way back */
-	netstate_on_dht_ack(&ns, 6, netstate_epoch(&ns, 6), node, 16, t);
+	qualify(&ns, 6, node);
 	assert(netstate_anchor(&ns, 6, got, &glen, &confirmed) && confirmed);
 	assert(netstate_conn(&ns, 6) == NET_CONN_UP);
 }
@@ -231,32 +240,42 @@ static void anchor_changes_only_on_replacement(void)
 	fill(a, 16, 70);
 	fill(b, 16, 170);
 	give_src(&ns, 6, 20);
-	netstate_on_dht_ack(&ns, 6, netstate_epoch(&ns, 6), a, 16, t);
+	qualify(&ns, 6, a);
 	drain(&ns);
 
-	/* another node answering does not displace one that is answering */
+	/* one answer from elsewhere displaces nothing */
 	netstate_on_dht_ack(&ns, 6, netstate_epoch(&ns, 6), b, 16, t);
 	assert(netstate_anchor(&ns, 6, got, &glen, &confirmed));
 	assert(!memcmp(got, a, 16));
 
-	for (i = 0; i < NETSTATE_ANCHOR_MISSES; i++)
-		netstate_on_rdv_attempt(&ns, 6, netstate_epoch(&ns, 6), t);
-	assert(drain(&ns).f[1] & NSA_RDV_RELOCATE);
+	/* nor does a run of them, while ours keeps answering in between */
+	netstate_on_dht_ack(&ns, 6, netstate_epoch(&ns, 6), a, 16, t);
+	for (i = 0; i < NETSTATE_ANCHOR_MISSES - 1; i++)
+		netstate_on_dht_ack(&ns, 6, netstate_epoch(&ns, 6), b, 16, t);
+	netstate_on_dht_ack(&ns, 6, netstate_epoch(&ns, 6), a, 16, t);
+	for (i = 0; i < NETSTATE_ANCHOR_MISSES - 1; i++)
+		netstate_on_dht_ack(&ns, 6, netstate_epoch(&ns, 6), b, 16, t);
 	assert(netstate_anchor(&ns, 6, got, &glen, &confirmed));
-	assert(!memcmp(got, a, 16));	/* still the best we have */
-	assert(!confirmed);
+	assert(!memcmp(got, a, 16));
 
-	netstate_on_dht_ack(&ns, 6, netstate_epoch(&ns, 6), b, 16, t);
-	assert(netstate_anchor(&ns, 6, got, &glen, &confirmed) && confirmed);
-	assert(!memcmp(got, b, 16));	/* replaced, now that one was found */
+	/* a node can genuinely die, so an unbroken run does replace it -- and
+	 * the node that gave them is the replacement, which then has to
+	 * qualify like any other before it reaches a token */
+	netstate_on_dht_ack(&ns, 6, netstate_epoch(&ns, 6), a, 16, t);
+	for (i = 0; i < NETSTATE_ANCHOR_MISSES; i++)
+		netstate_on_dht_ack(&ns, 6, netstate_epoch(&ns, 6), b, 16, t);
+	assert(netstate_anchor(&ns, 6, got, &glen, &confirmed));
+	assert(!memcmp(got, b, 16));
+	assert(!confirmed);
 }
 
 /*
- * A move is followed by seconds in which nothing works yet, and none of that
- * is the rendezvous node's doing. Until the family is proven reachable, a
- * round that came back empty says only that we could not ask.
+ * Nothing but another node answering in its place counts against a rendezvous.
+ * Not time, not rounds that came back empty, not a move: a token is shared by
+ * hand and cannot be recalled, so the node it names is given up only on
+ * evidence that something else is serving the mailbox instead.
  */
-static void silence_before_proof_condemns_nothing(void)
+static void only_another_answer_condemns(void)
 {
 	struct netstate ns;
 	uint8_t a[16], got[NETSTATE_SA_MAX];
@@ -266,54 +285,22 @@ static void silence_before_proof_condemns_nothing(void)
 	start(&ns, 1);
 	fill(a, 16, 70);
 	give_src(&ns, 6, 20);
-	netstate_on_dht_ack(&ns, 6, netstate_epoch(&ns, 6), a, 16, t);
-	netstate_on_netmon(&ns, NETMON_CH_V6, 1, 1, t);
-	give_src(&ns, 6, 20);			/* routed, but nothing proven */
-	assert(netstate_conn(&ns, 6) == NET_CONN_PENDING);
+	qualify(&ns, 6, a);
 	drain(&ns);
 
-	for (i = 0; i < NETSTATE_ANCHOR_MISSES * 4; i++) {
-		netstate_on_rdv_attempt(&ns, 6, netstate_epoch(&ns, 6), t);
-		t += NETSTATE_RDV_MS;
-	}
-	assert(!(drain(&ns).f[1] & NSA_RDV_RELOCATE));
-	assert(netstate_anchor(&ns, 6, got, &glen, &confirmed));
-	assert(!memcmp(got, a, 16));		/* still ours */
-
-	/* proven, and now silence is the node's */
-	netstate_on_roundtrip(&ns, 6, netstate_epoch(&ns, 6));
-	drain(&ns);
-	for (i = 0; i < NETSTATE_ANCHOR_MISSES; i++)
-		netstate_on_rdv_attempt(&ns, 6, netstate_epoch(&ns, 6), t);
-	assert(drain(&ns).f[1] & NSA_RDV_RELOCATE);
-}
-
-/* R4: the loop this runs on stalls for seconds behind a slow resolver. Time
- * passing is not evidence a node is gone; only rounds that went out and came
- * back empty are. */
-static void attempts_not_milliseconds(void)
-{
-	struct netstate ns;
-	uint8_t a[16], got[NETSTATE_SA_MAX];
-	uint8_t glen;
-	int confirmed, i;
-
-	start(&ns, 1);
-	fill(a, 16, 70);
-	give_src(&ns, 6, 20);
-	netstate_on_dht_ack(&ns, 6, netstate_epoch(&ns, 6), a, 16, t);
-	drain(&ns);
-
-	for (i = 0; i < 3600; i++) {	/* an hour, and not one attempt */
+	for (i = 0; i < 3600; i++) {		/* an hour of silence */
 		t += 1000;
 		netstate_tick(&ns, t);
 		drain(&ns);
 	}
 	assert(netstate_anchor(&ns, 6, got, &glen, &confirmed) && confirmed);
+	assert(!memcmp(got, a, 16));
 
-	for (i = 0; i < NETSTATE_ANCHOR_MISSES; i++)
-		netstate_on_rdv_attempt(&ns, 6, netstate_epoch(&ns, 6), t);
-	assert(netstate_anchor(&ns, 6, got, &glen, &confirmed) && !confirmed);
+	/* and a move keeps it, unconfirmed until it answers here too */
+	netstate_on_netmon(&ns, NETMON_CH_V6, 1, 1, t);
+	assert(netstate_anchor(&ns, 6, got, &glen, &confirmed));
+	assert(!memcmp(got, a, 16));
+	assert(!confirmed);
 }
 
 /* R5: two moves in quick succession, with the caller busy in between. The
@@ -595,8 +582,11 @@ static void epoch_gate_exhaustive(void)
 							       t + 1);
 					break;
 				default:
-					netstate_on_rdv_attempt(&ns, fam, e,
-								t + 1);
+					netstate_on_candidate(&ns, fam, e,
+							      NET_SCOPE_GLOBAL,
+							      NET_VIA_DIRECT, a,
+							      fam == 6 ? 16 : 4,
+							      "z");
 					break;
 				}
 				if (delta)
@@ -693,7 +683,9 @@ static void laws_hold_under_churn(void)
 			}
 			break;
 		case 5:
-			netstate_on_rdv_attempt(&ns, fam, e, t);
+			netstate_on_candidate(&ns, fam, e, NET_SCOPE_GLOBAL,
+					      NET_VIA_DIRECT, a,
+					      fam == 6 ? 16 : 4, "c");
 			break;
 		default:
 			t += 250;
@@ -731,8 +723,7 @@ int main(void)
 	late_src_retracts_the_wrong_row();
 	src_is_never_stale_on_the_wire();
 	anchor_changes_only_on_replacement();
-	silence_before_proof_condemns_nothing();
-	attempts_not_milliseconds();
+	only_another_answer_condemns();
 	latest_change_wins();
 	host_and_client_agree_except_on_the_token();
 	probe_slows_but_never_stops();

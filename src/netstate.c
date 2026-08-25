@@ -125,6 +125,7 @@ void netstate_on_netmon(struct netstate *ns, unsigned changed, int have4,
 		f->src_next_ms = now;
 
 		f->anchor_confirmed = 0;
+		f->anchor_acks = 0;
 		f->anchor_misses = 0;
 		f->anchor_next_ms = now;
 
@@ -259,48 +260,36 @@ void netstate_on_dht_ack(struct netstate *ns, int family, uint32_t epoch,
 	if (f->anchor_len && f->anchor_len == (uint8_t)len &&
 	    !memcmp(f->anchor, node, (size_t)len)) {
 		f->anchor_misses = 0;
-		if (!f->anchor_confirmed) {
+		if (f->anchor_acks < NETSTATE_ANCHOR_QUALIFY)
+			f->anchor_acks++;
+		if (!f->anchor_confirmed &&
+		    f->anchor_acks >= NETSTATE_ANCHOR_QUALIFY) {
 			f->anchor_confirmed = 1;
 			raise_act(ns, i, NSA_EMIT_RDV);
+			facts_moved(ns, i);
 		}
 		return;
 	}
 	/* A different node. One that moves under a token already in somebody's
 	 * clipboard is worse than one briefly unconfirmed, so ours stays until
 	 * it has been asked enough times and failed. */
-	if (f->anchor_len && f->anchor_misses < NETSTATE_ANCHOR_MISSES)
-		return;
+	if (f->anchor_len) {
+		/* Someone else is serving the mailbox and ours is not. That is
+		 * the only evidence that counts against it -- and the node
+		 * saying so is the replacement, so the two conditions for
+		 * giving one up are met together or not at all. */
+		f->anchor_misses++;
+		if (f->anchor_misses < NETSTATE_ANCHOR_MISSES)
+			return;
+	}
 	memset(f->anchor, 0, sizeof(f->anchor));
 	memcpy(f->anchor, node, (size_t)len);
 	f->anchor_len = (uint8_t)len;
-	f->anchor_confirmed = 1;
+	f->anchor_confirmed = 0;	/* it has answered once; that is not yet
+					 * enough to put in front of anyone */
+	f->anchor_acks = 1;
 	f->anchor_misses = 0;
 	raise_act(ns, i, NSA_RDV_PIN | NSA_EMIT_RDV);
-}
-
-void netstate_on_rdv_attempt(struct netstate *ns, int family, uint32_t epoch,
-			     uint64_t now)
-{
-	int i = fam_idx(family);
-	struct netstate_fam *f = &ns->f[i];
-
-	if (epoch != f->epoch || !f->anchor_len)
-		return;
-	/* Silence proves nothing about the node until we know we can reach
-	 * anything at all: right after a move it is our own link settling, and
-	 * condemning a rendezvous for that is how one gets replaced seconds
-	 * into a network that has not finished coming up. */
-	if (f->conn != NET_CONN_UP)
-		return;
-	f->anchor_misses++;
-	f->anchor_next_ms = now + NETSTATE_RDV_MS;
-	if (f->anchor_misses < NETSTATE_ANCHOR_MISSES)
-		return;
-	if (f->anchor_confirmed) {
-		f->anchor_confirmed = 0;
-		raise_act(ns, i, NSA_EMIT_RDV);
-	}
-	raise_act(ns, i, NSA_RDV_RELOCATE);
 }
 
 void netstate_on_rdv_offered(struct netstate *ns, int family,
@@ -460,7 +449,15 @@ void netstate_facts(const struct netstate *ns, int family,
 	memset(out, 0, sizeof(*out));
 	out->has_usable_addr = f->has_addr;
 	out->has_default_route = f->routed;
-	out->dht_acked = f->dht_acked;
+	/*
+	 * A node we hold and can still reach counts, even before it has
+	 * answered again here: a move clears the acknowledgement but not the
+	 * rendezvous, and dropping the family to pending in that gap makes the
+	 * token flap on every move. Reachability is the conjunct that matters
+	 * -- advertising a meeting point this host cannot get to would strand
+	 * whoever went there.
+	 */
+	out->dht_acked = f->anchor_confirmed && f->conn == NET_CONN_UP;
 	out->dht_attempt_concluded = f->concluded;
 	out->public_port_proven = 0;	/* no UPnP/NAT-PMP/PCP in the tree */
 }
