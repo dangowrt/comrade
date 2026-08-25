@@ -176,6 +176,9 @@ int sig_dht_acked(struct sig *s, int family);
 int sig_take_ack(struct sig *s, int family, struct sockaddr *out,
 		 socklen_t *out_len);
 
+/* Whether the DHT is up enough to have asked anything. */
+int sig_dht_ready(struct sig *s);
+
 /* Give up `family`'s rendezvous node, so the convergent store and lookup run
  * again and settle on whatever serves the mailbox now. */
 void sig_drop_anchor(struct sig *s, int family);

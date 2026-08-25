@@ -369,6 +369,11 @@ int sig_dht_acked(struct sig *s, int family)
 	return family == 6 ? s->acked6 : s->acked4;
 }
 
+int sig_dht_ready(struct sig *s)
+{
+	return s->dht_engaged && dhtnode_ready(s->node);
+}
+
 int sig_take_ack(struct sig *s, int family, struct sockaddr *out,
 		 socklen_t *out_len)
 {

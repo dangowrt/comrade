@@ -3445,10 +3445,13 @@ static void net_apply(struct sess *s, const struct netstate_actions *a)
 					      (socklen_t)nlen);
 		}
 		if (act & NSA_RDV_REVALIDATE) {
-			/* dht_pump already reads it back every second; this
-			 * counts a round that produced nothing. */
-			netstate_on_rdv_attempt(&s->ns, family, a->epoch[i],
-						now_ms());
+			/* Only where a round could actually have gone out: a
+			 * rebuilt node is bootstrapping and asks nothing for
+			 * seconds, and counting that would condemn the anchor
+			 * for our own silence. */
+			if (s->sig && sig_dht_ready(s->sig))
+				netstate_on_rdv_attempt(&s->ns, family,
+							a->epoch[i], now_ms());
 		}
 		if (act & NSA_RDV_RELOCATE) {
 			if (s->sig)
