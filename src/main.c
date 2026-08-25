@@ -51,10 +51,10 @@ static int usage(int ret)
 		"       --no-dht           skip the DHT, link-local discovery only\n"
 		"client: -L [bind:]port:host:hostport  forward a local port via the host\n"
 		"        -R [bind:]port:host:hostport  forward a host-side port back here\n"
-		"        -N                 no shell, only the -L/-R forwards\n"
+		"        -N, --forward-only  no shell, only the -L/-R forwards\n"
 		"host:  --no-forwarding    decline all client port forwarding\n"
-		"       --forward-only     with --headless: serve no shell, only\n"
-		"                          forwarding (no tmux)\n");
+		"       -N, --forward-only  with --headless: serve no shell,\n"
+		"                          only forwarding (no tmux)\n");
 	return ret;
 }
 
@@ -104,7 +104,8 @@ static int session_connect(const char *arg, int ui_mode, int no_mcast,
 	cfg.interactive = 1;
 	cfg.forward_only = forward_only;	/* -N: no shell, forwarding only */
 	if (forward_only && !nfwd_l && !nfwd_r)
-		fprintf(stderr, "comrade: -N with no -L/-R forwards nothing\n");
+		fprintf(stderr, "comrade: -N/--forward-only with no -L/-R "
+			"forwards nothing\n");
 	u = ui_create(UI_ROLE_CLIENT, ui_mode);	/* the view drives the dashboard */
 	if (u) {
 		ui_bind(u, &obs);
@@ -161,7 +162,7 @@ int main(int argc, char **argv)
 	int nfwd_l = 0, nfwd_r = 0, no_fwd = 0;
 	int ui_mode = UI_AUTO, no_mcast = 0, no_dht = 0;
 	int headless = 0, expire_s = 0, max_clients = 0;
-	int forward_only = 0, no_shell = 0;
+	int no_shell = 0;
 	const char *host_id = NULL;
 	const char *pos = NULL;
 	int i;
@@ -276,9 +277,13 @@ int main(int argc, char **argv)
 			no_dht = 1;
 		else if (!strcmp(argv[i], "--no-forwarding"))
 			no_fwd = 1;
-		else if (!strcmp(argv[i], "--forward-only"))
-			forward_only = 1;
-		else if (!strcmp(argv[i], "-N"))
+		/* One thing under two names: serve no shell. What that means
+		 * differs by side -- a host offers only forwarding, a client
+		 * asks for none -- but it is the same request either way, and
+		 * having to remember which spelling this side wanted was a
+		 * needless way to be told to go and try the other one. */
+		else if (!strcmp(argv[i], "-N") ||
+			 !strcmp(argv[i], "--forward-only"))
 			no_shell = 1;
 		else if (!strcmp(argv[i], "--headless"))
 			headless = 1;
@@ -313,19 +318,15 @@ int main(int argc, char **argv)
 				"(they are client options)\n");
 			return usage(1);
 		}
-		if (no_shell) {
-			fprintf(stderr, "comrade: -N is a client option "
-				"(the host uses --forward-only)\n");
-			return usage(1);
-		}
-		if (forward_only && !headless) {
-			fprintf(stderr, "comrade: --forward-only needs "
-				"--headless (it is the no-terminal mode)\n");
+		if (no_shell && !headless) {
+			fprintf(stderr, "comrade: -N/--forward-only needs "
+				"--headless on a host (there is no terminal "
+				"to enter)\n");
 			return usage(1);
 		}
 		if (headless)
 			return host_headless(host_id, no_mcast, no_dht, no_fwd,
-					     forward_only, expire_s, max_clients);
+					     no_shell, expire_s, max_clients);
 		if (host_id || expire_s || max_clients) {
 			fprintf(stderr, "comrade: --id/--expire/--max-clients "
 				"need --headless\n");
@@ -333,9 +334,9 @@ int main(int argc, char **argv)
 		}
 		return host_run(ui_mode, no_mcast, no_dht, no_fwd);
 	}
-	if (headless || host_id || expire_s || max_clients || forward_only) {
+	if (headless || host_id || expire_s || max_clients) {
 		fprintf(stderr, "comrade: --headless/--id/--expire/"
-			"--max-clients/--forward-only are host options\n");
+			"--max-clients are host options\n");
 		return usage(1);
 	}
 	if (no_fwd) {

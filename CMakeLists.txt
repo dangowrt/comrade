@@ -787,6 +787,14 @@ if(COMRADE_BUILD_TOOLS)
 	# so the offline suite is unaffected; the turnstile's race-freedom is
 	# proven deterministically by mailbox_test.
 	if(BUILD_TESTING AND UNIX)
+		# Port forwarding over a real path, both arrangements that work.
+		add_test(NAME forward_e2e
+			COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/forward.sh
+				$<TARGET_FILE:comrade>
+				$<TARGET_FILE:comrade-dhtseed>)
+		set_tests_properties(forward_e2e PROPERTIES
+			SKIP_RETURN_CODE 77 TIMEOUT 300)
+
 		add_test(NAME multiuser_e2e
 			COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/multiuser.sh
 				$<TARGET_FILE:comrade-e2e>
