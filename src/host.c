@@ -950,9 +950,18 @@ int host_run(int ui_mode, int no_mcast, int no_dht, int no_fwd)
 				no_mcast ? " --no-multicast" : "",
 				no_dht ? " --no-dht" : "",
 				no_fwd ? " --no-forwarding" : "");
-		do {
-			rc = attach(id);
-		} while (rc == 2);
+		/* A detach (2) leaves the service running and returns here.
+		 * Re-attaching on the spot is the one thing it cannot mean:
+		 * there is no dashboard on this path -- the events pipe belongs
+		 * to the foreground that started the service -- so hand the
+		 * terminal back and let `comrade` be run again. */
+		rc = attach(id);
+		if (rc == 2) {
+			fprintf(stderr, "comrade: detached -- the session is "
+				"still running (`comrade` to go back in, "
+				"`comrade stop` to end it)\n");
+			return 0;
+		}
 		return rc;
 	}
 	return start_new(ui_mode, no_mcast, no_dht, no_fwd);
