@@ -3338,6 +3338,11 @@ static int dht_attempt_concluded(struct sess *s, int family)
 {
 	if (!(s->cfg->sig_flags & SIG_DHT))
 		return 1;
+	/* Holding a rendezvous node is an attempt still running, whether it has
+	 * answered here yet or not: saying the family has none while one is on
+	 * the screen is worse than saying it is still being checked. */
+	if (netstate_anchor(&s->ns, family, NULL, NULL, NULL))
+		return 0;
 	if (now_ms() - s->dht_since_ms <= DHT_CONCLUDE_MS)
 		return 0;
 	return !sig_locating(s->sig, family);

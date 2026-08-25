@@ -235,7 +235,7 @@ static void net_label(int scope, int via, const char **color, const char **text)
 		*text = "LAN";
 	} else if (scope == NET_SCOPE_CGNAT) {
 		*color = YEL;
-		*text = via == NET_VIA_STUN ? "CGNAT (NAT)" : "CGNAT";
+		*text = "CGNAT";
 	} else if (via == NET_VIA_STUN) {
 		*color = BYE;
 		*text = "GLOBAL (NAT)";

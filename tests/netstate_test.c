@@ -251,6 +251,43 @@ static void anchor_changes_only_on_replacement(void)
 	assert(!memcmp(got, b, 16));	/* replaced, now that one was found */
 }
 
+/*
+ * A move is followed by seconds in which nothing works yet, and none of that
+ * is the rendezvous node's doing. Until the family is proven reachable, a
+ * round that came back empty says only that we could not ask.
+ */
+static void silence_before_proof_condemns_nothing(void)
+{
+	struct netstate ns;
+	uint8_t a[16], got[NETSTATE_SA_MAX];
+	uint8_t glen;
+	int confirmed, i;
+
+	start(&ns, 1);
+	fill(a, 16, 70);
+	give_src(&ns, 6, 20);
+	netstate_on_dht_ack(&ns, 6, netstate_epoch(&ns, 6), a, 16, t);
+	netstate_on_netmon(&ns, NETMON_CH_V6, 1, 1, t);
+	give_src(&ns, 6, 20);			/* routed, but nothing proven */
+	assert(netstate_conn(&ns, 6) == NET_CONN_PENDING);
+	drain(&ns);
+
+	for (i = 0; i < NETSTATE_ANCHOR_MISSES * 4; i++) {
+		netstate_on_rdv_attempt(&ns, 6, netstate_epoch(&ns, 6), t);
+		t += NETSTATE_RDV_MS;
+	}
+	assert(!(drain(&ns).f[1] & NSA_RDV_RELOCATE));
+	assert(netstate_anchor(&ns, 6, got, &glen, &confirmed));
+	assert(!memcmp(got, a, 16));		/* still ours */
+
+	/* proven, and now silence is the node's */
+	netstate_on_roundtrip(&ns, 6, netstate_epoch(&ns, 6));
+	drain(&ns);
+	for (i = 0; i < NETSTATE_ANCHOR_MISSES; i++)
+		netstate_on_rdv_attempt(&ns, 6, netstate_epoch(&ns, 6), t);
+	assert(drain(&ns).f[1] & NSA_RDV_RELOCATE);
+}
+
 /* R4: the loop this runs on stalls for seconds behind a slow resolver. Time
  * passing is not evidence a node is gone; only rounds that went out and came
  * back empty are. */
@@ -528,6 +565,12 @@ static void epoch_gate_exhaustive(void)
 				netstate_on_probe_started(&ns, fam,
 							  netstate_epoch(&ns, fam),
 							  t);
+				if (kind == 4)		/* an attempt only counts
+							 * once the family is
+							 * proven */
+					netstate_on_roundtrip(&ns, fam,
+							      netstate_epoch(&ns,
+									     fam));
 				drain(&ns);
 
 				before = ns;
@@ -688,6 +731,7 @@ int main(void)
 	late_src_retracts_the_wrong_row();
 	src_is_never_stale_on_the_wire();
 	anchor_changes_only_on_replacement();
+	silence_before_proof_condemns_nothing();
 	attempts_not_milliseconds();
 	latest_change_wins();
 	host_and_client_agree_except_on_the_token();

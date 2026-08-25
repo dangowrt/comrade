@@ -286,6 +286,12 @@ void netstate_on_rdv_attempt(struct netstate *ns, int family, uint32_t epoch,
 
 	if (epoch != f->epoch || !f->anchor_len)
 		return;
+	/* Silence proves nothing about the node until we know we can reach
+	 * anything at all: right after a move it is our own link settling, and
+	 * condemning a rendezvous for that is how one gets replaced seconds
+	 * into a network that has not finished coming up. */
+	if (f->conn != NET_CONN_UP)
+		return;
 	f->anchor_misses++;
 	f->anchor_next_ms = now + NETSTATE_RDV_MS;
 	if (f->anchor_misses < NETSTATE_ANCHOR_MISSES)
