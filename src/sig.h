@@ -206,6 +206,30 @@ void sig_search_again(struct sig *s, int family);
  */
 int sig_locating(struct sig *s, int family);
 
+/*
+ * What the shared mailbox is doing, for the view.
+ *
+ * Both ends meet in one BEP44 item and everything before the punch happens
+ * through it, so when a join stalls this is the first place to look: whether
+ * our own slot ever reached the DHT, whether the peer's has appeared, and how
+ * long since either moved. Without it the operator has a spinner and no way to
+ * tell "the offer never got stored" from "the answer never came back".
+ */
+struct sig_mailbox {
+	int engaged;			/* the DHT is up and being asked */
+	int stage;			/* RDV_*: cold, warmup, store, get, ready */
+	int have_mine;			/* we have something to publish */
+	int mine_stored;		/* and the last read showed it stored */
+	int peer_seen;			/* the peer's slot was in that read */
+	int64_t seq;			/* the container's sequence, -1 unread */
+	int gets;			/* validated reads so far */
+	int puts;			/* stores that found a home */
+	int claim;			/* enum sig_claim for the answer slot */
+	uint64_t last_get_ms;		/* 0 = never */
+	uint64_t last_put_ms;
+};
+void sig_mailbox_state(struct sig *s, struct sig_mailbox *out);
+
 /* Rendezvous progress for `family`: 0 cold, 1 warmup, 2 store, 3 get, 4 ready
  * (matches the RDV_* enum). The store/get phases are engine-wide; only ready is
  * truly per-family. Advisory, for the view's spinner. */

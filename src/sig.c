@@ -114,6 +114,10 @@ struct sig {
 					 * serving the one we hold */
 	int up4, up6;			/* proven connectivity, see sig_set_family_up */
 	int seq_regress;		/* consecutive reads older than what we hold */
+	int gets_ok;			/* validated reads of the container */
+	int puts_ok;			/* stores that found a home */
+	uint64_t last_get_ms;		/* when either last happened, 0 = never */
+	uint64_t last_put_ms;
 	uint64_t next_wide_get_ms;
 	uint64_t next_wide_put_ms;
 	int anchor_seen4, anchor_seen6;	/* the node we hold answered a get since
@@ -497,6 +501,27 @@ int sig_link_ifaces(struct sig *s, struct sig_mcast_if *out, int max)
 	return sig_mcast_ifaces(s->mc, out, max);
 }
 
+void sig_mailbox_state(struct sig *s, struct sig_mailbox *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (!s)
+		return;
+	out->engaged = s->dht_engaged;
+	out->stage = s->rdv_stage;
+	out->have_mine = s->mb.have_mine;
+	/* need_write is set while what is stored is not what we want stored,
+	 * so its absence is the only honest way to say "ours is up there". */
+	out->mine_stored = s->mb.have_mine && s->mb.have_cur && !s->mb.need_write;
+	out->peer_seen = s->mb.is_host ? s->mb.slot_a_len != 0 :
+					 s->mb.slot_o_len != 0;
+	out->seq = s->mb.have_cur ? s->cur_seq : -1;
+	out->gets = s->gets_ok;
+	out->puts = s->puts_ok;
+	out->claim = (int)sig_claim_status(s);
+	out->last_get_ms = s->last_get_ms;
+	out->last_put_ms = s->last_put_ms;
+}
+
 int sig_rdv_stage(struct sig *s, int family)
 {
 	socklen_t rl = family == 6 ? s->rnode6_len : s->rnode4_len;
@@ -554,6 +579,8 @@ static void on_dht_get(void *arg, const uint8_t *v, size_t v_len, int64_t seq,
 	    ++s->seq_regress < SIG_SEQ_REGRESS_MAX)
 		return;
 	s->seq_regress = 0;
+	s->gets_ok++;
+	s->last_get_ms = now_ms();
 	mailbox_parse(&s->mb, v, v_len);
 	s->cur_seq = seq;
 
@@ -758,6 +785,16 @@ static void on_host_put(void *arg, int stored, const struct sockaddr *node,
 	}
 }
 
+/* A store has gone out. Counted where it is issued rather than where it is
+ * acknowledged, because only the convergent one reports back at all -- and a
+ * store nobody answered is exactly what the operator needs to see. Whether it
+ * took is the separate question mine_stored answers. */
+static void sig_note_put(struct sig *s)
+{
+	s->puts_ok++;
+	s->last_put_ms = now_ms();
+}
+
 static void dht_pump(struct sig *s, uint64_t now)
 {
 	if (!dhtnode_ready(s->node))
@@ -828,6 +865,7 @@ static void dht_pump(struct sig *s, uint64_t now)
 			 * finds whoever is closest now, so the value has to be
 			 * there and not merely on the handful we pinned once.
 			 */
+			sig_note_put(s);
 			bep44_update(s->engine, s->keys.bep44_sk,
 				     s->keys.bep44_pk, SIG_SALT, sig_merge,
 				     s, NULL, NULL);
@@ -842,6 +880,7 @@ static void dht_pump(struct sig *s, uint64_t now)
 			 * offer (need_write is the GET-driven forget signal), so
 			 * the token never churns and the mailbox never expires.
 			 */
+			sig_note_put(s);
 			bep44_update_direct(s->engine, s->keys.bep44_sk,
 					    s->keys.bep44_pk, SIG_SALT,
 					    sig_merge, s, NULL, NULL);
@@ -849,6 +888,7 @@ static void dht_pump(struct sig *s, uint64_t now)
 		}
 	} else if (mailbox_client_should_claim(&s->mb)) {
 		dbg_logf("sig: writing claim to the rendezvous");
+		sig_note_put(s);
 		/*
 		 * The client claims by writing its answer straight to the pinned
 		 * rendezvous node once it has read the offer -- a round-trip, not

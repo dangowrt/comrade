@@ -42,6 +42,31 @@ enum {					/* per-family rendezvous progress (spinner) */
 	RDV_READY			/* the rendezvous node is captured */
 };
 
+/*
+ * The shared BEP44 mailbox, as the controller sees it. Mirrors sig's own view
+ * so the display never reaches into sig.
+ */
+struct session_mailbox {
+	int engaged;			/* the DHT is up and being asked */
+	int stage;			/* RDV_* */
+	int have_mine;			/* we have something to publish */
+	int mine_stored;		/* the last read showed it stored */
+	int peer_seen;			/* the peer's slot was in that read */
+	int64_t seq;			/* container sequence, -1 unread */
+	int gets;			/* validated reads */
+	int puts;			/* stores that found a home */
+	int claim;			/* SESSION_CLAIM_* */
+	int age_get_s;			/* since the last read, -1 = never */
+	int age_put_s;
+};
+
+enum {					/* the answer slot, from where we sit */
+	SESSION_CLAIM_UNKNOWN,		/* nothing read yet */
+	SESSION_CLAIM_FREE,		/* empty: a client may take it */
+	SESSION_CLAIM_HELD,		/* ours is in it */
+	SESSION_CLAIM_BUSY		/* somebody else's is */
+};
+
 struct session_obs {
 	void *arg;
 	/* A local path (family 4/6), classified by scope and how it was learnt;
@@ -95,6 +120,34 @@ struct session_obs {
 	void (*escalate_clear)(void *arg);
 	/* A path is up and the session is about to seize the terminal. */
 	void (*established)(void *arg);
+	/*
+	 * The mailbox moved. Everything before a punch goes through it, so
+	 * this is what turns "waiting" into a place to look when a join is
+	 * not happening.
+	 */
+	void (*mailbox)(void *arg, const struct session_mailbox *m);
+	/*
+	 * One candidate from the description peer `id` sent us, and a signal
+	 * to forget that peer's set because a fresh description replaced it.
+	 * Both ends' candidates have to be visible to tell a punch that never
+	 * had a usable pair from one that had pairs and still failed.
+	 *
+	 * `id` is the peer row it belongs to: a host serves several clients at
+	 * once and each has its own set.
+	 */
+	void (*peer_cand)(void *arg, int id, int family, int scope, int via,
+			  const char *addr);
+	void (*peer_cand_reset)(void *arg, int id);
+	/*
+	 * One transport path under peer `id`: where it goes, whether it is
+	 * carrying the session now, and its smoothed round trip in ms (-1 if
+	 * not yet known). A client that roamed and came back is served over a
+	 * second path while the first is still listed, which is exactly what
+	 * makes a resumption legible.
+	 */
+	void (*peer_path)(void *arg, int id, const char *addr, int carrying,
+			  int rtt_ms);
+	void (*peer_path_reset)(void *arg, int id);
 	/* Periodic heartbeat, ~10/s: advance spinners, repaint. */
 	void (*tick)(void *arg);
 };

@@ -457,6 +457,8 @@ struct sess {
 	 */
 	struct stun_mapping map4;
 	int mapping_reported;		/* 0 not yet, 1 sent independent, 2 sent dependent */
+	struct session_mailbox mb_told;	/* the last mailbox state sent to the view */
+	int mb_told_any;
 
 	/*
 	 * Reachability per family. Producers off this thread leave facts under
@@ -3633,6 +3635,44 @@ static void net_change_reset(struct sess *s)
 }
 
 /*
+ * Tell the view what the mailbox is doing, when it changes. Both ends run
+ * this: everything before a punch happens through that one item, so a join
+ * that is not progressing is nearly always visible here first -- our slot
+ * never stored, or the peer's never seen.
+ *
+ * The ages are seconds rather than timestamps because that is what the view
+ * would compute anyway, and it keeps the clock on this side of the seam.
+ */
+static void report_mailbox(struct sess *s)
+{
+	const struct session_obs *o = s->cfg->obs;
+	struct session_mailbox m;
+	struct sig_mailbox sm;
+	uint64_t now = now_ms();
+
+	if (!o || !o->mailbox || !s->sig)
+		return;
+	sig_mailbox_state(s->sig, &sm);
+	memset(&m, 0, sizeof(m));
+	m.engaged = sm.engaged;
+	m.stage = sm.stage;
+	m.have_mine = sm.have_mine;
+	m.mine_stored = sm.mine_stored;
+	m.peer_seen = sm.peer_seen;
+	m.seq = sm.seq;
+	m.gets = sm.gets;
+	m.puts = sm.puts;
+	m.claim = sm.claim;
+	m.age_get_s = sm.last_get_ms ? (int)((now - sm.last_get_ms) / 1000) : -1;
+	m.age_put_s = sm.last_put_ms ? (int)((now - sm.last_put_ms) / 1000) : -1;
+	if (s->mb_told_any && !memcmp(&m, &s->mb_told, sizeof(m)))
+		return;
+	s->mb_told = m;
+	s->mb_told_any = 1;
+	o->mailbox(o->arg, &m);
+}
+
+/*
  * Report the host's rendezvous progress to the view: which family has a node,
  * how far each is through locating one, and the endpoint the local status line
  * shows. What goes into the token is token_pump's.
@@ -4387,6 +4427,7 @@ static int host_turnstile(struct sess *s)
 		pump_once(s, 100);		/* the main thread owns sig + lan */
 		net_pump(s, now_ms());		/* notice a move, act on it */
 		maybe_announce_rendezvous(s);	/* report the rendezvous */
+		report_mailbox(s);
 		token_pump(s);			/* mint and advertise the token */
 		rdv_keep_warm(s);
 		lan_drain(s, ws, &dash_seq);	/* admit same-segment claimants */
@@ -4839,6 +4880,7 @@ int session_run(const struct session_cfg *cfg)
 		pump_once(&s, 100);
 		net_pump(&s, now_ms());
 		maybe_announce_rendezvous(&s);
+		report_mailbox(&s);
 		token_pump(&s);
 		/*
 		 * Roamed before the link came up: rebuild the signalling on the

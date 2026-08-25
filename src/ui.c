@@ -84,6 +84,8 @@ struct ui {
 	int nlink;
 	struct rdvrow rdv[2];		/* fixed slots: [0] v4, [1] v6 */
 	int stage4, stage6;		/* per-family rendezvous stage, -1 unknown */
+	struct session_mailbox mb;	/* the shared BEP44 item */
+	int have_mb;
 	char token[256];
 	int have_token;
 	int tok_st4, tok_st6;		/* TOKEN_STATE_* decoded from token */
@@ -424,6 +426,63 @@ static void draw_qr(struct ui *u)
 	u->dirty = 0;
 }
 
+/* "12s ago", or "never" for a step that has not happened. */
+static const char *ago(int secs, char *buf, size_t n)
+{
+	if (secs < 0)
+		return "never";
+	snprintf(buf, n, "%ds ago", secs);
+	return buf;
+}
+
+static void draw_mailbox(struct ui *u)
+{
+	const struct session_mailbox *m = &u->mb;
+	const char *ours = u->role == UI_ROLE_HOST ? "offer" : "answer";
+	const char *theirs = u->role == UI_ROLE_HOST ? "answer" : "offer";
+	char g[24], p[24];
+	const char *slot;
+
+	line(CYN "MAILBOX" RST DIM "  the rendezvous both ends meet in" RST);
+	if (!u->have_mb || !m->engaged) {
+		line(DIM "  waiting for the DHT ..." RST);
+		line("");
+		return;
+	}
+	/* Ours: what we have put up there, and whether it took. */
+	if (m->mine_stored)
+		line("  " DIM "%-8s" RST BGR "%-16s" RST DIM "written %s, seq %lld" RST,
+		     ours, "stored", ago(m->age_put_s, p, sizeof(p)),
+		     (long long)m->seq);
+	else if (m->have_mine)
+		line("  " DIM "%-8s" RST YEL "%-16s" RST DIM "last try %s" RST,
+		     ours, "not stored yet", ago(m->age_put_s, p, sizeof(p)));
+	else
+		line("  " DIM "%-8s%-16s" RST, ours, "nothing yet");
+
+	/* Theirs: what a stalled join is nearly always waiting on. */
+	if (m->peer_seen)
+		line("  " DIM "%-8s" RST BGR "%-16s" RST DIM "read %s" RST,
+		     theirs, "present", ago(m->age_get_s, g, sizeof(g)));
+	else
+		line("  " DIM "%-8s" RST YEL "%-16s" RST DIM "read %s" RST,
+		     theirs, "not there yet", ago(m->age_get_s, g, sizeof(g)));
+
+	/* Only a client competes for the answer slot; a host reads its state
+	 * from the answer being present at all, which is the line above. */
+	if (u->role != UI_ROLE_HOST) {
+		switch (m->claim) {
+		case SESSION_CLAIM_FREE:  slot = "free to claim"; break;
+		case SESSION_CLAIM_HELD:  slot = "our claim is in it"; break;
+		case SESSION_CLAIM_BUSY:  slot = "another client holds it"; break;
+		default:                  slot = "not read yet"; break;
+		}
+		line("  " DIM "%-8s%-16s" RST, "claim", slot);
+	}
+	line("  " DIM "%-8s%d read, %d written" RST, "so far", m->gets, m->puts);
+	line("");
+}
+
 static void draw(struct ui *u)
 {
 	int i, f = u->spin & 3, ns = 0, rc;
@@ -509,6 +568,8 @@ static void draw(struct ui *u)
 	if (u->have_escalate)
 		line("  " RED "! %s" RST, u->escalate);
 	line("");
+
+	draw_mailbox(u);
 
 	if (u->role == UI_ROLE_HOST) {
 		line(CYN "INVITE" RST);
@@ -741,6 +802,29 @@ static void um_rdv(struct ui *u, int family, int ready, const char *addr)
 		     ready ? "validated, pinned" : "contacting");
 }
 
+/*
+ * The shared mailbox. Both ends put one slot in it and read the other's out,
+ * and every join goes through that before any packet is punched -- so this is
+ * the line that tells an operator whether they are waiting on their own
+ * publish, on the peer's, or on the punch that follows both.
+ */
+static void um_mailbox(struct ui *u, const struct session_mailbox *m)
+{
+	if (u->have_mb && !memcmp(&u->mb, m, sizeof(*m)))
+		return;
+	u->mb = *m;
+	u->have_mb = 1;
+	if (u->anim)
+		u->dirty = 1;
+	else
+		vlog(u, "mbox   %s%s%s seq=%lld reads=%d writes=%d",
+		     m->mine_stored ? "ours stored" :
+		     m->have_mine ? "ours not stored yet" : "nothing to store",
+		     m->peer_seen ? ", peer slot present" : ", no peer slot",
+		     m->claim == SESSION_CLAIM_BUSY ? ", answer slot taken" : "",
+		     (long long)m->seq, m->gets, m->puts);
+}
+
 static void um_rdv_stage(struct ui *u, int family, int stage)
 {
 	int *cur = family == 6 ? &u->stage6 : &u->stage4;
@@ -956,6 +1040,10 @@ static void cb_link(void *a, const char *n, int h4, int h6) { um_link(a, n, h4, 
 static void cb_link_reset(void *a) { um_link_reset(a); }
 static void cb_rdv(void *a, int f, const char *ad, int rd) { um_rdv(a, f, rd, ad); }
 static void cb_rdv_stage(void *a, int f, int st) { um_rdv_stage(a, f, st); }
+static void cb_mailbox(void *a, const struct session_mailbox *m)
+{
+	um_mailbox(a, m);
+}
 static void cb_token(void *a, const char *t) { um_token(a, t); }
 static void cb_token_ro(void *a, const char *t) { um_token_ro(a, t); }
 static void cb_peer(void *a, int id, int s, const char *ad) { um_peer(a, id, s, ad); }
@@ -1002,6 +1090,7 @@ void ui_bind(struct ui *u, struct session_obs *obs)
 	obs->link_reset = cb_link_reset;
 	obs->rendezvous = cb_rdv;
 	obs->rdv_stage = cb_rdv_stage;
+	obs->mailbox = cb_mailbox;
 	obs->token = cb_token;
 	obs->token_ro = cb_token_ro;
 	obs->peer = cb_peer;
@@ -1131,6 +1220,13 @@ static void em_rdv_stage(void *a, int f, int st)
 {
 	emitf(a, "G %d %d\n", f, st);
 }
+/* The mailbox, as one line: eleven small integers in a fixed order. */
+static void em_mailbox(void *a, const struct session_mailbox *m)
+{
+	emitf(a, "B %d %d %d %d %d %lld %d %d %d %d %d\n", m->engaged, m->stage,
+	      m->have_mine, m->mine_stored, m->peer_seen, (long long)m->seq,
+	      m->gets, m->puts, m->claim, m->age_get_s, m->age_put_s);
+}
 static void em_token(void *a, const char *t)
 {
 	emitf(a, "T %s\n", t);
@@ -1203,6 +1299,7 @@ void ui_emitter(struct session_obs *obs, sock_t fd)
 	obs->link = em_link;
 	obs->rendezvous = em_rdv;
 	obs->rdv_stage = em_rdv_stage;
+	obs->mailbox = em_mailbox;
 	obs->token = em_token;
 	obs->token_ro = em_token_ro;
 	obs->peer = em_peer;
@@ -1261,6 +1358,20 @@ static void feed(struct ui *u, char *ln)
 		if (sscanf(ln + 1, "%d %d", &a, &b) == 2)
 			um_rdv_stage(u, a, b);
 		break;
+	case 'B': {
+		struct session_mailbox m;
+		long long sq = -1;
+
+		memset(&m, 0, sizeof(m));
+		if (sscanf(ln + 1, "%d %d %d %d %d %lld %d %d %d %d %d",
+			   &m.engaged, &m.stage, &m.have_mine, &m.mine_stored,
+			   &m.peer_seen, &sq, &m.gets, &m.puts, &m.claim,
+			   &m.age_get_s, &m.age_put_s) == 11) {
+			m.seq = sq;
+			um_mailbox(u, &m);
+		}
+		break;
+	}
 	case 'T':
 		if (sscanf(ln + 1, " %255s", tok) == 1)
 			um_token(u, tok);
