@@ -236,6 +236,8 @@ struct conn {
 	/* The peer ICE identity that primed this agent. Candidate trickles from
 	 * a rotated offer must not be sent to an agent for an older offer. */
 	char remote_ufrag[40];
+	char remote_pwd[40];		/* which attempt of that peer, so a later
+					 * one can take this punch's place */
 
 	struct nat_agent *nat;
 	struct stream *stream;
@@ -2276,6 +2278,22 @@ static void sdp_ufrag(const char *sdp, char *out)
 		sscanf(p, "ice-ufrag:%39s", out);
 }
 
+/*
+ * The password of the claim, which is what separates a claimant trying again
+ * from the DHT handing us its previous try a second time. The ufrag is the
+ * claimant's identity and is deliberately kept across a resumption, so it
+ * cannot tell the two apart; the password is minted fresh for every attempt
+ * (conn_fresh_pwd) precisely so an unchanged claim is recognisable as one.
+ */
+static void sdp_pwd(const char *sdp, char *out)
+{
+	const char *p = strstr(sdp, "ice-pwd:");
+
+	out[0] = '\0';
+	if (p)
+		sscanf(p, "ice-pwd:%39s", out);
+}
+
 /* Is this claimant already admitted over the direct path -- served by a LAN
  * worker, or queued for one? (host main thread only) */
 static int conn_is_lost(struct conn *c);
@@ -4015,6 +4033,60 @@ static int punch_in_flight(const struct sess *s, struct conn *const *punching,
 }
 
 /*
+ * A claimant we are already punching at has asked again, under a password we
+ * have not punched at. Its previous attempt is over as far as it is concerned
+ * -- it would not have minted a new one otherwise -- so let the new one take
+ * that punch's place instead of being refused until the old one times out.
+ *
+ * This is what carries a resumption through. The returning client keeps its
+ * ufrag so the worker holding its session is found again, and everything that
+ * session owns comes back with it: the shell, the forwarded ports, whatever
+ * is queued in either direction. Making it wait out a punch it has already
+ * abandoned is how that gets thrown away instead.
+ *
+ * The same password is the opposite case: the DHT serving its previous claim
+ * again, which must not disturb the punch already running for it.
+ */
+static int punch_tried_again(const struct sess *s, struct conn *const *punching,
+			     const char *ufrag, const char *pwd)
+{
+	int i;
+
+	if (!ufrag[0] || !pwd[0])
+		return 0;
+	for (i = 0; i < HOST_MAX_WORKERS; i++)
+		if (punching[i] && !strcmp(s->punch_ufrag[i], ufrag))
+			return strcmp(punching[i]->remote_pwd, pwd) != 0;
+	return 0;
+}
+
+/* Retire it, so the slot and the identity are free for the attempt that
+ * replaces it. Only called where that replacement is about to be admitted:
+ * dropping a punch and then refusing the claim would leave the claimant worse
+ * off than being told to wait. */
+static void punch_retire(struct sess *s, struct conn **punching,
+			 struct conn **punch_resume, const char *ufrag)
+{
+	int i;
+
+	for (i = 0; i < HOST_MAX_WORKERS; i++) {
+		struct conn *c = punching[i];
+
+		if (!c || strcmp(s->punch_ufrag[i], ufrag))
+			continue;
+		dbg_logf("host: claimant tried again -- retiring its punch");
+		if (punch_resume[i]) {
+			punch_resume[i]->resume_pending = 0;
+			punch_resume[i] = NULL;
+		}
+		punching[i] = NULL;
+		s->punch_ufrag[i][0] = '\0';
+		conn_free(c);
+		return;
+	}
+}
+
+/*
  * Admit each newly-claimed LAN endpoint: allocate a conn bound to that peer over
  * the shared lanlink socket (no ICE, no punch -- a multicast claimant is already
  * directly reachable) and spawn a worker for it, alongside the ICE turnstile.
@@ -4496,7 +4568,7 @@ static int host_turnstile(struct sess *s)
 		case TS_WAIT_CLAIM:
 			if (s->have_peer_sdp && !s->remote_set) {
 				struct conn *resume = NULL;
-				char cu[40];
+				char cu[40], cp[40];
 				int pslot = -1, inflight = 0;
 
 				/*
@@ -4512,14 +4584,29 @@ static int host_turnstile(struct sess *s)
 				 * before (either would be punched again: double-serve).
 				 */
 				sdp_ufrag(s->peer_sdp, cu);
+				sdp_pwd(s->peer_sdp, cp);
 				if (cu[0]) {
 					struct conn *w = worker_by_ufrag(ws, cu);
+					int again = punch_tried_again(s, punching,
+								      cu, cp);
 
 					if (w && conn_is_lost(w) &&
-					    !punch_in_flight(s, punching, cu) &&
+					    (again ||
+					     !punch_in_flight(s, punching, cu)) &&
 					    now_ms() - w->resume_last_ms >
 					    RESUME_ATTEMPT_MS) {
+						/* Its own newer attempt is the
+						 * one thing allowed to take the
+						 * place of a punch we are running
+						 * for it. */
+						if (again)
+							punch_retire(s, punching,
+								     punch_resume,
+								     cu);
 						resume = w;
+					} else if (!w && again) {
+						punch_retire(s, punching,
+							     punch_resume, cu);
 					} else if (w || ufrag_admitted(s, cu) ||
 						   lan_pending_ufrag(s, cu) ||
 						   (s->have_served &&
@@ -4568,6 +4655,8 @@ static int host_turnstile(struct sess *s)
 				}
 				snprintf(listen->remote_ufrag,
 					 sizeof(listen->remote_ufrag), "%s", cu);
+				snprintf(listen->remote_pwd,
+					 sizeof(listen->remote_pwd), "%s", cp);
 				/* Release on pickup: hand the punch to the in-flight
 				 * set and rotate a fresh offer at once, so the next
 				 * client is admitted without waiting for this punch. */
