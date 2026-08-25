@@ -496,9 +496,12 @@ static void draw(struct ui *u)
 
 		if (!r->family)			/* empty slot */
 			continue;
-		if (r->addr[0])			/* known address == located */
+		if (r->addr[0] && r->ready)
 			line("  " DIM "v%d" RST "  " CYN "%s" RST,
 			     r->family, r->addr);
+		else if (r->addr[0])		/* held, not yet in the invite */
+			line("  " DIM "v%d" RST "  " DIM "%s" RST DIM
+			     "  checking ..." RST, r->family, r->addr);
 		else
 			line("  " DIM "v%d" RST DIM
 			     "  locating a close node ..." RST, r->family);

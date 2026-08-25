@@ -1167,7 +1167,6 @@ static int seed_node_for(struct sess *s, int family, struct sockaddr_storage *sa
 static void seed_rendezvous(struct sess *s)
 {
 	static const int famv[2] = { 4, 6 };
-	const struct session_obs *o = s->cfg->obs;
 	int i;
 
 	for (i = 0; i < 2; i++) {
@@ -1176,16 +1175,16 @@ static void seed_rendezvous(struct sess *s)
 
 		if (seed_node_for(s, famv[i], &sa, &sl))
 			continue;
-		if (s->cfg->is_host) {
+		if (s->cfg->is_host)
 			sig_reinforce(s->sig, famv[i], (struct sockaddr *)&sa,
 				      sl);
-		} else if (!sig_seed_node(s->sig, (struct sockaddr *)&sa, sl) &&
-			   o && o->rendezvous) {
-			char b[80];
-
-			addr_str((struct sockaddr *)&sa, b, sizeof(b));
-			o->rendezvous(o->arg, famv[i], b, 0);
-		}
+		else if (sig_seed_node(s->sig, (struct sockaddr *)&sa, sl))
+			continue;
+		/* Adopted, not confirmed: whoever minted this node did so on
+		 * another network, and report_rendezvous says so until it has
+		 * answered here. */
+		netstate_on_rdv_offered(&s->ns, famv[i], (const uint8_t *)&sa,
+					(int)sl);
 	}
 }
 
@@ -3403,6 +3402,8 @@ static void ns_take_acks(struct sess *s, uint64_t now)
 	}
 }
 
+static void report_rendezvous(struct sess *s);
+
 static void net_apply(struct sess *s, const struct netstate_actions *a)
 {
 	static const int famv[2] = { 4, 6 };
@@ -3465,6 +3466,8 @@ static void net_apply(struct sess *s, const struct netstate_actions *a)
 			if (s->sig)
 				sig_search_again(s->sig, family);
 		}
+		if (act & NSA_EMIT_RDV)
+			report_rendezvous(s);
 		/* NSA_EMIT_TOKEN is advisory: token_pump recomputes on its own
 		 * cadence, which is what stops a token churning through the
 		 * transient states a move passes through. */
@@ -3587,23 +3590,38 @@ static void maybe_announce_rendezvous(struct sess *s)
 		if (s->expect6)
 			o->rdv_stage(o->arg, 6, sig_rdv_stage(s->sig, 6));
 	}
+	report_rendezvous(s);		/* also for a family still expected */
+}
 
-	/* Tell the view each family's state -- located, or expected-but-pending --
-	 * so the invite can say "IPv4 ready, locating IPv6" rather than warn early. */
-	if (o && o->rendezvous) {
+/*
+ * Tell the view each family's rendezvous: the node the model holds, and
+ * whether it has qualified to go into a token.
+ *
+ * The same fact token_pump mints from, so the panel cannot name a node while
+ * the invite line is still saying it is looking for one -- a contradiction the
+ * operator sees for as long as qualifying takes, and which then resolves as a
+ * token changing under a shared invite for no visible reason.
+ */
+static void report_rendezvous(struct sess *s)
+{
+	static const int famv[2] = { 4, 6 };
+	const struct session_obs *o = s->cfg->obs;
+	int i;
+
+	if (!o || !o->rendezvous)
+		return;
+	for (i = 0; i < 2; i++) {
+		uint8_t node[NETSTATE_SA_MAX], nlen = 0;
+		int confirmed = 0;
 		char b[80];
 
-		if (have4) {
-			addr_str((struct sockaddr *)&a4, b, sizeof(b));
-			o->rendezvous(o->arg, 4, b, 1);
-		} else if (s->expect4) {
-			o->rendezvous(o->arg, 4, "", 0);
-		}
-		if (have6) {
-			addr_str((struct sockaddr *)&a6, b, sizeof(b));
-			o->rendezvous(o->arg, 6, b, 1);
-		} else if (s->expect6) {
-			o->rendezvous(o->arg, 6, "", 0);
+		if (netstate_anchor(&s->ns, famv[i], node, &nlen, &confirmed) &&
+		    nlen) {
+			addr_str((const struct sockaddr *)node, b, sizeof(b));
+			o->rendezvous(o->arg, famv[i], b, confirmed);
+		} else if (s->cfg->is_host &&
+			   (famv[i] == 4 ? s->expect4 : s->expect6)) {
+			o->rendezvous(o->arg, famv[i], "", 0);
 		}
 	}
 }
