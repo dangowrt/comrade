@@ -110,7 +110,8 @@ struct session_cfg {
 	uint16_t stun_port;
 	int stun_auto;			/* rotate community STUN servers */
 	int log_level;			/* libjuice log level, <0 = quiet */
-	int connect_timeout_s;		/* give up establishing after this */
+	int connect_timeout_s;		/* give up establishing after this;
+					 * 0 = keep trying indefinitely */
 
 	/* Host only. */
 	void *hostkey;			/* ssh_key (private) */

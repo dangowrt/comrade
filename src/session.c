@@ -3292,6 +3292,20 @@ static int stun_stall(struct sess *s)
 	return now_ms() - s->stun_since_ms > STUN_ROTATE_MS;
 }
 
+/*
+ * A zero connect budget means keep trying, so every test of it goes through
+ * these two: "no deadline" must never read as "already past it".
+ */
+static int deadline_passed(uint64_t deadline, uint64_t now)
+{
+	return deadline && now >= deadline;
+}
+
+static int deadline_room(uint64_t deadline, uint64_t now, uint64_t need)
+{
+	return !deadline || now + need < deadline;
+}
+
 /* The single-connection path (client, or a host serving one connection): run
  * the session's one connection, driving signalling from the same loop. */
 static int run_ssh(struct sess *s)
@@ -4673,7 +4687,16 @@ int session_run(const struct session_cfg *cfg)
 	}
 
 	s.start_ms = now_ms();
-	deadline = s.start_ms + (uint64_t)cfg->connect_timeout_s * 1000;
+	/*
+	 * Zero means keep trying. Nothing about a rendezvous that has not
+	 * answered yet says it never will -- a DHT converges when it converges,
+	 * a network comes back when the operator walks into range -- so a
+	 * deadline can only ever end an attempt that would have succeeded. The
+	 * operator ends it instead, which is the one judgement that is never
+	 * wrong.
+	 */
+	deadline = cfg->connect_timeout_s > 0 ?
+		   s.start_ms + (uint64_t)cfg->connect_timeout_s * 1000 : 0;
 
 	/*
 	 * A DHT host serves many clients through the turnstile (multi-user),
@@ -4686,7 +4709,8 @@ int session_run(const struct session_cfg *cfg)
 		goto done;
 	}
 
-	while (st != ST_DONE && st != ST_FAIL && now_ms() < deadline) {
+	while (st != ST_DONE && st != ST_FAIL &&
+	       !deadline_passed(deadline, now_ms())) {
 		char filtered[NAT_SDP_MAX];
 		const struct session_obs *o = cfg->obs;
 
@@ -4954,8 +4978,9 @@ int session_run(const struct session_cfg *cfg)
 				 * dispatching sig.
 				 */
 				dbg_logf("session: rejoin (roam)");
-				deadline = now_ms() +
-					(uint64_t)cfg->connect_timeout_s * 1000;
+				deadline = cfg->connect_timeout_s > 0 ?
+					now_ms() +
+					(uint64_t)cfg->connect_timeout_s * 1000 : 0;
 				/* Nothing has been watching the interfaces
 				 * while the link was up, so look now. */
 				net_pump(&s, now_ms());
@@ -4971,7 +4996,8 @@ int session_run(const struct session_cfg *cfg)
 				}
 				st = client_regather(&s) ? ST_FAIL :
 							   ST_GATHER;
-			} else if (!cfg->is_host && now_ms() + 10000 < deadline) {
+			} else if (!cfg->is_host &&
+				   deadline_room(deadline, now_ms(), 10000)) {
 				/*
 				 * The nominated pair never carried a session. It is
 				 * not a host that is merely slow to serve: the SSH
@@ -4983,7 +5009,7 @@ int session_run(const struct session_cfg *cfg)
 				 */
 				dbg_logf("session: bring-up failed -- re-claiming");
 				st = client_regather(&s) ? ST_FAIL : ST_GATHER;
-			} else if (now_ms() + 10000 < deadline) {
+			} else if (deadline_room(deadline, now_ms(), 10000)) {
 				/* A host retries its own listener rather than
 				 * re-gathering: the turnstile owns the offer. */
 				st = ST_WAIT_ICE;

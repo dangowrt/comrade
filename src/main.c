@@ -100,7 +100,7 @@ static int session_connect(const char *arg, int ui_mode, int no_mcast,
 	cfg.stun_port = 3478;
 	cfg.stun_auto = 1;
 	cfg.log_level = -1;
-	cfg.connect_timeout_s = 120;
+	cfg.connect_timeout_s = 0;	/* keep trying; the operator ends it */
 	cfg.interactive = 1;
 	cfg.forward_only = forward_only;	/* -N: no shell, forwarding only */
 	if (forward_only && !nfwd_l && !nfwd_r)
