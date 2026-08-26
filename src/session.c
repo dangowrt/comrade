@@ -4997,6 +4997,8 @@ static int host_turnstile(struct sess *s)
 				 * rejoin, so leaving it here refused that
 				 * client for the rest of the session.
 				 */
+				dbg_logf("host: reap worker %.8s",
+					 ws[i].c->claim_ufrag);
 				if (ws[i].c->claim_ufrag[0] && s->have_served &&
 				    !strcmp(s->last_served_ufrag,
 					    ws[i].c->claim_ufrag)) {
@@ -5133,6 +5135,20 @@ static int host_turnstile(struct sess *s)
 					struct conn *w = worker_by_ufrag(ws, cu);
 					int again = punch_tried_again(s, punching,
 								      cu, cp);
+					int adm = ufrag_admitted(s, cu);
+					int lanq = lan_pending_ufrag(s, cu);
+					int just = s->have_served &&
+						   !strcmp(cu,
+							   s->last_served_ufrag);
+
+					/* Named, because which of these decided
+					 * it is the whole story when a client
+					 * cannot get in and nobody can say why. */
+					dbg_logf("host: claim %.8s pwd %.6s: "
+						 "worker=%d again=%d admitted=%d "
+						 "lanq=%d justserved=%d",
+						 cu, cp, w ? 1 : 0, again, adm,
+						 lanq, just);
 
 					if (w && conn_is_lost(w) &&
 					    (again ||
@@ -5151,11 +5167,12 @@ static int host_turnstile(struct sess *s)
 					} else if (!w && again) {
 						punch_retire(s, punching,
 							     punch_resume, cu);
-					} else if (w || ufrag_admitted(s, cu) ||
-						   lan_pending_ufrag(s, cu) ||
-						   (s->have_served &&
-						    !strcmp(cu, s->last_served_ufrag))) {
-						dbg_logf("host: ignore stale/in-flight claim");
+					} else if (w || adm || lanq || just) {
+						dbg_logf("host: ignore claim %.8s "
+							 "(worker=%d admitted=%d "
+							 "lanq=%d justserved=%d)",
+							 cu, w ? 1 : 0, adm,
+							 lanq, just);
 						/* Ignoring it is not leaving it
 						 * there: the slot is the mutex,
 						 * and a claim we will not serve
@@ -5191,8 +5208,9 @@ static int host_turnstile(struct sess *s)
 				if (pslot < 0 || inflight >= HOST_MAX_WORKERS)
 					break;
 				dbg_logf(resume ?
-					 "host: resume claim -> punch (release)" :
-					 "host: claim received -> punch (release)");
+					 "host: resume claim -> punch (release) %.8s" :
+					 "host: claim received -> punch (release) %.8s",
+					 cu);
 				sdp_filter_peer(s->peer_sdp, cfg->family, filtered,
 					   sizeof(filtered));
 				if (nat_set_remote_description(listen->nat,
