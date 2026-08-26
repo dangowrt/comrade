@@ -495,6 +495,11 @@ static struct dhtnode *dhtnode_create_impl(int do_bootstrap)
 	n->engine = bep44_create(n->myid, n->s4, n->s6);
 	if (!n->engine)
 		goto fail;
+	/* Hold items for other peers and answer their get/put, so this node is
+	 * a full participant in BEP 44 storage rather than only a client of it
+	 * (and a peer that lands the mailbox here reaches it in one round-trip
+	 * instead of a lookup). */
+	bep44_serve(n->engine, 1);
 
 	netmon_init(&n->netmon);
 	if (do_bootstrap) {
@@ -617,31 +622,20 @@ int dhtnode_ready(struct dhtnode *n)
 	return good >= 2;
 }
 
-static int is_bep44_reply(const uint8_t *buf, size_t len)
-{
-	static const char needle[] = "1:t4:pm";
-	size_t nlen = sizeof(needle) - 1;
-	size_t i;
-
-	if (len < nlen)
-		return 0;
-	for (i = 0; i + nlen <= len; i++) {
-		if (!memcmp(buf + i, needle, nlen))
-			return 1;
-	}
-	return 0;
-}
-
+/*
+ * jech/dht speaks BEP 5 and nothing else, so the BEP 44 engine gets first
+ * refusal on every datagram: it claims its own replies and the get/put queries
+ * it serves, and returns everything else here for the BEP 5 engine. A packet is
+ * therefore answered by exactly one of them, never both.
+ */
 static void packet_route(struct dhtnode *n, uint8_t *buf, size_t len,
 			 const struct sockaddr *from, socklen_t fromlen)
 {
 	time_t tosleep = 0;
 
 	buf[len] = '\0';
-	if (is_bep44_reply(buf, len)) {
-		bep44_input(n->engine, buf, len, from, fromlen);
+	if (bep44_input(n->engine, buf, len, from, fromlen))
 		return;
-	}
 	dht_periodic(buf, len, from, fromlen, &tosleep, dht_event, n);
 	n->next_dht_ms = now_ms() + (uint64_t)tosleep * 1000;
 }

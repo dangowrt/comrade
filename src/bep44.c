@@ -19,6 +19,7 @@ static int debug_on(void)
 #include "bencode.h"
 #include "bep44.h"
 #include "ccrypto.h"
+#include "keys.h"
 #include "sha1.h"
 
 /*
@@ -43,6 +44,61 @@ static int debug_on(void)
 #define B44_SEEDS_MAX 16
 #define B44_PINNED_MAX 8
 #define B44_RETAINED_MAX 8
+
+/*
+ * Storing-node side. The item store is the whole of what this node holds for
+ * other peers: entries are allocated on demand, so a client-only embedder that
+ * never calls bep44_serve() pays nothing for it. Items live two hours unless a
+ * republish refreshes them, the interval BEP 44 assumes and mldht uses.
+ *
+ * The write-token secret rotates on a timer with the previous one still
+ * accepted, so a token stays usable across a rotation without ever being valid
+ * for long -- BEP 5's rule, and what libtorrent and libbtdht both do.
+ */
+_Static_assert(BEP44_MAX_VALUE <= UINT16_MAX, "v_len is stored in a uint16_t");
+_Static_assert(BEP44_MAX_SALT <= UINT8_MAX, "salt_len is stored in a uint8_t");
+
+#define B44_STORE_MAX 256
+#define B44_ITEM_TTL_MS (2 * 60 * 60 * 1000)
+#define B44_TOKEN_ROTATE_MS (5 * 60 * 1000)
+#define B44_TOKEN_LEN 8
+#define B44_SECRET_LEN 16
+#define B44_TID_MAX 64
+#define B44_CACHE_MAX 128
+#define B44_REPLY_NODES 8
+#define B44_CACHE_TTL_MS (60 * 60 * 1000)	/* drop a referral unseen for an hour */
+#define B44_RL_RATE 200				/* served queries per second, sustained */
+#define B44_RL_BURST 512			/* bucket depth */
+#define B44_COMPACT_CACHE_MAX 4			/* cache entries taken from one reply */
+
+/*
+ * One stored item. v is the value's bencoded bytes exactly as they arrived: the
+ * signature covers those bytes, so anything that re-encodes them destroys the
+ * item even though it still decodes to the same value.
+ */
+struct b44_item {
+	uint8_t target[20];
+	uint8_t k[32];
+	uint8_t sig[64];
+	uint8_t salt[BEP44_MAX_SALT];
+	uint8_t salt_len;
+	uint8_t is_mutable;
+	int64_t seq;
+	uint64_t expires_ms;
+	uint16_t v_len;
+	uint8_t v[];
+};
+
+/*
+ * A node we have seen with its id, kept so a get we answer can name closer
+ * nodes and the querier's lookup keeps converging instead of dead-ending here.
+ */
+struct b44_cnode {
+	uint8_t id[20];
+	struct sockaddr_storage ss;
+	socklen_t sslen;
+	uint64_t seen_ms;
+};
 
 enum b44_node_state {
 	B44_NODE_FRESH,
@@ -79,6 +135,7 @@ struct b44_op {
 	struct b44_op *next;
 	struct bep44_engine *e;
 	uint8_t is_put;
+	uint8_t is_immutable;		/* item named by sha1(v), no key or seq */
 	uint8_t is_update;		/* get, then merge, then put on same nodes */
 	uint8_t direct;			/* rendezvous mode: talk only to the seeded
 					 * and pinned nodes, never converge toward
@@ -145,6 +202,21 @@ struct bep44_engine {
 	struct b44_seed retained[B44_RETAINED_MAX];
 	int retain_next;
 	struct b44_op *ops;
+	/* Storing side; all of it stays zero until bep44_serve() enables it. */
+	uint8_t serving;
+	uint8_t token_secret[2][B44_SECRET_LEN];
+	uint64_t token_rotate_ms;
+	struct b44_item *store[B44_STORE_MAX];
+	struct b44_cnode cache[B44_CACHE_MAX];
+	int cache_next;
+	/*
+	 * A global token bucket over served queries, the same defence jech/dht
+	 * applies at its own ingress (dht.c token_bucket): the BEP 44 engine now
+	 * answers get/put before jech sees them, so it must carry its own cap or
+	 * an unauthenticated get becomes an unmetered reflector.
+	 */
+	int32_t rl_tokens;
+	uint64_t rl_ms;
 };
 
 static uint64_t now_ms(void)
@@ -155,11 +227,16 @@ static uint64_t now_ms(void)
 	return (uint64_t)ts.tv_sec * 1000 + (uint64_t)(ts.tv_nsec / 1000000);
 }
 
-size_t bep44_sig_buffer(uint8_t *dst, size_t dst_len, const char *salt,
-			int64_t seq, const uint8_t *v, size_t v_len)
+/*
+ * The salt is a byte string, not text: it may hold NUL and is only bound by its
+ * length. The public entry points take the C string pmate itself uses; the
+ * storing side, which relays whatever a peer sent, needs the explicit length.
+ */
+static size_t sig_buffer_n(uint8_t *dst, size_t dst_len, const uint8_t *salt,
+			   size_t salt_len, int64_t seq, const uint8_t *v,
+			   size_t v_len)
 {
 	struct benc_buf b;
-	size_t salt_len = salt ? strlen(salt) : 0;
 
 	benc_buf_init(&b, dst, dst_len);
 	if (salt_len) {
@@ -173,15 +250,33 @@ size_t bep44_sig_buffer(uint8_t *dst, size_t dst_len, const char *salt,
 	return b.err ? 0 : b.len;
 }
 
-void bep44_target(uint8_t target[20], const uint8_t pk[32], const char *salt)
+static void target_n(uint8_t target[20], const uint8_t pk[32],
+		     const uint8_t *salt, size_t salt_len)
 {
 	struct cc_sha1_ctx ctx;
 
 	cc_sha1_init(&ctx);
 	cc_sha1_update(&ctx, pk, 32);
-	if (salt)
-		cc_sha1_update(&ctx, salt, strlen(salt));
+	if (salt_len)
+		cc_sha1_update(&ctx, salt, salt_len);
 	cc_sha1_final(&ctx, target);
+}
+
+size_t bep44_sig_buffer(uint8_t *dst, size_t dst_len, const char *salt,
+			int64_t seq, const uint8_t *v, size_t v_len)
+{
+	return sig_buffer_n(dst, dst_len, (const uint8_t *)salt,
+			    salt ? strlen(salt) : 0, seq, v, v_len);
+}
+
+void bep44_target(uint8_t target[20], const uint8_t pk[32], const char *salt)
+{
+	target_n(target, pk, (const uint8_t *)salt, salt ? strlen(salt) : 0);
+}
+
+void bep44_immutable_target(uint8_t target[20], const uint8_t *v, size_t v_len)
+{
+	cc_sha1(target, v, v_len);
 }
 
 struct bep44_engine *bep44_create(const uint8_t myid[20], sock_t s4, sock_t s6)
@@ -209,8 +304,12 @@ static void op_free(struct bep44_engine *e, struct b44_op *op)
 
 void bep44_free(struct bep44_engine *e)
 {
+	int i;
+
 	while (e->ops)
 		op_free(e, e->ops);
+	for (i = 0; i < B44_STORE_MAX; i++)
+		free(e->store[i]);
 	free(e);
 }
 
@@ -305,31 +404,94 @@ static int node_insert(struct b44_op *op, const uint8_t *id,
 	return 1;
 }
 
+static void cache_add(struct bep44_engine *e, const uint8_t id[20],
+		      const struct sockaddr *sa, socklen_t salen);
+
+/*
+ * A source we must not serve, refer a peer to, or cache: the unroutable and
+ * unspoofable-target ranges jech/dht filters at its own ingress (dht.c
+ * is_martian). Since the BEP 44 engine now answers before jech, it repeats the
+ * check, so a get/put spoofed from loopback, 0/8, multicast or a link-local
+ * address is neither answered (a reflector aimed at that address) nor turned
+ * into a referral this node hands out.
+ */
+static int addr_martian(const struct sockaddr *sa, socklen_t salen)
+{
+	if (sa && sa->sa_family == AF_INET &&
+	    salen >= (socklen_t)sizeof(struct sockaddr_in)) {
+		const struct sockaddr_in *s = (const struct sockaddr_in *)sa;
+		const uint8_t *a = (const uint8_t *)&s->sin_addr;
+
+		return s->sin_port == 0 || a[0] == 0 || a[0] == 127 ||
+		       (a[0] & 0xe0) == 0xe0;
+	}
+	if (sa && sa->sa_family == AF_INET6 &&
+	    salen >= (socklen_t)sizeof(struct sockaddr_in6)) {
+		const struct sockaddr_in6 *s = (const struct sockaddr_in6 *)sa;
+		const uint8_t *a = (const uint8_t *)&s->sin6_addr;
+		static const uint8_t v4map[12] = {
+			0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
+		static const uint8_t zero[15] = { 0 };
+
+		return s->sin6_port == 0 || a[0] == 0xff ||
+		       (a[0] == 0xfe && (a[1] & 0xc0) == 0x80) ||
+		       !memcmp(a, v4map, 12) ||
+		       (!memcmp(a, zero, 15) && (a[15] == 0 || a[15] == 1));
+	}
+	return 1;
+}
+
+/* Same host, ignoring the port: an address behind a NAT keeps one cache slot
+ * however many source ports it speaks from, so a single host cannot crowd the
+ * referral cache with an entry per port. */
+static int addr_same_host(const struct sockaddr *a, socklen_t alen,
+			  const struct sockaddr_storage *b, socklen_t blen)
+{
+	if (alen != blen || a->sa_family != b->ss_family)
+		return 0;
+	if (a->sa_family == AF_INET)
+		return !memcmp(&((const struct sockaddr_in *)a)->sin_addr,
+			       &((const struct sockaddr_in *)b)->sin_addr, 4);
+	if (a->sa_family == AF_INET6)
+		return !memcmp(&((const struct sockaddr_in6 *)a)->sin6_addr,
+			       &((const struct sockaddr_in6 *)b)->sin6_addr, 16);
+	return 0;
+}
+
 static void nodes_compact_add(struct b44_op *op, const uint8_t *data,
 			      size_t len, int af)
 {
 	size_t entry = af == AF_INET ? 26 : 38;
 	size_t i;
+	int cached = 0;
 
 	for (i = 0; i + entry <= len; i += entry) {
 		const uint8_t *p = data + i;
+		struct sockaddr_storage ss;
+		socklen_t sslen;
 
+		memset(&ss, 0, sizeof(ss));
 		if (af == AF_INET) {
-			struct sockaddr_in sin;
+			struct sockaddr_in *sin = (struct sockaddr_in *)&ss;
 
-			memset(&sin, 0, sizeof(sin));
-			sin.sin_family = AF_INET;
-			memcpy(&sin.sin_addr, p + 20, 4);
-			memcpy(&sin.sin_port, p + 24, 2);
-			node_insert(op, p, (struct sockaddr *)&sin, sizeof(sin), 0);
+			sin->sin_family = AF_INET;
+			memcpy(&sin->sin_addr, p + 20, 4);
+			memcpy(&sin->sin_port, p + 24, 2);
+			sslen = sizeof(*sin);
 		} else {
-			struct sockaddr_in6 sin6;
+			struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&ss;
 
-			memset(&sin6, 0, sizeof(sin6));
-			sin6.sin6_family = AF_INET6;
-			memcpy(&sin6.sin6_addr, p + 20, 16);
-			memcpy(&sin6.sin6_port, p + 36, 2);
-			node_insert(op, p, (struct sockaddr *)&sin6, sizeof(sin6), 0);
+			sin6->sin6_family = AF_INET6;
+			memcpy(&sin6->sin6_addr, p + 20, 16);
+			memcpy(&sin6->sin6_port, p + 36, 2);
+			sslen = sizeof(*sin6);
+		}
+		node_insert(op, p, (struct sockaddr *)&ss, sslen, 0);
+		/* Cap what one reply contributes to the referral cache, so a
+		 * single node answering our lookup cannot fill the ring. */
+		if (cached < B44_COMPACT_CACHE_MAX) {
+			cache_add(op->e, p, (struct sockaddr *)&ss, sslen);
+			cached++;
 		}
 	}
 }
@@ -405,6 +567,31 @@ static int put_send(struct b44_op *op, int node)
 	if (!req)
 		return -1;
 	tid_bytes(tid, req->tid);
+
+	if (op->is_immutable) {
+		/* An immutable item is named by its own bytes: no key, no salt,
+		 * no seq, nothing to sign. */
+		benc_buf_init(&b, msg, sizeof(msg));
+		benc_raw_add(&b, "d1:ad", 5);
+		benc_key_add(&b, "id");
+		benc_str_add(&b, op->e->myid, 20);
+		benc_key_add(&b, "token");
+		benc_str_add(&b, op->nodes[node].token,
+			     op->nodes[node].token_len);
+		benc_key_add(&b, "v");
+		benc_raw_add(&b, op->value, op->value_len);
+		benc_raw_add(&b, "e1:q3:put1:t", 12);
+		benc_str_add(&b, tid, 4);
+		benc_raw_add(&b, "1:y1:qe", 7);
+		if (b.err) {
+			req->in_use = 0;
+			return -1;
+		}
+		op->nodes[node].state = B44_NODE_STORE_INFLIGHT;
+		msg_send(op->e, &op->nodes[node].ss, op->nodes[node].sslen,
+			 msg, b.len);
+		return 0;
+	}
 
 	sigbuf_len = bep44_sig_buffer(sigbuf, sizeof(sigbuf), op->salt,
 				      op->seq, op->value, op->value_len);
@@ -742,7 +929,8 @@ static int node_addr_usable(const struct sockaddr *sa, socklen_t len)
 static void record_best_node(struct b44_op *op, const struct sockaddr *sa,
 			     socklen_t salen)
 {
-	if (op->best_node_len || !sa || !node_addr_usable(sa, salen))
+	if (op->best_node_len || !sa || (size_t)salen > sizeof(op->best_node) ||
+	    !node_addr_usable(sa, salen))
 		return;
 	memcpy(&op->best_node, sa, salen);
 	op->best_node_len = salen;
@@ -761,6 +949,26 @@ static void value_check(struct b44_op *op, const struct sockaddr *from,
 
 	if (benc_dict_find(rdict, rlen, "v", &v, &v_len) || v_len > BEP44_MAX_VALUE)
 		return;
+	if (op->is_immutable) {
+		uint8_t got[20];
+
+		/* The name IS the hash of the value, so a served value either
+		 * hashes to what we asked for or is somebody else's. */
+		cc_sha1(got, v, v_len);
+		if (memcmp(got, op->target, 20))
+			return;
+		if (op->have_best) {
+			record_best_node(op, from, fromlen);
+			return;
+		}
+		memcpy(op->best, v, v_len);
+		op->best_len = (uint16_t)v_len;
+		op->best_seq = -1;
+		op->have_best = 1;
+		op->best_node_len = 0;
+		record_best_node(op, from, fromlen);
+		return;
+	}
 	if (benc_dict_find(rdict, rlen, "k", &val, &val_len) ||
 	    benc_str_get(val, val_len, &k, &k_len) || k_len != 32)
 		return;
@@ -891,6 +1099,776 @@ static void reply_handle(struct b44_op *op, struct b44_req *req,
 	op_step(op);
 }
 
+/*
+ * ---------------------------------------------------------------------------
+ * Storing side: answer other peers' get and put, and hold what they store.
+ *
+ * bep44_input() offers every datagram here first and falls back to the BEP 5
+ * engine for anything this does not claim, so get and put are answered once,
+ * by whichever layer understands them, and never twice.
+ * ---------------------------------------------------------------------------
+ */
+
+static size_t addr_bytes(const struct sockaddr *sa, socklen_t salen,
+			 const uint8_t **out)
+{
+	*out = NULL;
+	if (!sa)
+		return 0;
+	if (sa->sa_family == AF_INET &&
+	    salen >= (socklen_t)sizeof(struct sockaddr_in)) {
+		*out = (const uint8_t *)
+			&((const struct sockaddr_in *)sa)->sin_addr;
+		return 4;
+	}
+	if (sa->sa_family == AF_INET6 &&
+	    salen >= (socklen_t)sizeof(struct sockaddr_in6)) {
+		*out = (const uint8_t *)
+			&((const struct sockaddr_in6 *)sa)->sin6_addr;
+		return 16;
+	}
+	return 0;
+}
+
+/*
+ * A write token proves the peer receives at the address it claims. It covers
+ * the address but not the port, so a peer behind a NAT that reassigns ports
+ * mid-lookup keeps its token, and it covers the target, so a token earned for
+ * one item cannot be spent on another.
+ */
+static void token_make(uint8_t out[B44_TOKEN_LEN],
+		       const uint8_t secret[B44_SECRET_LEN],
+		       const struct sockaddr *sa, socklen_t salen,
+		       const uint8_t target[20])
+{
+	struct cc_sha1_ctx ctx;
+	const uint8_t *ab;
+	size_t ablen = addr_bytes(sa, salen, &ab);
+	uint8_t d[SHA1_LEN];
+
+	cc_sha1_init(&ctx);
+	cc_sha1_update(&ctx, secret, B44_SECRET_LEN);
+	if (ablen)
+		cc_sha1_update(&ctx, ab, ablen);
+	cc_sha1_update(&ctx, target, 20);
+	cc_sha1_final(&ctx, d);
+	memcpy(out, d, B44_TOKEN_LEN);
+}
+
+static int ct_eq(const uint8_t *a, const uint8_t *b, size_t len)
+{
+	uint8_t diff = 0;
+	size_t i;
+
+	for (i = 0; i < len; i++)
+		diff |= (uint8_t)(a[i] ^ b[i]);
+	return diff == 0;
+}
+
+static int token_valid(struct bep44_engine *e, const uint8_t *tok,
+		       size_t tok_len, const struct sockaddr *sa,
+		       socklen_t salen, const uint8_t target[20])
+{
+	uint8_t want[B44_TOKEN_LEN];
+	int i;
+
+	if (tok_len != B44_TOKEN_LEN)
+		return 0;
+	for (i = 0; i < 2; i++) {
+		token_make(want, e->token_secret[i], sa, salen, target);
+		if (ct_eq(want, tok, B44_TOKEN_LEN))
+			return 1;
+	}
+	return 0;
+}
+
+/*
+ * Rotate the secret on a timer, keeping the previous one valid: a token handed
+ * out just before a rotation still works, and none stays usable for long. Both
+ * secrets are random from the start -- shifting an all-zero initial secret into
+ * the "previous" slot would leave a window where anyone could mint a token.
+ */
+static void token_rotate(struct bep44_engine *e, uint64_t now)
+{
+	uint8_t fresh[B44_SECRET_LEN];
+
+	if (now < e->token_rotate_ms)
+		return;
+	if (random_bytes(fresh, sizeof(fresh)))
+		return;
+	memcpy(e->token_secret[1], e->token_secret[0], sizeof(fresh));
+	memcpy(e->token_secret[0], fresh, sizeof(fresh));
+	e->token_rotate_ms = now + B44_TOKEN_ROTATE_MS;
+}
+
+/* -- the item store ------------------------------------------------------ */
+
+static void store_expire(struct bep44_engine *e, uint64_t now)
+{
+	int i;
+
+	for (i = 0; i < B44_STORE_MAX; i++) {
+		if (e->store[i] && now >= e->store[i]->expires_ms) {
+			free(e->store[i]);
+			e->store[i] = NULL;
+		}
+	}
+}
+
+static struct b44_item **store_slot_of(struct bep44_engine *e,
+				       const uint8_t target[20])
+{
+	int i;
+
+	for (i = 0; i < B44_STORE_MAX; i++) {
+		if (e->store[i] && !memcmp(e->store[i]->target, target, 20))
+			return &e->store[i];
+	}
+	return NULL;
+}
+
+/*
+ * A free slot for an item at new_target, evicting if need be. The victim is the
+ * stored item furthest from our own id: the one we are least responsible for
+ * holding, and so the one its owner is most likely to also have stored on
+ * better-placed nodes. When the store is full, the incoming item is admitted
+ * only if it is closer to our id than that furthest item -- so a flood of
+ * distant items cannot evict a nearby one we are the right node to hold. -1
+ * means "full, and this item is the least important of all": decline it.
+ */
+static int store_free_slot(struct bep44_engine *e, const uint8_t new_target[20])
+{
+	uint8_t vdist[20], ndist[20];
+	int i, victim = -1;
+
+	for (i = 0; i < B44_STORE_MAX; i++) {
+		if (!e->store[i])
+			return i;
+	}
+	for (i = 0; i < B44_STORE_MAX; i++) {
+		uint8_t d[20];
+
+		dist_calc(d, e->store[i]->target, e->myid);
+		if (victim < 0 || memcmp(d, vdist, 20) > 0) {
+			victim = i;
+			memcpy(vdist, d, 20);
+		}
+	}
+	dist_calc(ndist, new_target, e->myid);
+	if (memcmp(ndist, vdist, 20) >= 0)
+		return -1;			/* no closer than what we hold */
+	free(e->store[victim]);
+	e->store[victim] = NULL;
+	return victim;
+}
+
+static struct b44_item *item_new(const uint8_t target[20], const uint8_t *v,
+				 size_t v_len, uint64_t now)
+{
+	struct b44_item *it = calloc(1, sizeof(*it) + v_len);
+
+	if (!it)
+		return NULL;
+	memcpy(it->target, target, 20);
+	memcpy(it->v, v, v_len);
+	it->v_len = (uint16_t)v_len;
+	it->expires_ms = now + B44_ITEM_TTL_MS;
+	return it;
+}
+
+/* -- the node cache ------------------------------------------------------ */
+
+/*
+ * Nodes we have seen with their ids, so a get we answer can name closer ones
+ * and the asker's lookup keeps converging. Fed from the compact node lists our
+ * own lookups collect and from peers whose write token proved their address.
+ */
+static void cache_add(struct bep44_engine *e, const uint8_t id[20],
+		      const struct sockaddr *sa, socklen_t salen)
+{
+	struct b44_cnode *c;
+	int i;
+
+	/*
+	 * The id is only ever claimed, never proven (a write token proves the
+	 * address, not the id it travels with), so a poisoned referral can at
+	 * worst mislead a lookup -- values stay Ed25519-verified regardless.
+	 * What is enforced here is that the address is real and routable and
+	 * that one host holds at most one slot.
+	 */
+	if (!e->serving || !id || !id_nonzero(id) || !sa ||
+	    (size_t)salen > sizeof(c->ss) || !node_addr_usable(sa, salen) ||
+	    addr_martian(sa, salen) || !memcmp(id, e->myid, 20))
+		return;
+	for (i = 0; i < B44_CACHE_MAX; i++) {
+		c = &e->cache[i];
+		if (c->sslen && addr_same_host(sa, salen, &c->ss, c->sslen)) {
+			memcpy(c->id, id, 20);
+			memcpy(&c->ss, sa, salen);
+			c->sslen = salen;
+			c->seen_ms = now_ms();
+			return;
+		}
+	}
+	c = &e->cache[e->cache_next];
+	e->cache_next = (e->cache_next + 1) % B44_CACHE_MAX;
+	memset(c, 0, sizeof(*c));
+	memcpy(c->id, id, 20);
+	memcpy(&c->ss, sa, salen);
+	c->sslen = salen;
+	c->seen_ms = now_ms();
+}
+
+static size_t cache_nodes(struct bep44_engine *e, const uint8_t target[20],
+			  int af, uint8_t *out, size_t out_cap)
+{
+	uint8_t pdist[B44_REPLY_NODES][20];
+	int pick[B44_REPLY_NODES];
+	size_t entry = af == AF_INET ? 26 : 38;
+	uint64_t now = now_ms();
+	int i, j, n = 0;
+	size_t len = 0;
+
+	if (out_cap < entry)
+		return 0;
+	for (i = 0; i < B44_CACHE_MAX; i++) {
+		struct b44_cnode *c = &e->cache[i];
+		uint8_t d[20];
+
+		if (!c->sslen || c->ss.ss_family != af ||
+		    now - c->seen_ms > B44_CACHE_TTL_MS)
+			continue;
+		dist_calc(d, c->id, target);
+		for (j = 0; j < n; j++) {
+			if (memcmp(d, pdist[j], 20) < 0)
+				break;
+		}
+		if (j >= B44_REPLY_NODES)
+			continue;
+		if (n < B44_REPLY_NODES)
+			n++;
+		for (int m = n - 1; m > j; m--) {
+			pick[m] = pick[m - 1];
+			memcpy(pdist[m], pdist[m - 1], 20);
+		}
+		pick[j] = i;
+		memcpy(pdist[j], d, 20);
+	}
+	for (i = 0; i < n && len + entry <= out_cap; i++) {
+		struct b44_cnode *c = &e->cache[pick[i]];
+
+		memcpy(out + len, c->id, 20);
+		if (af == AF_INET) {
+			const struct sockaddr_in *s =
+				(const struct sockaddr_in *)&c->ss;
+
+			memcpy(out + len + 20, &s->sin_addr, 4);
+			memcpy(out + len + 24, &s->sin_port, 2);
+		} else {
+			const struct sockaddr_in6 *s =
+				(const struct sockaddr_in6 *)&c->ss;
+
+			memcpy(out + len + 20, &s->sin6_addr, 16);
+			memcpy(out + len + 36, &s->sin6_port, 2);
+		}
+		len += entry;
+	}
+	return len;
+}
+
+/* -- incoming queries ---------------------------------------------------- */
+
+struct b44_query {
+	struct bep44_engine *e;
+	const uint8_t *tid;
+	size_t tid_len;
+	const uint8_t *id;
+	const struct sockaddr *from;
+	socklen_t fromlen;
+	const uint8_t *args;
+	size_t args_len;
+	uint8_t want4;
+	uint8_t want6;
+};
+
+static void query_send(struct b44_query *q, const uint8_t *msg, size_t len)
+{
+	struct sockaddr_storage ss;
+
+	if (!q->from || !q->fromlen || (size_t)q->fromlen > sizeof(ss))
+		return;
+	memset(&ss, 0, sizeof(ss));
+	memcpy(&ss, q->from, q->fromlen);
+	msg_send(q->e, &ss, q->fromlen, msg, len);
+}
+
+/* A KRPC error is y="e" with e=[code, message] and no r dict at all. */
+static void send_error(struct b44_query *q, int code, const char *msg)
+{
+	uint8_t buf[256];
+	struct benc_buf b;
+
+	benc_buf_init(&b, buf, sizeof(buf));
+	benc_raw_add(&b, "d1:el", 5);
+	benc_int_add(&b, code);
+	benc_str_add(&b, msg, strlen(msg));
+	benc_raw_add(&b, "e1:t", 4);
+	benc_str_add(&b, q->tid, q->tid_len);
+	benc_raw_add(&b, "1:y1:ee", 7);
+	if (!b.err)
+		query_send(q, buf, b.len);
+}
+
+static void send_ack(struct b44_query *q)
+{
+	uint8_t buf[128];
+	struct benc_buf b;
+
+	benc_buf_init(&b, buf, sizeof(buf));
+	benc_raw_add(&b, "d1:rd", 5);
+	benc_key_add(&b, "id");
+	benc_str_add(&b, q->e->myid, 20);
+	benc_raw_add(&b, "e1:t", 4);
+	benc_str_add(&b, q->tid, q->tid_len);
+	benc_raw_add(&b, "1:y1:re", 7);
+	if (!b.err)
+		query_send(q, buf, b.len);
+}
+
+/*
+ * Argument accessors with three outcomes, because a field that is present but
+ * malformed must never be mistaken for one that is absent: reading a mangled
+ * cas as "no cas given" is exactly how a compare-and-swap gets bypassed.
+ * 0 = present and of the wanted type, 1 = absent, -1 = present but malformed.
+ * These distinguish a field's own type; a put runs benc_canonical over the
+ * whole args dict first, so a dict that stops parsing before the field cannot
+ * masquerade as the field being absent. A get carries nothing signed, so the
+ * worst such a malformed get can do is hide the asker's own conditional seq.
+ */
+static int arg_raw(struct b44_query *q, const char *key, const uint8_t **data,
+		   size_t *len)
+{
+	if (!q->args || benc_dict_find(q->args, q->args_len, key, data, len))
+		return 1;
+	return 0;
+}
+
+static int arg_str(struct b44_query *q, const char *key, const uint8_t **data,
+		   size_t *len)
+{
+	const uint8_t *val;
+	size_t val_len;
+
+	if (!q->args ||
+	    benc_dict_find(q->args, q->args_len, key, &val, &val_len))
+		return 1;
+	return benc_str_get(val, val_len, data, len) ? -1 : 0;
+}
+
+static int arg_int(struct b44_query *q, const char *key, int64_t *out)
+{
+	const uint8_t *val;
+	size_t val_len;
+
+	if (!q->args ||
+	    benc_dict_find(q->args, q->args_len, key, &val, &val_len))
+		return 1;
+	return benc_int_get(val, val_len, out) ? -1 : 0;
+}
+
+static void handle_get(struct b44_query *q)
+{
+	struct bep44_engine *e = q->e;
+	const uint8_t *target;
+	size_t tlen, nlen;
+	int64_t want_seq = 0;
+	int rc, have_seq, serve_value = 1;
+	struct b44_item **slot, *it = NULL;
+	uint8_t msg[B44_MSG_MAX];
+	uint8_t nodes[B44_REPLY_NODES * 38];
+	uint8_t token[B44_TOKEN_LEN];
+	struct benc_buf b;
+
+	if (arg_str(q, "target", &target, &tlen) || tlen != 20) {
+		send_error(q, 203, "get requires a 20-byte target");
+		return;
+	}
+	rc = arg_int(q, "seq", &want_seq);
+	if (rc < 0) {
+		send_error(q, 203, "seq must be an integer");
+		return;
+	}
+	have_seq = rc == 0;
+
+	store_expire(e, now_ms());
+	slot = store_slot_of(e, target);
+	if (slot)
+		it = *slot;
+	/*
+	 * A conditional get withholds the value only from an asker that already
+	 * has this seq or a better one. There is no floor on the asker's seq: a
+	 * negative one is below every stored seq, so the value is still due. An
+	 * immutable item has no seq to compare and is always served.
+	 */
+	if (it && it->is_mutable && have_seq && it->seq <= want_seq)
+		serve_value = 0;
+
+	token_make(token, e->token_secret[0], q->from, q->fromlen, target);
+
+	benc_buf_init(&b, msg, sizeof(msg));
+	benc_raw_add(&b, "d1:rd", 5);
+	benc_key_add(&b, "id");
+	benc_str_add(&b, e->myid, 20);
+	if (it && it->is_mutable && serve_value) {
+		benc_key_add(&b, "k");
+		benc_str_add(&b, it->k, 32);
+	}
+	/*
+	 * Referrals and a value are alternatives, not a pair: once the value is
+	 * in the reply the asker's lookup is over, so leaving the node lists out
+	 * keeps the reply inside one datagram. A get is unauthenticated, so a
+	 * value reply is still larger than the query -- the rate limiter, not
+	 * this, is what bounds that reflection.
+	 */
+	if (!(it && serve_value)) {
+		if (q->want4) {
+			nlen = cache_nodes(e, target, AF_INET, nodes,
+					   sizeof(nodes));
+			if (nlen) {
+				benc_key_add(&b, "nodes");
+				benc_str_add(&b, nodes, nlen);
+			}
+		}
+		if (q->want6) {
+			nlen = cache_nodes(e, target, AF_INET6, nodes,
+					   sizeof(nodes));
+			if (nlen) {
+				benc_key_add(&b, "nodes6");
+				benc_str_add(&b, nodes, nlen);
+			}
+		}
+	}
+	if (it && it->is_mutable) {
+		benc_key_add(&b, "seq");
+		benc_int_add(&b, it->seq);
+	}
+	if (it && it->is_mutable && serve_value) {
+		benc_key_add(&b, "sig");
+		benc_str_add(&b, it->sig, 64);
+	}
+	benc_key_add(&b, "token");
+	benc_str_add(&b, token, B44_TOKEN_LEN);
+	if (it && serve_value) {
+		benc_key_add(&b, "v");
+		benc_raw_add(&b, it->v, it->v_len);
+	}
+	benc_raw_add(&b, "e1:t", 4);
+	benc_str_add(&b, q->tid, q->tid_len);
+	benc_raw_add(&b, "1:y1:re", 7);
+	if (!b.err)
+		query_send(q, msg, b.len);
+}
+
+static void handle_put(struct b44_query *q)
+{
+	struct bep44_engine *e = q->e;
+	const uint8_t *v, *tok, *k = NULL, *sig = NULL, *salt = NULL;
+	size_t v_len, tok_len, k_len = 0, sig_len = 0, salt_len = 0;
+	int64_t seq = 0, cas = 0;
+	int have_k, have_sig, have_salt, have_seq, have_cas, is_mutable, rc;
+	uint8_t target[20];
+	uint8_t sigbuf[BEP44_MAX_VALUE + 128];
+	uint64_t now = now_ms();
+	struct b44_item **slot, *it, *fresh;
+
+	/*
+	 * The signature covers the value's exact bytes, so an item encoded
+	 * non-canonically cannot survive a hop that re-encodes it. Refuse the
+	 * put rather than store something nobody downstream can verify.
+	 */
+	if (benc_canonical(q->args, q->args_len)) {
+		send_error(q, 203, "put arguments are not canonical bencode");
+		return;
+	}
+	if (arg_raw(q, "v", &v, &v_len)) {
+		send_error(q, 203, "put requires v");
+		return;
+	}
+
+	rc = arg_str(q, "k", &k, &k_len);
+	if (rc < 0) {
+		send_error(q, 203, "k must be a string");
+		return;
+	}
+	have_k = rc == 0;
+	rc = arg_str(q, "sig", &sig, &sig_len);
+	if (rc < 0) {
+		send_error(q, 203, "sig must be a string");
+		return;
+	}
+	have_sig = rc == 0;
+	rc = arg_str(q, "salt", &salt, &salt_len);
+	if (rc < 0) {
+		send_error(q, 203, "salt must be a string");
+		return;
+	}
+	have_salt = rc == 0;
+	rc = arg_int(q, "seq", &seq);
+	if (rc < 0) {
+		send_error(q, 203, "seq must be an integer");
+		return;
+	}
+	have_seq = rc == 0;
+	rc = arg_int(q, "cas", &cas);
+	if (rc < 0) {
+		send_error(q, 203, "cas must be an integer");
+		return;
+	}
+	have_cas = rc == 0;
+
+	/*
+	 * Any one mutable field commits the put to being mutable, and then all
+	 * of k, sig and seq must be there and well formed. A malformed mutable
+	 * put is refused outright, never quietly demoted to an immutable store
+	 * at sha1(v): that turns a write the sender never authorised into one
+	 * that lands under a name they cannot predict.
+	 */
+	is_mutable = have_k || have_sig || have_seq || have_cas;
+	if (is_mutable &&
+	    (!have_k || !have_sig || !have_seq || k_len != 32 ||
+	     sig_len != 64 || seq < 0)) {
+		send_error(q, 203, "incomplete or malformed mutable put");
+		return;
+	}
+	if (!have_salt)
+		salt_len = 0;
+
+	/* The target is derived here and nowhere else; a target sent in the
+	 * put is not consulted, or any signed value could squat any id. */
+	if (is_mutable)
+		target_n(target, k, salt, salt_len);
+	else
+		cc_sha1(target, v, v_len);
+
+	if (arg_str(q, "token", &tok, &tok_len) ||
+	    !token_valid(e, tok, tok_len, q->from, q->fromlen, target)) {
+		send_error(q, 203, "bad write token");
+		return;
+	}
+	if (v_len > BEP44_MAX_VALUE) {
+		send_error(q, 205, "message (v field) too big");
+		return;
+	}
+	if (salt_len > BEP44_MAX_SALT) {
+		send_error(q, 207, "salt (salt field) too big");
+		return;
+	}
+	if (is_mutable) {
+		size_t n = sig_buffer_n(sigbuf, sizeof(sigbuf), salt, salt_len,
+					seq, v, v_len);
+
+		if (!n || cc_ed25519_check(sig, k, sigbuf, n)) {
+			send_error(q, 206, "invalid signature");
+			return;
+		}
+	}
+
+	store_expire(e, now);
+	slot = store_slot_of(e, target);
+	it = slot ? *slot : NULL;
+	if (it) {
+		if (it->is_mutable != (is_mutable ? 1 : 0)) {
+			send_error(q, 203,
+				   "cannot replace an item with the other kind");
+			return;
+		}
+		if (!it->is_mutable) {
+			/* Immutable: the value is its own name, so a repeat put
+			 * carries the same bytes. Keep it alive. */
+			it->expires_ms = now + B44_ITEM_TTL_MS;
+			send_ack(q);
+			return;
+		}
+		if (have_cas && cas != it->seq) {
+			send_error(q, 301,
+				   "CAS mismatched, re-read value and try again");
+			return;
+		}
+		if (seq == it->seq && v_len == it->v_len &&
+		    !memcmp(v, it->v, v_len)) {
+			it->expires_ms = now + B44_ITEM_TTL_MS;
+			send_ack(q);
+			return;
+		}
+		if (seq <= it->seq) {
+			send_error(q, 302, "sequence number less than current");
+			return;
+		}
+	}
+
+	fresh = item_new(target, v, v_len, now);
+	if (!fresh) {
+		send_error(q, 202, "server error");
+		return;
+	}
+	if (is_mutable) {
+		fresh->is_mutable = 1;
+		fresh->seq = seq;
+		memcpy(fresh->k, k, 32);
+		memcpy(fresh->sig, sig, 64);
+		if (salt_len)
+			memcpy(fresh->salt, salt, salt_len);
+		fresh->salt_len = (uint8_t)salt_len;
+	}
+	if (slot) {
+		free(*slot);
+		*slot = fresh;
+	} else {
+		int at = store_free_slot(e, target);
+
+		if (at < 0) {
+			/* The store is full of items we are a closer node for.
+			 * Acknowledge -- the value lives on the nodes that are
+			 * its proper home -- but do not evict a nearer item. */
+			free(fresh);
+			send_ack(q);
+			return;
+		}
+		e->store[at] = fresh;
+	}
+	send_ack(q);
+}
+
+/* BEP 32: which address families the asker wants back. Absent means the one it
+ * reached us on, which is all a v4-only or v6-only peer can use anyway. */
+static void want_parse(struct b44_query *q)
+{
+	const uint8_t *want;
+	size_t want_len, i;
+
+	if (arg_raw(q, "want", &want, &want_len)) {
+		q->want4 = q->from && q->from->sa_family == AF_INET;
+		q->want6 = q->from && q->from->sa_family == AF_INET6;
+		return;
+	}
+	for (i = 0; i + 4 <= want_len; i++) {
+		if (!memcmp(want + i, "2:n4", 4))
+			q->want4 = 1;
+		else if (!memcmp(want + i, "2:n6", 4))
+			q->want6 = 1;
+	}
+}
+
+/*
+ * A token bucket over served queries: refill at B44_RL_RATE per second up to
+ * B44_RL_BURST, spend one per query answered. This caps the rate at which an
+ * unauthenticated get can be turned into a reflected reply, the protection
+ * jech/dht applies at its own ingress that a get/put no longer passes through.
+ */
+static int rate_ok(struct bep44_engine *e)
+{
+	uint64_t now = now_ms();
+
+	if (now > e->rl_ms) {
+		int64_t add = (int64_t)(now - e->rl_ms) * B44_RL_RATE / 1000;
+
+		if (add > 0) {
+			int64_t t = e->rl_tokens + add;
+
+			e->rl_tokens = t > B44_RL_BURST ? B44_RL_BURST : (int32_t)t;
+			e->rl_ms = now;
+		}
+	}
+	if (e->rl_tokens <= 0)
+		return 0;
+	e->rl_tokens--;
+	return 1;
+}
+
+static int query_handle(struct bep44_engine *e, const uint8_t *buf, size_t len,
+			const struct sockaddr *from, socklen_t fromlen)
+{
+	struct b44_query q;
+	const uint8_t *val, *meth;
+	size_t val_len, meth_len, id_len;
+	int is_put;
+
+	if (!e->serving)
+		return 0;
+	if (benc_dict_find(buf, len, "q", &val, &val_len) ||
+	    benc_str_get(val, val_len, &meth, &meth_len) || meth_len != 3)
+		return 0;
+	if (!memcmp(meth, "get", 3))
+		is_put = 0;
+	else if (!memcmp(meth, "put", 3))
+		is_put = 1;
+	else
+		return 0;
+
+	/*
+	 * A martian source is dropped, not served: it is either spoofed (so a
+	 * reply is a reflection aimed at that address) or unroutable. It is
+	 * consumed here rather than handed on, since jech/dht would only drop it
+	 * too. Over the rate limit, likewise drop it silently.
+	 */
+	if (addr_martian(from, fromlen) || !rate_ok(e))
+		return 1;
+
+	/* From here the query is ours to answer, well formed or not: falling
+	 * through would let the BEP 5 engine reply to it as well. */
+	memset(&q, 0, sizeof(q));
+	q.e = e;
+	q.from = from;
+	q.fromlen = fromlen;
+	if (benc_dict_find(buf, len, "t", &val, &val_len) ||
+	    benc_str_get(val, val_len, &q.tid, &q.tid_len) ||
+	    q.tid_len > B44_TID_MAX)
+		return 1;		/* nothing to address a reply to */
+
+	if (benc_dict_find(buf, len, "a", &val, &val_len) || val_len < 2 ||
+	    val[0] != 'd') {
+		send_error(&q, 203, "missing arguments dict");
+		return 1;
+	}
+	q.args = val;
+	q.args_len = val_len;
+	if (arg_str(&q, "id", &q.id, &id_len) || id_len != 20) {
+		send_error(&q, 203, "bad node id");
+		return 1;
+	}
+	if (is_put) {
+		handle_put(&q);
+	} else {
+		want_parse(&q);
+		handle_get(&q);
+	}
+	return 1;
+}
+
+int bep44_serve(struct bep44_engine *e, int enable)
+{
+	if (!enable) {
+		e->serving = 0;
+		return 0;
+	}
+	if (!e->serving) {
+		if (random_bytes(e->token_secret[0], B44_SECRET_LEN) ||
+		    random_bytes(e->token_secret[1], B44_SECRET_LEN))
+			return -1;
+		e->token_rotate_ms = now_ms() + B44_TOKEN_ROTATE_MS;
+		e->rl_tokens = B44_RL_BURST;
+		e->rl_ms = now_ms();
+		e->serving = 1;
+	}
+	return 0;
+}
+
+/*
+ * Returns 1 when the datagram was consumed here -- one of our replies, or a
+ * get/put we answered or deliberately dropped (martian, rate-limited, or
+ * unanswerable) -- and 0 when the caller should hand it to its BEP 5 engine
+ * instead. Nothing is ever answered by both.
+ */
 int bep44_input(struct bep44_engine *e, const uint8_t *buf, size_t len,
 		const struct sockaddr *from, socklen_t fromlen)
 {
@@ -900,22 +1878,24 @@ int bep44_input(struct bep44_engine *e, const uint8_t *buf, size_t len,
 	int is_error;
 	struct b44_op *op;
 
+	if (benc_dict_find(buf, len, "y", &val, &val_len) ||
+	    benc_str_get(val, val_len, &y, &y_len) || y_len != 1)
+		return 0;
+	if (y[0] == 'q')
+		return query_handle(e, buf, len, from, fromlen);
+	if (y[0] == 'e')
+		is_error = 1;
+	else if (y[0] == 'r')
+		is_error = 0;
+	else
+		return 0;
+
 	if (benc_dict_find(buf, len, "t", &val, &val_len) ||
 	    benc_str_get(val, val_len, &t, &t_len))
 		return 0;
 	if (t_len != 4 || t[0] != 'p' || t[1] != 'm')
 		return 0;
 	tid = (uint16_t)(t[2] | t[3] << 8);
-
-	if (benc_dict_find(buf, len, "y", &val, &val_len) ||
-	    benc_str_get(val, val_len, &y, &y_len) || y_len != 1)
-		return 1;
-	if (y[0] == 'e')
-		is_error = 1;
-	else if (y[0] == 'r')
-		is_error = 0;
-	else
-		return 1;
 
 	for (op = e->ops; op; op = op->next) {
 		int i;
@@ -946,6 +1926,13 @@ int bep44_periodic(struct bep44_engine *e, int *timeout_ms)
 {
 	struct b44_op *op = e->ops;
 
+	if (e->serving) {
+		uint64_t now = now_ms();
+
+		token_rotate(e, now);
+		store_expire(e, now);
+	}
+
 	while (op) {
 		struct b44_op *next = op->next;
 
@@ -958,22 +1945,17 @@ int bep44_periodic(struct bep44_engine *e, int *timeout_ms)
 	return e->ops != NULL;
 }
 
-static struct b44_op *op_create(struct bep44_engine *e, const uint8_t pk[32],
-				const char *salt, int direct)
+static struct b44_op *op_new(struct bep44_engine *e, const uint8_t target[20],
+			    int direct)
 {
-	struct b44_op *op;
+	struct b44_op *op = calloc(1, sizeof(*op));
 	int i;
 
-	if (strlen(salt) > BEP44_MAX_SALT)
-		return NULL;
-	op = calloc(1, sizeof(*op));
 	if (!op)
 		return NULL;
 	op->e = e;
 	op->direct = (uint8_t)(direct != 0);
-	memcpy(op->pk, pk, 32);
-	strcpy(op->salt, salt);
-	bep44_target(op->target, pk, salt);
+	memcpy(op->target, target, 20);
 	op->start_ms = now_ms();
 	op->phase = B44_PHASE_LOOKUP;
 
@@ -1009,6 +1991,23 @@ static struct b44_op *op_create(struct bep44_engine *e, const uint8_t pk[32],
 
 	op->next = e->ops;
 	e->ops = op;
+	return op;
+}
+
+static struct b44_op *op_create(struct bep44_engine *e, const uint8_t pk[32],
+				const char *salt, int direct)
+{
+	struct b44_op *op;
+	uint8_t target[20];
+
+	if (strlen(salt) > BEP44_MAX_SALT)
+		return NULL;
+	bep44_target(target, pk, salt);
+	op = op_new(e, target, direct);
+	if (!op)
+		return NULL;
+	memcpy(op->pk, pk, 32);
+	strcpy(op->salt, salt);
 	return op;
 }
 
@@ -1073,7 +2072,7 @@ int bep44_put(struct bep44_engine *e, const uint8_t sk[64], const uint8_t pk[32]
 {
 	struct b44_op *op;
 
-	if (v_len > BEP44_MAX_VALUE)
+	if (!v_len || v_len > BEP44_MAX_VALUE)
 		return -1;
 	op = op_create(e, pk, salt, 0);
 	if (!op)
@@ -1149,4 +2148,41 @@ int bep44_get_direct(struct bep44_engine *e, const uint8_t pk[32],
 		     const char *salt, bep44_get_cb *cb, void *arg)
 {
 	return get_impl(e, pk, salt, 1, cb, arg);
+}
+
+int bep44_put_immutable(struct bep44_engine *e, const uint8_t *v, size_t v_len,
+			bep44_put_cb *cb, void *arg)
+{
+	struct b44_op *op;
+	uint8_t target[20];
+
+	if (!v_len || v_len > BEP44_MAX_VALUE)
+		return -1;
+	cc_sha1(target, v, v_len);
+	op = op_new(e, target, 0);
+	if (!op)
+		return -1;
+	op->is_put = 1;
+	op->is_immutable = 1;
+	op->cas = -1;
+	memcpy(op->value, v, v_len);
+	op->value_len = (uint16_t)v_len;
+	op->put_cb = cb;
+	op->cb_arg = arg;
+	op_step(op);
+	return 0;
+}
+
+int bep44_get_immutable(struct bep44_engine *e, const uint8_t target[20],
+			bep44_get_cb *cb, void *arg)
+{
+	struct b44_op *op = op_new(e, target, 0);
+
+	if (!op)
+		return -1;
+	op->is_immutable = 1;
+	op->get_cb = cb;
+	op->cb_arg = arg;
+	op_step(op);
+	return 0;
 }

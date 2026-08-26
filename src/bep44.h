@@ -86,8 +86,26 @@ int bep44_update_direct(struct bep44_engine *e, const uint8_t sk[64],
 			bep44_merge_fn *merge, void *merge_arg,
 			bep44_put_cb *cb, void *arg);
 
+/*
+ * Serve BEP 44 to the network: hold items other peers store here and answer
+ * their get and put. Off until enabled, so an embedder that only reads and
+ * writes its own items stores nothing for anybody else.
+ */
+int bep44_serve(struct bep44_engine *e, int enable);
+
+/*
+ * Immutable items: the value is its own name, so there is no key, salt, seq or
+ * signature, and no way to change what a target resolves to. A get reports
+ * seq -1. The value passed to put is already bencoded, as for bep44_put.
+ */
+int bep44_put_immutable(struct bep44_engine *e, const uint8_t *v, size_t v_len,
+			bep44_put_cb *cb, void *arg);
+int bep44_get_immutable(struct bep44_engine *e, const uint8_t target[20],
+			bep44_get_cb *cb, void *arg);
+
 size_t bep44_sig_buffer(uint8_t *dst, size_t dst_len, const char *salt,
 			int64_t seq, const uint8_t *v, size_t v_len);
 void bep44_target(uint8_t target[20], const uint8_t pk[32], const char *salt);
+void bep44_immutable_target(uint8_t target[20], const uint8_t *v, size_t v_len);
 
 #endif
