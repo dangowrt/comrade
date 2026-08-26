@@ -17,6 +17,7 @@
 #include "nat.h"
 #include "netmon.h"
 #include "netstate.h"
+#include "nsfacts.h"
 #include "path.h"
 #include "session.h"
 #include "sig.h"
@@ -103,19 +104,6 @@ static int fam_idx(int family)
 	return family == 6 ? 1 : 0;
 }
 
-#define NS_FACTS_MAX 16
-enum {
-	NSF_ROUNDTRIP,			/* something answered us */
-	NSF_PROBE_DONE,			/* a probe round ended, proving nothing */
-	NSF_ADDR			/* and the address it said we are seen as */
-};
-struct ns_fact {
-	int kind;
-	int family;
-	uint32_t epoch;			/* which network it was learnt on */
-	uint8_t addr[16];		/* NSF_ADDR: as bytes, and as printed */
-	char text[64];
-};
 /*
  * Backstop only, well above real-internet connect time: libjuice reaches its
  * own FAILED verdict after a full ICE negotiation, which drives retry; this
@@ -551,8 +539,7 @@ struct sess {
 	unsigned net_ch;		/* families whose move the loop still owes
 					 * its own teardown for */
 	pthread_mutex_t ns_lock;
-	struct ns_fact ns_facts[NS_FACTS_MAX];
-	int ns_nfacts;
+	struct nsfacts ns_facts;
 	/* The epoch each producer was started for, stamped before it starts. */
 	volatile uint32_t probe_epoch[2];
 	volatile uint32_t gather_epoch[2];
@@ -1441,14 +1428,7 @@ static void on_local_sdp(void *arg, const char *sdp)
 static void ns_post(struct sess *s, int kind, int family, uint32_t epoch)
 {
 	pthread_mutex_lock(&s->ns_lock);
-	if (s->ns_nfacts < NS_FACTS_MAX) {
-		struct ns_fact *f = &s->ns_facts[s->ns_nfacts++];
-
-		memset(f, 0, sizeof(*f));
-		f->kind = kind;
-		f->family = family;
-		f->epoch = epoch;
-	}
+	nsfacts_post(&s->ns_facts, kind, family, epoch);
 	pthread_mutex_unlock(&s->ns_lock);
 }
 
@@ -1456,16 +1436,7 @@ static void ns_post_addr(struct sess *s, int family, uint32_t epoch,
 			 const uint8_t *addr, const char *text)
 {
 	pthread_mutex_lock(&s->ns_lock);
-	if (s->ns_nfacts < NS_FACTS_MAX) {
-		struct ns_fact *f = &s->ns_facts[s->ns_nfacts++];
-
-		memset(f, 0, sizeof(*f));
-		f->kind = NSF_ADDR;
-		f->family = family;
-		f->epoch = epoch;
-		memcpy(f->addr, addr, family == 6 ? 16 : 4);
-		snprintf(f->text, sizeof(f->text), "%s", text);
-	}
+	nsfacts_post_addr(&s->ns_facts, family, epoch, addr, text);
 	pthread_mutex_unlock(&s->ns_lock);
 }
 
@@ -1474,13 +1445,11 @@ static void stun_probe6_reap(struct sess *s);
 
 static void ns_drain(struct sess *s)
 {
-	struct ns_fact f[NS_FACTS_MAX];
+	struct nsfact f[NSFACTS_OUT];
 	int n, i;
 
 	pthread_mutex_lock(&s->ns_lock);
-	n = s->ns_nfacts;
-	memcpy(f, s->ns_facts, sizeof(f[0]) * (size_t)n);
-	s->ns_nfacts = 0;
+	n = nsfacts_take(&s->ns_facts, f, NSFACTS_OUT);
 	pthread_mutex_unlock(&s->ns_lock);
 
 	for (i = 0; i < n; i++) {
@@ -5606,6 +5575,7 @@ int session_run(const struct session_cfg *cfg)
 	pthread_mutex_init(&s.pub_lock, NULL);
 	path_table_init(&s.c.paths);
 	pthread_mutex_init(&s.ns_lock, NULL);
+	nsfacts_init(&s.ns_facts);
 	netmon_init(&s.netmon);
 	netstate_init(&s.ns, cfg->is_host, now_ms());
 	s.next_roam_ms = now_ms() + (uint64_t)cfg->test_roam_ms;
