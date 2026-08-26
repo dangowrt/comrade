@@ -4088,6 +4088,25 @@ static void net_change_reset(struct sess *s)
 	stun_mapping_reset(&s->map4);
 	pthread_mutex_unlock(&s->trickle_lock);
 	s->stun_rotations = 0;		/* fresh budget on the new network */
+	/*
+	 * And a fresh place in the pool to spend it from. The budget above is
+	 * per network; the position it walks from was not, so each move handed
+	 * the new network wherever the last one had got to, and the walk was
+	 * unbounded across a session. Landing on a server that does not answer
+	 * then meant an offer with no reflexive address in it -- which looks
+	 * from this end exactly like one that works, while no peer can punch to
+	 * it -- and nothing ever moved off that server again. Restarting on the
+	 * very same network succeeded, because startup draws a fresh index.
+	 *
+	 * Random rather than zero, or the head of the list would take every
+	 * host's first attempt on every network.
+	 */
+	if (s->stun_count > 0) {
+		uint8_t rb[2];
+
+		random_bytes(rb, 2);
+		s->ice_attempt = ((rb[0] << 8) | rb[1]) % s->stun_count;
+	}
 	s->have_priv4 = 0;		/* and fresh v4 facts to run it on */
 	s->have_srflx4 = 0;
 	s->pool_reported = 0;
