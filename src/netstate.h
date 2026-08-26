@@ -62,18 +62,31 @@ enum {					/* how a local address was learnt */
  * one before publishing costs only us; cycling through nodes afterwards costs
  * everyone who was given the old one, and is worst exactly during a move.
  */
-#define NETSTATE_ANCHOR_QUALIFY 3
+#define NETSTATE_ANCHOR_QUALIFY 4
 #define NETSTATE_RDV_MS 2000		/* between re-validation attempts */
 
 /*
  * How long a node must go on answering before its address is put in a token.
  * Counting answers alone passes a node in a few seconds, which is long enough
- * to say it replied and far too short to say it is dependable. Making the
- * operator wait costs them a moment before the invite is complete; publishing
- * a node that then has to be taken back costs whoever they already sent it to
- * a session that simply does not connect.
+ * to say it replied and far too short to say it is dependable. Publishing a
+ * node that then has to be taken back costs whoever was already given it a
+ * session that simply does not connect.
+ *
+ * But the operator waits on exactly this: the invite is incomplete until a
+ * rendezvous has qualified, and every second of it is a second spent watching
+ * a spinner for no reason they can see. The whole decision is to be made
+ * within fifteen seconds of the store that put the value there, so the window
+ * has to leave room for the first answer to come back.
+ *
+ * Halving it does not buy the time by asking for less. The direct get already
+ * runs once a second, so answers arrive far faster than the old window needed
+ * and nearly all of it was spent waiting rather than learning; one more answer
+ * over half the time is a denser demand, not a weaker one -- 0.4 answers a
+ * second where it used to be 0.15. It also asks nothing extra of the node,
+ * which matters where a rendezvous rate-limits by source address and a whole
+ * carrier NAT shares the budget.
  */
-#define NETSTATE_ANCHOR_PROVE_MS 20000
+#define NETSTATE_ANCHOR_PROVE_MS 10000
 
 /*
  * The same window seen from the other end: how long a node is given to manage

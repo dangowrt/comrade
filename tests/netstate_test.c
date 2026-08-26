@@ -600,6 +600,53 @@ static void a_client_holds_no_trial_until_it_is_asked(void)
 	assert(!netstate_anchor(&ns, 4, NULL, NULL, NULL));
 }
 
+/*
+ * The operator waits on this one: the invite is incomplete until a rendezvous
+ * has qualified. A node answering at the direct get's own cadence has to be
+ * decided within fifteen seconds of the store that placed the value, leaving
+ * room inside that for the first answer to come back.
+ */
+static void qualifying_is_decided_within_fifteen_seconds(void)
+{
+	struct netstate ns;
+	uint8_t node[16];
+	uint64_t first;
+	int confirmed = 0, i;
+
+	start(&ns, 1);
+	give_src(&ns, 6, 20);
+	fill(node, 16, 70);
+	first = t;
+
+	/* One answer a second, which is what the direct get produces. */
+	for (i = 0; i < 30; i++) {
+		netstate_on_dht_ack(&ns, 6, netstate_epoch(&ns, 6), node, 16, t);
+		netstate_tick(&ns, t);
+		if (netstate_anchor(&ns, 6, NULL, NULL, &confirmed) && confirmed)
+			break;
+		t += 1000;
+	}
+	assert(confirmed);
+	assert(t - first <= 15000);
+
+	/* And it is still a run of answers over time, not a count collected in
+	 * an instant: the same number arriving at once does not qualify. */
+	{
+		struct netstate burst;
+		int c2 = 0;
+
+		start(&burst, 1);
+		give_src(&burst, 6, 20);
+		for (i = 0; i < NETSTATE_ANCHOR_QUALIFY * 3; i++)
+			netstate_on_dht_ack(&burst, 6,
+					    netstate_epoch(&burst, 6), node, 16,
+					    t);
+		netstate_tick(&burst, t);
+		assert(netstate_anchor(&burst, 6, NULL, NULL, &c2));
+		assert(!c2);
+	}
+}
+
 static void latest_change_wins(void)
 {
 	struct netstate ns;
@@ -1075,6 +1122,7 @@ int main(void)
 	a_qualified_node_outlives_the_deadline();
 	an_offered_node_is_not_on_trial();
 	a_move_gives_a_candidate_a_fresh_run();
+	qualifying_is_decided_within_fifteen_seconds();
 	a_dead_first_answer_does_not_hold_the_place();
 	a_busy_candidate_does_not_unseat_a_proven_node();
 	a_client_holds_no_trial_until_it_is_asked();
