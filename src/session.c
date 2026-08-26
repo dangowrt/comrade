@@ -145,6 +145,22 @@ struct ns_fact {
  * must not cut short.
  */
 #define HOST_PUNCH_MS 15000
+/*
+ * How long a punched connection has to become a session before the host gives
+ * up on it and frees the claimant.
+ *
+ * This used to be bounded by connect_timeout_s, which is a different question:
+ * that is how long the operator is willing to wait for a session at all, and a
+ * host sets it in minutes (or, for a test harness, whatever it likes). Waiting
+ * that long here holds the claimant's identity against every attempt it makes
+ * in the meantime, so a client whose punch connected on our side but never on
+ * its own was locked out for as long as the operator was patient -- the more
+ * patient the setting, the longer the lockout.
+ *
+ * Generous against a slow link's key exchange, short against a session that is
+ * never coming.
+ */
+#define HOST_HANDSHAKE_MS 30000
 
 /*
  * If, this long after start, we still hold only a private/CGNAT IPv4 and STUN
@@ -2364,6 +2380,7 @@ static void sdp_pwd(const char *sdp, char *out)
 /* Is this claimant already admitted over the direct path -- served by a LAN
  * worker, or queued for one? (host main thread only) */
 static int conn_is_lost(struct conn *c);
+static int conn_is_proven(struct conn *c);
 
 /*
  * A claimant already served over lanlink is refused a second admission -- once
@@ -3635,7 +3652,7 @@ static int conn_run(struct conn *c, int drive_sig)
 			 * (never is_host) stays up on loss, showing the outage
 			 * and letting the user quit or roam. Before the first pong,
 			 * the comrade-ctl channel may still be mid-handshake, so
-			 * silence is bounded by connect_timeout_s instead of the
+			 * silence is bounded by the handshake grace instead of the
 			 * tighter heartbeat-loss window. */
 			if (s->cfg->is_host) {
 				/* A recent resume pickup restarts the clock: the
@@ -3647,8 +3664,8 @@ static int conn_run(struct conn *c, int drive_sig)
 				    (!c->resume_last_ms ||
 				     now - c->resume_last_ms > HOST_REAP_MS))
 					done = 1;
-				else if (!pong_seen && now - conn_start >
-					 (uint64_t)s->cfg->connect_timeout_s * 1000) {
+				else if (!pong_seen &&
+					 now - conn_start > HOST_HANDSHAKE_MS) {
 					done = 1;
 					if (s->cfg->obs && s->cfg->obs->escalate)
 						s->cfg->obs->escalate(
@@ -4524,6 +4541,22 @@ static int conn_is_lost(struct conn *c)
 	return lost;
 }
 
+/*
+ * Has anything ever come back over this connection? A punch connecting proves
+ * the host's half of it and says nothing whatever about the client's, so until
+ * a pong has arrived there is no evidence a session exists here at all -- and
+ * "lost" cannot stand in, since a link that was never up never goes down.
+ */
+static int conn_is_proven(struct conn *c)
+{
+	int seen;
+
+	pthread_mutex_lock(&c->hb_lock);
+	seen = c->hb_pong_seen;
+	pthread_mutex_unlock(&c->hb_lock);
+	return seen;
+}
+
 /* Is this claimant queued for LAN admission (not yet a worker)? */
 static int lan_pending_ufrag(const struct sess *s, const char *ufrag)
 {
@@ -5150,7 +5183,8 @@ static int host_turnstile(struct sess *s)
 						 cu, cp, w ? 1 : 0, again, adm,
 						 lanq, just);
 
-					if (w && conn_is_lost(w) &&
+					if (w && (conn_is_lost(w) ||
+						  !conn_is_proven(w)) &&
 					    (again ||
 					     !punch_in_flight(s, punching, cu)) &&
 					    now_ms() - w->resume_last_ms >
@@ -5159,6 +5193,13 @@ static int host_turnstile(struct sess *s)
 						 * one thing allowed to take the
 						 * place of a punch we are running
 						 * for it. */
+						/* A worker that has never carried
+						 * anything counts as lost too:
+						 * the punch proved the host's
+						 * half and nothing else, and the
+						 * client saying it is still
+						 * trying is the only account of
+						 * the other half there is. */
 						if (again)
 							punch_retire(s, punching,
 								     punch_resume,
