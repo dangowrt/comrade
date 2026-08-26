@@ -54,15 +54,13 @@
  */
 #define HOST_REAP_MS 12000
 /*
- * Rendezvous keep-warm cadence. Re-validating a rendezvous node touches the
- * DHT, so do it rarely: a node dying AND a roam needing it inside the same
- * window is unlikely, and a full DHT lookup is always the fallback. Poll faster
- * only until the first node is captured after locate starts. The peer
- * announcement rides the transport (not the DHT), so it can refresh more often.
+ * Rendezvous announcement backstop. Each end tells the other where it
+ * rendezvous the moment the set moves -- a family newly qualified, a node
+ * replaced -- so nothing waits on a cadence to learn of it. The repeat is only
+ * there because a control frame is written into the channel without waiting to
+ * watch it leave.
  */
-#define RDV_WARM_MS 180000		/* 3 min: re-validate/keep warm */
-#define RDV_POLL_MS 5000		/* until the first node is captured */
-#define RDV_TELL_MS 30000		/* announce our nodes to the peer */
+#define RDV_TELL_MS 30000
 /*
  * Candidate advertisement cadence. Each end names its own local endpoints on
  * the shared lanlink socket over CTLM_CAND, so both explore the full set rather
@@ -73,12 +71,13 @@
  */
 #define CAND_TELL_MS 5000
 
-/* Rendezvous node kept for reconnection (ours when we can reach the family, or
- * the peer's for a family we cannot yet reach but might roam to). */
+/* One end's rendezvous node for one family: where its mailbox is served, and
+ * so where the other end reads it. */
 struct rdv_node {
 	struct sockaddr_storage sa;
 	socklen_t len;
 	int have;
+	int qualified;			/* proven here, so fit to hand over */
 };
 
 /* [0] is IPv4, [1] is IPv6. */
@@ -338,7 +337,8 @@ struct conn {
 	struct rdv_node rdv_in[2];
 	pthread_mutex_t rdv_lock;
 	int rdv_in_dirty;
-	uint64_t next_rdv_tell_ms;
+	uint32_t rdv_told_gen;		/* published set this peer has been told */
+	uint64_t next_rdv_tell_ms;	/* backstop repeat of that announcement */
 	uint64_t next_cand_ms;		/* when to advertise our own endpoints */
 
 	/* This connection's status (data only; the view renders it). */
@@ -425,12 +425,19 @@ struct sess {
 	char status_rdv[80];		/* located rendezvous endpoint (host side) */
 
 	/*
-	 * Rendezvous nodes we have located and keep warm for a fast reconnect:
-	 * [0]=v4 [1]=v6, our own located node per family (or the peer's, adopted
-	 * for one we cannot yet reach but might roam to).
+	 * Where this session rendezvous, as told to every peer: [0]=v4 [1]=v6,
+	 * with a generation each connection compares against what it has already
+	 * sent. Published from the model by the thread that owns it and read by
+	 * each connection on its own, which is why it is a copy behind a lock
+	 * rather than the model itself.
+	 *
+	 * Only ever added to or replaced, never retracted: a peer holding a node
+	 * we have stopped being sure of is better off than one holding none, and
+	 * the node keeps being served either way.
 	 */
 	struct rdv_node rdv[2];
-	uint64_t next_rdv_warm_ms;
+	uint32_t rdv_gen;
+	pthread_mutex_t rdv_pub_lock;
 
 	char **stun_servers;		/* rotated across ICE retries (host:port) */
 	int stun_count;
@@ -976,21 +983,24 @@ static void obs_report_net(struct sess *s)
 }
 
 /*
- * The rendezvous node for `family` (4 or 6), printable ("addr:port"). Prefer a
- * node located this session -- our own kept-warm one, or the peer's adopted over
- * the control channel -- so both families show once the in-band exchange has
- * caught up; fall back to whatever the token carried for that family.
+ * The rendezvous node for `family` (4 or 6), printable ("addr:port"). The
+ * published one, so both families show once the in-band exchange has caught up;
+ * fall back to whatever the token carried for that family. Called from each
+ * connection's own thread, hence the lock.
  */
 static void fmt_rdv_fam(struct sess *s, int family, char *out, size_t n)
 {
 	const struct token *t = &s->cfg->tok;
-	int i = fam_idx(family);
+	struct rdv_node r;
 	char ip[64];
 
+	pthread_mutex_lock(&s->rdv_pub_lock);
+	r = s->rdv[fam_idx(family)];
+	pthread_mutex_unlock(&s->rdv_pub_lock);
+
 	out[0] = '\0';
-	if (s->rdv[i].have)
-		fmt_sockaddr((struct sockaddr *)&s->rdv[i].sa, s->rdv[i].len,
-			     out, n);
+	if (r.have)
+		fmt_sockaddr((struct sockaddr *)&r.sa, r.len, out, n);
 	else if (family == 6 &&
 		 token_family_state(t, 6) == TOKEN_STATE_RENDEZVOUS &&
 		 inet_ntop(AF_INET6, t->ep6_addr, ip, sizeof(ip)))
@@ -1160,9 +1170,9 @@ static void sdp_filter_peer(const char *in, int family, char *out, size_t outlen
 }
 
 /*
- * The rendezvous node a fresh sig should be seeded with for `family`: the one
- * this session located and keeps warm, or the peer's adopted over the control
- * channel (s->rdv[]); the token's slot only where we hold neither, since a
+ * The rendezvous node a fresh sig should be seeded with for `family`: the
+ * anchor the model holds, whether this end found it or the peer handed it over
+ * the control channel; the token's slot only where the model has none, since a
  * token minted long ago can name a node that has since gone. Returns 0 and
  * fills sa/len, -1 when neither has one for this family.
  */
@@ -1171,32 +1181,8 @@ static int seed_node_for(struct sess *s, int family, struct sockaddr_storage *sa
 {
 	const struct token *t = &s->cfg->tok;
 	uint8_t node[NETSTATE_SA_MAX], nlen = 0;
-	int i = fam_idx(family);
 
-	/*
-	 * A host discovered its own node, so the model holds the truest copy:
-	 * s->rdv[] is filled on a cadence and the token slot only once a family
-	 * has been published, so either can be empty at a rebuild, and a
-	 * rendezvous that goes missing there is one somebody has already been
-	 * handed.
-	 *
-	 * A client discovered nothing. Its rendezvous is whatever the host last
-	 * said, so the announcement it was given outranks anything it has
-	 * observed -- that is how it follows a host that has moved.
-	 */
-	if (s->cfg->is_host && netstate_anchor(&s->ns, family, node, &nlen,
-					       NULL) && nlen) {
-		memcpy(sa, node, nlen);
-		*len = nlen;
-		return 0;
-	}
-	if (s->rdv[i].have) {
-		*sa = s->rdv[i].sa;
-		*len = s->rdv[i].len;
-		return 0;
-	}
-	if (!s->cfg->is_host &&
-	    netstate_anchor(&s->ns, family, node, &nlen, NULL) && nlen) {
+	if (netstate_anchor(&s->ns, family, node, &nlen, NULL) && nlen) {
 		memcpy(sa, node, nlen);
 		*len = nlen;
 		return 0;
@@ -1686,7 +1672,7 @@ static void ctl_send(struct conn *c, int type, const uint8_t *payload,
 
 /* Act on one decoded control message (a ctl_reframer callback): answer a ping,
  * record a pong's round trip, stash the peer's announced rendezvous node for
- * rdv_maintain to adopt, or enter an endpoint it advertises as one more path.
+ * rdv_adopt to take, or enter an endpoint it advertises as one more path.
  * Runs on the connection's own loop thread, the same one as path_tick. */
 static void ctl_dispatch(void *arg, int type, const uint8_t *pl, size_t plen)
 {
@@ -2807,86 +2793,160 @@ static void cand_tell(struct conn *c, uint64_t now)
 }
 
 /*
- * Keep a rendezvous node warm on each reachable family, re-announce them to the
- * peer in-band, and adopt the peer's node for any family we cannot reach yet.
- * The result is that both ends hold both families' rendezvous nodes, kept fresh
- * and validated for the whole session, so a forced family downgrade can
- * re-signal over the survivor. Self-throttled; runs from the
- * live loop's thread, where sig is single-threaded.
+ * Publish the anchor each family holds, for the connections to read.
+ *
+ * Only a qualified one is handed to a peer: a node that has not proven itself
+ * here is one we may still replace, and handing it over is the churn the
+ * qualification exists to prevent. Unqualified ones are published all the same,
+ * because the status line has to be able to say where this end is meeting even
+ * while that is still being settled.
+ *
+ * Nothing is ever retracted, and nothing needs to be: the announcement can name
+ * a node but has no way to unname one, so a peer keeps what it was last told
+ * until it is told somewhere better.
+ *
+ * Runs on the thread that owns the model; every connection reads the result on
+ * its own thread, which is what the lock is for.
  */
-static void rdv_maintain(struct conn *c)
+static void rdv_publish(struct sess *s)
 {
-	struct sess *s = c->sess;
 	static const int famv[2] = { 4, 6 };
-	uint64_t now = now_ms();
-	int i;
+	int i, told = 0;
 
 	if (!(s->cfg->sig_flags & SIG_DHT))
 		return;
+	for (i = 0; i < 2; i++) {
+		uint8_t node[NETSTATE_SA_MAX], nlen = 0;
+		int confirmed = 0, same;
 
-	/* Re-validate and keep warm each family we can reach ourselves. Rare (a
-	 * held node dying inside the window is unlikely and the DHT lookup is the
-	 * fallback), but poll faster until the first node has been captured. */
-	if (now >= s->next_rdv_warm_ms) {
-		int captured = 0;
-
-		for (i = 0; i < 2; i++) {
-			struct sockaddr_storage sa;
-			socklen_t sl = sizeof(sa);
-
-			if (!sig_located(s->sig, famv[i],
-					 (struct sockaddr *)&sa, &sl))
-				continue;
-			captured = 1;
-			if (!s->rdv[i].have || s->rdv[i].len != sl ||
-			    memcmp(&s->rdv[i].sa, &sa, sl)) {
-				s->rdv[i].sa = sa;
-				s->rdv[i].len = sl;
-				s->rdv[i].have = 1;
+		if (!netstate_anchor(&s->ns, famv[i], node, &nlen, &confirmed) ||
+		    !nlen)
+			continue;
+		pthread_mutex_lock(&s->rdv_pub_lock);
+		same = s->rdv[i].have && s->rdv[i].len == nlen &&
+		       !memcmp(&s->rdv[i].sa, node, nlen);
+		if (!same || s->rdv[i].qualified != confirmed) {
+			memset(&s->rdv[i].sa, 0, sizeof(s->rdv[i].sa));
+			memcpy(&s->rdv[i].sa, node, nlen);
+			s->rdv[i].len = nlen;
+			s->rdv[i].have = 1;
+			s->rdv[i].qualified = confirmed;
+			if (confirmed) {
+				s->rdv_gen++;
+				told = 1;
 			}
-			sig_reinforce(s->sig, famv[i],
-				      (struct sockaddr *)&sa, sl);
 		}
-		s->next_rdv_warm_ms = now + (captured ? RDV_WARM_MS : RDV_POLL_MS);
+		pthread_mutex_unlock(&s->rdv_pub_lock);
 	}
+	if (told)
+		dbg_logf("rdv: publishing set %u", (unsigned)s->rdv_gen);
+}
 
-	/* Tell the peer our nodes, so it has fresh ones to reconnect through even
-	 * if the token only carried one family. */
-	if (now >= c->next_rdv_tell_ms) {
-		for (i = 0; i < 2; i++)
-			if (s->rdv[i].have) {
-				uint8_t pl[CTL_RDV_PLEN];
+/*
+ * Tell this peer where we rendezvous, whenever what we have told it is no
+ * longer what we publish. A connection starts owing the whole set, so a client
+ * that arrives on a token minted before a family had a node is told of it as it
+ * joins rather than at its next reconnection, and a node found or replaced
+ * mid-session reaches every peer at once. That is what lets a peer follow us
+ * across a move instead of falling back on a full DHT search.
+ *
+ * Runs on the connection's own thread and touches nothing but the published
+ * copy, so a host worker announces exactly as the thread driving the
+ * signalling does.
+ */
+static void rdv_tell(struct conn *c, uint64_t now)
+{
+	static const int famv[2] = { 4, 6 };
+	struct sess *s = c->sess;
+	struct rdv_node pub[2];
+	uint32_t gen;
+	int i;
 
-				ctl_rdv_encode(pl, famv[i],
-					       (struct sockaddr *)&s->rdv[i].sa);
-				ctl_send(c, CTLM_RDV, pl, sizeof(pl));
-			}
-		c->next_rdv_tell_ms = now + RDV_TELL_MS;
+	pthread_mutex_lock(&s->rdv_pub_lock);
+	memcpy(pub, s->rdv, sizeof(pub));
+	gen = s->rdv_gen;
+	pthread_mutex_unlock(&s->rdv_pub_lock);
+
+	if (gen == c->rdv_told_gen && now < c->next_rdv_tell_ms)
+		return;
+	c->rdv_told_gen = gen;
+	c->next_rdv_tell_ms = now + RDV_TELL_MS;
+	for (i = 0; i < 2; i++) {
+		uint8_t pl[CTL_RDV_PLEN];
+
+		if (!pub[i].have || !pub[i].qualified)
+			continue;
+		ctl_rdv_encode(pl, famv[i], (struct sockaddr *)&pub[i].sa);
+		ctl_send(c, CTLM_RDV, pl, sizeof(pl));
 	}
+}
 
-	/* Adopt the peer's announcement for any family we cannot reach ourselves,
-	 * readying us to roam onto it (e.g. a v4-only host gaining v6, told a v6
-	 * node by a dual-stack client). */
-	if (c->rdv_in_dirty) {
-		struct rdv_node in[2];
+/*
+ * Take this peer's announcement.
+ *
+ * A client takes it as it stands. The mailbox is the host's, and the node the
+ * host names is the only one whose copy of it the host keeps current, so
+ * following the host's word is the whole of how a client stays reachable
+ * through a rendezvous that changed under a token already handed out.
+ *
+ * A host takes one only for a family it has no node of its own for: its own is
+ * what the token names and what it serves, and a client may not move it.
+ *
+ * Adopting means the node becomes this end's anchor -- pinned for the direct
+ * get, shown on the panel, seeded into the next sig -- not a note kept aside
+ * for a reconnection. Runs on the thread that owns the model.
+ */
+static void rdv_adopt(struct sess *s, struct conn *c)
+{
+	static const int famv[2] = { 4, 6 };
+	struct rdv_node in[2];
+	int i;
 
-		pthread_mutex_lock(&c->rdv_lock);
-		memcpy(in, c->rdv_in, sizeof(in));
-		c->rdv_in_dirty = 0;
+	if (!c)
+		return;
+	pthread_mutex_lock(&c->rdv_lock);
+	if (!c->rdv_in_dirty) {
 		pthread_mutex_unlock(&c->rdv_lock);
-		for (i = 0; i < 2; i++) {
-			struct sockaddr_storage sa;
-			socklen_t sl = sizeof(sa);
-
-			if (in[i].have && !sig_located(s->sig, famv[i],
-						(struct sockaddr *)&sa, &sl))
-				s->rdv[i] = in[i];
-		}
+		return;
 	}
+	memcpy(in, c->rdv_in, sizeof(in));
+	c->rdv_in_dirty = 0;
+	pthread_mutex_unlock(&c->rdv_lock);
+	for (i = 0; i < 2; i++) {
+		uint8_t node[NETSTATE_SA_MAX], nlen = 0;
+		char b[80];
+
+		if (!in[i].have)
+			continue;
+		if (netstate_anchor(&s->ns, famv[i], node, &nlen, NULL)) {
+			if (s->cfg->is_host)
+				continue;
+			if (nlen == in[i].len && !memcmp(node, &in[i].sa, nlen))
+				continue;
+		}
+		netstate_on_rdv_offered(&s->ns, famv[i],
+					(const uint8_t *)&in[i].sa,
+					(int)in[i].len);
+		fmt_sockaddr((struct sockaddr *)&in[i].sa, in[i].len, b,
+			     sizeof(b));
+		dbg_logf("rdv: adopted the peer's v%d node %s", famv[i], b);
+	}
+}
+
+/* Every served connection's announcement, drained on the host's own thread: a
+ * worker runs the transport and never touches the model. */
+static void rdv_adopt_all(struct sess *s)
+{
+	int i;
+
+	for (i = 0; i < HOST_MAX_WORKERS; i++)
+		if (s->conns[i])
+			rdv_adopt(s, s->conns[i]);
 }
 
 static int net_changed(struct sess *s);
 static int sig_rebuild(struct sess *s);
+static void net_settle(struct sess *s);
 
 /*
  * A fresh ICE password under the same ufrag: the identity naming this
@@ -3082,6 +3142,10 @@ static int conn_run(struct conn *c, int drive_sig)
 	next_hb = now_ms();
 	conn_start = now_ms();
 	c->next_cand_ms = conn_start;
+	/* A fresh connection is owed the whole set, whatever an earlier one on
+	 * this struct was told. */
+	c->rdv_told_gen = 0;
+	c->next_rdv_tell_ms = conn_start;
 
 	if (drive_sig) {
 		/* Capture a rendezvous node per family for reconnection (the host
@@ -3097,8 +3161,6 @@ static int conn_run(struct conn *c, int drive_sig)
 		 */
 		if (!s->cfg->is_host)
 			sig_withdraw(s->sig);
-		s->next_rdv_warm_ms = now_ms();
-		c->next_rdv_tell_ms = now_ms() + 1500;
 	}
 
 	while (!done) {
@@ -3159,6 +3221,7 @@ static int conn_run(struct conn *c, int drive_sig)
 		 * than a rediscovery. */
 		path_tick(c, now_ms());
 		cand_tell(c, now_ms());
+		rdv_tell(c, now_ms());
 		if (s->cfg->test_blackhole_ms > 0 && c->bh_kind < 0 &&
 		    !c->bh_done &&
 		    now_ms() - conn_start >
@@ -3200,8 +3263,15 @@ static int conn_run(struct conn *c, int drive_sig)
 			ctl_send(c, CTLM_PING, ts, sizeof(ts));
 			next_hb = now_ms() + HB_INTERVAL_MS;
 		}
-		if (drive_sig)
-			rdv_maintain(c);
+		if (drive_sig) {
+			/* This loop owns the model here, so what the peer has
+			 * told us is acted on now rather than at the end of the
+			 * session: the pin is what a re-claim goes out through,
+			 * which is the whole point of following the host. */
+			rdv_publish(s);
+			rdv_adopt(s, c);
+			net_settle(s);
+		}
 		if (drive_sig && !s->cfg->is_host)
 			resume_tick(c);
 		if (now_ms() >= c->next_status_ms) {
@@ -3573,12 +3643,22 @@ static void net_apply(struct sess *s, const struct netstate_actions *a)
 	}
 }
 
+/* Drain what the model has decided and carry it out. Every path that feeds the
+ * model ends here, including the ones that run while a session is up and
+ * nothing is watching the interfaces. */
+static void net_settle(struct sess *s)
+{
+	struct netstate_actions a;
+
+	if (netstate_take_actions(&s->ns, &a))
+		net_apply(s, &a);
+}
+
 /* The one place a network change is noticed and acted on, at the top of both
  * loops. What is left for each is taken from net_changed. */
 static void net_pump(struct sess *s, uint64_t now)
 {
 	const struct session_cfg *cfg = s->cfg;
-	struct netstate_actions a;
 	unsigned ch = 0;
 	int synth = 0;
 
@@ -3610,8 +3690,7 @@ static void net_pump(struct sess *s, uint64_t now)
 	ns_take_acks(s, now);
 	ns_drain(s);
 	netstate_tick(&s->ns, now);
-	if (netstate_take_actions(&s->ns, &a))
-		net_apply(s, &a);
+	net_settle(s);
 }
 
 /* Re-run on a rebuild: a cable going in adds one that was not there at
@@ -3962,34 +4041,6 @@ static void token_pump(struct sess *s)
 		s->tok_told[i] = 1;
 		s->cfg->on_token_state(s->cfg->arg, famv[i], st, a, port);
 	}
-}
-
-/* Keep the located rendezvous nodes warm (host, main thread only -- sig is
- * single-threaded). The per-connection announce/adopt lives in rdv_maintain. */
-static void rdv_keep_warm(struct sess *s)
-{
-	static const int famv[2] = { 4, 6 };
-	uint64_t now = now_ms();
-	int i, captured = 0;
-
-	if (!(s->cfg->sig_flags & SIG_DHT) || now < s->next_rdv_warm_ms)
-		return;
-	for (i = 0; i < 2; i++) {
-		struct sockaddr_storage sa;
-		socklen_t sl = sizeof(sa);
-
-		if (!sig_located(s->sig, famv[i], (struct sockaddr *)&sa, &sl))
-			continue;
-		captured = 1;
-		if (!s->rdv[i].have || s->rdv[i].len != sl ||
-		    memcmp(&s->rdv[i].sa, &sa, sl)) {
-			s->rdv[i].sa = sa;
-			s->rdv[i].len = sl;
-			s->rdv[i].have = 1;
-		}
-		sig_reinforce(s->sig, famv[i], (struct sockaddr *)&sa, sl);
-	}
-	s->next_rdv_warm_ms = now + (captured ? RDV_WARM_MS : RDV_POLL_MS);
 }
 
 /*
@@ -4458,8 +4509,8 @@ static int sig_arm(struct sess *s)
  * and its node set is not persisted because the fresh one is what the run
  * should leave behind. The lanlink socket is deliberately left as it is, since
  * worker threads and libjuice's receive thread send on it unlocked and a host's
- * direct endpoint names its port. The new sig is seeded from the rendezvous
- * nodes this session kept warm and exchanged over CTLM_RDV, so it starts from a
+ * direct endpoint names its port. The new sig is seeded from the anchors the
+ * model holds -- found here, or handed over CTLM_RDV -- so it starts from a
  * node the peer holds too.
  *
  * Callers must run this on the thread that owns sig, with no sig callback in
@@ -4475,7 +4526,6 @@ static int sig_rebuild(struct sess *s)
 		dbg_logf("sig: rebuild failed -- giving up the session");
 		return -1;
 	}
-	s->next_rdv_warm_ms = now_ms();
 	report_links(s);
 	dbg_logf("sig: rebuilt on the new network");
 	return 0;
@@ -4528,7 +4578,9 @@ static int host_turnstile(struct sess *s)
 		maybe_announce_rendezvous(s);	/* report the rendezvous */
 		report_mailbox(s);
 		token_pump(s);			/* mint and advertise the token */
-		rdv_keep_warm(s);
+		rdv_publish(s);			/* where we rendezvous, for the
+						 * workers to announce */
+		rdv_adopt_all(s);
 		lan_drain(s, ws, &dash_seq);	/* admit same-segment claimants */
 
 		/*
@@ -4919,6 +4971,7 @@ int session_run(const struct session_cfg *cfg)
 	pthread_mutex_init(&s.c.rdv_lock, NULL);
 	pthread_mutex_init(&s.c.stream_lock, NULL);
 	pthread_mutex_init(&s.c.path_lock, NULL);
+	pthread_mutex_init(&s.rdv_pub_lock, NULL);
 	path_table_init(&s.c.paths);
 	pthread_mutex_init(&s.ns_lock, NULL);
 	netmon_init(&s.netmon);
@@ -5310,5 +5363,6 @@ done:
 	pthread_mutex_destroy(&s.c.rdv_lock);
 	pthread_mutex_destroy(&s.c.stream_lock);
 	pthread_mutex_destroy(&s.c.path_lock);
+	pthread_mutex_destroy(&s.rdv_pub_lock);
 	return rc;
 }

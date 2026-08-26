@@ -901,6 +901,16 @@ if(COMRADE_BUILD_TOOLS)
 		set_tests_properties(hostroam_e2e PROPERTIES
 			SKIP_RETURN_CODE 77 TIMEOUT 300)
 
+		# Clients join on a token minted before the host had a
+		# rendezvous node, and must be told of the one it qualified
+		# afterwards. DHT rendezvous, so SKIPs without the net gate.
+		add_test(NAME rdvsync_e2e
+			COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/rdvsync.sh
+				$<TARGET_FILE:comrade-e2e>
+				$<TARGET_FILE:comrade-dhtseed>)
+		set_tests_properties(rdvsync_e2e PROPERTIES
+			SKIP_RETURN_CODE 77 TIMEOUT 400)
+
 		# Each of these stands up its own DHT node and multicast
 		# announcer on this host, so under `ctest -j` they contend for
 		# the segment and each other's rendezvous timing. Serialise them
@@ -909,7 +919,7 @@ if(COMRADE_BUILD_TOOLS)
 			lan_concurrent_e2e lan_mixed_e2e turnstile_stuck_e2e
 			roam_lan_e2e roam_fam_e2e roam_client_e2e
 			path_switch_e2e resume_e2e
-			hostroam_e2e
+			hostroam_e2e rdvsync_e2e
 			PROPERTIES RESOURCE_LOCK comrade_net)
 	endif()
 endif()
