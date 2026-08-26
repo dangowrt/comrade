@@ -27,7 +27,7 @@ SEED="${2:?path to comrade-dhtseed}"
 . "$(dirname "$0")/swarm.sh"
 
 if [ "${COMRADE_E2E_NET:-0}" != 1 ]; then
-	swarm_start "$SEED" || exit 1
+	swarm_start "$SEED" || exit $?
 fi
 
 tmp="$(mktemp -d)"

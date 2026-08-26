@@ -34,7 +34,7 @@ SEED="${2:?path to comrade-dhtseed}"
 
 # A private DHT of our own, unless asked to use the real one.
 if [ "${COMRADE_E2E_NET:-0}" != 1 ]; then
-	swarm_start "$SEED" || exit 1
+	swarm_start "$SEED" || exit $?
 fi
 
 # grep -c says nothing at all when the log does not exist yet, which is not 0.

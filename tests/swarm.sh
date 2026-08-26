@@ -15,6 +15,18 @@
 # swarm_start <path-to-comrade-dhtseed> [count]  -- exports COMRADE_DHT_BOOTSTRAP
 # swarm_stop                                     -- kills the nodes
 #
+# swarm_start returns 77 (ctest SKIP) where this machine has no address a swarm
+# can be built on, and 1 where one could not be built for any other reason;
+# callers pass the status straight out, since a test that cannot have a DHT has
+# nothing to say either way.
+#
+# The nodes are addressed at one of this machine's own interface addresses,
+# never 127.0.0.1: jech/dht drops any datagram whose source is a martian and
+# counts loopback among them, so a loopback swarm never forms -- each member
+# ignores every other, comrade ignores all of them, and the run silently falls
+# back on whatever real DHT nodes the on-disk cache still holds. Each node
+# reports the address it can be reached at, and this agrees with them.
+#
 # jech/dht keeps its state in globals, so each node is its own process. Each is
 # told where the previous ones are, which is enough for them to find each other.
 #
@@ -50,8 +62,16 @@ swarm_start() {
 			swarm_stop
 			return 1
 		fi
-		_peers="$_peers 127.0.0.1:$_port"
-		_boot="${_boot:+$_boot,}127.0.0.1:$_port"
+		# After the port and not beside it: the node prints the address
+		# first, so a read that has the port has the address too.
+		_addr=$(sed -n 's/^addr //p' "$SWARM_DIR/$_i.out" 2>/dev/null)
+		if [ -z "$_addr" ] || [ "$_addr" = "-" ]; then
+			echo "skipped: no non-loopback address to build a swarm on" >&2
+			swarm_stop
+			return 77
+		fi
+		_peers="$_peers $_addr:$_port"
+		_boot="${_boot:+$_boot,}$_addr:$_port"
 		_i=$((_i + 1))
 	done
 	COMRADE_DHT_BOOTSTRAP="$_boot"
