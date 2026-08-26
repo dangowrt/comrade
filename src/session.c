@@ -1567,6 +1567,27 @@ static void *stun_probe_thread(void *arg)
 	random_bytes(seed, sizeof(seed));
 	stun_probe_run(s->stun_servers, s->stun_count, STUN_PROBE_MS, seed,
 		       &s->probe_stop, probe_hit, s);
+	{
+		int st, stable, npool;
+
+		pthread_mutex_lock(&s->trickle_lock);
+		st = stun_mapping_result(&s->map4);
+		stable = stun_mapping_port_stable(&s->map4);
+		npool = s->npool4;
+		pthread_mutex_unlock(&s->trickle_lock);
+		/* The verdict this round reached, and the pool it reached it
+		 * against. Which way this goes decides whether the offer names
+		 * every egress address or one of them, and until it was said
+		 * out loud the difference was visible only as a punch that
+		 * sometimes worked. */
+		dbg_logf("stun: round done -- mapping %s, port %s, "
+			 "%d egress address(es) known",
+			 st == STUN_MAPPING_DEPENDENT ? "per-destination" :
+			 st == STUN_MAPPING_INDEPENDENT ? "one for all" :
+							  "not yet known",
+			 stable ? "stable" : "moves with the destination",
+			 npool);
+	}
 	ns_post(s, NSF_PROBE_DONE, 4, epoch);
 	return NULL;
 }
