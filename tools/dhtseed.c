@@ -25,6 +25,7 @@
 #include <string.h>
 
 #include "dhtnode.h"
+#include "bep44.h"
 #include "netmon.h"
 
 static int seed_peer(struct dhtnode *n, const char *spec)
@@ -89,6 +90,14 @@ int main(int argc, char **argv)
 		fprintf(stderr, "dhtseed: could not create a node\n");
 		return 1;
 	}
+	/*
+	 * This is a test fixture: a private swarm's members share one source
+	 * address, and the shipping per-source rate limiter would count them as
+	 * one flooder and ban them. Turn it off here, the way drivers/libtorrent
+	 * turns off libtorrent's dht dos_blocker to run the same kind of tests.
+	 * A real node (dhtnode_create) keeps the limiter on.
+	 */
+	bep44_ratelimit(dhtnode_engine(n), 1000000, 0);
 	for (i = 1; i < argc; i++)
 		if (seed_peer(n, argv[i]))
 			fprintf(stderr, "dhtseed: bad peer '%s'\n", argv[i]);

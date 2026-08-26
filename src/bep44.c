@@ -1984,6 +1984,10 @@ static void ban_escalate(struct bep44_engine *e, const uint8_t seed_net[16],
 		e->ban[first].bits = (uint8_t)pbits;
 		e->ban[first].weight = (uint16_t)weight;
 		e->ban[first].banned_until = now + e->rl_ban_ms;
+		if (debug_on())
+			fprintf(stderr,
+				"[bep44] widen ban to %s /%d (%d offenders)\n",
+				family == AF_INET6 ? "v6" : "v4", pbits, weight);
 	}
 }
 
@@ -2054,6 +2058,11 @@ static int ban_ok(struct bep44_engine *e, const struct sockaddr *from,
 		track->banned_until = now + e->rl_ban_ms;
 		track->weight = 1;
 		track->count = 0;
+		if (debug_on())
+			fprintf(stderr, "[bep44] ban %s /%u %02x%02x%02x%02x\n",
+				family == AF_INET6 ? "v6" : "v4", track->bits,
+				track->net[0], track->net[1], track->net[2],
+				track->net[3]);
 		ban_escalate(e, track->net, family, now);
 		return 0;
 	}
@@ -2062,6 +2071,8 @@ static int ban_ok(struct bep44_engine *e, const struct sockaddr *from,
 		slot = lru;			/* reuse the least active tracker */
 	if (!slot) {
 		e->block_all_until = now + B44_FAILCLOSED_MS;	/* saturated */
+		if (debug_on())
+			fprintf(stderr, "[bep44] ban table full, failing closed\n");
 		return 0;
 	}
 	memset(slot, 0, sizeof(*slot));
