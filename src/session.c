@@ -161,6 +161,10 @@ struct ns_fact {
  * never coming.
  */
 #define HOST_HANDSHAKE_MS 30000
+/* Between attempts to gather an offer worth publishing. Gathering costs an
+ * agent and a round of STUN, and the thing being waited for -- an interface
+ * finishing coming up after a move -- takes about this long anyway. */
+#define HOST_REGATHER_MS 1000
 
 /*
  * If, this long after start, we still hold only a private/CGNAT IPv4 and STUN
@@ -449,6 +453,7 @@ struct sess {
 	char regathered_for[40];
 	struct conn *offer_conn;		/* live conn the peer-offer callback feeds */
 
+	uint64_t next_gather_ms;	/* backoff after a gather found nothing */
 	uint64_t ice_attempt_start;
 	int ice_attempt;
 	int expect4, expect6;		/* host has DHT reach on this family */
@@ -1182,6 +1187,8 @@ static int fan_local_sdp(struct sess *s)
  * (sig_post, not sig_rotate), so the turnstile's answer slot is untouched and
  * the credentials do not change.
  */
+static void log_offer(const char *sdp, int served, int active);
+
 static void pool_pump(struct sess *s)
 {
 	const struct session_obs *o = s->cfg->obs;
@@ -1216,6 +1223,12 @@ static void pool_pump(struct sess *s)
 		s->pool_posted = fan_local_sdp(s);
 		sig_post(s->sig, (const uint8_t *)s->local_sdp,
 			 strlen(s->local_sdp));
+		/* The fan is the whole answer to a carrier that picks a
+		 * different egress address per destination, and it reaches a
+		 * peer only through this re-post -- which is not the publish
+		 * the offer log reports, so without this the one thing that
+		 * makes such a network work is invisible. */
+		log_offer(s->local_sdp, -1, n);
 	}
 }
 
@@ -4870,6 +4883,11 @@ static void punch_scan(struct sess *s, struct worker *ws, struct conn **punching
  * and simply never connects. Behind a carrier NAT the difference is one
  * candidate -- whether STUN answered before the offer went out -- and there was
  * no way to tell the two apart from a log.
+ *
+ * Reflexive is counted rather than "reachable", because the two are not the
+ * same: a globally routable IPv6 host candidate needs no STUN and is reachable
+ * with none, so on a v6 network a count of zero here is the ordinary case and
+ * says nothing is wrong.
  */
 static void log_offer(const char *sdp, int served, int active)
 {
@@ -4888,9 +4906,20 @@ static void log_offer(const char *sdp, int served, int active)
 		    !strncmp(t, "typ relay", 9))
 			reflexive++;
 	}
-	dbg_logf("host: offer published (served=%d active=%d) "
-		 "%d candidate(s), %d reachable from outside",
-		 served, active, cands, reflexive);
+	if (served < 0)
+		dbg_logf("host: offer re-posted, fanned across %d egress "
+			 "address(es): %d candidate(s), %d reflexive",
+			 active, cands, reflexive);
+	else
+		dbg_logf("host: offer published (served=%d active=%d) "
+			 "%d candidate(s), %d reflexive",
+			 served, active, cands, reflexive);
+}
+
+/* Whether an offer has anything in it at all for a peer to aim at. */
+static int sdp_has_candidate(const char *sdp)
+{
+	return strstr(sdp, "a=candidate:") != NULL;
 }
 
 static int host_is_multiuser(const struct session_cfg *cfg)
@@ -5215,7 +5244,7 @@ static int host_turnstile(struct sess *s)
 
 		switch (ts) {
 		case TS_GATHER:
-			if (!listen) {
+			if (!listen && now_ms() >= s->next_gather_ms) {
 				listen = conn_alloc(s);
 				if (!listen)
 					break;
@@ -5238,6 +5267,36 @@ static int host_turnstile(struct sess *s)
 					   sizeof(filtered));
 				snprintf(s->local_sdp, sizeof(s->local_sdp),
 					 "%s", filtered);
+				/*
+				 * Gathering finished and found nothing -- the
+				 * interfaces were still coming up when this
+				 * agent was made, which is exactly what a move
+				 * looks like from here. The description is a
+				 * snapshot taken when gathering ended, so
+				 * nothing will be added to it later: waiting
+				 * would wait for ever.
+				 *
+				 * Publishing it is worse than waiting. The
+				 * mailbox holds one offer, so an empty one does
+				 * not merely fail to help, it replaces the
+				 * working offer a peer was about to claim
+				 * against with one that names nowhere to go.
+				 * Start again instead, and leave what is
+				 * published alone until there is something
+				 * better to say.
+				 */
+				if (!sdp_has_candidate(s->local_sdp)) {
+					dbg_logf("host: gathered no candidates "
+						 "-- not offering, regathering");
+					conn_free(listen);
+					listen = NULL;
+					s->offer_conn = NULL;
+					s->have_local_sdp = 0;
+					s->local_sdp[0] = '\0';
+					s->next_gather_ms = now_ms() +
+							    HOST_REGATHER_MS;
+					break;
+				}
 				s->pool_posted = fan_local_sdp(s);
 				sig_rotate(s->sig, (const uint8_t *)s->local_sdp,
 					   strlen(s->local_sdp));
@@ -5301,7 +5360,17 @@ static int host_turnstile(struct sess *s)
 						 * half and nothing else, and the
 						 * client saying it is still
 						 * trying is the only account of
-						 * the other half there is. */
+						 * the other half there is.
+						 *
+						 * A repeat of the same claim is
+						 * weak evidence -- the DHT serves
+						 * it back for seconds after it
+						 * was written -- but acting on it
+						 * is another punch for a claimant
+						 * that has none that worked, and
+						 * over concurrent joins that
+						 * measured better than the
+						 * tidiness of ignoring it. */
 						if (again)
 							punch_retire(s, punching,
 								     punch_resume,
