@@ -3887,24 +3887,14 @@ static void ns_take_acks(struct sess *s, uint64_t now)
 		if (sig_take_anchor_seen(s->sig, famv[i]))
 			netstate_on_anchor_seen(&s->ns, famv[i], now);
 		/*
-		 * Rendezvousing for the peer on this family: sig has captured
-		 * whichever node served the get that followed its store, which
-		 * is how a host's own is captured too. Take it as this end's
-		 * anchor, so it is pinned, proven and announced by the rules
-		 * every other node goes through -- the peer must not be able to
-		 * tell a node found this way from one we found for ourselves.
+		 * Rendezvousing for the peer on this family is precisely being
+		 * allowed to choose one, so the ordinary trial runs and the
+		 * node that wins it becomes this end's anchor by the rules
+		 * every other node goes through. The peer must not be able to
+		 * tell one found this way from one we found for ourselves.
 		 */
-		if (s->relay_fam[i] &&
-		    !netstate_anchor(&s->ns, famv[i], NULL, NULL, NULL)) {
-			struct sockaddr_storage r;
-			socklen_t rl = sizeof(r);
-
-			if (sig_located(s->sig, famv[i], (struct sockaddr *)&r,
-					&rl))
-				netstate_on_rdv_found(&s->ns, famv[i],
-						      (const uint8_t *)&r,
-						      (int)rl, now);
-		}
+		netstate_set_picking(&s->ns, famv[i],
+				     s->cfg->is_host || s->relay_fam[i]);
 		memset(&sa, 0, sizeof(sa));
 		if (!sig_take_ack(s->sig, famv[i], (struct sockaddr *)&sa, &sl))
 			continue;

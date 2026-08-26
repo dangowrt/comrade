@@ -144,6 +144,30 @@ enum {					/* how a local address was learnt */
 #define NSA_RDV_RELOCATE   (1u << 6)	/* quiet: look for one alongside it */
 #define NSA_EMIT_TOKEN	   (1u << 7)	/* host only: the advert changed */
 
+/*
+ * A node on trial to become this family's rendezvous.
+ *
+ * Several are tried at once, because several are already answering: the
+ * convergent store puts the value on the nodes closest to the key, the direct
+ * get addresses every one of them that has been pinned or retained, and each
+ * round several reply. Counting only the one node we happened to latch onto
+ * threw all the other answers away and made finding a good rendezvous a queue
+ * of one-at-a-time trials, each costing the full give-up window before the
+ * next began. Counting them side by side costs not one extra packet -- the
+ * replies are already arriving -- and the first node to earn its place wins.
+ */
+struct netstate_cand {
+	uint8_t addr[NETSTATE_SA_MAX];
+	uint8_t len;
+	int acks;			/* separate answers from it, this epoch */
+	uint64_t first_ms;		/* when its run of answers began */
+	uint64_t seen_ms;		/* when it last answered */
+};
+
+/* Enough to hold the handful a convergent store lands on, and no more: past
+ * that the extra entries are nodes too far from the key to be worth a token. */
+#define NETSTATE_CANDS_MAX 4
+
 /* One local address, and whether it should be shown. Held rather than emitted
  * as it arrives, because whether a global v6 is ours to show is not knowable
  * until the source address is, which is often later. */
@@ -179,6 +203,11 @@ struct netstate_fam {
 
 	uint8_t anchor[NETSTATE_SA_MAX];	/* opaque sockaddr bytes */
 	uint8_t anchor_len;
+	int picking;			/* this end is choosing this family's
+					 * rendezvous: a host always, a client
+					 * only while asked to find one */
+	struct netstate_cand cands[NETSTATE_CANDS_MAX];
+	int ncands;
 	int anchor_confirmed;		/* adopting a node never confirms it */
 	int anchor_candidate;		/* ours, on trial, and shown to nobody:
 					 * droppable, unlike one that has
@@ -261,8 +290,13 @@ void netstate_on_rdv_offered(struct netstate *ns, int family,
  * being dropped when it does not earn its place as much as it means anything
  * else.
  */
-void netstate_on_rdv_found(struct netstate *ns, int family,
-			   const uint8_t *node, int len, uint64_t now);
+/*
+ * Whether this end may choose `family`'s rendezvous from the nodes answering
+ * it. A host always may. A client may not -- the rendezvous is the node the
+ * host named, and only that one's copy of the mailbox is kept current -- except
+ * while the host has asked it to find one, which is the whole of that request.
+ */
+void netstate_set_picking(struct netstate *ns, int family, int on);
 
 
 void netstate_on_candidate(struct netstate *ns, int family, uint32_t epoch,

@@ -504,6 +504,102 @@ static void a_move_gives_a_candidate_a_fresh_run(void)
 	assert(!netstate_anchor(&ns, 6, NULL, NULL, NULL));
 }
 
+/* Answer `n` times from `node`, spread widely enough to clear the proving
+ * window on the last of them. */
+static void answers(struct netstate *ns, int fam, const uint8_t *node, int n)
+{
+	int i;
+
+	for (i = 0; i < n; i++) {
+		netstate_on_dht_ack(ns, fam, netstate_epoch(ns, fam), node, 16, t);
+		t += NETSTATE_ANCHOR_PROVE_MS / NETSTATE_ANCHOR_QUALIFY + 1;
+	}
+}
+
+/*
+ * The node we happened to latch onto first answers once and stops. Another is
+ * answering all along -- the store put the value on several and the direct get
+ * asks all of them -- and it takes the place as soon as it has earned it,
+ * rather than after the dead one has used up its whole give-up window.
+ */
+static void a_dead_first_answer_does_not_hold_the_place(void)
+{
+	struct netstate ns;
+	uint8_t dead[16], good[16], got[NETSTATE_SA_MAX];
+	uint8_t glen = 0;
+	uint64_t began;
+	int confirmed = 0;
+
+	start(&ns, 1);
+	give_src(&ns, 6, 20);
+	fill(dead, 16, 70);
+	fill(good, 16, 90);
+	began = t;
+
+	/* One answer from the dead one: it is what we hold, unproven. */
+	netstate_on_dht_ack(&ns, 6, netstate_epoch(&ns, 6), dead, 16, t);
+	drain(&ns);
+	assert(netstate_anchor(&ns, 6, got, &glen, &confirmed));
+	assert(!memcmp(got, dead, 16) && !confirmed);
+
+	/* The other one answers throughout, and wins on its own merits. */
+	answers(&ns, 6, good, NETSTATE_ANCHOR_QUALIFY + 1);
+	assert(netstate_anchor(&ns, 6, got, &glen, &confirmed));
+	assert(glen == 16 && !memcmp(got, good, 16));
+	assert(confirmed);
+	/* And well inside what waiting the dead one out would have cost. */
+	assert(t - began < NETSTATE_ANCHOR_TRY_MS);
+}
+
+/*
+ * Once a node has qualified it may be in somebody's token, so a livelier node
+ * answering is not a reason to move: only its own long silence is.
+ */
+static void a_busy_candidate_does_not_unseat_a_proven_node(void)
+{
+	struct netstate ns;
+	uint8_t held[16], other[16], got[NETSTATE_SA_MAX];
+	uint8_t glen = 0;
+
+	start(&ns, 1);
+	give_src(&ns, 6, 20);
+	fill(held, 16, 70);
+	fill(other, 16, 90);
+	qualify(&ns, 6, held);
+	drain(&ns);
+
+	answers(&ns, 6, other, NETSTATE_ANCHOR_QUALIFY * 3);
+	assert(netstate_anchor(&ns, 6, got, &glen, NULL));
+	assert(glen == 16 && !memcmp(got, held, 16));
+}
+
+/*
+ * A client runs no trial at all: whoever answers, the rendezvous is the node
+ * the host named. Being asked to find one is the exception, and turning that
+ * on is the whole of the difference.
+ */
+static void a_client_holds_no_trial_until_it_is_asked(void)
+{
+	struct netstate ns;
+	uint8_t node[16], got[NETSTATE_SA_MAX];
+	uint8_t glen = 0;
+
+	start(&ns, 0);
+	give_src(&ns, 6, 20);
+	fill(node, 16, 70);
+
+	answers(&ns, 6, node, NETSTATE_ANCHOR_QUALIFY * 2);
+	assert(!netstate_anchor(&ns, 6, NULL, NULL, NULL));
+
+	netstate_set_picking(&ns, 6, 1);
+	answers(&ns, 6, node, NETSTATE_ANCHOR_QUALIFY + 1);
+	assert(netstate_anchor(&ns, 6, got, &glen, NULL));
+	assert(glen == 16 && !memcmp(got, node, 16));
+
+	/* And v4 is not swept along by v6 being asked for. */
+	assert(!netstate_anchor(&ns, 4, NULL, NULL, NULL));
+}
+
 static void latest_change_wins(void)
 {
 	struct netstate ns;
@@ -979,6 +1075,9 @@ int main(void)
 	a_qualified_node_outlives_the_deadline();
 	an_offered_node_is_not_on_trial();
 	a_move_gives_a_candidate_a_fresh_run();
+	a_dead_first_answer_does_not_hold_the_place();
+	a_busy_candidate_does_not_unseat_a_proven_node();
+	a_client_holds_no_trial_until_it_is_asked();
 	latest_change_wins();
 	host_and_client_agree_except_on_the_token();
 	only_a_host_picks_its_own_rendezvous();

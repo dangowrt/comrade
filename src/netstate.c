@@ -85,6 +85,7 @@ void netstate_init(struct netstate *ns, int is_host, uint64_t now)
 	memset(ns, 0, sizeof(*ns));
 	ns->is_host = is_host;
 	for (i = 0; i < 2; i++) {
+		ns->f[i].picking = is_host;	/* a client only while asked */
 		ns->f[i].epoch = 1;	/* so a fact stamped zero is from no
 					 * network we have been on */
 		ns->f[i].src_next_ms = now;
@@ -132,6 +133,7 @@ void netstate_on_netmon(struct netstate *ns, unsigned changed, int have4,
 		f->anchor_first_ms = 0;
 		f->anchor_quiet = 0;
 		f->anchor_next_ms = now;
+		f->ncands = 0;		/* they answered on a network we left */
 
 		f->dht_acked = 0;
 		f->concluded = 0;
@@ -241,6 +243,55 @@ void netstate_on_roundtrip(struct netstate *ns, int family, uint32_t epoch)
 }
 
 /*
+ * Record that `node` answered, as one of the nodes on trial for this family.
+ * Answers 1 once it has answered often enough, and for long enough, to be
+ * worth putting in front of anyone -- the same bar an anchor has to clear,
+ * since a node chosen this way is indistinguishable from one chosen any other.
+ *
+ * The weakest entry gives way when the set is full: a node that has answered
+ * more times, or begun answering sooner, is the better prospect, and a set
+ * churning through every node that ever replies would never accumulate a run
+ * from any of them.
+ */
+static int cand_ack(struct netstate_fam *f, const uint8_t *node, int len,
+		    uint64_t now)
+{
+	struct netstate_cand *c = NULL;
+	int i, worst = 0;
+
+	for (i = 0; i < f->ncands; i++)
+		if (f->cands[i].len == (uint8_t)len &&
+		    !memcmp(f->cands[i].addr, node, (size_t)len)) {
+			c = &f->cands[i];
+			break;
+		}
+	if (!c) {
+		if (f->ncands < NETSTATE_CANDS_MAX) {
+			c = &f->cands[f->ncands++];
+		} else {
+			for (i = 1; i < f->ncands; i++)
+				if (f->cands[i].acks < f->cands[worst].acks ||
+				    (f->cands[i].acks == f->cands[worst].acks &&
+				     f->cands[i].first_ms >
+				     f->cands[worst].first_ms))
+					worst = i;
+			if (f->cands[worst].acks >= NETSTATE_ANCHOR_QUALIFY)
+				return 0;	/* all of them are doing better */
+			c = &f->cands[worst];
+		}
+		memset(c, 0, sizeof(*c));
+		memcpy(c->addr, node, (size_t)len);
+		c->len = (uint8_t)len;
+		c->first_ms = now;
+	}
+	c->seen_ms = now;
+	if (c->acks < NETSTATE_ANCHOR_QUALIFY)
+		c->acks++;
+	return c->acks >= NETSTATE_ANCHOR_QUALIFY &&
+	       now - c->first_ms >= NETSTATE_ANCHOR_PROVE_MS;
+}
+
+/*
  * Take `node` as this family's anchor. `candidate` says whether it is ours on
  * trial (so the deadline applies) and `acks` how many answers it arrives with:
  * one for a node that just served us, none for one merely named to us.
@@ -304,10 +355,25 @@ void netstate_on_dht_ack(struct netstate *ns, int family, uint32_t epoch,
 	 * of the mailbox current. Another node holding the key may well answer --
 	 * the convergent store put it on several -- but with a copy that stopped
 	 * being refreshed, so following it reads an offer that never changes
-	 * again.
+	 * again. Being asked to find one for the peer is the exception, and the
+	 * only one.
 	 */
-	if (!ns->is_host)
+	if (!f->picking)
 		return;
+	/*
+	 * Nothing has qualified yet, so this node is on trial beside whatever
+	 * else is answering, and the first to earn its place takes it. Waiting
+	 * out one node at a time made the cost of a dead one the whole give-up
+	 * window, repeated; they are all answering anyway.
+	 */
+	if (!f->anchor_confirmed && cand_ack(f, node, len, now)) {
+		anchor_set(ns, i, node, len, now, 0, NETSTATE_ANCHOR_QUALIFY);
+		f->anchor_confirmed = 1;
+		f->ncands = 0;
+		raise_act(ns, i, NSA_EMIT_RDV);
+		facts_moved(ns, i);
+		return;
+	}
 	/*
 	 * This says nothing whatever about the node we hold. Several nodes hold
 	 * the value by design and the quickest answers, so treating another
@@ -347,14 +413,15 @@ void netstate_on_rdv_offered(struct netstate *ns, int family,
 	anchor_set(ns, fam_idx(family), node, len, now, 0, 0);
 }
 
-void netstate_on_rdv_found(struct netstate *ns, int family,
-			   const uint8_t *node, int len, uint64_t now)
+void netstate_set_picking(struct netstate *ns, int family, int on)
 {
-	/* Ours, and on the same terms as a host's own: it answered once, which
-	 * is where its trial starts rather than ends. The peer must not be able
-	 * to tell a node found this way from one it found itself, and that has
-	 * to include being dropped when it does not earn its place. */
-	anchor_set(ns, fam_idx(family), node, len, now, 1, 1);
+	struct netstate_fam *f = &ns->f[fam_idx(family)];
+
+	if (f->picking == on)
+		return;
+	f->picking = on;
+	if (!on)
+		f->ncands = 0;
 }
 
 void netstate_on_candidate(struct netstate *ns, int family, uint32_t epoch,
