@@ -28,12 +28,45 @@
  * ourselves; a second initialisation elsewhere is harmless. */
 static pthread_once_t cc_once = PTHREAD_ONCE_INIT;
 
+/*
+ * Ed25519 domain constants for the public-key screen below. libgcrypt 1.12's
+ * EdDSA verify calls log_fatal("mulm_25519: different sizes") -- an abort --
+ * on certain degenerate public keys (the identity, several off-curve points,
+ * and cofactor points), which a serving node feeds straight off the wire. The
+ * two other backends reject these; this backend must not die. Built once under
+ * the same pthread_once as the library init and only read afterwards.
+ */
+static gcry_mpi_t scr_p, scr_d, scr_2d, scr_L;
+
+static void screen_init(void)
+{
+	gcry_mpi_t a, b;
+
+	gcry_mpi_scan(&scr_p, GCRYMPI_FMT_HEX, (const unsigned char *)
+		"7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffed",
+		0, NULL);
+	gcry_mpi_scan(&scr_L, GCRYMPI_FMT_HEX, (const unsigned char *)
+		"1000000000000000000000000000000014def9dea2f79cd65812631a5cf5d3ed",
+		0, NULL);
+	a = gcry_mpi_set_ui(NULL, 121665);
+	b = gcry_mpi_set_ui(NULL, 121666);
+	gcry_mpi_subm(a, scr_p, a, scr_p);		/* -121665 */
+	gcry_mpi_invm(b, b, scr_p);			/* 1/121666 */
+	scr_d = gcry_mpi_new(0);
+	gcry_mpi_mulm(scr_d, a, b, scr_p);		/* d */
+	scr_2d = gcry_mpi_new(0);
+	gcry_mpi_addm(scr_2d, scr_d, scr_d, scr_p);	/* 2d */
+	gcry_mpi_release(a);
+	gcry_mpi_release(b);
+}
+
 static void cc_init_once(void)
 {
 	if (!gcry_control(GCRYCTL_INITIALIZATION_FINISHED_P)) {
 		gcry_check_version(NULL);
 		gcry_control(GCRYCTL_INITIALIZATION_FINISHED, 0);
 	}
+	screen_init();
 }
 
 static void cc_init(void)
@@ -246,6 +279,178 @@ out:
 	return ok ? 0 : -1;
 }
 
+/*
+ * Recover the x coordinate of a compressed Ed25519 point; 1 if the point is on
+ * the curve, 0 otherwise. y is already reduced and canonical.
+ */
+static int screen_recover_x(gcry_mpi_t x, gcry_mpi_t y, int sign)
+{
+	gcry_mpi_t y2 = gcry_mpi_new(0), u = gcry_mpi_new(0), v = gcry_mpi_new(0);
+	gcry_mpi_t xx = gcry_mpi_new(0), e = gcry_mpi_new(0), chk = gcry_mpi_new(0);
+	gcry_mpi_t one = gcry_mpi_set_ui(NULL, 1);
+	int ok = 0;
+
+	gcry_mpi_mulm(y2, y, y, scr_p);
+	gcry_mpi_subm(u, y2, one, scr_p);			/* y^2 - 1 */
+	gcry_mpi_mulm(v, scr_d, y2, scr_p);
+	gcry_mpi_addm(v, v, one, scr_p);			/* d y^2 + 1 */
+	if (!gcry_mpi_invm(v, v, scr_p))
+		goto out;
+	gcry_mpi_mulm(xx, u, v, scr_p);				/* x^2 */
+	gcry_mpi_add_ui(e, scr_p, 3);
+	gcry_mpi_rshift(e, e, 3);
+	gcry_mpi_powm(x, xx, e, scr_p);				/* x = x^2 ^ ((p+3)/8) */
+	gcry_mpi_mulm(chk, x, x, scr_p);
+	if (gcry_mpi_cmp(chk, xx) != 0) {
+		gcry_mpi_t e2 = gcry_mpi_new(0), i2 = gcry_mpi_new(0);
+
+		gcry_mpi_sub_ui(e2, scr_p, 1);
+		gcry_mpi_rshift(e2, e2, 2);
+		gcry_mpi_powm(i2, gcry_mpi_set_ui(NULL, 2), e2, scr_p);
+		gcry_mpi_mulm(x, x, i2, scr_p);			/* x *= sqrt(-1) */
+		gcry_mpi_mulm(chk, x, x, scr_p);
+		gcry_mpi_release(e2);
+		gcry_mpi_release(i2);
+		if (gcry_mpi_cmp(chk, xx) != 0)
+			goto out;				/* not a square: off curve */
+	}
+	if (gcry_mpi_cmp_ui(x, 0) == 0 && sign)
+		goto out;					/* x=0 cannot carry a sign */
+	if (gcry_mpi_test_bit(x, 0) != sign) {
+		gcry_mpi_t nx = gcry_mpi_new(0);
+
+		gcry_mpi_subm(nx, scr_p, x, scr_p);
+		gcry_mpi_snatch(x, nx);
+	}
+	ok = 1;
+out:
+	gcry_mpi_release(y2); gcry_mpi_release(u); gcry_mpi_release(v);
+	gcry_mpi_release(xx); gcry_mpi_release(e); gcry_mpi_release(chk);
+	gcry_mpi_release(one);
+	return ok;
+}
+
+/* Extended twisted-Edwards coordinates (a = -1): no inversion per add. */
+struct screen_pt { gcry_mpi_t X, Y, Z, T; };
+
+static void screen_pt_free(struct screen_pt *p)
+{
+	gcry_mpi_release(p->X); gcry_mpi_release(p->Y);
+	gcry_mpi_release(p->Z); gcry_mpi_release(p->T);
+}
+
+static void screen_pt_add(struct screen_pt *r, const struct screen_pt *p1,
+			  const struct screen_pt *p2)
+{
+	gcry_mpi_t A = gcry_mpi_new(0), B = gcry_mpi_new(0), C = gcry_mpi_new(0);
+	gcry_mpi_t Dp = gcry_mpi_new(0), E = gcry_mpi_new(0), F = gcry_mpi_new(0);
+	gcry_mpi_t G = gcry_mpi_new(0), H = gcry_mpi_new(0);
+	gcry_mpi_t t = gcry_mpi_new(0), t2 = gcry_mpi_new(0);
+	gcry_mpi_t X3 = gcry_mpi_new(0), Y3 = gcry_mpi_new(0);
+	gcry_mpi_t Z3 = gcry_mpi_new(0), T3 = gcry_mpi_new(0);
+
+	gcry_mpi_subm(t, p1->Y, p1->X, scr_p);
+	gcry_mpi_subm(t2, p2->Y, p2->X, scr_p);
+	gcry_mpi_mulm(A, t, t2, scr_p);
+	gcry_mpi_addm(t, p1->Y, p1->X, scr_p);
+	gcry_mpi_addm(t2, p2->Y, p2->X, scr_p);
+	gcry_mpi_mulm(B, t, t2, scr_p);
+	gcry_mpi_mulm(C, p1->T, scr_2d, scr_p);
+	gcry_mpi_mulm(C, C, p2->T, scr_p);
+	gcry_mpi_mulm(Dp, p1->Z, p2->Z, scr_p);
+	gcry_mpi_addm(Dp, Dp, Dp, scr_p);
+	gcry_mpi_subm(E, B, A, scr_p);
+	gcry_mpi_subm(F, Dp, C, scr_p);
+	gcry_mpi_addm(G, Dp, C, scr_p);
+	gcry_mpi_addm(H, B, A, scr_p);
+	gcry_mpi_mulm(X3, E, F, scr_p);
+	gcry_mpi_mulm(Y3, G, H, scr_p);
+	gcry_mpi_mulm(Z3, F, G, scr_p);
+	gcry_mpi_mulm(T3, E, H, scr_p);
+	gcry_mpi_release(r->X); gcry_mpi_release(r->Y);
+	gcry_mpi_release(r->Z); gcry_mpi_release(r->T);
+	r->X = X3; r->Y = Y3; r->Z = Z3; r->T = T3;
+	gcry_mpi_release(A); gcry_mpi_release(B); gcry_mpi_release(C);
+	gcry_mpi_release(Dp); gcry_mpi_release(E); gcry_mpi_release(F);
+	gcry_mpi_release(G); gcry_mpi_release(H);
+	gcry_mpi_release(t); gcry_mpi_release(t2);
+}
+
+/*
+ * A public key safe to hand to gcry_pk_verify: canonical, on the curve, and in
+ * the prime-order subgroup (so not the identity and not a low-order or cofactor
+ * point). Real Ed25519 keys are always such points; the ones this rejects are
+ * exactly the degenerate inputs that abort libgcrypt, and are what the other
+ * backends reject too.
+ */
+static int screen_pubkey(const uint8_t pk[32])
+{
+	uint8_t be[32];
+	int sign = (pk[31] >> 7) & 1, i, ok = 0;
+	gcry_mpi_t y, x = gcry_mpi_new(0);
+	struct screen_pt A, R;
+
+	for (i = 0; i < 32; i++)
+		be[i] = pk[31 - i];
+	be[0] &= 0x7f;
+	gcry_mpi_scan(&y, GCRYMPI_FMT_USG, be, 32, NULL);
+	if (gcry_mpi_cmp(y, scr_p) >= 0)			/* non-canonical y */
+		goto out;
+	if (!screen_recover_x(x, y, sign))			/* off curve */
+		goto out;
+	if (gcry_mpi_cmp_ui(x, 0) == 0 && gcry_mpi_cmp_ui(y, 1) == 0)
+		goto out;					/* the identity */
+
+	A.X = gcry_mpi_copy(x);
+	A.Y = gcry_mpi_copy(y);
+	A.Z = gcry_mpi_set_ui(NULL, 1);
+	A.T = gcry_mpi_new(0);
+	gcry_mpi_mulm(A.T, x, y, scr_p);
+	R.X = gcry_mpi_set_ui(NULL, 0);
+	R.Y = gcry_mpi_set_ui(NULL, 1);
+	R.Z = gcry_mpi_set_ui(NULL, 1);
+	R.T = gcry_mpi_set_ui(NULL, 0);
+	for (i = (int)gcry_mpi_get_nbits(scr_L) - 1; i >= 0; i--) {
+		struct screen_pt tmp = R;
+
+		screen_pt_add(&R, &tmp, &tmp);			/* double */
+		if (gcry_mpi_test_bit(scr_L, i)) {
+			struct screen_pt s = R;
+
+			screen_pt_add(&R, &s, &A);		/* add */
+		}
+	}
+	/* L*A == identity in projective form: X == 0 and Y == Z (Z != 0). */
+	if (gcry_mpi_cmp_ui(R.X, 0) == 0 && gcry_mpi_cmp(R.Y, R.Z) == 0 &&
+	    gcry_mpi_cmp_ui(R.Z, 0) != 0)
+		ok = 1;
+	screen_pt_free(&A);
+	screen_pt_free(&R);
+out:
+	gcry_mpi_release(x);
+	gcry_mpi_release(y);
+	return ok;
+}
+
+/*
+ * RFC 8032 requires S < L; a signature with S >= L is a second, malleated
+ * encoding of the same signature. gcry_pk_verify does not enforce this, so a
+ * gcrypt node would otherwise store what a monocypher or openssl node rejects.
+ */
+static int screen_sig_canonical(const uint8_t sig[64])
+{
+	uint8_t be[32];
+	int i, lt;
+	gcry_mpi_t s;
+
+	for (i = 0; i < 32; i++)
+		be[i] = sig[63 - i];
+	gcry_mpi_scan(&s, GCRYMPI_FMT_USG, be, 32, NULL);
+	lt = gcry_mpi_cmp(s, scr_L) < 0;
+	gcry_mpi_release(s);
+	return lt;
+}
+
 int cc_ed25519_check(const uint8_t sig[64], const uint8_t pk[32],
 		     const uint8_t *msg, size_t msg_len)
 {
@@ -253,6 +458,10 @@ int cc_ed25519_check(const uint8_t sig[64], const uint8_t pk[32],
 	int ok = 0;
 
 	cc_init();
+	/* Screen the key and signature before libgcrypt sees them: a degenerate
+	 * key aborts its verifier, and it does not enforce S < L. */
+	if (!screen_pubkey(pk) || !screen_sig_canonical(sig))
+		return -1;
 	if (gcry_sexp_build(&s_pk, NULL,
 			    "(public-key(ecc(curve Ed25519)(flags eddsa)(q %b)))",
 			    32, pk))
