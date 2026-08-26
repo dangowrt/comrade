@@ -63,14 +63,21 @@ if "$E2E" token "$early" 2>/dev/null | grep -qE "ep4_rdv=1|ep6_rdv=1"; then
 fi
 
 # Now let the host find and qualify one, so what it would hand out today names
-# a node the early token does not.
+# a node the early token does not. Whichever family gets there first: the two
+# converge on their own schedules and which one it is says nothing about the
+# property under test.
 rdv=""
+fam=""
 i=0
 while [ "$i" -lt 150 ]; do
 	c=$(sed -n 's/^COMRADE TOKEN: //p' "$tmp/host.out" 2>/dev/null | tail -1)
-	if [ -n "$c" ] && "$E2E" token "$c" 2>/dev/null | grep -q "ep4_rdv=1"; then
-		rdv=$("$E2E" token "$c" 2>/dev/null | sed -n 's/^ep4=//p')
-		break
+	if [ -n "$c" ]; then
+		d=$("$E2E" token "$c" 2>/dev/null)
+		case "$d" in
+		*ep4_rdv=1*)	fam=4; rdv=$(echo "$d" | sed -n 's/^ep4=//p') ;;
+		*ep6_rdv=1*)	fam=6; rdv=$(echo "$d" | sed -n 's/^ep6=//p') ;;
+		esac
+		[ -n "$rdv" ] && break
 	fi
 	kill -0 "$hostpid" 2>/dev/null || {
 		echo "host exited before qualifying a rendezvous"
@@ -80,7 +87,7 @@ while [ "$i" -lt 150 ]; do
 	sleep 1
 	i=$((i + 1))
 done
-[ -n "$rdv" ] || { echo "host qualified no v4 rendezvous after ${i}s"; exit 1; }
+[ -n "$rdv" ] || { echo "host qualified no rendezvous at all after ${i}s"; exit 1; }
 
 # Both clients join on the early token, so both have to be told.
 COMRADE_DEBUG="$tmp/c1.dbg" "$E2E" client "$early" --hold-ms 20000 \
@@ -99,11 +106,25 @@ for n in 1 2; do
 		tail -5 "$tmp/c$n.out"
 		rc=1
 	}
-	grep -q "rdv: adopted the peer's v4 node $rdv" "$tmp/c$n.dbg" || {
+	# -F: a v6 endpoint is written [addr]:port, which as a pattern is a
+	# bracket expression matching one character.
+	grep -qF "rdv: adopted the peer's v$fam node $rdv" "$tmp/c$n.dbg" || {
 		echo "client $n was never told the host rendezvous at $rdv"
 		grep "rdv:" "$tmp/c$n.dbg" | tail -3
 		rc=1
 	}
 done
+
+# Each client says what it can reach as it joins, which is what lets a host
+# that has lost a family pick one to rendezvous on its behalf. Reports are
+# counted rather than peers: the dashboard id belongs to a row and is handed to
+# the next client when a row is freed, so two clients served one after the
+# other are both peer 0.
+told=$(grep -c "reach: peer [0-9][0-9]* v4 " "$tmp/host.dbg")
+if [ "$told" -lt 2 ]; then
+	echo "the host was told what a peer can reach $told times, wanted 2"
+	grep "reach:" "$tmp/host.dbg" | tail -4
+	rc=1
+fi
 [ "$rc" = 0 ] && echo "rendezvous consensus: both clients hold the host's node"
 exit $rc

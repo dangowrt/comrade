@@ -196,6 +196,23 @@ int sig_take_anchor_seen(struct sig *s, int family);
 void sig_search_again(struct sig *s, int family);
 
 /*
+ * Client: establish a rendezvous on `family` for a peer that cannot reach it.
+ *
+ * The sequence is the one a host runs for itself -- store the container where
+ * the key says it belongs, read it back, and let whichever node answered be
+ * the rendezvous -- because a node found any other way would carry a weaker
+ * promise than one the host found, while being indistinguishable from it
+ * afterwards. In particular a node proven only by serving a read may still
+ * refuse the write a claim is, and the claim would then fail silently against
+ * an anchor that looked sound.
+ *
+ * What is stored is the container untouched, neither slot ours: see
+ * mailbox_relay. Ends by itself once the family has a node; sig_relay(.., 0)
+ * ends it early.
+ */
+void sig_relay(struct sig *s, int family, int on);
+
+/*
  * Host: still actively chasing `family`'s rendezvous node -- true once the
  * other family has proven the DHT reachable at all, until this one is
  * captured too, however long that takes: no fixed run length, since a slower

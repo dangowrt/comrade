@@ -112,6 +112,8 @@ struct sig {
 	int ack_new4, ack_new6;
 	int relocate4, relocate6;	/* search for a replacement, while still
 					 * serving the one we hold */
+	int relay4, relay6;		/* client: asked to establish a
+					 * rendezvous the peer cannot reach */
 	int up4, up6;			/* proven connectivity, see sig_set_family_up */
 	int seq_regress;		/* consecutive reads older than what we hold */
 	int gets_ok;			/* validated reads of the container */
@@ -432,6 +434,16 @@ int sig_take_anchor_seen(struct sig *s, int family)
 
 	*seen = 0;
 	return was;
+}
+
+void sig_relay(struct sig *s, int family, int on)
+{
+	if (family == 6)
+		s->relay6 = on;
+	else
+		s->relay4 = on;
+	if (on)
+		s->locate = 1;		/* the get that follows is what captures */
 }
 
 void sig_search_again(struct sig *s, int family)
@@ -760,6 +772,16 @@ static int sig_merge(void *arg, const uint8_t *cur, size_t cur_len,
 	return mailbox_merge(&s->mb, cur, cur_len, out, out_len, max);
 }
 
+/* Place the container unchanged, for a store made on the peer's behalf: see
+ * mailbox_relay for why neither slot may be written here. */
+static int sig_relay_merge(void *arg, const uint8_t *cur, size_t cur_len,
+			   uint8_t *out, size_t *out_len, size_t max)
+{
+	struct sig *s = arg;
+
+	return mailbox_relay(&s->mb, cur, cur_len, out, out_len, max);
+}
+
 /*
  * The convergent store finished (on the k-closest nodes). It does not pick the
  * rendezvous node: a store acknowledgement does not prove a node will serve the
@@ -795,6 +817,14 @@ static void sig_note_put(struct sig *s)
 	s->last_put_ms = now_ms();
 }
 
+/* Asked to establish a rendezvous for a family we have not captured one on
+ * yet. A family we already hold needs no store: what we hold is what the peer
+ * is told. */
+static int relaying(const struct sig *s)
+{
+	return (s->relay4 && !s->rnode4_len) || (s->relay6 && !s->rnode6_len);
+}
+
 static void dht_pump(struct sig *s, uint64_t now)
 {
 	if (!dhtnode_ready(s->node))
@@ -822,9 +852,12 @@ static void dht_pump(struct sig *s, uint64_t now)
 		const uint8_t *slot;
 
 		bep44_get(s->engine, s->keys.bep44_pk, SIG_SALT, on_dht_get, s);
-		s->next_wide_get_ms = now + (mailbox_peer_slot(&s->mb, &slot) ?
-					     SIG_DHT_WIDE_IDLE_MS :
-					     SIG_DHT_WIDE_GET_MS);
+		/* Relaying keeps it eager: this read is not looking for the
+		 * peer's slot, it is what turns the store just made into a node
+		 * that has answered here. */
+		s->next_wide_get_ms = now +
+			((mailbox_peer_slot(&s->mb, &slot) && !relaying(s)) ?
+			 SIG_DHT_WIDE_IDLE_MS : SIG_DHT_WIDE_GET_MS);
 	}
 	if (now < s->next_put_ms)
 		return;
@@ -900,6 +933,26 @@ static void dht_pump(struct sig *s, uint64_t now)
 		bep44_update_direct(s->engine, s->keys.bep44_sk,
 				    s->keys.bep44_pk, SIG_SALT, sig_merge,
 				    s, NULL, NULL);
+		s->next_put_ms = now + SIG_DHT_PUT_MS;
+	} else if (relaying(s) && !s->put_inflight) {
+		/*
+		 * Rendezvous on the peer's behalf: a host that cannot reach a
+		 * family has asked us to establish one there. The sequence is
+		 * the host's own -- the convergent store places the container
+		 * on the nodes the key belongs to, and the validating get that
+		 * follows picks whichever of them answers -- because a node
+		 * established any other way would carry a weaker promise while
+		 * being indistinguishable afterwards.
+		 *
+		 * What differs is only what is written: the container as it
+		 * stands, neither slot ours (mailbox_relay). Claiming the
+		 * answer slot here would take the turnstile and hold it for the
+		 * session, locking out every other client, for a store that was
+		 * never about claiming anything.
+		 */
+		sig_note_put(s);
+		bep44_update(s->engine, s->keys.bep44_sk, s->keys.bep44_pk,
+			     SIG_SALT, sig_relay_merge, s, NULL, NULL);
 		s->next_put_ms = now + SIG_DHT_PUT_MS;
 	}
 }

@@ -62,6 +62,23 @@
  */
 #define RDV_TELL_MS 30000
 /*
+ * Reachability announcement backstop, on the same reasoning and for the same
+ * reason: sent the moment it moves, repeated rarely in case a frame was
+ * written into a channel that never carried it.
+ */
+#define REACH_TELL_MS 30000
+/*
+ * How often a host repeats its request that a client rendezvous for it. Slow:
+ * the request costs the client a convergent store and the search runs until it
+ * succeeds, so repeating is only for a client whose own situation has changed
+ * since, or one that never heard the first.
+ */
+#define RDVASK_MS 60000
+/* And how long one of those requests stands unrenewed. Several rounds, so a
+ * request survives a lost frame or a host busy with something else, but not a
+ * host that has stopped needing it. */
+#define RELAY_HOLD_MS (3 * RDVASK_MS)
+/*
  * Candidate advertisement cadence. Each end names its own local endpoints on
  * the shared lanlink socket over CTLM_CAND, so both explore the full set rather
  * than only the pair admission produced, and a multi-homed end has its
@@ -332,13 +349,27 @@ struct conn {
 	int hb_pong_seen;		/* a pong has ever come back on this conn */
 	uint64_t lost_since_ms;		/* when the link was first seen lost, 0 if live */
 
-	/* The peer's rendezvous announcement, handed from the ctl reader to the
-	 * loop; [0]=v4 [1]=v6. */
+	/* What the peer has said about itself, handed from the ctl reader to
+	 * whichever loop owns the model; [0]=v4 [1]=v6. */
 	struct rdv_node rdv_in[2];
-	pthread_mutex_t rdv_lock;
+	pthread_mutex_t peer_in_lock;
 	int rdv_in_dirty;
+	uint8_t reach_in[CTL_REACH_PLEN];	/* the peer's own reachability */
+	int reach_in_seen;
+	int reach_in_dirty;
+	int rdvask_in;			/* families the peer asked us to
+					 * rendezvous on for it; bit 0 v4, 1 v6 */
+	int rdvask_out;			/* families to ask this peer about,
+					 * decided by the thread that owns the
+					 * model and sent by this connection's
+					 * own loop -- nothing else may write
+					 * ctl_fd, or two frames interleave */
+	uint64_t next_rdvask_ms[2];	/* host: when this peer may be asked
+					 * again about each family */
 	uint32_t rdv_told_gen;		/* published set this peer has been told */
 	uint64_t next_rdv_tell_ms;	/* backstop repeat of that announcement */
+	uint32_t reach_told_gen;	/* reachability this peer has been told */
+	uint64_t next_reach_tell_ms;
 	uint64_t next_cand_ms;		/* when to advertise our own endpoints */
 
 	/* This connection's status (data only; the view renders it). */
@@ -437,7 +468,24 @@ struct sess {
 	 */
 	struct rdv_node rdv[2];
 	uint32_t rdv_gen;
-	pthread_mutex_t rdv_pub_lock;
+	/*
+	 * And what this end can reach, in the wire's own encoding, likewise with
+	 * a generation. A peer is told on connect and whenever it moves, which
+	 * is what lets a host that has lost a family ask somebody who still has
+	 * it to rendezvous on its behalf.
+	 */
+	uint8_t reach[CTL_REACH_PLEN];
+	uint32_t reach_gen;
+	/*
+	 * Families a peer has asked us to rendezvous on for it, kept here as
+	 * well as in sig because a rebuilt sig starts with none and the peer's
+	 * request stands until it has a node. [0]=v4 [1]=v6.
+	 */
+	int relay_fam[2];
+	uint64_t relay_until_ms[2];	/* when an unrenewed request lapses */
+	pthread_mutex_t pub_lock;	/* both of the above; written by the
+					 * thread that owns the model, read by
+					 * every connection on its own */
 
 	char **stun_servers;		/* rotated across ICE retries (host:port) */
 	int stun_count;
@@ -994,9 +1042,9 @@ static void fmt_rdv_fam(struct sess *s, int family, char *out, size_t n)
 	struct rdv_node r;
 	char ip[64];
 
-	pthread_mutex_lock(&s->rdv_pub_lock);
+	pthread_mutex_lock(&s->pub_lock);
 	r = s->rdv[fam_idx(family)];
-	pthread_mutex_unlock(&s->rdv_pub_lock);
+	pthread_mutex_unlock(&s->pub_lock);
 
 	out[0] = '\0';
 	if (r.have)
@@ -1702,12 +1750,24 @@ static void ctl_dispatch(void *arg, int type, const uint8_t *pl, size_t plen)
 		if (fam) {
 			int i = fam_idx(fam);
 
-			pthread_mutex_lock(&c->rdv_lock);
+			pthread_mutex_lock(&c->peer_in_lock);
 			c->rdv_in[i].sa = sa;
 			c->rdv_in[i].len = sl;
 			c->rdv_in[i].have = 1;
 			c->rdv_in_dirty = 1;
-			pthread_mutex_unlock(&c->rdv_lock);
+			pthread_mutex_unlock(&c->peer_in_lock);
+		}
+	} else if (type == CTLM_REACH && plen >= CTL_REACH_PLEN) {
+		pthread_mutex_lock(&c->peer_in_lock);
+		memcpy(c->reach_in, pl, CTL_REACH_PLEN);
+		c->reach_in_seen = 1;
+		c->reach_in_dirty = 1;
+		pthread_mutex_unlock(&c->peer_in_lock);
+	} else if (type == CTLM_RDVASK && plen >= CTL_RDVASK_PLEN) {
+		if (pl[0] == 4 || pl[0] == 6) {
+			pthread_mutex_lock(&c->peer_in_lock);
+			c->rdvask_in |= pl[0] == 6 ? 2 : 1;
+			pthread_mutex_unlock(&c->peer_in_lock);
 		}
 	} else if (type == CTLM_CAND && plen >= CTL_RDV_PLEN) {
 		struct sockaddr_storage sa;
@@ -2822,7 +2882,7 @@ static void rdv_publish(struct sess *s)
 		if (!netstate_anchor(&s->ns, famv[i], node, &nlen, &confirmed) ||
 		    !nlen)
 			continue;
-		pthread_mutex_lock(&s->rdv_pub_lock);
+		pthread_mutex_lock(&s->pub_lock);
 		same = s->rdv[i].have && s->rdv[i].len == nlen &&
 		       !memcmp(&s->rdv[i].sa, node, nlen);
 		if (!same || s->rdv[i].qualified != confirmed) {
@@ -2836,7 +2896,7 @@ static void rdv_publish(struct sess *s)
 				told = 1;
 			}
 		}
-		pthread_mutex_unlock(&s->rdv_pub_lock);
+		pthread_mutex_unlock(&s->pub_lock);
 	}
 	if (told)
 		dbg_logf("rdv: publishing set %u", (unsigned)s->rdv_gen);
@@ -2862,10 +2922,10 @@ static void rdv_tell(struct conn *c, uint64_t now)
 	uint32_t gen;
 	int i;
 
-	pthread_mutex_lock(&s->rdv_pub_lock);
+	pthread_mutex_lock(&s->pub_lock);
 	memcpy(pub, s->rdv, sizeof(pub));
 	gen = s->rdv_gen;
-	pthread_mutex_unlock(&s->rdv_pub_lock);
+	pthread_mutex_unlock(&s->pub_lock);
 
 	if (gen == c->rdv_told_gen && now < c->next_rdv_tell_ms)
 		return;
@@ -2904,14 +2964,14 @@ static void rdv_adopt(struct sess *s, struct conn *c)
 
 	if (!c)
 		return;
-	pthread_mutex_lock(&c->rdv_lock);
+	pthread_mutex_lock(&c->peer_in_lock);
 	if (!c->rdv_in_dirty) {
-		pthread_mutex_unlock(&c->rdv_lock);
+		pthread_mutex_unlock(&c->peer_in_lock);
 		return;
 	}
 	memcpy(in, c->rdv_in, sizeof(in));
 	c->rdv_in_dirty = 0;
-	pthread_mutex_unlock(&c->rdv_lock);
+	pthread_mutex_unlock(&c->peer_in_lock);
 	for (i = 0; i < 2; i++) {
 		uint8_t node[NETSTATE_SA_MAX], nlen = 0;
 		char b[80];
@@ -2933,20 +2993,250 @@ static void rdv_adopt(struct sess *s, struct conn *c)
 	}
 }
 
-/* Every served connection's announcement, drained on the host's own thread: a
- * worker runs the transport and never touches the model. */
-static void rdv_adopt_all(struct sess *s)
+/*
+ * Publish what this end can reach, for the connections to tell their peers.
+ *
+ * A verdict alone would not be enough to act on: NET_CONN_UP is asserted by a
+ * STUN round trip as readily as by the DHT, and it is the DHT a peer would be
+ * relying on if it asked us to rendezvous for it. So the DHT's own answer
+ * travels beside the verdict rather than folded into it.
+ *
+ * Runs on the thread that owns the model. Unlike the rendezvous set this is
+ * retracted as freely as it is raised: a family that has gone is exactly what
+ * the other end needs to know.
+ */
+static void reach_publish(struct sess *s)
+{
+	static const int famv[2] = { 4, 6 };
+	uint8_t pl[CTL_REACH_PLEN];
+	int i, moved;
+
+	memset(pl, 0, sizeof(pl));
+	for (i = 0; i < 2; i++) {
+		int conn = 0, acked = 0, state;
+
+		netstate_reach(&s->ns, famv[i], &conn, &acked);
+		state = conn == NET_CONN_UP ? CTL_REACH_UP :
+			conn == NET_CONN_PENDING ? CTL_REACH_PENDING :
+						   CTL_REACH_DOWN;
+		ctl_reach_encode(pl, i, state, acked ? CTL_REACHF_DHT : 0);
+	}
+	pthread_mutex_lock(&s->pub_lock);
+	moved = memcmp(s->reach, pl, sizeof(pl)) != 0;
+	if (moved) {
+		memcpy(s->reach, pl, sizeof(pl));
+		s->reach_gen++;
+	}
+	pthread_mutex_unlock(&s->pub_lock);
+	if (moved)
+		dbg_logf("reach: v4 %u/%u v6 %u/%u", pl[0], pl[1], pl[2], pl[3]);
+}
+
+/*
+ * Tell this peer what we can reach, whenever that is no longer what it was
+ * told. A connection starts owing it, so the peer knows the moment it is
+ * connected and again on every move. Runs on the connection's own thread.
+ */
+static void reach_tell(struct conn *c, uint64_t now)
+{
+	struct sess *s = c->sess;
+	uint8_t pl[CTL_REACH_PLEN];
+	uint32_t gen;
+
+	pthread_mutex_lock(&s->pub_lock);
+	memcpy(pl, s->reach, sizeof(pl));
+	gen = s->reach_gen;
+	pthread_mutex_unlock(&s->pub_lock);
+
+	if (!gen)			/* nothing observed to report yet */
+		return;
+	if (gen == c->reach_told_gen && now < c->next_reach_tell_ms)
+		return;
+	c->reach_told_gen = gen;
+	c->next_reach_tell_ms = now + REACH_TELL_MS;
+	ctl_send(c, CTLM_REACH, pl, sizeof(pl));
+}
+
+/* Take this peer's account of itself. Kept per connection, since in a
+ * multi-user host each one is a different machine on a different network. */
+static void reach_take(struct sess *s, struct conn *c)
+{
+	static const int famv[2] = { 4, 6 };
+	uint8_t pl[CTL_REACH_PLEN];
+	int i;
+
+	(void)s;
+	if (!c)
+		return;
+	pthread_mutex_lock(&c->peer_in_lock);
+	if (!c->reach_in_dirty) {
+		pthread_mutex_unlock(&c->peer_in_lock);
+		return;
+	}
+	c->reach_in_dirty = 0;
+	memcpy(pl, c->reach_in, sizeof(pl));
+	pthread_mutex_unlock(&c->peer_in_lock);
+	for (i = 0; i < 2; i++) {
+		int state = 0, flags = 0;
+
+		ctl_reach_decode(pl, sizeof(pl), i, &state, &flags);
+		dbg_logf("reach: peer %d v%d state=%d dht=%d", c->dash_id,
+			 famv[i], state, !!(flags & CTL_REACHF_DHT));
+	}
+}
+
+/*
+ * Whether this end can settle `family`'s rendezvous by itself: it reaches the
+ * DHT there, or it already holds a node. Either way there is nobody to ask.
+ */
+static int rdv_self_sufficient(struct sess *s, int family)
+{
+	int conn = 0, acked = 0;
+
+	if (netstate_anchor(&s->ns, family, NULL, NULL, NULL))
+		return 1;
+	netstate_reach(&s->ns, family, &conn, &acked);
+	return conn == NET_CONN_UP && acked;
+}
+
+/*
+ * Ask a client to establish the rendezvous this host cannot.
+ *
+ * A host with no global connectivity on a family has no way to place its
+ * mailbox where a peer arriving on that family would look, and no way to
+ * recover a node it lost when it moved. A client that still has the family has
+ * both, and is already trusted with the mailbox -- it holds the same key and
+ * writes to the same item. So it is asked, and what it finds comes back as an
+ * ordinary announcement.
+ *
+ * Asked, not told: the client answers with a node or it does not, and the host
+ * is no worse off either way. Repeated on a slow cadence for as long as the
+ * family is missing, since the client's own situation may improve, and stopped
+ * the moment a node arrives from anywhere at all.
+ *
+ * Decides here, on the thread that owns the model, and leaves the sending to
+ * the connection's own loop: the control socket belongs to that loop, and two
+ * threads writing a stream socket interleave whatever they were framing.
+ */
+static void rdv_ask(struct sess *s, struct conn *c, uint64_t now)
+{
+	static const int famv[2] = { 4, 6 };
+	uint8_t reach[CTL_REACH_PLEN];
+	int seen, i;
+
+	if (!s->cfg->is_host || !c || !(s->cfg->sig_flags & SIG_DHT))
+		return;
+	pthread_mutex_lock(&c->peer_in_lock);
+	seen = c->reach_in_seen;
+	memcpy(reach, c->reach_in, sizeof(reach));
+	pthread_mutex_unlock(&c->peer_in_lock);
+	if (!seen)			/* it has not said, so do not presume */
+		return;
+	for (i = 0; i < 2; i++) {
+		int state = 0, flags = 0;
+
+		if (now < c->next_rdvask_ms[i])
+			continue;
+		if (rdv_self_sufficient(s, famv[i]))
+			continue;
+		ctl_reach_decode(reach, sizeof(reach), i, &state, &flags);
+		/* Its own DHT has to have answered it there. A family merely
+		 * carrying traffic proves nothing about reaching the DHT over
+		 * it, and that is the whole of what is being asked for. */
+		if (state != CTL_REACH_UP || !(flags & CTL_REACHF_DHT))
+			continue;
+		c->next_rdvask_ms[i] = now + RDVASK_MS;
+		pthread_mutex_lock(&c->peer_in_lock);
+		c->rdvask_out |= i ? 2 : 1;
+		pthread_mutex_unlock(&c->peer_in_lock);
+		dbg_logf("rdv: asking peer %d to rendezvous on v%d", c->dash_id,
+			 famv[i]);
+	}
+}
+
+/* Send what rdv_ask decided, from the loop that owns the control socket. */
+static void rdvask_tell(struct conn *c)
+{
+	static const int famv[2] = { 4, 6 };
+	uint8_t pl[CTL_RDVASK_PLEN];
+	int ask, i;
+
+	pthread_mutex_lock(&c->peer_in_lock);
+	ask = c->rdvask_out;
+	c->rdvask_out = 0;
+	pthread_mutex_unlock(&c->peer_in_lock);
+	for (i = 0; i < 2; i++) {
+		if (!(ask & (i ? 2 : 1)))
+			continue;
+		pl[0] = (uint8_t)famv[i];
+		ctl_send(c, CTLM_RDVASK, pl, sizeof(pl));
+	}
+}
+
+/*
+ * Act on a peer's request that we rendezvous for it.
+ *
+ * Standing rather than one-shot, because the search runs until it succeeds and
+ * a single answer would strand a host whose first request was lost. It lapses
+ * all the same: the host repeats it only while it still lacks the family, so a
+ * request that stops being renewed is one the host no longer needs, and a
+ * client that can never capture a node would otherwise store into the DHT for
+ * the rest of the session on behalf of somebody long since recovered.
+ *
+ * Runs on the thread that owns the model.
+ */
+static void rdv_serve_ask(struct sess *s, struct conn *c, uint64_t now)
+{
+	static const int famv[2] = { 4, 6 };
+	int ask = 0, i;
+
+	if (s->cfg->is_host || !s->sig)
+		return;
+	if (c) {
+		pthread_mutex_lock(&c->peer_in_lock);
+		ask = c->rdvask_in;
+		c->rdvask_in = 0;
+		pthread_mutex_unlock(&c->peer_in_lock);
+	}
+	for (i = 0; i < 2; i++) {
+		if (ask & (i ? 2 : 1)) {
+			s->relay_until_ms[i] = now + RELAY_HOLD_MS;
+			if (!s->relay_fam[i]) {
+				s->relay_fam[i] = 1;
+				sig_relay(s->sig, famv[i], 1);
+				dbg_logf("rdv: rendezvousing on v%d for the peer",
+					 famv[i]);
+			}
+			continue;
+		}
+		if (s->relay_fam[i] && now >= s->relay_until_ms[i]) {
+			s->relay_fam[i] = 0;
+			sig_relay(s->sig, famv[i], 0);
+			dbg_logf("rdv: no longer asked to rendezvous on v%d",
+				 famv[i]);
+		}
+	}
+}
+
+/* Everything each served connection's peer has said about itself, drained on
+ * the host's own thread: a worker runs the transport and never touches the
+ * model. */
+static void peer_in_drain(struct sess *s)
 {
 	int i;
 
 	for (i = 0; i < HOST_MAX_WORKERS; i++)
-		if (s->conns[i])
+		if (s->conns[i]) {
 			rdv_adopt(s, s->conns[i]);
+			reach_take(s, s->conns[i]);
+			rdv_ask(s, s->conns[i], now_ms());
+		}
 }
 
 static int net_changed(struct sess *s);
 static int sig_rebuild(struct sess *s);
 static void net_settle(struct sess *s);
+static void ns_take_acks(struct sess *s, uint64_t now);
 
 /*
  * A fresh ICE password under the same ufrag: the identity naming this
@@ -3146,6 +3436,10 @@ static int conn_run(struct conn *c, int drive_sig)
 	 * this struct was told. */
 	c->rdv_told_gen = 0;
 	c->next_rdv_tell_ms = conn_start;
+	c->reach_told_gen = 0;
+	c->next_reach_tell_ms = conn_start;
+	c->next_rdvask_ms[0] = conn_start;
+	c->next_rdvask_ms[1] = conn_start;
 
 	if (drive_sig) {
 		/* Capture a rendezvous node per family for reconnection (the host
@@ -3222,6 +3516,8 @@ static int conn_run(struct conn *c, int drive_sig)
 		path_tick(c, now_ms());
 		cand_tell(c, now_ms());
 		rdv_tell(c, now_ms());
+		reach_tell(c, now_ms());
+		rdvask_tell(c);
 		if (s->cfg->test_blackhole_ms > 0 && c->bh_kind < 0 &&
 		    !c->bh_done &&
 		    now_ms() - conn_start >
@@ -3264,12 +3560,25 @@ static int conn_run(struct conn *c, int drive_sig)
 			next_hb = now_ms() + HB_INTERVAL_MS;
 		}
 		if (drive_sig) {
-			/* This loop owns the model here, so what the peer has
+			/*
+			 * This loop owns the model here, so what the peer has
 			 * told us is acted on now rather than at the end of the
 			 * session: the pin is what a re-claim goes out through,
-			 * which is the whole point of following the host. */
+			 * which is the whole point of following the host.
+			 *
+			 * Nothing watches the interfaces while a link is up (a
+			 * move drops it and comes back through the reconnect),
+			 * but the DHT keeps answering, and its answers are what
+			 * a peer relying on us would be relying on -- so they
+			 * are taken here and reported as they change.
+			 */
+			ns_take_acks(s, now_ms());
 			rdv_publish(s);
+			reach_publish(s);
 			rdv_adopt(s, c);
+			reach_take(s, c);
+			rdv_serve_ask(s, c, now_ms());
+			rdv_ask(s, c, now_ms());
 			net_settle(s);
 		}
 		if (drive_sig && !s->cfg->is_host)
@@ -3568,6 +3877,25 @@ static void ns_take_acks(struct sess *s, uint64_t now)
 		 * to be given up seconds after being chosen. */
 		if (sig_take_anchor_seen(s->sig, famv[i]))
 			netstate_on_anchor_seen(&s->ns, famv[i], now);
+		/*
+		 * Rendezvousing for the peer on this family: sig has captured
+		 * whichever node served the get that followed its store, which
+		 * is how a host's own is captured too. Take it as this end's
+		 * anchor, so it is pinned, proven and announced by the rules
+		 * every other node goes through -- the peer must not be able to
+		 * tell a node found this way from one we found for ourselves.
+		 */
+		if (s->relay_fam[i] &&
+		    !netstate_anchor(&s->ns, famv[i], NULL, NULL, NULL)) {
+			struct sockaddr_storage r;
+			socklen_t rl = sizeof(r);
+
+			if (sig_located(s->sig, famv[i], (struct sockaddr *)&r,
+					&rl))
+				netstate_on_rdv_offered(&s->ns, famv[i],
+							(const uint8_t *)&r,
+							(int)rl);
+		}
 		memset(&sa, 0, sizeof(sa));
 		if (!sig_take_ack(s->sig, famv[i], (struct sockaddr *)&sa, &sl))
 			continue;
@@ -4080,7 +4408,7 @@ static struct conn *conn_alloc(struct sess *s)
 	c->ctl_fd = INVALID_SOCK;
 	c->bh_kind = -1;
 	pthread_mutex_init(&c->hb_lock, NULL);
-	pthread_mutex_init(&c->rdv_lock, NULL);
+	pthread_mutex_init(&c->peer_in_lock, NULL);
 	pthread_mutex_init(&c->status_lock, NULL);
 	pthread_mutex_init(&c->stream_lock, NULL);
 	pthread_mutex_init(&c->path_lock, NULL);
@@ -4098,7 +4426,7 @@ static void conn_free(struct conn *c)
 	if (c->nat)
 		nat_destroy(c->nat);
 	pthread_mutex_destroy(&c->hb_lock);
-	pthread_mutex_destroy(&c->rdv_lock);
+	pthread_mutex_destroy(&c->peer_in_lock);
 	pthread_mutex_destroy(&c->status_lock);
 	pthread_mutex_destroy(&c->stream_lock);
 	pthread_mutex_destroy(&c->path_lock);
@@ -4497,6 +4825,12 @@ static int sig_arm(struct sess *s)
 		}
 	}
 	seed_rendezvous(s);
+	/* A peer's request that we rendezvous for it stands until it has a
+	 * node; a fresh signaller starts knowing nothing of it. */
+	if (s->relay_fam[0])
+		sig_relay(s->sig, 4, 1);
+	if (s->relay_fam[1])
+		sig_relay(s->sig, 6, 1);
 	return 0;
 }
 
@@ -4580,7 +4914,8 @@ static int host_turnstile(struct sess *s)
 		token_pump(s);			/* mint and advertise the token */
 		rdv_publish(s);			/* where we rendezvous, for the
 						 * workers to announce */
-		rdv_adopt_all(s);
+		reach_publish(s);		/* and what we can reach */
+		peer_in_drain(s);
 		lan_drain(s, ws, &dash_seq);	/* admit same-segment claimants */
 
 		/*
@@ -4968,10 +5303,10 @@ int session_run(const struct session_cfg *cfg)
 	pthread_mutex_init(&s.trickle_lock, NULL);
 	pthread_mutex_init(&s.c.status_lock, NULL);	/* s.c.status zeroed = connecting */
 	pthread_mutex_init(&s.c.hb_lock, NULL);
-	pthread_mutex_init(&s.c.rdv_lock, NULL);
+	pthread_mutex_init(&s.c.peer_in_lock, NULL);
 	pthread_mutex_init(&s.c.stream_lock, NULL);
 	pthread_mutex_init(&s.c.path_lock, NULL);
-	pthread_mutex_init(&s.rdv_pub_lock, NULL);
+	pthread_mutex_init(&s.pub_lock, NULL);
 	path_table_init(&s.c.paths);
 	pthread_mutex_init(&s.ns_lock, NULL);
 	netmon_init(&s.netmon);
@@ -5360,9 +5695,9 @@ done:
 	pthread_mutex_destroy(&s.trickle_lock);
 	pthread_mutex_destroy(&s.c.status_lock);
 	pthread_mutex_destroy(&s.c.hb_lock);
-	pthread_mutex_destroy(&s.c.rdv_lock);
+	pthread_mutex_destroy(&s.c.peer_in_lock);
 	pthread_mutex_destroy(&s.c.stream_lock);
 	pthread_mutex_destroy(&s.c.path_lock);
-	pthread_mutex_destroy(&s.rdv_pub_lock);
+	pthread_mutex_destroy(&s.pub_lock);
 	return rc;
 }

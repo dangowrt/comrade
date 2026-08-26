@@ -94,6 +94,29 @@ size_t mailbox_build(struct mailbox *m, uint8_t *out, size_t outlen);
 int mailbox_merge(struct mailbox *m, const uint8_t *cur, size_t cur_len,
 		  uint8_t *out, size_t *out_len, size_t max);
 
+/*
+ * Re-store the container as it stands, for an end publishing on somebody
+ * else's behalf: a client asked by a host to establish a rendezvous on a
+ * family the host cannot reach itself.
+ *
+ * Neither slot is the relayer's to write. The offer is the host's, and the
+ * answer is whichever client holds the turnstile -- writing our own slot here
+ * would claim that mutex and lock every other client out for the session, and
+ * dropping the slot would throw away a claim in flight. So both go back
+ * exactly as found.
+ *
+ * What the read found wins, since it is the newer of the two views; where it
+ * found nothing -- which is the whole point, these being nodes that do not
+ * hold the value yet -- what we last read is what gets placed. An end that has
+ * never read the container has nothing to relay and this returns -1, rather
+ * than storing an empty one over a good one.
+ *
+ * Reads m and does not touch it: the relayer's own turnstile state is not this
+ * operation's business. Matches the bep44 merge-callback contract otherwise.
+ */
+int mailbox_relay(const struct mailbox *m, const uint8_t *cur, size_t cur_len,
+		  uint8_t *out, size_t *out_len, size_t max);
+
 /* The client's view of the answer slot in the last-read container. */
 enum mailbox_claim mailbox_claim_status(const struct mailbox *m);
 

@@ -194,6 +194,54 @@ int main(void)
 		}
 	}
 
-	printf("ctlproto: all framing, rendezvous and candidate cases pass\n");
+	/*
+	 * Reachability: both families in one message, so a peer learns the
+	 * whole situation at once instead of a family at a time.
+	 */
+	{
+		uint8_t pl[CTL_REACH_PLEN];
+		uint8_t f[CTL_FRAME_MAX];
+		int st = -1, fl = -1;
+		size_t n;
+
+		memset(pl, 0, sizeof(pl));
+		ctl_reach_encode(pl, 0, CTL_REACH_UP, CTL_REACHF_DHT);
+		ctl_reach_encode(pl, 1, CTL_REACH_PENDING, 0);
+		n = ctl_frame(f, CTLM_REACH, pl, CTL_REACH_PLEN);
+		assert(n == CTL_HDR + CTL_REACH_PLEN);
+		reset(&r);
+		ctl_reframer_feed(&r, f, n, collect, NULL);
+		assert(nseen == 1 && seen[0].type == CTLM_REACH);
+		assert(seen[0].plen == CTL_REACH_PLEN);
+		assert(ctl_reach_decode(seen[0].pl, seen[0].plen, 0, &st, &fl));
+		assert(st == CTL_REACH_UP && (fl & CTL_REACHF_DHT));
+		assert(ctl_reach_decode(seen[0].pl, seen[0].plen, 1, &st, &fl));
+		assert(st == CTL_REACH_PENDING && !(fl & CTL_REACHF_DHT));
+
+		/* One family says nothing about the other. */
+		memset(pl, 0, sizeof(pl));
+		ctl_reach_encode(pl, 1, CTL_REACH_UP, CTL_REACHF_DHT);
+		assert(ctl_reach_decode(pl, sizeof(pl), 0, &st, &fl));
+		assert(st == CTL_REACH_DOWN && fl == 0);
+
+		/*
+		 * A state this build has no meaning for is not reachability: a
+		 * peer on a later build must never have a value it invented
+		 * read here as "you can rely on me".
+		 */
+		memset(pl, 0, sizeof(pl));
+		pl[0] = 99;
+		pl[1] = CTL_REACHF_DHT;
+		assert(ctl_reach_decode(pl, sizeof(pl), 0, &st, &fl));
+		assert(st == CTL_REACH_DOWN);
+
+		/* Short payloads decode to nothing rather than to whatever is
+		 * past the end. */
+		st = CTL_REACH_UP;
+		assert(ctl_reach_decode(pl, CTL_REACH_PLEN - 1, 0, &st, &fl) == 0);
+		assert(st == CTL_REACH_DOWN && fl == 0);
+	}
+
+	printf("ctlproto: all framing, rendezvous, candidate and reach cases pass\n");
 	return 0;
 }

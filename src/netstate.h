@@ -262,4 +262,12 @@ void netstate_facts(const struct netstate *ns, int family,
 int netstate_anchor(const struct netstate *ns, int family, uint8_t *out,
 		    uint8_t *out_len, int *confirmed);
 
+/*
+ * What this end can reach on `family`, for telling a peer. The verdict alone
+ * does not answer it: a STUN round trip asserts NET_CONN_UP without saying
+ * anything about the DHT, and it is the DHT a peer would be relying on.
+ */
+void netstate_reach(const struct netstate *ns, int family, int *conn,
+		    int *dht_acked);
+
 #endif

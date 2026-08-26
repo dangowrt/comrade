@@ -96,6 +96,31 @@ void ctl_rdv_encode(uint8_t *pl, int family, const struct sockaddr *sa)
 	pl[2] = (uint8_t)port;
 }
 
+void ctl_reach_encode(uint8_t *pl, int slot, int state, int flags)
+{
+	if (slot != 0 && slot != 1)
+		return;
+	pl[slot * 2] = (uint8_t)state;
+	pl[slot * 2 + 1] = (uint8_t)flags;
+}
+
+int ctl_reach_decode(const uint8_t *pl, size_t plen, int slot, int *state,
+		     int *flags)
+{
+	uint8_t st;
+
+	*state = CTL_REACH_DOWN;
+	*flags = 0;
+	if (plen < CTL_REACH_PLEN || (slot != 0 && slot != 1))
+		return 0;
+	st = pl[slot * 2];
+	/* Anything this build has no meaning for is not reachability. */
+	if (st == CTL_REACH_PENDING || st == CTL_REACH_UP)
+		*state = st;
+	*flags = pl[slot * 2 + 1];
+	return 1;
+}
+
 int ctl_rdv_decode(const uint8_t *pl, size_t plen, struct sockaddr_storage *out,
 		   socklen_t *len)
 {

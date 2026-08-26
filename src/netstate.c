@@ -507,6 +507,17 @@ void netstate_facts(const struct netstate *ns, int family,
 	out->public_port_proven = 0;	/* no UPnP/NAT-PMP/PCP in the tree */
 }
 
+void netstate_reach(const struct netstate *ns, int family, int *conn,
+		    int *dht_acked)
+{
+	const struct netstate_fam *f = &ns->f[fam_idx(family)];
+
+	if (conn)
+		*conn = f->conn;
+	if (dht_acked)
+		*dht_acked = f->dht_acked;
+}
+
 int netstate_anchor(const struct netstate *ns, int family, uint8_t *out,
 		    uint8_t *out_len, int *confirmed)
 {

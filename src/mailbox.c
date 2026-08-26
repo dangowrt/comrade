@@ -92,9 +92,30 @@ void mailbox_parse(struct mailbox *m, const uint8_t *v, size_t v_len)
 	recompute_need_write(m);
 }
 
-size_t mailbox_build(struct mailbox *m, uint8_t *out, size_t outlen)
+/* The container itself: the answer slot then the offer slot, each omitted when
+ * empty. Both writers go through here, so there is one definition of what the
+ * value on the wire looks like. */
+static size_t build_slots(const uint8_t *pa, size_t la, const uint8_t *po,
+			  size_t lo, uint8_t *out, size_t outlen)
 {
 	struct benc_buf b;
+
+	benc_buf_init(&b, out, outlen);
+	benc_raw_add(&b, "d", 1);
+	if (la) {
+		benc_key_add(&b, "a");
+		benc_str_add(&b, pa, la);
+	}
+	if (lo) {
+		benc_key_add(&b, "o");
+		benc_str_add(&b, po, lo);
+	}
+	benc_raw_add(&b, "e", 1);
+	return b.err ? 0 : b.len;
+}
+
+size_t mailbox_build(struct mailbox *m, uint8_t *out, size_t outlen)
+{
 	const uint8_t *pa = NULL, *po = NULL;
 	size_t la = 0, lo = 0;
 
@@ -112,18 +133,7 @@ size_t mailbox_build(struct mailbox *m, uint8_t *out, size_t outlen)
 		lo = m->slot_o_len;
 	}
 
-	benc_buf_init(&b, out, outlen);
-	benc_raw_add(&b, "d", 1);
-	if (la) {
-		benc_key_add(&b, "a");
-		benc_str_add(&b, pa, la);
-	}
-	if (lo) {
-		benc_key_add(&b, "o");
-		benc_str_add(&b, po, lo);
-	}
-	benc_raw_add(&b, "e", 1);
-	return b.err ? 0 : b.len;
+	return build_slots(pa, la, po, lo, out, outlen);
 }
 
 int mailbox_merge(struct mailbox *m, const uint8_t *cur, size_t cur_len,
@@ -134,6 +144,33 @@ int mailbox_merge(struct mailbox *m, const uint8_t *cur, size_t cur_len,
 	if (cur)
 		parse_slots(m, cur, cur_len);
 	n = mailbox_build(m, out, max);
+	if (!n)
+		return -1;
+	*out_len = n;
+	return 0;
+}
+
+int mailbox_relay(const struct mailbox *m, const uint8_t *cur, size_t cur_len,
+		  uint8_t *out, size_t *out_len, size_t max)
+{
+	uint8_t a[MAILBOX_SLOT_MAX], o[MAILBOX_SLOT_MAX];
+	size_t la = 0, lo = 0, n;
+
+	if (cur && cur_len) {
+		la = slot_extract(cur, cur_len, "a", a, sizeof(a));
+		lo = slot_extract(cur, cur_len, "o", o, sizeof(o));
+	}
+	if (!la && !lo) {
+		if (!m->have_cur)
+			return -1;
+		memcpy(a, m->slot_a, m->slot_a_len);
+		la = m->slot_a_len;
+		memcpy(o, m->slot_o, m->slot_o_len);
+		lo = m->slot_o_len;
+	}
+	if (!la && !lo)			/* nothing worth placing anywhere */
+		return -1;
+	n = build_slots(a, la, o, lo, out, max);
 	if (!n)
 		return -1;
 	*out_len = n;

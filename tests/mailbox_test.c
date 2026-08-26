@@ -531,6 +531,69 @@ int main(void)
 		assert(mailbox_client_should_claim(&c));
 	}
 
-	printf("mailbox: all container, turnstile and CAS cases pass\n");
+	/*
+	 * Relaying: a client asked to place the container on a family its host
+	 * cannot reach. It is publishing for somebody else, so it must put back
+	 * exactly what is there -- taking the answer slot would seize the
+	 * turnstile for the session, and dropping it would discard a claim in
+	 * flight.
+	 */
+	{
+		struct mailbox c, other, blank;
+		uint8_t cur[BEP44_MAX_VALUE], relayed[BEP44_MAX_VALUE];
+		uint8_t held[BEP44_MAX_VALUE];
+		size_t curlen, outlen = 0, heldlen;
+
+		/* The container as it stands: another client's claim in the
+		 * answer slot, the host's offer in the other. */
+		mailbox_init(&other, 0);
+		mailbox_set_mine(&other, ANS2, sizeof(ANS2));
+		mailbox_parse(&other, offv, offlen);
+		curlen = mailbox_build(&other, cur, sizeof(cur));
+		assert(curlen);
+
+		/* The relayer has an answer of its own, which is exactly what
+		 * must not go out. */
+		mailbox_init(&c, 0);
+		mailbox_set_mine(&c, ANS1, sizeof(ANS1));
+		mailbox_parse(&c, cur, curlen);
+
+		assert(!mailbox_relay(&c, cur, curlen, relayed, &outlen,
+				      sizeof(relayed)));
+		/* Byte for byte what was read: not our answer, and not a
+		 * container with the other client's claim missing. */
+		assert(outlen == curlen && !memcmp(relayed, cur, curlen));
+
+		/* The ordinary merge on the same input is what the relay must
+		 * NOT do: it writes our own answer in. */
+		heldlen = mailbox_build(&c, held, sizeof(held));
+		assert(heldlen != curlen || memcmp(held, cur, curlen));
+
+		/*
+		 * The nodes being stored to are the ones that do not hold the
+		 * value yet, so the read comes back empty. What we last read is
+		 * placed instead -- otherwise the store would put an empty
+		 * container where the mailbox belongs.
+		 */
+		outlen = 0;
+		assert(!mailbox_relay(&c, NULL, 0, relayed, &outlen,
+				      sizeof(relayed)));
+		assert(outlen == curlen && !memcmp(relayed, cur, curlen));
+
+		/* An end that has never read the container has nothing to
+		 * place, and must not place emptiness over a good value. */
+		mailbox_init(&blank, 0);
+		mailbox_set_mine(&blank, ANS1, sizeof(ANS1));
+		outlen = 0;
+		assert(mailbox_relay(&blank, NULL, 0, relayed, &outlen,
+				     sizeof(relayed)) == -1);
+
+		/* Relaying leaves the relayer's own turnstile state alone: it
+		 * still holds what it held and still owes what it owed. */
+		assert(mailbox_claim_status(&c) == MAILBOX_CLAIM_BUSY);
+		assert(!mailbox_client_should_claim(&c));
+	}
+
+	printf("mailbox: all container, turnstile, CAS and relay cases pass\n");
 	return 0;
 }
