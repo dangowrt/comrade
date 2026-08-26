@@ -1157,17 +1157,25 @@ static void sdp_filter(const char *in, int family, char *out, size_t outlen)
 static int fan_local_sdp(struct sess *s)
 {
 	uint8_t pool[POOL4_MAX][4];
-	int n, i, st;
+	int n, i;
 
 	pthread_mutex_lock(&s->trickle_lock);
 	n = s->npool4;
 	for (i = 0; i < n; i++)
 		memcpy(pool[i], s->pool4[i], 4);
-	st = stun_mapping_result(&s->map4);
 	pthread_mutex_unlock(&s->trickle_lock);
+	/*
+	 * A dependent mapping is the case this exists for, not a reason to skip
+	 * it: a carrier handing out an egress address per destination is
+	 * exactly why naming one of them is a guess. What the fan cannot
+	 * survive is the PORT moving too, since it names the pool's addresses
+	 * against this description's own reflexive port -- so that, and only
+	 * that, calls it off. Asking the coarser question turned the fan off in
+	 * every case it was written for.
+	 */
 	if (n >= 2)
 		cand_sdp_fan_v4(s->local_sdp, sizeof(s->local_sdp), pool,
-				(size_t)n, st == STUN_MAPPING_DEPENDENT);
+				(size_t)n, !stun_mapping_port_stable(&s->map4));
 	return n;
 }
 

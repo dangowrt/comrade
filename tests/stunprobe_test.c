@@ -132,6 +132,36 @@ static void mapping_check(void)
 	/* A reset drops all of that and starts over. */
 	stun_mapping_reset(&m);
 	assert(stun_mapping_result(&m) == STUN_MAPPING_UNKNOWN);
+
+	/*
+	 * Which half moved is a separate question, and the one that decides
+	 * whether a peer can still be told where to aim. A carrier pool hands
+	 * out an address per destination and keeps the port: every address is
+	 * worth naming, against the port this socket was mapped to. Answering
+	 * the coarser question instead turns the fan off in exactly the case
+	 * it exists for.
+	 */
+	stun_mapping_reset(&m);
+	assert(stun_mapping_port_stable(&m));		/* nothing has moved yet */
+	stun_mapping_add(&m, a1, 40000);
+	stun_mapping_add(&m, a2, 40000);
+	assert(stun_mapping_result(&m) == STUN_MAPPING_DEPENDENT);
+	assert(stun_mapping_port_stable(&m));
+
+	/* A port that moves with the destination leaves nothing to name: it is
+	 * not the port ICE listens on and cannot be guessed. */
+	stun_mapping_reset(&m);
+	stun_mapping_add(&m, a1, 40000);
+	stun_mapping_add(&m, a2, 40001);
+	assert(stun_mapping_result(&m) == STUN_MAPPING_DEPENDENT);
+	assert(!stun_mapping_port_stable(&m));
+
+	/* Sticky, the same way the verdict is. */
+	stun_mapping_reset(&m);
+	stun_mapping_add(&m, a1, 40000);
+	stun_mapping_add(&m, a1, 40001);
+	stun_mapping_add(&m, a1, 40000);
+	assert(!stun_mapping_port_stable(&m));
 }
 
 

@@ -456,8 +456,16 @@ void stun_mapping_add(struct stun_mapping *m, const uint8_t addr[4],
 		memcpy(m->addr, addr, 4);
 		m->port = port;
 		m->agree = 1;
-	} else if (memcmp(m->addr, addr, 4) || m->port != port) {
-		m->agree = 0;
+		m->addr_agree = 1;
+		m->port_agree = 1;
+	} else {
+		/* Tracked apart: which of the two moved is what decides
+		 * whether a peer can still be told where to aim. */
+		if (memcmp(m->addr, addr, 4))
+			m->addr_agree = 0;
+		if (m->port != port)
+			m->port_agree = 0;
+		m->agree = m->addr_agree && m->port_agree;
 	}
 	m->nsamples++;
 }
@@ -467,4 +475,9 @@ int stun_mapping_result(const struct stun_mapping *m)
 	if (m->nsamples < 2)
 		return STUN_MAPPING_UNKNOWN;
 	return m->agree ? STUN_MAPPING_INDEPENDENT : STUN_MAPPING_DEPENDENT;
+}
+
+int stun_mapping_port_stable(const struct stun_mapping *m)
+{
+	return m->nsamples < 1 || m->port_agree;
 }

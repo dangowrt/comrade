@@ -86,12 +86,32 @@ struct stun_mapping {
 	uint8_t addr[4];
 	uint16_t port;
 	int nsamples;
-	int agree;
+	int agree;			/* both of the two below */
+	int addr_agree;			/* every server saw the same address */
+	int port_agree;			/* every server saw the same port */
 };
 
 void stun_mapping_reset(struct stun_mapping *m);
 void stun_mapping_add(struct stun_mapping *m, const uint8_t addr[4],
 		      uint16_t port);
 int stun_mapping_result(const struct stun_mapping *m);
+
+/*
+ * Whether the port survived, whatever the address did.
+ *
+ * The two halves of a dependent mapping are not the same news. A carrier that
+ * hands out an egress address per destination but keeps the port is one a peer
+ * can still be pointed at: name every address the pool has seen against the
+ * port this socket was mapped to, and whichever address the carrier picks for
+ * that peer is among them.
+ *
+ * A port that moves leaves nothing to name. The ports the probe observes are
+ * its own socket's, not the one ICE listens on, so they cannot stand in -- and
+ * a port that varies by destination cannot be guessed.
+ *
+ * Answers 1 until something has actually disagreed, so a single sample is not
+ * read as a port that moves.
+ */
+int stun_mapping_port_stable(const struct stun_mapping *m);
 
 #endif
