@@ -1548,6 +1548,22 @@ static void *stun_probe_thread(void *arg)
 	 * many that is belongs to the carrier -- so asking a subset leaves a
 	 * number of our own egress addresses undiscovered that nothing here can
 	 * predict. */
+	/*
+	 * One round, one socket, one verdict. The mapping test asks whether two
+	 * servers saw the same mapping for the SAME socket, and every round
+	 * opens a new one -- so carrying the samples across rounds compares two
+	 * sockets, which differ by construction. From the second round on the
+	 * answer was therefore always "it depends on the destination", however
+	 * well-behaved the NAT, and the fan that answers a per-destination
+	 * address was switched off by a port difference that meant nothing.
+	 *
+	 * The pool is not reset with it: which addresses this carrier maps us
+	 * to is a fact about the carrier and accumulates across rounds, where
+	 * one socket's port is a fact about that socket.
+	 */
+	pthread_mutex_lock(&s->trickle_lock);
+	stun_mapping_reset(&s->map4);
+	pthread_mutex_unlock(&s->trickle_lock);
 	random_bytes(seed, sizeof(seed));
 	stun_probe_run(s->stun_servers, s->stun_count, STUN_PROBE_MS, seed,
 		       &s->probe_stop, probe_hit, s);
