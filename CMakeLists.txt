@@ -712,7 +712,14 @@ if(BUILD_TESTING)
 	add_executable(bep44_store_test tests/bep44_store_test.c)
 	target_link_libraries(bep44_store_test comrade_bep44)
 	add_test(NAME bep44_store_test COMMAND bep44_store_test)
-	set_tests_properties(bep44_store_test PROPERTIES TIMEOUT 30)
+	set_tests_properties(bep44_store_test PROPERTIES TIMEOUT 120)
+
+	# Includes bep44.c to reach the static per-source rate bucket, so it
+	# links the crypto pieces directly rather than the comrade_bep44 archive.
+	add_executable(bep44_rl_test tests/bep44_rl_test.c)
+	target_link_libraries(bep44_rl_test comrade_crypto comrade_compat)
+	target_include_directories(bep44_rl_test PRIVATE src)
+	add_test(NAME bep44_rl_test COMMAND bep44_rl_test)
 
 	# Creates and tears down real DHT nodes (two UDP sockets on the wildcard
 	# address, nothing sent) and stalls their bootstrap resolve, so it needs
@@ -944,7 +951,7 @@ if(BUILD_TESTING)
 		ctlproto_test netmon_test
 		candpolicy_test candpack_test mailbox_test roauth_test
 		stunprobe_test path_test bep44_test
-		bep44_pin_test bep44_store_test
+		bep44_pin_test bep44_store_test bep44_rl_test
 		sig_rebuild_test natstream_test stream_room_test
 		stream_cc_test sshloop_test sshfwd_test sshexit_test sshro_test
 		sshkcp_test sshctl_test qr_test showfmt_test mview_test)

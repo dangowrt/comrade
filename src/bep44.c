@@ -7,6 +7,20 @@
 #include <time.h>
 #include "wsock.h"
 
+/*
+ * Platform headers for the installed-memory query that sizes the item store.
+ * wsock.h has already pulled in windows.h on Win32 (GlobalMemoryStatusEx);
+ * the BSDs and macOS answer through sysctl, everyone else through sysconf.
+ */
+#ifndef _WIN32
+#include <unistd.h>
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || \
+    defined(__OpenBSD__) || defined(__DragonFly__)
+#include <sys/types.h>
+#include <sys/sysctl.h>
+#endif
+#endif
+
 static int b44_debug = -1;
 
 static int debug_on(void)
@@ -58,7 +72,18 @@ static int debug_on(void)
 _Static_assert(BEP44_MAX_VALUE <= UINT16_MAX, "v_len is stored in a uint16_t");
 _Static_assert(BEP44_MAX_SALT <= UINT8_MAX, "salt_len is stored in a uint8_t");
 
-#define B44_STORE_MAX 256
+/*
+ * The item store is sized to the machine, not fixed: hold at most 0.5% of
+ * installed memory worth of items, budgeting a full ~1.25 KiB for each, so a
+ * 64 MB box lands near 256 and a large host scales up. Total installed memory
+ * is the portable choice (available memory needs per-OS vm stats); the clamp
+ * keeps a tiny box usable and a huge one from reserving gigabytes, and the
+ * default covers a host whose memory we cannot read.
+ */
+#define B44_STORE_MIN 64
+#define B44_STORE_MAX 32768
+#define B44_STORE_DEFAULT 256
+#define B44_ITEM_BUDGET 1280			/* bytes charged per stored item */
 #define B44_ITEM_TTL_MS (2 * 60 * 60 * 1000)
 #define B44_TOKEN_ROTATE_MS (5 * 60 * 1000)
 #define B44_TOKEN_LEN 8
@@ -67,8 +92,26 @@ _Static_assert(BEP44_MAX_SALT <= UINT8_MAX, "salt_len is stored in a uint8_t");
 #define B44_CACHE_MAX 128
 #define B44_REPLY_NODES 8
 #define B44_CACHE_TTL_MS (60 * 60 * 1000)	/* drop a referral unseen for an hour */
-#define B44_RL_RATE 200				/* served queries per second, sustained */
-#define B44_RL_BURST 512			/* bucket depth */
+/*
+ * Per-source rate limiting, the way a real libtorrent/uTorrent node does it
+ * (its dht dos_blocker): count a source's messages over a fixed window and, if
+ * it exceeds the limit, ban it for a while (here 50 in 10 s -> a 5-minute ban).
+ * On top of that plain per-address ban is prefix consolidation. Tracking
+ * starts at the individual address; when offenders appear in distinct siblings
+ * of a wider prefix the ban widens to it, each step needing one more offender:
+ * v6 /128 -> /64 (2) -> /56 (3) -> /48 (4) -> /40 (5) -> /32 (6), v4 in fine
+ * steps that stop at /24, /32 -> /30 (2) -> /28 (3) -> /26 (4) -> /24 (5), since
+ * a whole ISP can sit behind a /24. A banned prefix swallows its interior --
+ * offenders inside it are dropped, not re-counted -- so lone offenders that
+ * merely share a wide prefix never widen the ban; only spread across it does.
+ * If the table of bans fills, the node fails closed, dropping all unsolicited
+ * queries until it drains.
+ */
+#define B44_BAN_MAX 128				/* blocklist / tracker entries */
+#define B44_BAN_WINDOW_MS 10000			/* the counting window (libtorrent's 10s) */
+#define B44_BAN_RATE 5				/* messages/sec over the window before a ban */
+#define B44_BAN_TIME_MS (5 * 60 * 1000)		/* ban duration (libtorrent's 5 min) */
+#define B44_FAILCLOSED_MS 30000			/* block-all window when the table saturates */
 #define B44_COMPACT_CACHE_MAX 4			/* cache entries taken from one reply */
 
 /*
@@ -87,6 +130,22 @@ struct b44_item {
 	uint64_t expires_ms;
 	uint16_t v_len;
 	uint8_t v[];
+};
+
+/*
+ * One entry in the ban list: a network prefix that is either being rate-tracked
+ * (banned_until == 0) or currently banned. libtorrent (dos_blocker) and mldht
+ * (SpamThrottle) both rate-limit per source; this keeps the global bucket
+ * underneath as a total-load backstop and adds the prefix escalation above.
+ */
+struct b44_ban {
+	uint8_t net[16];		/* network prefix, masked to `bits` */
+	uint8_t family;			/* AF_INET / AF_INET6; 0 = free slot */
+	uint8_t bits;			/* prefix length */
+	uint16_t weight;		/* offenders this ban stands for (for widening) */
+	int32_t count;			/* messages seen in the current window */
+	uint64_t window_ms;		/* end of the current counting window */
+	uint64_t banned_until;		/* 0 = tracking, else banned through this time */
 };
 
 /*
@@ -206,7 +265,8 @@ struct bep44_engine {
 	uint8_t serving;
 	uint8_t token_secret[2][B44_SECRET_LEN];
 	uint64_t token_rotate_ms;
-	struct b44_item *store[B44_STORE_MAX];
+	struct b44_item **store;
+	int store_cap;
 	struct b44_cnode cache[B44_CACHE_MAX];
 	int cache_next;
 	/*
@@ -215,8 +275,10 @@ struct bep44_engine {
 	 * answers get/put before jech sees them, so it must carry its own cap or
 	 * an unauthenticated get becomes an unmetered reflector.
 	 */
-	int32_t rl_tokens;
-	uint64_t rl_ms;
+	struct b44_ban ban[B44_BAN_MAX];
+	uint64_t block_all_until;	/* fail-closed window when the ban table saturates */
+	int rl_rate;			/* per-source messages/sec threshold (0 disables) */
+	uint64_t rl_ban_ms;		/* ban duration; 0 disables rate limiting */
 };
 
 static uint64_t now_ms(void)
@@ -225,6 +287,61 @@ static uint64_t now_ms(void)
 
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return (uint64_t)ts.tv_sec * 1000 + (uint64_t)(ts.tv_nsec / 1000000);
+}
+
+/* Total installed physical memory in bytes, or 0 if the platform will not say. */
+static uint64_t plat_total_memory(void)
+{
+#if defined(_WIN32)
+	MEMORYSTATUSEX st;
+
+	st.dwLength = sizeof(st);
+	if (GlobalMemoryStatusEx(&st))
+		return st.ullTotalPhys;
+	return 0;
+#elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || \
+	defined(__OpenBSD__) || defined(__DragonFly__)
+	int mib[2] = { CTL_HW,
+#if defined(HW_MEMSIZE)
+		HW_MEMSIZE		/* macOS: 64-bit total */
+#elif defined(HW_PHYSMEM64)
+		HW_PHYSMEM64		/* NetBSD/OpenBSD */
+#else
+		HW_PHYSMEM		/* older BSD: may saturate at 4 GiB */
+#endif
+	};
+	uint64_t mem = 0;
+	size_t len = sizeof(mem);
+
+	if (sysctl(mib, 2, &mem, &len, NULL, 0) == 0 && len == sizeof(mem))
+		return mem;
+	return 0;
+#elif defined(_SC_PHYS_PAGES) && defined(_SC_PAGESIZE)
+	long pages = sysconf(_SC_PHYS_PAGES);
+	long psz = sysconf(_SC_PAGESIZE);
+
+	if (pages > 0 && psz > 0)
+		return (uint64_t)pages * (uint64_t)psz;
+	return 0;
+#else
+	return 0;
+#endif
+}
+
+/* How many items to hold: 0.5% of installed memory, one B44_ITEM_BUDGET each. */
+static int store_cap_for_memory(void)
+{
+	uint64_t total = plat_total_memory();
+	uint64_t records;
+
+	if (!total)
+		return B44_STORE_DEFAULT;
+	records = (total / 200) / B44_ITEM_BUDGET;	/* 0.5% */
+	if (records < B44_STORE_MIN)
+		return B44_STORE_MIN;
+	if (records > B44_STORE_MAX)
+		return B44_STORE_MAX;
+	return (int)records;
 }
 
 /*
@@ -285,6 +402,12 @@ struct bep44_engine *bep44_create(const uint8_t myid[20], sock_t s4, sock_t s6)
 
 	if (!e)
 		return NULL;
+	e->store_cap = store_cap_for_memory();
+	e->store = calloc((size_t)e->store_cap, sizeof(*e->store));
+	if (!e->store) {
+		free(e);
+		return NULL;
+	}
 	memcpy(e->myid, myid, 20);
 	e->s4 = s4;
 	e->s6 = s6;
@@ -308,8 +431,9 @@ void bep44_free(struct bep44_engine *e)
 
 	while (e->ops)
 		op_free(e, e->ops);
-	for (i = 0; i < B44_STORE_MAX; i++)
+	for (i = 0; i < e->store_cap; i++)
 		free(e->store[i]);
+	free(e->store);
 	free(e);
 }
 
@@ -1207,7 +1331,7 @@ static void store_expire(struct bep44_engine *e, uint64_t now)
 {
 	int i;
 
-	for (i = 0; i < B44_STORE_MAX; i++) {
+	for (i = 0; i < e->store_cap; i++) {
 		if (e->store[i] && now >= e->store[i]->expires_ms) {
 			free(e->store[i]);
 			e->store[i] = NULL;
@@ -1220,7 +1344,7 @@ static struct b44_item **store_slot_of(struct bep44_engine *e,
 {
 	int i;
 
-	for (i = 0; i < B44_STORE_MAX; i++) {
+	for (i = 0; i < e->store_cap; i++) {
 		if (e->store[i] && !memcmp(e->store[i]->target, target, 20))
 			return &e->store[i];
 	}
@@ -1241,11 +1365,11 @@ static int store_free_slot(struct bep44_engine *e, const uint8_t new_target[20])
 	uint8_t vdist[20], ndist[20];
 	int i, victim = -1;
 
-	for (i = 0; i < B44_STORE_MAX; i++) {
+	for (i = 0; i < e->store_cap; i++) {
 		if (!e->store[i])
 			return i;
 	}
-	for (i = 0; i < B44_STORE_MAX; i++) {
+	for (i = 0; i < e->store_cap; i++) {
 		uint8_t d[20];
 
 		dist_calc(d, e->store[i]->target, e->myid);
@@ -1760,28 +1884,192 @@ static void want_parse(struct b44_query *q)
 }
 
 /*
- * A token bucket over served queries: refill at B44_RL_RATE per second up to
- * B44_RL_BURST, spend one per query answered. This caps the rate at which an
- * unauthenticated get can be turned into a reflected reply, the protection
- * jech/dht applies at its own ingress that a get/put no longer passes through.
+ * Prefix ladders the ban list widens along. v6 is coarse-stepped: a customer
+ * holds a /64 at least, often a /56 or /48, so a lone /128 is pointless to
+ * block and the useful units start at /64. v4 is fine-stepped and stops at
+ * /24: an attacker's contiguous block is small, and a whole ISP can sit behind
+ * a /24, so widening past it would punish bystanders for one bad host.
  */
-static int rate_ok(struct bep44_engine *e)
+static const uint8_t b44_ladder6[] = { 128, 64, 56, 48, 40, 32 };
+static const uint8_t b44_ladder4[] = { 32, 30, 28, 26, 24 };
+
+static size_t fam_len(int family)
 {
+	return family == AF_INET6 ? 16 : 4;
+}
+
+static int ban_base_bits(int family)
+{
+	return family == AF_INET6 ? 128 : 32;
+}
+
+/* Copy addr into out, clearing every bit past the prefix length. */
+static void net_mask(uint8_t out[16], const uint8_t *addr, size_t alen, int bits)
+{
+	size_t i;
+
+	for (i = 0; i < alen; i++) {
+		int keep = bits - (int)i * 8;
+
+		if (keep >= 8)
+			out[i] = addr[i];
+		else if (keep <= 0)
+			out[i] = 0;
+		else
+			out[i] = addr[i] & (uint8_t)(0xff << (8 - keep));
+	}
+}
+
+/* Does addr fall inside this ban's prefix? (family is checked by the caller.) */
+static int net_contains(const struct b44_ban *b, const uint8_t *addr, size_t alen)
+{
+	uint8_t m[16];
+
+	net_mask(m, addr, alen, b->bits);
+	return !memcmp(m, b->net, alen);
+}
+
+/*
+ * A prefix has just been banned: walk up its family's ladder and, at each
+ * wider prefix, sum the offender weight of the bans within it; when that
+ * reaches the level's threshold (one more per step -- 2 for the first widening,
+ * 3 for the next, and so on) replace those bans with a single ban of the wider
+ * prefix carrying their combined weight, then keep climbing. Because a banned
+ * prefix already swallows its interior, the weight in a wider prefix can only
+ * grow through offenders in distinct un-banned siblings, so widening tracks
+ * spread, not a single busy corner.
+ */
+static void ban_escalate(struct bep44_engine *e, const uint8_t seed_net[16],
+			 int family, uint64_t now)
+{
+	const uint8_t *ladder = family == AF_INET6 ? b44_ladder6 : b44_ladder4;
+	size_t n = family == AF_INET6 ? sizeof(b44_ladder6) : sizeof(b44_ladder4);
+	size_t alen = fam_len(family);
+	size_t i;
+
+	for (i = 1; i < n; i++) {		/* index 0 is the base; parents follow */
+		int pbits = ladder[i];
+		uint8_t pnet[16], bm[16];
+		int j, weight = 0, first = -1;
+
+		net_mask(pnet, seed_net, alen, pbits);
+		for (j = 0; j < B44_BAN_MAX; j++) {
+			struct b44_ban *b = &e->ban[j];
+
+			if (b->family != family || b->banned_until <= now ||
+			    b->bits < pbits)
+				continue;
+			net_mask(bm, b->net, alen, pbits);
+			if (memcmp(bm, pnet, alen))
+				continue;
+			weight += b->weight;
+			if (first < 0)
+				first = j;
+		}
+		if (weight < (int)(i + 1))	/* one more offender per level */
+			continue;
+		for (j = 0; j < B44_BAN_MAX; j++) {
+			struct b44_ban *b = &e->ban[j];
+
+			if (b->family != family || b->banned_until <= now ||
+			    b->bits < pbits)
+				continue;
+			net_mask(bm, b->net, alen, pbits);
+			if (!memcmp(bm, pnet, alen))
+				memset(b, 0, sizeof(*b));
+		}
+		memset(&e->ban[first], 0, sizeof(e->ban[first]));
+		memcpy(e->ban[first].net, pnet, alen);
+		e->ban[first].family = (uint8_t)family;
+		e->ban[first].bits = (uint8_t)pbits;
+		e->ban[first].weight = (uint16_t)weight;
+		e->ban[first].banned_until = now + e->rl_ban_ms;
+	}
+}
+
+/*
+ * The per-source half of the limit. A source is dropped if it falls inside a
+ * banned prefix; otherwise it is rate-tracked at its family's base prefix
+ * (/64 for v6, /32 for v4). Exceeding the bucket only throttles; sustained
+ * abuse past the empty bucket bans the prefix and tries to widen the ban. When
+ * every slot is an active ban the table is saturated, so the node fails closed,
+ * dropping all unsolicited queries for a cool-off. A caller with no usable
+ * address is left to the global bucket.
+ */
+static int ban_ok(struct bep44_engine *e, const struct sockaddr *from,
+		  socklen_t fromlen)
+{
+	const uint8_t *ab;
+	size_t alen = addr_bytes(from, fromlen, &ab);
+	int family = from ? from->sa_family : 0;
 	uint64_t now = now_ms();
+	struct b44_ban *track = NULL, *slot = NULL, *lru = NULL;
+	uint8_t base[16];
+	int i, base_bits;
 
-	if (now > e->rl_ms) {
-		int64_t add = (int64_t)(now - e->rl_ms) * B44_RL_RATE / 1000;
+	if (!e->rl_ban_ms)		/* rate limiting disabled (a test driver) */
+		return 1;
+	if (e->block_all_until > now)
+		return 0;
+	if (!alen)
+		return 1;
 
-		if (add > 0) {
-			int64_t t = e->rl_tokens + add;
+	base_bits = ban_base_bits(family);
+	net_mask(base, ab, alen, base_bits);
 
-			e->rl_tokens = t > B44_RL_BURST ? B44_RL_BURST : (int32_t)t;
-			e->rl_ms = now;
+	for (i = 0; i < B44_BAN_MAX; i++) {
+		struct b44_ban *b = &e->ban[i];
+
+		if (!b->family) {
+			if (!slot)
+				slot = b;
+			continue;
+		}
+		if (b->banned_until && b->banned_until <= now) {
+			memset(b, 0, sizeof(*b));	/* expired: reclaim */
+			if (!slot)
+				slot = b;
+			continue;
+		}
+		if (b->family != family)
+			continue;
+		if (b->banned_until > now && net_contains(b, ab, alen))
+			return 0;			/* inside a banned prefix */
+		if (!b->banned_until) {
+			if (b->bits == base_bits && !memcmp(b->net, base, alen))
+				track = b;
+			if (!lru || b->count < lru->count)
+				lru = b;
 		}
 	}
-	if (e->rl_tokens <= 0)
+
+	if (track) {
+		if (now >= track->window_ms) {	/* window elapsed: start a fresh one */
+			track->count = 0;
+			track->window_ms = now + B44_BAN_WINDOW_MS;
+		}
+		if (++track->count < e->rl_rate * 10)
+			return 1;		/* under the window's limit: served */
+		/* too many in one window: ban the address and try to widen it */
+		track->banned_until = now + e->rl_ban_ms;
+		track->weight = 1;
+		track->count = 0;
+		ban_escalate(e, track->net, family, now);
 		return 0;
-	e->rl_tokens--;
+	}
+
+	if (!slot)
+		slot = lru;			/* reuse the least active tracker */
+	if (!slot) {
+		e->block_all_until = now + B44_FAILCLOSED_MS;	/* saturated */
+		return 0;
+	}
+	memset(slot, 0, sizeof(*slot));
+	memcpy(slot->net, base, alen);
+	slot->family = (uint8_t)family;
+	slot->bits = (uint8_t)base_bits;
+	slot->count = 1;
+	slot->window_ms = now + B44_BAN_WINDOW_MS;
 	return 1;
 }
 
@@ -1811,7 +2099,7 @@ static int query_handle(struct bep44_engine *e, const uint8_t *buf, size_t len,
 	 * consumed here rather than handed on, since jech/dht would only drop it
 	 * too. Over the rate limit, likewise drop it silently.
 	 */
-	if (addr_martian(from, fromlen) || !rate_ok(e))
+	if (addr_martian(from, fromlen) || !ban_ok(e, from, fromlen))
 		return 1;
 
 	/* From here the query is ours to answer, well formed or not: falling
@@ -1845,6 +2133,21 @@ static int query_handle(struct bep44_engine *e, const uint8_t *buf, size_t len,
 	return 1;
 }
 
+/*
+ * Tune or disable the per-source rate limiter, the way libtorrent exposes
+ * dht_block_ratelimit / dht_block_timeout. A real node keeps the default (a
+ * source is banned for ban_seconds once it exceeds per_source_rate messages a
+ * second over a 10s window); a conformance harness passes ban_seconds 0 to turn
+ * it off, since a black-box suite drives one source far faster than any peer --
+ * exactly what drivers/libtorrent does to run the same tests.
+ */
+void bep44_ratelimit(struct bep44_engine *e, int per_source_rate,
+		     int ban_seconds)
+{
+	e->rl_rate = per_source_rate;
+	e->rl_ban_ms = (uint64_t)(ban_seconds > 0 ? ban_seconds : 0) * 1000;
+}
+
 int bep44_serve(struct bep44_engine *e, int enable)
 {
 	if (!enable) {
@@ -1856,8 +2159,8 @@ int bep44_serve(struct bep44_engine *e, int enable)
 		    random_bytes(e->token_secret[1], B44_SECRET_LEN))
 			return -1;
 		e->token_rotate_ms = now_ms() + B44_TOKEN_ROTATE_MS;
-		e->rl_tokens = B44_RL_BURST;
-		e->rl_ms = now_ms();
+		e->rl_rate = B44_BAN_RATE;
+		e->rl_ban_ms = B44_BAN_TIME_MS;
 		e->serving = 1;
 	}
 	return 0;

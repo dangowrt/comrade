@@ -26,7 +26,6 @@
 #define V_LEN 15
 
 static struct bep44_engine *e;
-static uint8_t g_myid[20];
 static sock_t s_node, s_peer;
 static struct sockaddr_in peer_addr;
 static uint8_t pk[32], sk[64];
@@ -77,8 +76,7 @@ static sock_t bind_addr(struct sockaddr_in *out, uint32_t addr)
 	return s;
 }
 
-/* Feed one datagram and collect whatever the node sends back. */
-static int deliver(const uint8_t *msg, size_t len)
+static int deliver_once(const uint8_t *msg, size_t len)
 {
 	struct pollfd fd;
 	int consumed;
@@ -88,13 +86,24 @@ static int deliver(const uint8_t *msg, size_t len)
 			       sizeof(peer_addr));
 	fd.fd = s_peer;
 	fd.events = POLLIN;
-	if (sock_poll(&fd, 1, 50) > 0) {
+	if (sock_poll(&fd, 1, 10) > 0) {
 		ssize_t n = recv(s_peer, (char *)last, sizeof(last), 0);
 
 		if (n > 0)
 			last_len = (size_t)n;
 	}
 	return consumed;
+}
+
+/*
+ * Feed one datagram and collect the reply. Each test runs on a fresh engine
+ * and sends well under the rate limiter's window, so every serving query is
+ * answered; serving_off and martian, which expect no reply, call bep44_input
+ * directly and check for silence.
+ */
+static int deliver(const uint8_t *msg, size_t len)
+{
+	return deliver_once(msg, len);
 }
 
 static int feed_str(const char *msg)
@@ -336,17 +345,6 @@ static void serves(const uint8_t target[20], const char *v, size_t v_len)
 
 	assert(deliver(buf, q_get(buf, sizeof(buf), target, NULL, 0)) == 1);
 	assert(reply_v_is(v, v_len));
-}
-
-static int stored_value_present(const uint8_t target[20])
-{
-	uint8_t buf[512];
-	const uint8_t *v;
-	size_t vlen;
-
-	if (deliver(buf, q_get(buf, sizeof(buf), target, NULL, 0)) != 1)
-		return 0;
-	return reply_field("v", &v, &vlen) == 0;
 }
 
 static void serves_nothing(const uint8_t target[20])
@@ -642,9 +640,7 @@ static void malformed_check(void)
 	assert(reply_error_code() == 203);
 	serves_nothing(target);
 	bep44_immutable_target(target, (const uint8_t *)V_RAW, V_LEN);
-	/* immutable_check stored exactly this value already, so the check is
-	 * that it is unchanged rather than that nothing is there */
-	serves(target, V_RAW, V_LEN);
+	serves_nothing(target);		/* not silently downgraded to immutable */
 
 	/* a non-canonical integer in a put: the signature covers exact bytes,
 	 * so it must not be stored */
@@ -715,103 +711,6 @@ static void martian_check(void)
 }
 
 /*
- * A distant flood must not evict a nearby item. Plant one item whose target is
- * genuinely close to our id (grind an immutable value until sha1(v) shares our
- * id's top bits), flood the store past full with items at random distance, and
- * confirm the near item is still served: eviction takes the furthest, so the
- * nearest never goes.
- */
-static void admission_check(void)
-{
-	struct put_spec s = { 0 };
-	uint8_t near_target[20], tok[64], near_v[40], buf[600];
-	size_t tok_len, near_len = 0;
-	char salt[24];
-	uint32_t n;
-	int i;
-
-	/* find v with sha1(v) matching our id in the top 16 bits */
-	for (n = 0; n < 1000000; n++) {
-		char body[16];
-		int bl = snprintf(body, sizeof(body), "near%u", n);
-		struct benc_buf vb;
-
-		benc_buf_init(&vb, near_v, sizeof(near_v));
-		benc_str_add(&vb, body, (size_t)bl);
-		assert(!vb.err);
-		bep44_immutable_target(near_target, near_v, vb.len);
-		if (near_target[0] == g_myid[0] && near_target[1] == g_myid[1]) {
-			near_len = vb.len;
-			break;
-		}
-	}
-	assert(near_len);
-	token_for(near_target, tok, &tok_len);
-	{
-		struct benc_buf b;
-
-		benc_buf_init(&b, buf, sizeof(buf));
-		benc_raw_add(&b, "d1:ad", 5);
-		benc_key_add(&b, "id");
-		benc_str_add(&b, "aaaaaaaaaaaaaaaaaaaa", 20);
-		benc_key_add(&b, "token");
-		benc_str_add(&b, tok, tok_len);
-		benc_key_add(&b, "v");
-		benc_raw_add(&b, near_v, near_len);
-		benc_raw_add(&b, "e1:q3:put1:t2:zz1:y1:qe", 23);
-		assert(!b.err);
-		assert(deliver(buf, b.len) == 1 && reply_is("r"));
-	}
-	assert(stored_value_present(near_target));
-
-	/* flood well past the 256-item store with distinct far-ish items */
-	s.mutable_put = 1;
-	s.seq = 1;
-	s.v = V_RAW;
-	s.v_len = V_LEN;
-	for (i = 0; i < 400; i++) {
-		snprintf(salt, sizeof(salt), "fill-%d", i);
-		s.salt = (const uint8_t *)salt;
-		s.salt_len = strlen(salt);
-		put_and_expect(&s, 0);		/* always acked */
-		if (i % 100 == 99)
-			sleep(1);		/* let the token bucket refill */
-	}
-	/* the near item, closest of all, is untouched */
-	assert(stored_value_present(near_target));
-}
-
-/* The token-bucket limiter drops served queries past the burst, and refills
- * over time; a genuine node under the limit is unaffected. */
-static void rate_limit_check(void)
-{
-	uint8_t buf[512], target[20];
-	int replies = 0, i;
-
-	memset(target, 0x77, sizeof(target));
-	/* Fire well past the burst in a tight loop (no time passes, so no
-	 * refill): some are answered, then the bucket empties and the rest are
-	 * dropped. */
-	for (i = 0; i < 4000; i++) {
-		last_len = 0;
-		bep44_input(e, buf, q_get(buf, sizeof(buf), target, NULL, 0),
-			    (struct sockaddr *)&peer_addr, sizeof(peer_addr));
-		{
-			struct pollfd fd = { .fd = s_peer, .events = POLLIN };
-
-			while (sock_poll(&fd, 1, 0) > 0) {
-				char junk[2048];
-
-				if (recv(s_peer, junk, sizeof(junk), 0) > 0)
-					replies++;
-			}
-		}
-	}
-	/* far below 4000: the bucket bounded it */
-	assert(replies > 0 && replies < 2000);
-}
-
-/*
  * A put carrying a degenerate public key (here the Ed25519 identity point) must
  * be rejected, not verified into a crash. On the gcrypt backend libgcrypt's
  * verifier aborts on such a key unless it is screened first; on every backend
@@ -868,7 +767,9 @@ static void serving_off_check(void)
 	assert(!bep44_serve(e, 0));
 	/* with serving off nothing is claimed, so the caller can hand every
 	 * packet to its BEP 5 engine as before */
-	assert(deliver(buf, q_get(buf, sizeof(buf), target, NULL, 0)) == 0);
+	last_len = 0;
+	assert(bep44_input(e, buf, q_get(buf, sizeof(buf), target, NULL, 0),
+			   (struct sockaddr *)&peer_addr, sizeof(peer_addr)) == 0);
 	assert(!last_len);
 	assert(!bep44_serve(e, 1));
 }
@@ -880,7 +781,6 @@ int main(void)
 
 	for (i = 0; i < sizeof(myid); i++)
 		myid[i] = (uint8_t)(i * 5 + 3);
-	memcpy(g_myid, myid, sizeof(myid));
 	for (i = 0; i < sizeof(seed); i++)
 		seed[i] = (uint8_t)(i + 1);
 	assert(!cc_ed25519_key_pair(sk, pk, seed));
@@ -896,24 +796,30 @@ int main(void)
 		s_peer = bind_addr(&peer_addr, addr);
 	}
 
-	e = bep44_create(myid, s_node, INVALID_SOCK);
-	assert(e);
-	assert(!bep44_serve(e, 1));
+	{
+		void (*tests[])(void) = {
+			immutable_check, mutable_check, cas_check, limits_check,
+			binary_salt_check, conditional_get_check, malformed_check,
+			referral_empty_check, martian_check, low_order_key_check,
+			serving_off_check,
+		};
+		size_t t;
 
-	immutable_check();
-	mutable_check();
-	cas_check();
-	limits_check();
-	binary_salt_check();
-	conditional_get_check();
-	malformed_check();
-	referral_empty_check();
-	martian_check();
-	admission_check();
-	low_order_key_check();
-	rate_limit_check();
-	serving_off_check();
-
-	bep44_free(e);
+		/*
+		 * A fresh engine per test: the per-source rate limiter counts a
+		 * source's messages over a window and bans it past the limit, the
+		 * way a real libtorrent node does, so a fresh window each test
+		 * keeps these back-to-back protocol checks under it. The limiter
+		 * itself, and eviction from a full store, are driven from many
+		 * sources in bep44_rl_test where that is natural.
+		 */
+		for (t = 0; t < sizeof(tests) / sizeof(tests[0]); t++) {
+			e = bep44_create(myid, s_node, INVALID_SOCK);
+			assert(e);
+			assert(!bep44_serve(e, 1));
+			tests[t]();
+			bep44_free(e);
+		}
+	}
 	return 0;
 }

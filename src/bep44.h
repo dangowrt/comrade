@@ -94,6 +94,14 @@ int bep44_update_direct(struct bep44_engine *e, const uint8_t sk[64],
 int bep44_serve(struct bep44_engine *e, int enable);
 
 /*
+ * Tune the per-source rate limiter (libtorrent's dht_block_ratelimit /
+ * dht_block_timeout). The default when serving is on is a real node's; pass
+ * ban_seconds 0 to disable it, as a black-box conformance harness must.
+ */
+void bep44_ratelimit(struct bep44_engine *e, int per_source_rate,
+		     int ban_seconds);
+
+/*
  * Immutable items: the value is its own name, so there is no key, salt, seq or
  * signature, and no way to change what a target resolves to. A get reports
  * seq -1. The value passed to put is already bencoded, as for bep44_put.
