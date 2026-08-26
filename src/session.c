@@ -4791,6 +4791,14 @@ static void punch_scan(struct sess *s, struct worker *ws, struct conn **punching
 			if (punch_resume[i]) {
 				punch_resume[i]->resume_pending = 0;
 				punch_resume[i] = NULL;
+			} else if (s->admitted_n > 0) {
+				/* It was counted against the grant when it was
+				 * picked up, and it admitted nobody. Left spent,
+				 * one failed punch is enough to close a
+				 * --max-clients 1 grant against the very client
+				 * it was opened for. A resumption never counted
+				 * in the first place. */
+				s->admitted_n--;
 			}
 			punching[i] = NULL;
 			s->punch_ufrag[i][0] = '\0';
@@ -5038,9 +5046,26 @@ static int host_turnstile(struct sess *s)
 					s->last_served_ufrag[0] = '\0';
 					s->have_served = 0;
 				}
+				/*
+				 * Counted as served only if it ever carried
+				 * anything. A punch that connected on this side
+				 * and then produced no session served nobody,
+				 * and a host told to serve N would otherwise
+				 * spend its whole grant on failed punches and
+				 * exit while the client it was meant for was
+				 * still asking. Its admission goes back for the
+				 * same reason.
+				 */
+				if (conn_is_proven(ws[i].c)) {
+					served++;
+				} else if (s->admitted_n > 0) {
+					s->admitted_n--;
+					dbg_logf("host: worker %.8s carried "
+						 "nothing -- not counted",
+						 ws[i].c->claim_ufrag);
+				}
 				conn_free(ws[i].c);
 				ws[i].used = 0;
-				served++;
 			}
 			if (!ws[i].used)
 				continue;
