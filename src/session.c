@@ -1427,7 +1427,7 @@ static void ns_post_addr(struct sess *s, int family, uint32_t epoch,
 		f->family = family;
 		f->epoch = epoch;
 		memcpy(f->addr, addr, family == 6 ? 16 : 4);
-		strncpy(f->text, text, sizeof(f->text) - 1);
+		snprintf(f->text, sizeof(f->text), "%s", text);
 	}
 	pthread_mutex_unlock(&s->ns_lock);
 }
