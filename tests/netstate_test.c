@@ -376,7 +376,7 @@ static void quiet_says_nothing_until_the_family_is_up(void)
 	start(&ns, 1);
 	fill(a, 16, 70);
 	give_src(&ns, 6, 20);
-	netstate_on_rdv_offered(&ns, 6, a, 16);
+	netstate_on_rdv_offered(&ns, 6, a, 16, 0);
 	drain(&ns);
 	assert(netstate_conn(&ns, 6) != NET_CONN_UP);
 
@@ -389,6 +389,121 @@ static void quiet_says_nothing_until_the_family_is_up(void)
 
 /* R5: two moves in quick succession, with the caller busy in between. The
  * later one wins and nothing is skipped for having arrived late. */
+/*
+ * A node that answered once and never again used to be held for the life of
+ * the session: the panel said it was being checked for ever, and no other node
+ * could take its place, since nothing was being looked for. Nobody has been
+ * shown a candidate, so there is nothing to take back by dropping it.
+ */
+static void a_candidate_that_never_qualifies_is_dropped(void)
+{
+	struct netstate ns;
+	struct netstate_actions a;
+	uint8_t node[16];
+
+	start(&ns, 1);
+	give_src(&ns, 6, 20);
+	fill(node, 16, 70);
+
+	/* One answer, then silence. */
+	netstate_on_dht_ack(&ns, 6, netstate_epoch(&ns, 6), node, 16, t);
+	drain(&ns);
+	assert(netstate_anchor(&ns, 6, NULL, NULL, NULL));
+
+	/* Still on trial while its time runs. */
+	t += NETSTATE_ANCHOR_TRY_MS - 1;
+	netstate_tick(&ns, t);
+	assert(netstate_anchor(&ns, 6, NULL, NULL, NULL));
+
+	t += 2;
+	netstate_tick(&ns, t);
+	a = drain(&ns);
+	assert(!netstate_anchor(&ns, 6, NULL, NULL, NULL));
+	/* And the search that could turn up another one is asked for: the
+	 * direct get only ever asks the nodes already held. */
+	assert(a.f[1] & NSA_RDV_RELOCATE);
+	assert(a.f[1] & NSA_EMIT_RDV);
+	/* The other family is untouched by any of it. */
+	assert(!(a.f[0] & NSA_RDV_RELOCATE));
+
+	/* And the next node to answer takes the empty place. */
+	fill(node, 16, 90);
+	netstate_on_dht_ack(&ns, 6, netstate_epoch(&ns, 6), node, 16, t);
+	assert(netstate_anchor(&ns, 6, NULL, NULL, NULL));
+}
+
+/* Once it has qualified it may be in somebody's token, so the deadline stops
+ * applying: from there it is only ever replaced, never dropped. */
+static void a_qualified_node_outlives_the_deadline(void)
+{
+	struct netstate ns;
+	uint8_t node[16], got[NETSTATE_SA_MAX];
+	uint8_t glen = 0;
+
+	start(&ns, 1);
+	give_src(&ns, 6, 20);
+	fill(node, 16, 70);
+	qualify(&ns, 6, node);
+	assert(netstate_anchor(&ns, 6, NULL, NULL, NULL));
+
+	t += NETSTATE_ANCHOR_TRY_MS * 4;
+	netstate_tick(&ns, t);
+	assert(netstate_anchor(&ns, 6, got, &glen, NULL));
+	assert(glen == 16 && !memcmp(got, node, 16));
+}
+
+/*
+ * A node the peer handed over is not a candidate of ours either. Failing to
+ * prove it here is not grounds to go looking somewhere else: it is where the
+ * peer says it is, and following that is the whole point.
+ */
+static void an_offered_node_is_not_on_trial(void)
+{
+	struct netstate ns;
+	uint8_t node[16], got[NETSTATE_SA_MAX];
+	uint8_t glen = 0;
+
+	start(&ns, 0);
+	give_src(&ns, 6, 20);
+	fill(node, 16, 70);
+	netstate_on_rdv_offered(&ns, 6, node, 16, t);
+	drain(&ns);
+
+	t += NETSTATE_ANCHOR_TRY_MS * 4;
+	netstate_tick(&ns, t);
+	assert(netstate_anchor(&ns, 6, got, &glen, NULL));
+	assert(glen == 16 && !memcmp(got, node, 16));
+}
+
+/*
+ * A move restarts the trial rather than ending it: the candidate has a fresh
+ * network to prove itself on and should not inherit a clock from the one we
+ * have left.
+ */
+static void a_move_gives_a_candidate_a_fresh_run(void)
+{
+	struct netstate ns;
+	uint8_t node[16];
+
+	start(&ns, 1);
+	give_src(&ns, 6, 20);
+	fill(node, 16, 70);
+	netstate_on_dht_ack(&ns, 6, netstate_epoch(&ns, 6), node, 16, t);
+	drain(&ns);
+
+	t += NETSTATE_ANCHOR_TRY_MS - 1;
+	netstate_on_netmon(&ns, NETMON_CH_V6, 1, 1, t);
+	drain(&ns);
+
+	t += 2;				/* past the original deadline */
+	netstate_tick(&ns, t);
+	assert(netstate_anchor(&ns, 6, NULL, NULL, NULL));
+
+	t += NETSTATE_ANCHOR_TRY_MS;	/* past the new one */
+	netstate_tick(&ns, t);
+	assert(!netstate_anchor(&ns, 6, NULL, NULL, NULL));
+}
+
 static void latest_change_wins(void)
 {
 	struct netstate ns;
@@ -433,7 +548,7 @@ static void host_and_client_agree_except_on_the_token(void)
 
 		give_src(ns, 4, 10);
 		give_src(ns, 6, 20);
-		netstate_on_rdv_offered(ns, 6, node, 16);
+		netstate_on_rdv_offered(ns, 6, node, 16, t);
 		netstate_on_dht_ack(ns, 6, netstate_epoch(ns, 6), node, 16, t);
 		netstate_on_netmon(ns, NETMON_CH_V6, 1, 0, t);
 		netstate_on_dht_concluded(ns, 4, 1);
@@ -476,7 +591,7 @@ static void only_a_host_picks_its_own_rendezvous(void)
 		struct netstate *ns = k ? &c : &h;
 
 		give_src(ns, 6, 20);
-		netstate_on_rdv_offered(ns, 6, a, 16);
+		netstate_on_rdv_offered(ns, 6, a, 16, 0);
 		qualify(ns, 6, a);
 		drain(ns);
 		quiet_rounds(ns, NETSTATE_ANCHOR_GONE);
@@ -491,7 +606,7 @@ static void only_a_host_picks_its_own_rendezvous(void)
 
 	/* What does move a client is being told: the host announcing a node
 	 * over the control channel outranks anything either has observed. */
-	netstate_on_rdv_offered(&c, 6, b, 16);
+	netstate_on_rdv_offered(&c, 6, b, 16, 0);
 	assert(netstate_anchor(&c, 6, got, &glen, NULL));
 	assert(!memcmp(got, b, 16));
 }
@@ -682,7 +797,7 @@ static void epoch_gate_exhaustive(void)
 				 */
 				give_src(&ns, fam, 33);
 				fill(node, 16, 70);
-				netstate_on_rdv_offered(&ns, fam, node, 16);
+				netstate_on_rdv_offered(&ns, fam, node, 16, 0);
 				netstate_on_probe_started(&ns, fam,
 							  netstate_epoch(&ns, fam),
 							  t);
@@ -860,6 +975,10 @@ int main(void)
 	only_another_answer_condemns();
 	quiet_searches_without_giving_up();
 	quiet_says_nothing_until_the_family_is_up();
+	a_candidate_that_never_qualifies_is_dropped();
+	a_qualified_node_outlives_the_deadline();
+	an_offered_node_is_not_on_trial();
+	a_move_gives_a_candidate_a_fresh_run();
 	latest_change_wins();
 	host_and_client_agree_except_on_the_token();
 	only_a_host_picks_its_own_rendezvous();

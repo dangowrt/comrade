@@ -1284,7 +1284,7 @@ static void seed_rendezvous(struct sess *s)
 		 * another network, and report_rendezvous says so until it has
 		 * answered here. */
 		netstate_on_rdv_offered(&s->ns, famv[i], (const uint8_t *)&sa,
-					(int)sl);
+					(int)sl, now_ms());
 	}
 }
 
@@ -2986,7 +2986,7 @@ static void rdv_adopt(struct sess *s, struct conn *c)
 		}
 		netstate_on_rdv_offered(&s->ns, famv[i],
 					(const uint8_t *)&in[i].sa,
-					(int)in[i].len);
+					(int)in[i].len, now_ms());
 		fmt_sockaddr((struct sockaddr *)&in[i].sa, in[i].len, b,
 			     sizeof(b));
 		dbg_logf("rdv: adopted the peer's v%d node %s", famv[i], b);
@@ -3140,10 +3140,19 @@ static void rdv_ask(struct sess *s, struct conn *c, uint64_t now)
 		if (rdv_self_sufficient(s, famv[i]))
 			continue;
 		ctl_reach_decode(reach, sizeof(reach), i, &state, &flags);
-		/* Its own DHT has to have answered it there. A family merely
-		 * carrying traffic proves nothing about reaching the DHT over
-		 * it, and that is the whole of what is being asked for. */
-		if (state != CTL_REACH_UP || !(flags & CTL_REACHF_DHT))
+		/*
+		 * Proven reachable is enough to be worth asking. Its DHT having
+		 * already answered there would be the stronger claim, but it is
+		 * not one to wait for: a client has no reason to have exercised
+		 * the DHT over a family it was not using, so requiring it left
+		 * exactly the dual-stack client a v4-only host needs looking
+		 * unqualified, and the request was never made at all.
+		 *
+		 * Asking costs the client a convergent store and nothing if it
+		 * turns out it cannot; the flag still travels, and still says
+		 * which client to prefer once there is a choice.
+		 */
+		if (state != CTL_REACH_UP)
 			continue;
 		c->next_rdvask_ms[i] = now + RDVASK_MS;
 		pthread_mutex_lock(&c->peer_in_lock);
@@ -3892,9 +3901,9 @@ static void ns_take_acks(struct sess *s, uint64_t now)
 
 			if (sig_located(s->sig, famv[i], (struct sockaddr *)&r,
 					&rl))
-				netstate_on_rdv_offered(&s->ns, famv[i],
-							(const uint8_t *)&r,
-							(int)rl);
+				netstate_on_rdv_found(&s->ns, famv[i],
+						      (const uint8_t *)&r,
+						      (int)rl, now);
 		}
 		memset(&sa, 0, sizeof(sa));
 		if (!sig_take_ack(s->sig, famv[i], (struct sockaddr *)&sa, &sl))
@@ -4987,6 +4996,23 @@ static int host_turnstile(struct sess *s)
 							s->punch_ufrag[j][0] = '\0';
 							break;
 						}
+				/*
+				 * And it stops being the claimant we have just
+				 * served. That memory exists to keep one pickup
+				 * from being served twice while its claim is
+				 * still in the slot; once the session it was
+				 * served for is gone, the same claimant asking
+				 * again is a client wanting in, not a repeat.
+				 * A claimant identity is stable across a
+				 * rejoin, so leaving it here refused that
+				 * client for the rest of the session.
+				 */
+				if (ws[i].c->claim_ufrag[0] && s->have_served &&
+				    !strcmp(s->last_served_ufrag,
+					    ws[i].c->claim_ufrag)) {
+					s->last_served_ufrag[0] = '\0';
+					s->have_served = 0;
+				}
 				conn_free(ws[i].c);
 				ws[i].used = 0;
 				served++;
@@ -5140,6 +5166,12 @@ static int host_turnstile(struct sess *s)
 						   (s->have_served &&
 						    !strcmp(cu, s->last_served_ufrag))) {
 						dbg_logf("host: ignore stale/in-flight claim");
+						/* Ignoring it is not leaving it
+						 * there: the slot is the mutex,
+						 * and a claim we will not serve
+						 * holding it stops every other
+						 * client from writing one. */
+						sig_release(s->sig);
 						s->have_peer_sdp = 0;
 						break;
 					}

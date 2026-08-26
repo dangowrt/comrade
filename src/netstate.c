@@ -124,6 +124,11 @@ void netstate_on_netmon(struct netstate *ns, unsigned changed, int have4,
 
 		f->anchor_confirmed = 0;
 		f->anchor_acks = 0;
+		/* A candidate gets its full run on the network it is now to
+		 * prove itself on, rather than inheriting a clock from the one
+		 * we have left. What has qualified stays not-a-candidate: it
+		 * may be in a token, and moving does not take that back. */
+		f->anchor_set_ms = now;
 		f->anchor_first_ms = 0;
 		f->anchor_quiet = 0;
 		f->anchor_next_ms = now;
@@ -235,6 +240,35 @@ void netstate_on_roundtrip(struct netstate *ns, int family, uint32_t epoch)
 	sync_conn(ns, i);
 }
 
+/*
+ * Take `node` as this family's anchor. `candidate` says whether it is ours on
+ * trial (so the deadline applies) and `acks` how many answers it arrives with:
+ * one for a node that just served us, none for one merely named to us.
+ * Answers 1 when the anchor moved.
+ */
+static int anchor_set(struct netstate *ns, int i, const uint8_t *node, int len,
+		      uint64_t now, int candidate, int acks)
+{
+	struct netstate_fam *f = &ns->f[i];
+
+	if (!node || len <= 0 || (size_t)len > sizeof(f->anchor))
+		return 0;
+	if (f->anchor_len == (uint8_t)len &&
+	    !memcmp(f->anchor, node, (size_t)len))
+		return 0;
+	memset(f->anchor, 0, sizeof(f->anchor));
+	memcpy(f->anchor, node, (size_t)len);
+	f->anchor_len = (uint8_t)len;
+	f->anchor_confirmed = 0;	/* arriving is never qualifying */
+	f->anchor_candidate = candidate;
+	f->anchor_acks = acks;
+	f->anchor_set_ms = now;
+	f->anchor_first_ms = acks ? now : 0;
+	f->anchor_quiet = 0;
+	raise_act(ns, i, NSA_RDV_PIN | NSA_EMIT_RDV);
+	return 1;
+}
+
 void netstate_on_dht_ack(struct netstate *ns, int family, uint32_t epoch,
 			 const uint8_t *node, int len, uint64_t now)
 {
@@ -285,15 +319,9 @@ void netstate_on_dht_ack(struct netstate *ns, int family, uint32_t epoch,
 	 */
 	if (f->anchor_len && f->anchor_quiet < NETSTATE_ANCHOR_GONE)
 		return;
-	memset(f->anchor, 0, sizeof(f->anchor));
-	memcpy(f->anchor, node, (size_t)len);
-	f->anchor_len = (uint8_t)len;
-	f->anchor_confirmed = 0;	/* it has answered once; that is not yet
-					 * enough to put in front of anyone */
-	f->anchor_acks = 1;
-	f->anchor_first_ms = now;
-	f->anchor_quiet = 0;
-	raise_act(ns, i, NSA_RDV_PIN | NSA_EMIT_RDV);
+	/* It has answered once, which is not yet enough to put in front of
+	 * anyone: ours, on trial, and not yet anybody's. */
+	anchor_set(ns, i, node, len, now, 1, 1);
 }
 
 void netstate_on_anchor_seen(struct netstate *ns, int family, uint64_t now)
@@ -311,24 +339,22 @@ void netstate_on_anchor_seen(struct netstate *ns, int family, uint64_t now)
 }
 
 void netstate_on_rdv_offered(struct netstate *ns, int family,
-			     const uint8_t *node, int len)
+			     const uint8_t *node, int len, uint64_t now)
 {
-	int i = fam_idx(family);
-	struct netstate_fam *f = &ns->f[i];
+	/* Not a candidate: this is where the peer says it is, and following
+	 * that is the point. Failing to prove it here is not grounds for us to
+	 * pick somewhere else. */
+	anchor_set(ns, fam_idx(family), node, len, now, 0, 0);
+}
 
-	if (!node || len <= 0 || (size_t)len > sizeof(f->anchor))
-		return;
-	if (f->anchor_len == (uint8_t)len &&
-	    !memcmp(f->anchor, node, (size_t)len))
-		return;
-	memset(f->anchor, 0, sizeof(f->anchor));
-	memcpy(f->anchor, node, (size_t)len);
-	f->anchor_len = (uint8_t)len;
-	f->anchor_confirmed = 0;
-	f->anchor_acks = 0;
-	f->anchor_first_ms = 0;
-	f->anchor_quiet = 0;
-	raise_act(ns, i, NSA_RDV_PIN | NSA_EMIT_RDV);
+void netstate_on_rdv_found(struct netstate *ns, int family,
+			   const uint8_t *node, int len, uint64_t now)
+{
+	/* Ours, and on the same terms as a host's own: it answered once, which
+	 * is where its trial starts rather than ends. The peer must not be able
+	 * to tell a node found this way from one it found itself, and that has
+	 * to include being dropped when it does not earn its place. */
+	anchor_set(ns, fam_idx(family), node, len, now, 1, 1);
 }
 
 void netstate_on_candidate(struct netstate *ns, int family, uint32_t epoch,
@@ -418,7 +444,29 @@ void netstate_tick(struct netstate *ns, uint64_t now)
 		    f->anchor_acks >= NETSTATE_ANCHOR_QUALIFY &&
 		    now - f->anchor_first_ms >= NETSTATE_ANCHOR_PROVE_MS) {
 			f->anchor_confirmed = 1;
+			/* From here it may be named in a token, so it stops
+			 * being ours to drop and can only be replaced. */
+			f->anchor_candidate = 0;
 			raise_act(ns, i, NSA_EMIT_RDV);
+			facts_moved(ns, i);
+		}
+		/*
+		 * A candidate that did not qualify in the time it was given.
+		 * Nobody has been shown it, so it simply goes, and the search
+		 * that finds the next one starts again -- which is the only
+		 * way another node can ever answer, the direct get asking only
+		 * the nodes already held.
+		 */
+		if (f->anchor_len && f->anchor_candidate &&
+		    now - f->anchor_set_ms >= NETSTATE_ANCHOR_TRY_MS) {
+			memset(f->anchor, 0, sizeof(f->anchor));
+			f->anchor_len = 0;
+			f->anchor_candidate = 0;
+			f->anchor_confirmed = 0;
+			f->anchor_acks = 0;
+			f->anchor_first_ms = 0;
+			f->anchor_quiet = 0;
+			raise_act(ns, i, NSA_EMIT_RDV | NSA_RDV_RELOCATE);
 			facts_moved(ns, i);
 		}
 	}

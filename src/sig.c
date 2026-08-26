@@ -339,6 +339,11 @@ int sig_rotate(struct sig *s, const uint8_t *offer, size_t len)
 	return 0;
 }
 
+void sig_release(struct sig *s)
+{
+	mailbox_arm_release(&s->mb);
+}
+
 void sig_redeliver(struct sig *s)
 {
 	s->have_last = 0;
@@ -825,6 +830,25 @@ static int relaying(const struct sig *s)
 	return (s->relay4 && !s->rnode4_len) || (s->relay6 && !s->rnode6_len);
 }
 
+/*
+ * A family this end has, that the DHT has not answered on yet.
+ *
+ * A client has no reason of its own to exercise a family it is not currently
+ * meeting over, and would settle into a trickle on whichever one its token
+ * happened to name -- so the other stays cold, and the first thing that needs
+ * it (a host that moved, or one that never had it) waits for a warm-up that
+ * could have happened long before. Every family this end has is kept engaged
+ * until it has answered, whether or not anything wants it yet.
+ *
+ * A family that never answers keeps this true, and that is the same judgement
+ * the host's own locating makes: there is no point past which a family that
+ * has not answered is known never to.
+ */
+static int warming(const struct sig *s)
+{
+	return (s->up4 && !s->acked4) || (s->up6 && !s->acked6);
+}
+
 static void dht_pump(struct sig *s, uint64_t now)
 {
 	if (!dhtnode_ready(s->node))
@@ -852,11 +876,16 @@ static void dht_pump(struct sig *s, uint64_t now)
 		const uint8_t *slot;
 
 		bep44_get(s->engine, s->keys.bep44_pk, SIG_SALT, on_dht_get, s);
-		/* Relaying keeps it eager: this read is not looking for the
+		/*
+		 * Relaying keeps it eager: this read is not looking for the
 		 * peer's slot, it is what turns the store just made into a node
-		 * that has answered here. */
+		 * that has answered here. So does a family still to answer at
+		 * all, which is how both of them get warm rather than only the
+		 * one in use.
+		 */
 		s->next_wide_get_ms = now +
-			((mailbox_peer_slot(&s->mb, &slot) && !relaying(s)) ?
+			((mailbox_peer_slot(&s->mb, &slot) && !relaying(s) &&
+			  !warming(s)) ?
 			 SIG_DHT_WIDE_IDLE_MS : SIG_DHT_WIDE_GET_MS);
 	}
 	if (now < s->next_put_ms)

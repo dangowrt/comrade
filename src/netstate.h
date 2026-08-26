@@ -76,6 +76,30 @@ enum {					/* how a local address was learnt */
 #define NETSTATE_ANCHOR_PROVE_MS 20000
 
 /*
+ * The same window seen from the other end: how long a node is given to manage
+ * that before it is dropped and another looked for.
+ *
+ * PROVE_MS is a floor on succeeding -- answer steadily for at least this long.
+ * It says nothing about failing, and a node that answers once and then stops
+ * never reaches it, so on its own it leaves such a node held for the life of
+ * the session: the panel says it is being checked for ever, and no other node
+ * can take its place because nothing is looking for one. The state even
+ * survives a move to a network without that family, where checking anything is
+ * impossible by construction.
+ *
+ * A ceiling is the missing half, and it has to be the longer of the two or a
+ * node would be given up at the very moment it was about to qualify. Expressed
+ * as a multiple rather than a number of its own, because that relationship is
+ * the whole of why it exists. Generous, so a slow but real node is not thrown
+ * away part-way through proving itself.
+ *
+ * It applies only to a candidate -- a node this end picked and has shown to
+ * nobody. One that has qualified may be named in a token that is already in
+ * somebody's hands, and is only ever replaced, never dropped.
+ */
+#define NETSTATE_ANCHOR_TRY_MS (3 * NETSTATE_ANCHOR_PROVE_MS)
+
+/*
  * Rounds a held node may leave unanswered, on a network this family has
  * proven, before an alternative is searched for alongside it.
  *
@@ -156,8 +180,14 @@ struct netstate_fam {
 	uint8_t anchor[NETSTATE_SA_MAX];	/* opaque sockaddr bytes */
 	uint8_t anchor_len;
 	int anchor_confirmed;		/* adopting a node never confirms it */
+	int anchor_candidate;		/* ours, on trial, and shown to nobody:
+					 * droppable, unlike one that has
+					 * qualified (a token may name it) or
+					 * one the peer handed over (its word,
+					 * not our choice) */
 	int anchor_acks;		/* separate answers from it, this epoch */
 	int anchor_quiet;		/* rounds it left unanswered, while up */
+	uint64_t anchor_set_ms;		/* when we started trying this one */
 	uint64_t anchor_first_ms;	/* when its run of answers began */
 	uint64_t anchor_next_ms;
 
@@ -222,7 +252,17 @@ void netstate_on_anchor_seen(struct netstate *ns, int family, uint64_t now);
  * channel): authoritative, so it displaces whatever is held, and is never
  * confirmed by the handing over -- it was minted on another network. */
 void netstate_on_rdv_offered(struct netstate *ns, int family,
-			     const uint8_t *node, int len);
+			     const uint8_t *node, int len, uint64_t now);
+
+/*
+ * A node we located ourselves at the peer's request, for a family the peer
+ * cannot reach. Enters on exactly the terms a host's own does, trial included:
+ * the peer must not be able to tell one from the other, and that has to mean
+ * being dropped when it does not earn its place as much as it means anything
+ * else.
+ */
+void netstate_on_rdv_found(struct netstate *ns, int family,
+			   const uint8_t *node, int len, uint64_t now);
 
 
 void netstate_on_candidate(struct netstate *ns, int family, uint32_t epoch,

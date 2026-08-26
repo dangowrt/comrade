@@ -92,6 +92,16 @@ void sig_withdraw(struct sig *s);
 int sig_rotate(struct sig *s, const uint8_t *offer, size_t len);
 
 /*
+ * Host: let go of the answer slot without rotating an offer, for a claim that
+ * will not be served -- one already served, or belonging to a session that has
+ * since ended. The slot is the turnstile mutex, so a claim nobody will act on
+ * must not keep holding it: no other client can write a claim while it is
+ * there, and the host has no reason of its own to write again, so the mailbox
+ * simply stops turning. Idempotent, and a no-op on an empty slot.
+ */
+void sig_release(struct sig *s);
+
+/*
  * Deliver the peer's slot again even if it has not changed. A peer slot is
  * delivered once per distinct value, so a side that discards what it was given
  * -- a client re-claiming after losing a turnstile round -- would otherwise wait

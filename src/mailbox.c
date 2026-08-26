@@ -80,6 +80,15 @@ static void recompute_need_write(struct mailbox *m)
 
 	if (!m->have_mine)
 		m->need_write = 0;
+	else if (m->is_host && releasing(m))
+		/*
+		 * The claim being released is still in the container, so what
+		 * is stored is not what we would write, whatever our own slot
+		 * says. Without this a release armed without a fresh offer
+		 * beside it never reaches the DHT, and the answer slot -- the
+		 * turnstile mutex -- stays held by a claim nobody will serve.
+		 */
+		m->need_write = 1;
 	else
 		m->need_write = (cur_len != m->mine_len ||
 				 memcmp(cur, m->mine, m->mine_len)) ? 1 : 0;
