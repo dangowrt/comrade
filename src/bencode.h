@@ -28,5 +28,12 @@ int benc_dict_find(const uint8_t *dict, size_t dict_len, const char *key,
 int benc_str_get(const uint8_t *val, size_t val_len,
 		 const uint8_t **data, size_t *data_len);
 int benc_int_get(const uint8_t *val, size_t val_len, int64_t *out);
+/*
+ * 0 if buf is exactly one canonically encoded bencode value: no leading zeros,
+ * no i-0e, dict keys strictly ascending, nothing trailing. A BEP 44 signature
+ * covers the value's exact bytes, so an item that is not canonical cannot
+ * survive a hop that re-encodes it.
+ */
+int benc_canonical(const uint8_t *buf, size_t len);
 
 #endif

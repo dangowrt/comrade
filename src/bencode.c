@@ -52,9 +52,11 @@ static int benc_digits(const uint8_t **p, const uint8_t *end, int64_t *out)
 	int digits = 0;
 
 	while (*p < end && **p >= '0' && **p <= '9') {
-		if (val > (INT64_MAX - 9) / 10)
+		int d = **p - '0';
+
+		if (val > (INT64_MAX - d) / 10)
 			return -1;
-		val = val * 10 + (**p - '0');
+		val = val * 10 + d;
 		(*p)++;
 		digits++;
 	}
@@ -175,4 +177,109 @@ int benc_int_get(const uint8_t *val, size_t val_len, int64_t *out)
 		return -1;
 	*out = neg ? -num : num;
 	return 0;
+}
+
+static int benc_key_cmp(const uint8_t *a, size_t alen,
+			const uint8_t *b, size_t blen)
+{
+	size_t n = alen < blen ? alen : blen;
+	int rc = n ? memcmp(a, b, n) : 0;
+
+	if (rc)
+		return rc;
+	return alen < blen ? -1 : alen > blen ? 1 : 0;
+}
+
+static int benc_canon_str(const uint8_t **p, const uint8_t *end,
+			  const uint8_t **data, size_t *data_len)
+{
+	const uint8_t *q = *p;
+	int64_t num;
+
+	if (q >= end || *q < '0' || *q > '9')
+		return -1;
+	if (*q == '0' && end - q > 1 && q[1] >= '0' && q[1] <= '9')
+		return -1;
+	if (benc_digits(&q, end, &num))
+		return -1;
+	if (q >= end || *q != ':' || end - q - 1 < num)
+		return -1;
+	*data = q + 1;
+	*data_len = (size_t)num;
+	*p = q + 1 + num;
+	return 0;
+}
+
+static int benc_canon(const uint8_t **p, const uint8_t *end, int depth)
+{
+	const uint8_t *q = *p, *data;
+	size_t data_len;
+	int64_t num;
+
+	if (depth > BENC_MAX_DEPTH || q >= end)
+		return -1;
+
+	switch (*q) {
+	case 'i':
+		q++;
+		if (q < end && *q == '-') {
+			q++;
+			if (q < end && *q == '0')
+				return -1;
+		} else if (end - q > 1 && *q == '0' &&
+			   q[1] >= '0' && q[1] <= '9') {
+			return -1;			/* leading zero */
+		}
+		if (benc_digits(&q, end, &num))
+			return -1;
+		if (q >= end || *q != 'e')
+			return -1;
+		*p = q + 1;
+		return 0;
+	case 'l':
+		q++;
+		while (q < end && *q != 'e') {
+			if (benc_canon(&q, end, depth + 1))
+				return -1;
+		}
+		if (q >= end)
+			return -1;
+		*p = q + 1;
+		return 0;
+	case 'd': {
+		const uint8_t *prev = NULL;
+		size_t prev_len = 0;
+
+		q++;
+		while (q < end && *q != 'e') {
+			if (benc_canon_str(&q, end, &data, &data_len))
+				return -1;
+			if (prev &&
+			    benc_key_cmp(prev, prev_len, data, data_len) >= 0)
+				return -1;
+			prev = data;
+			prev_len = data_len;
+			if (benc_canon(&q, end, depth + 1))
+				return -1;
+		}
+		if (q >= end)
+			return -1;
+		*p = q + 1;
+		return 0;
+	}
+	default:
+		if (benc_canon_str(&q, end, &data, &data_len))
+			return -1;
+		*p = q;
+		return 0;
+	}
+}
+
+int benc_canonical(const uint8_t *buf, size_t len)
+{
+	const uint8_t *p = buf, *end = buf + len;
+
+	if (benc_canon(&p, end, 0))
+		return -1;
+	return p == end ? 0 : -1;
 }
