@@ -2915,8 +2915,25 @@ static void rdv_publish(struct sess *s)
 		}
 		pthread_mutex_unlock(&s->pub_lock);
 	}
-	if (told)
-		dbg_logf("rdv: publishing set %u", (unsigned)s->rdv_gen);
+	if (told) {
+		char b4[80], b6[80];
+
+		/* Named, because "published" alone cannot distinguish the
+		 * family that was already known from the one somebody is
+		 * waiting to be told about. */
+		b4[0] = b6[0] = '\0';
+		pthread_mutex_lock(&s->pub_lock);
+		if (s->rdv[0].have && s->rdv[0].qualified)
+			fmt_sockaddr((struct sockaddr *)&s->rdv[0].sa,
+				     s->rdv[0].len, b4, sizeof(b4));
+		if (s->rdv[1].have && s->rdv[1].qualified)
+			fmt_sockaddr((struct sockaddr *)&s->rdv[1].sa,
+				     s->rdv[1].len, b6, sizeof(b6));
+		pthread_mutex_unlock(&s->pub_lock);
+		dbg_logf("rdv: publishing set %u: v4 %s v6 %s",
+			 (unsigned)s->rdv_gen, b4[0] ? b4 : "-",
+			 b6[0] ? b6 : "-");
+	}
 }
 
 /*
@@ -2995,6 +3012,9 @@ static void rdv_adopt(struct sess *s, struct conn *c)
 
 		if (!in[i].have)
 			continue;
+		fmt_sockaddr((struct sockaddr *)&in[i].sa, in[i].len, b,
+			     sizeof(b));
+		dbg_logf("rdv: peer names v%d %s", famv[i], b);
 		if (netstate_anchor(&s->ns, famv[i], node, &nlen, NULL)) {
 			if (s->cfg->is_host)
 				continue;
@@ -3004,8 +3024,6 @@ static void rdv_adopt(struct sess *s, struct conn *c)
 		netstate_on_rdv_offered(&s->ns, famv[i],
 					(const uint8_t *)&in[i].sa,
 					(int)in[i].len, now_ms());
-		fmt_sockaddr((struct sockaddr *)&in[i].sa, in[i].len, b,
-			     sizeof(b));
 		dbg_logf("rdv: adopted the peer's v%d node %s", famv[i], b);
 	}
 }
@@ -4783,8 +4801,18 @@ static void punch_scan(struct sess *s, struct worker *ws, struct conn **punching
 				s->punch_ufrag[i][0] = '\0';
 				conn_free(c);		/* table full */
 			}
-		} else if (now_ms() - punch_start[i] > (punch_resume[i] ?
-						ICE_ATTEMPT_MS : HOST_PUNCH_MS) ||
+		/*
+		 * A resumption gets the long budget because a client coming
+		 * back may be slow to reappear -- but only one that has a
+		 * session to come back to. Resuming a worker that never carried
+		 * anything is a first punch in all but name, and giving it the
+		 * long budget holds the claimant's identity for a minute and a
+		 * half while the client it belongs to is asking once a second
+		 * and being told a punch is already running for it.
+		 */
+		} else if (now_ms() - punch_start[i] >
+			   ((punch_resume[i] && conn_is_proven(punch_resume[i])) ?
+			    ICE_ATTEMPT_MS : HOST_PUNCH_MS) ||
 			   (!punch_stuck[i] && nat_failed(c->nat))) {
 			dbg_logf("host: punch %s -> drop",
 				 punch_stuck[i] ? "wedged (test)" : "failed");
@@ -4815,6 +4843,37 @@ static void punch_scan(struct sess *s, struct worker *ws, struct conn **punching
  * capped at one client. Only the test-only single-connection flag forces the
  * sequential re-serve state machine instead.
  */
+/*
+ * What went into the offer a peer is about to read.
+ *
+ * An offer with nothing in it a peer could reach looks, from this end, exactly
+ * like one that works: the host publishes, the client claims, the punch is made
+ * and simply never connects. Behind a carrier NAT the difference is one
+ * candidate -- whether STUN answered before the offer went out -- and there was
+ * no way to tell the two apart from a log.
+ */
+static void log_offer(const char *sdp, int served, int active)
+{
+	const char *p;
+	int cands = 0, reflexive = 0;
+
+	for (p = sdp; (p = strstr(p, "a=candidate:")) != NULL; p += 12) {
+		const char *end = strchr(p, '\n');
+		const char *t = strstr(p, "typ ");
+
+		cands++;
+		if (!t || (end && t > end))
+			continue;
+		if (!strncmp(t, "typ srflx", 9) ||
+		    !strncmp(t, "typ prflx", 9) ||
+		    !strncmp(t, "typ relay", 9))
+			reflexive++;
+	}
+	dbg_logf("host: offer published (served=%d active=%d) "
+		 "%d candidate(s), %d reachable from outside",
+		 served, active, cands, reflexive);
+}
+
 static int host_is_multiuser(const struct session_cfg *cfg)
 {
 	return cfg->is_host && (cfg->sig_flags & (SIG_DHT | SIG_MCAST)) &&
@@ -5164,8 +5223,7 @@ static int host_turnstile(struct sess *s)
 				sig_rotate(s->sig, (const uint8_t *)s->local_sdp,
 					   strlen(s->local_sdp));
 				sig_locate(s->sig);
-				dbg_logf("host: offer published (served=%d "
-					 "active=%d)", served, active);
+				log_offer(s->local_sdp, served, active);
 				ts = TS_WAIT_CLAIM;
 			}
 			break;
