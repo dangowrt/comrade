@@ -22,15 +22,27 @@ up)
 		echo "COMRADE_E2E_NET=1: the real DHT, no swarm to build"
 		exit 0
 	fi
-	# Detached, so they outlive the process that starts them.
-	SWARM_SPAWN=setsid
+	# Detached, so they outlive the process that starts them. setsid is
+	# util-linux's and macOS has none, where nohup does the same for this
+	# purpose; a machine with neither still gets nodes, just ones a stray
+	# hangup could take with it.
+	if command -v setsid >/dev/null 2>&1; then
+		SWARM_SPAWN=setsid
+	elif command -v nohup >/dev/null 2>&1; then
+		SWARM_SPAWN=nohup
+	else
+		SWARM_SPAWN=
+	fi
 	export SWARM_SPAWN
 	. "$(dirname "$0")/swarm.sh"
 	swarm_start "$SEED" || exit $?
 	printf '%s' "$COMRADE_DHT_BOOTSTRAP" > "$FILE"
 	printf '%s' "$SWARM_PIDS" > "$PIDF"
 	printf '%s' "$SWARM_DIR" > "$DIRF"
-	echo "swarm up: $COMRADE_DHT_BOOTSTRAP"
+	# The count, not the list: this line lands in a workflow log, and the
+	# addresses in it are the runner's own.
+	echo "swarm up: $(printf '%s\n' "$COMRADE_DHT_BOOTSTRAP" |
+			  awk -F, '{print NF}') node(s)"
 	;;
 down)
 	# shellcheck disable=SC2046

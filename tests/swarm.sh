@@ -77,7 +77,8 @@ swarm_start() {
 	_i=0
 	while [ "$_i" -lt "$_n" ]; do
 		# shellcheck disable=SC2086
-		${SWARM_SPAWN:-} "$_seed" $_peers >"$SWARM_DIR/$_i.out" 2>/dev/null &
+		${SWARM_SPAWN:-} "$_seed" $_peers >"$SWARM_DIR/$_i.out" \
+			2>"$SWARM_DIR/$_i.err" &
 		SWARM_PIDS="$SWARM_PIDS $!"
 		_w=0
 		_port=""
@@ -89,6 +90,11 @@ swarm_start() {
 		done
 		if [ -z "$_port" ] || [ "$_port" = 0 ]; then
 			echo "swarm: node $_i never reported a port" >&2
+			# What it said instead. A node that cannot start at all
+			# -- a missing spawn helper, a library it cannot find --
+			# is otherwise indistinguishable from a slow one.
+			sed 's/^/swarm: node '"$_i"': /' \
+				"$SWARM_DIR/$_i.err" >&2 2>/dev/null
 			swarm_stop
 			return 1
 		fi
