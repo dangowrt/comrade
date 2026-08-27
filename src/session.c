@@ -548,6 +548,7 @@ struct sess {
 	uint64_t adopt_ms;
 	char punch_ufrag[HOST_MAX_WORKERS][40];	/* each punch's claimant id */
 	char last_served_ufrag[40];
+	struct claim_served served;	/* claimants this host has served */
 	int admitted_n;			/* claimants admitted this run (the
 					 * host_admit_max budget) */		/* the most recently served one */
 	int have_served;
@@ -4905,11 +4906,18 @@ static void punch_scan(struct sess *s, struct worker *ws, struct conn **punching
 					addr);
 			}
 			punching[i] = NULL;
-			/* Said before it is served: a claimant that thought it
-			 * was resuming learns here that it is not, and can go
-			 * round again at once rather than waiting out the
-			 * silence that would eventually tell it. */
-			conn_tell_fresh(c, NULL);
+			/*
+			 * Said before it is served, and only to a claimant we
+			 * have served before: that one thought it was resuming
+			 * and learns here that it is not, so it can go round
+			 * again at once rather than waiting out the silence
+			 * that would eventually tell it. A claimant joining for
+			 * the first time has no session of its own to be told
+			 * about, and telling it would end the one it is in.
+			 */
+			if (claim_served_has(&s->served, s->punch_ufrag[i]))
+				conn_tell_fresh(c, NULL);
+			claim_served_note(&s->served, s->punch_ufrag[i]);
 			conn_register(s, c);
 			if (worker_spawn(ws, c)) {
 				s->punch_ufrag[i][0] = '\0';

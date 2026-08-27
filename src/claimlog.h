@@ -22,4 +22,26 @@
  * that connection's remote password. */
 int claim_made(const char *conn_pwd, const char *claim_pwd);
 
+/*
+ * The claimants this host has served, by the ICE ufrag that identifies them.
+ *
+ * A ufrag is session-stable across a resumption and fresh after a full
+ * rejoin, so a claimant already in here is one coming back to a session it
+ * had, and one that is not is joining for the first time and has nothing to
+ * be told about a worker of its own.
+ *
+ * A ring: only the recent ones matter, and a claimant that has fallen out of
+ * it is treated as new, which costs it the notice and nothing else.
+ */
+#define CLAIM_SERVED_MAX 8
+#define CLAIM_UFRAG_LEN 40
+
+struct claim_served {
+	char ufrag[CLAIM_SERVED_MAX][CLAIM_UFRAG_LEN];
+	int next;
+};
+
+void claim_served_note(struct claim_served *l, const char *ufrag);
+int claim_served_has(const struct claim_served *l, const char *ufrag);
+
 #endif /* COMRADE_CLAIMLOG_H */
