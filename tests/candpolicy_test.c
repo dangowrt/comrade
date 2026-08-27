@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "candpolicy.h"
+#include "path.h"
 #include "wsock.h"
 
 static void default_policy_check(void)
@@ -91,33 +92,43 @@ static void sdp_filter_check(void)
 	assert(!strstr(out, "192.168.1.5"));
 }
 
-static void drop_self_check(void)
+/*
+ * An endpoint the peer advertised over the segment is probed with nothing
+ * having arrived from it, so one of our own addresses is not the peer -- and
+ * a v4 address arrives here in the mapped form paths hold.
+ */
+static void own_endpoint_check(void)
 {
-	char out[1024];
 	struct netmon_addr local[2];
-	static const char sdp[] =
-		"a=ice-ufrag:abcd\r\n"
-		"a=ice-pwd:secretpwd\r\n"
-		"a=candidate:1 1 UDP 2 192.168.5.164 40000 typ host\r\n"
-		"a=candidate:2 1 UDP 2 192.168.5.170 40001 typ host\r\n"
-		"a=candidate:3 1 UDP 2 203.0.113.9 40002 typ srflx raddr 0.0.0.0 rport 0\r\n";
+	struct path_ep ep;
+	struct sockaddr_in sa4;
 
 	memset(local, 0, sizeof(local));
 	local[0].family = AF_INET;
 	local[0].addrlen = 4;
 	assert(inet_pton(AF_INET, "192.168.5.164", local[0].addr) == 1);
-	local[1].family = AF_INET;
-	local[1].addrlen = 4;
-	assert(inet_pton(AF_INET, "203.0.113.9", local[1].addr) == 1);
+	local[1].family = AF_INET6;
+	local[1].addrlen = 16;
+	assert(inet_pton(AF_INET6, "2a01:db8::1", local[1].addr) == 1);
 
-	cand_sdp_drop_self(sdp, local, 2, out, sizeof(out));
-	assert(strstr(out, "ice-ufrag"));
-	assert(!strstr(out, "192.168.5.164"));
-	assert(strstr(out, "192.168.5.170"));
-	assert(strstr(out, "203.0.113.9"));
+	memset(&sa4, 0, sizeof(sa4));
+	sa4.sin_family = AF_INET;
+	sa4.sin_port = htons(40000);
+	assert(inet_pton(AF_INET, "192.168.5.164", &sa4.sin_addr) == 1);
+	assert(!path_ep_from_sockaddr(&ep, (struct sockaddr *)&sa4,
+				      sizeof(sa4)));
+	assert(cand_ep_is_local(ep.addr, local, 2));
 
-	cand_sdp_drop_self(sdp, NULL, 0, out, sizeof(out));
-	assert(strstr(out, "192.168.5.164"));
+	assert(inet_pton(AF_INET, "192.168.5.170", &sa4.sin_addr) == 1);
+	assert(!path_ep_from_sockaddr(&ep, (struct sockaddr *)&sa4,
+				      sizeof(sa4)));
+	assert(!cand_ep_is_local(ep.addr, local, 2));
+
+	/* The v6 half, and a machine that knows of no address of its own. */
+	memset(&ep, 0, sizeof(ep));
+	assert(inet_pton(AF_INET6, "2a01:db8::1", ep.addr) == 1);
+	assert(cand_ep_is_local(ep.addr, local, 2));
+	assert(!cand_ep_is_local(ep.addr, NULL, 0));
 }
 
 static void fan_check(void)
@@ -259,7 +270,7 @@ int main(void)
 	default_policy_check();
 	opt_in_check();
 	sdp_filter_check();
-	drop_self_check();
+	own_endpoint_check();
 	fan_check();
 	mapping_dependent_check();
 	return 0;

@@ -108,21 +108,8 @@ static int line_addr(const char *line, size_t len, char *buf, size_t buflen)
 	return -1;
 }
 
-/* "typ host", the literal ICE wrote for a host candidate (see candpack.c's
- * candpack_decode) -- other types always trail more attributes after it. */
-static int line_is_host(const char *line, size_t len)
-{
-	const char *p = os_memmem(line, len, " typ host", 9);
-	const char *end = line + len;
-
-	if (!p)
-		return 0;
-	p += 9;
-	return p == end || *p == '\r' || *p == '\n';
-}
-
-static int addr_is_local(const char *addr, const struct netmon_addr *local,
-			 size_t nlocal)
+int cand_addr_is_local(const char *addr, const struct netmon_addr *local,
+		       size_t nlocal)
 {
 	uint8_t b[16];
 	int alen;
@@ -236,31 +223,25 @@ void cand_sdp_fan_v4(char *sdp, size_t cap, const uint8_t (*pool)[4],
 	}
 }
 
-void cand_sdp_drop_self(const char *in, const struct netmon_addr *local,
-			size_t nlocal, char *out, size_t outlen)
+int cand_ep_is_local(const uint8_t addr[16], const struct netmon_addr *local,
+		     size_t nlocal)
 {
-	const char *line = in;
-	size_t o = 0;
+	static const uint8_t v4_prefix[12] = {
+		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff
+	};
+	const uint8_t *a = addr;
+	int alen = 16;
+	size_t i;
 
-	while (*line) {
-		const char *nl = strchr(line, '\n');
-		size_t len = nl ? (size_t)(nl - line + 1) : strlen(line);
-		int keep = 1;
-		char addr[64];
-
-		if (nlocal && line_is_host(line, len) &&
-		    !line_addr(line, len, addr, sizeof(addr)) &&
-		    addr_is_local(addr, local, nlocal))
-			keep = 0;
-		if (keep && o + len < outlen) {
-			memcpy(out + o, line, len);
-			o += len;
-		}
-		if (!nl)
-			break;
-		line = nl + 1;
+	if (!memcmp(addr, v4_prefix, sizeof(v4_prefix))) {
+		a = addr + 12;
+		alen = 4;
 	}
-	out[o] = '\0';
+	for (i = 0; i < nlocal; i++)
+		if (local[i].addrlen == alen &&
+		    !memcmp(local[i].addr, a, (size_t)alen))
+			return 1;
+	return 0;
 }
 
 /*

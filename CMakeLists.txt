@@ -740,7 +740,7 @@ if(BUILD_TESTING)
 	add_test(NAME path_test COMMAND path_test)
 
 	add_executable(candpolicy_test tests/candpolicy_test.c)
-	target_link_libraries(candpolicy_test comrade_crypto)
+	target_link_libraries(candpolicy_test comrade_crypto comrade_path)
 	add_test(NAME candpolicy_test COMMAND candpolicy_test)
 
 	add_executable(stunprobe_test tests/stunprobe_test.c)

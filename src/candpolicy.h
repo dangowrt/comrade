@@ -25,15 +25,24 @@ void cand_sdp_filter(const char *in, int family_filter,
 		     const struct cand_policy *p, char *out, size_t outlen);
 
 /*
- * Drop remote host candidates that name one of our own local addresses --
- * a peer cannot be reachable at an address that is ours, so the candidate is
- * worse than useless whatever produced it (an overlapping virtual/NAT subnet,
- * misdirected signalling). srflx/prflx/relay candidates are left alone even
- * on a match: two peers sharing one public address behind the same NAT/CGNAT
- * is ordinary and still worth trying.
+ * Whether `addr` names one of this machine's own addresses.
+ *
+ * Used where a peer is taken at its word: an endpoint advertised over the
+ * segment is probed on the shared socket with nothing having been seen to
+ * arrive from it, so our own address on our own port must be refused --
+ * both ends of one session hold the same key, so we would answer ourselves
+ * and the path would look alive while carrying nothing. ICE needs no such
+ * rule: its checks carry credentials, so a pair aimed at ourselves fails on
+ * its own, and two peers that really share a machine have no other way to
+ * meet.
  */
-void cand_sdp_drop_self(const char *in, const struct netmon_addr *local,
-			size_t nlocal, char *out, size_t outlen);
+int cand_addr_is_local(const char *addr, const struct netmon_addr *local,
+		       size_t nlocal);
+
+/* The same question for an address already in the v6-mapped form paths hold;
+ * a v4-mapped one is compared against this machine's v4 addresses. */
+int cand_ep_is_local(const uint8_t addr[16], const struct netmon_addr *local,
+		     size_t nlocal);
 
 /*
  * Append, in place, a server-reflexive variant for every pool address not

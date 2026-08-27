@@ -933,6 +933,7 @@ static enum path_kind ep_kind(const struct path_ep *ep)
 static void conn_offer_path(struct conn *c, const struct sockaddr *sa,
 			    socklen_t len)
 {
+	struct netmon_addr local[NETMON_MAX_ADDRS];
 	char added[PATH_LABEL_MAX];
 	struct sockaddr_in6 remote;
 	struct path_ep ep;
@@ -945,6 +946,21 @@ static void conn_offer_path(struct conn *c, const struct sockaddr *sa,
 		return;
 	if (path_ep_any(&ep) || !ep.port)
 		return;
+	/*
+	 * Our own listening endpoint, advertised back at us: both ends of one
+	 * session hold the same key, so a probe sent there is answered by us
+	 * and the path looks alive while carrying nothing. Only this exact
+	 * endpoint is refused -- our address on another port is another
+	 * process, which is what a peer sharing this machine looks like, and
+	 * what a peer that merely shares an address (a VM and its host under
+	 * passt) offers is left to fail its probes like any other dead path.
+	 */
+	if (c->sess->lan && ep.port == lanlink_port(c->sess->lan) &&
+	    cand_ep_is_local(ep.addr, local,
+			     netmon_snapshot(local, NETMON_MAX_ADDRS))) {
+		dbg_logf("path advertised: declined, it is our own endpoint");
+		return;
+	}
 	added[0] = '\0';
 	pthread_mutex_lock(&c->path_lock);
 	fresh = path_table_find_ep(&c->paths, &ep) == NULL;
@@ -1208,18 +1224,19 @@ static void pool_pump(struct sess *s)
 	}
 }
 
-/* Like sdp_filter(), for a peer's SDP: also drops any host candidate that
- * names one of our own local addresses (see cand_sdp_drop_self). */
+/*
+ * Like sdp_filter(), for a peer's SDP.
+ *
+ * A candidate naming one of our own addresses is kept. ICE checks carry
+ * credentials, so one aimed at ourselves reaches an agent expecting a
+ * different username and the pair fails on its own; and two peers that really
+ * are on one machine -- a VM and its host under passt, both ends of a test --
+ * have no other address to meet at. The transport that must not take a peer
+ * at its word is the segment one, and the rule lives there (conn_offer_path).
+ */
 static void sdp_filter_peer(const char *in, int family, char *out, size_t outlen)
 {
-	struct netmon_addr local[NETMON_MAX_ADDRS];
-	size_t nlocal = netmon_snapshot(local, NETMON_MAX_ADDRS);
-	char tmp[NAT_SDP_MAX];
-
-	sdp_filter(in, family, tmp, sizeof(tmp));
-	cand_sdp_drop_self(tmp, local, nlocal, out, outlen);
-	if (strlen(out) != strlen(tmp))
-		dbg_logf("sdp_filter_peer: dropped self-address host candidate(s)");
+	sdp_filter(in, family, out, outlen);
 }
 
 /*
