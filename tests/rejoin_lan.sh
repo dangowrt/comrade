@@ -63,7 +63,7 @@ COMRADE_DEBUG="$tmp/client.dbg" "$E2E" client "$tok" --mcast --no-dht \
 	--stun none --hold-ms 120000 --timeout 150 > "$tmp/client.out" 2>&1 &
 clientpid=$!
 i=0
-while [ "$i" -lt 120 ]; do
+while [ "$i" -lt 90 ]; do
 	n=$(grep -c "conn_run: sock_pair" "$tmp/client.dbg" 2>/dev/null)
 	[ "${n:-0}" -ge 2 ] && break
 	kill -0 "$clientpid" 2>/dev/null || break

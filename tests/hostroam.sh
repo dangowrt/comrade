@@ -23,7 +23,7 @@ hostpid=""
 clientpid=""
 trap 'kill "$hostpid" "$clientpid" 2>/dev/null; swarm_stop; rm -rf "$tmp"' EXIT
 
-COMRADE_DEBUG="$tmp/host.dbg" "$E2E" host --serve 1 --timeout 300 \
+COMRADE_DEBUG="$tmp/host.dbg" "$E2E" host --serve 1 --timeout 150 \
 	--roam-ms 30000 --roams 1 --roam-hard \
 	> "$tmp/host.out" 2> "$tmp/host.err" &
 hostpid=$!

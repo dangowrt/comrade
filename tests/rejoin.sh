@@ -41,7 +41,7 @@ trap 'kill "$hostpid" "$clientpid" 2>/dev/null; swarm_stop; keep' EXIT
 # Serves twice: the session the reap ends, and the one the client comes back
 # with. The reap lands well inside the client's hold.
 COMRADE_DEBUG="$tmp/host.dbg" "$E2E" host --serve 2 --reap-ms 15000 \
-	--timeout 300 > "$tmp/host.out" 2> "$tmp/host.err" &
+	--timeout 150 > "$tmp/host.out" 2> "$tmp/host.err" &
 hostpid=$!
 
 tok=""
@@ -67,10 +67,10 @@ done
 # that follows, and stopped as soon as the fresh session is up rather than
 # sitting out the rest of a hold that has nothing left to prove.
 COMRADE_DEBUG="$tmp/client.dbg" "$E2E" client "$tok" \
-	--hold-ms 200000 --timeout 300 > "$tmp/client.out" 2>&1 &
+	--hold-ms 110000 --timeout 150 > "$tmp/client.out" 2>&1 &
 clientpid=$!
 i=0
-while [ "$i" -lt 200 ]; do
+while [ "$i" -lt 120 ]; do
 	n=$(grep -c "conn_run: sock_pair" "$tmp/client.dbg" 2>/dev/null)
 	[ "${n:-0}" -ge 2 ] && break
 	kill -0 "$clientpid" 2>/dev/null || break

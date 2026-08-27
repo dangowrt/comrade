@@ -225,12 +225,27 @@ jobs:
       - name: Build
         run: cmake --build build
 
-      # --output-on-failure so a flake in CI arrives with its output attached
-      # rather than as a bare red cross; --timeout 120 so a hung test fails fast
-      # with diagnostics instead of stalling the worker (the e2e tests carry
-      # their own longer per-test TIMEOUT in the CMake).
+      # --output-on-failure so a flake arrives with its output attached rather
+      # than as a bare red cross; --timeout 120 so a hung test fails fast with
+      # diagnostics instead of stalling the worker (the e2e tests carry their
+      # own longer per-test TIMEOUT in the CMake).
       - name: Test
-        run: ctest --test-dir build --output-on-failure --timeout 120
+        run: ctest --test-dir build --output-on-failure --timeout 120 -E "_e2e|swarm_"
+
+      # The end-to-end tests, and only these, stop at the first failure. They
+      # share one machine and one network, so when the environment cannot carry
+      # a session at all they do not fail independently -- they all fail, each
+      # waiting out its own budget, and the job is cancelled before it can say
+      # anything. One failure with its output is the useful report; the rest
+      # would only repeat it.
+      - name: Test (end to end)
+        run: |
+          ctest --test-dir build --output-on-failure --stop-on-failure \
+            -R "_e2e|swarm_" || rc=$?
+          # The swarm outlives a run that stopped early, so take it down by
+          # hand before the next job on this worker builds its own.
+          ctest --test-dir build -R swarm_down >/dev/null 2>&1 || true
+          exit ${rc:-0}
 
       - name: Smoke test the binary
         run: |

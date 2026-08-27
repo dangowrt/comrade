@@ -39,7 +39,7 @@ c1=""
 c2=""
 trap 'kill "$hostpid" "$c1" "$c2" 2>/dev/null; swarm_stop; rm -rf "$tmp"' EXIT
 
-COMRADE_DEBUG="$tmp/host.dbg" "$E2E" host --serve 2 --timeout 300 \
+COMRADE_DEBUG="$tmp/host.dbg" "$E2E" host --serve 2 --timeout 150 \
 	> "$tmp/host.out" 2> "$tmp/host.err" &
 hostpid=$!
 
@@ -72,7 +72,7 @@ fi
 rdv=""
 fam=""
 i=0
-while [ "$i" -lt 150 ]; do
+while [ "$i" -lt 100 ]; do
 	c=$(sed -n 's/^COMRADE TOKEN: //p' "$tmp/host.out" 2>/dev/null | tail -1)
 	if [ -n "$c" ]; then
 		d=$("$E2E" token "$c" 2>/dev/null)

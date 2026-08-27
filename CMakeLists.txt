@@ -898,7 +898,7 @@ if(COMRADE_BUILD_TOOLS)
 				$<TARGET_FILE:comrade>
 				$<TARGET_FILE:comrade-dhtseed>)
 		set_tests_properties(forward_e2e PROPERTIES
-			SKIP_RETURN_CODE 77 TIMEOUT 300
+			SKIP_RETURN_CODE 77 TIMEOUT 180
 			FIXTURES_REQUIRED swarm
 			ENVIRONMENT COMRADE_SWARM_FILE=${COMRADE_SWARM_FILE})
 
@@ -907,7 +907,7 @@ if(COMRADE_BUILD_TOOLS)
 				$<TARGET_FILE:comrade-e2e>
 				$<TARGET_FILE:comrade-dhtseed> 2)
 		set_tests_properties(multiuser_e2e PROPERTIES
-			SKIP_RETURN_CODE 77 TIMEOUT 300
+			SKIP_RETURN_CODE 77 TIMEOUT 180
 			FIXTURES_REQUIRED swarm
 			ENVIRONMENT COMRADE_SWARM_FILE=${COMRADE_SWARM_FILE})
 
@@ -918,7 +918,7 @@ if(COMRADE_BUILD_TOOLS)
 			COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/isolated_lan.sh
 				$<TARGET_FILE:comrade-e2e>)
 		set_tests_properties(isolated_lan_e2e PROPERTIES
-			SKIP_RETURN_CODE 77 TIMEOUT 120)
+			SKIP_RETURN_CODE 77 TIMEOUT 90)
 
 		# Concurrent isolated-LAN admission: N clients join one no-DHT host at
 		# once over multicast. Offline and
@@ -927,7 +927,7 @@ if(COMRADE_BUILD_TOOLS)
 			COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/lan_concurrent.sh
 				$<TARGET_FILE:comrade-e2e> 4)
 		set_tests_properties(lan_concurrent_e2e PROPERTIES
-			SKIP_RETURN_CODE 77 TIMEOUT 180)
+			SKIP_RETURN_CODE 77 TIMEOUT 120)
 
 		# Mixed lanlink + DHT/ICE peers in one session: a
 		# lanlink worker and an ICE worker must coexist live. Needs the live
@@ -937,7 +937,7 @@ if(COMRADE_BUILD_TOOLS)
 				$<TARGET_FILE:comrade-e2e>
 				$<TARGET_FILE:comrade-dhtseed>)
 		set_tests_properties(lan_mixed_e2e PROPERTIES
-			SKIP_RETURN_CODE 77 TIMEOUT 300
+			SKIP_RETURN_CODE 77 TIMEOUT 180
 			FIXTURES_REQUIRED swarm
 			ENVIRONMENT COMRADE_SWARM_FILE=${COMRADE_SWARM_FILE})
 
@@ -950,7 +950,7 @@ if(COMRADE_BUILD_TOOLS)
 				$<TARGET_FILE:comrade-e2e>
 				$<TARGET_FILE:comrade-dhtseed>)
 		set_tests_properties(turnstile_stuck_e2e PROPERTIES
-			SKIP_RETURN_CODE 77 TIMEOUT 300
+			SKIP_RETURN_CODE 77 TIMEOUT 180
 			FIXTURES_REQUIRED swarm
 			ENVIRONMENT COMRADE_SWARM_FILE=${COMRADE_SWARM_FILE})
 
@@ -962,7 +962,7 @@ if(COMRADE_BUILD_TOOLS)
 			COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/roam.sh
 				$<TARGET_FILE:comrade-e2e>)
 		set_tests_properties(roam_lan_e2e PROPERTIES
-			SKIP_RETURN_CODE 77 TIMEOUT 180)
+			SKIP_RETURN_CODE 77 TIMEOUT 120)
 
 		# One family moving is not the other one moving: a v6-only
 		# renumbering must leave v4's facts standing. Offline, same
@@ -971,7 +971,7 @@ if(COMRADE_BUILD_TOOLS)
 			COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/roam_fam.sh
 				$<TARGET_FILE:comrade-e2e>)
 		set_tests_properties(roam_fam_e2e PROPERTIES
-			SKIP_RETURN_CODE 77 TIMEOUT 150)
+			SKIP_RETURN_CODE 77 TIMEOUT 90)
 
 		# The client half of the same handler: a client that rebuilds
 		# while still looking must still join over what it rebuilt. Its
@@ -981,7 +981,7 @@ if(COMRADE_BUILD_TOOLS)
 				$<TARGET_FILE:comrade-e2e>
 				$<TARGET_FILE:comrade-dhtseed>)
 		set_tests_properties(roam_client_e2e PROPERTIES
-			SKIP_RETURN_CODE 77 TIMEOUT 300
+			SKIP_RETURN_CODE 77 TIMEOUT 180
 			FIXTURES_REQUIRED swarm
 			ENVIRONMENT COMRADE_SWARM_FILE=${COMRADE_SWARM_FILE})
 
@@ -994,7 +994,7 @@ if(COMRADE_BUILD_TOOLS)
 			COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/path_switch.sh
 				$<TARGET_FILE:comrade-e2e>)
 		set_tests_properties(path_switch_e2e PROPERTIES
-			SKIP_RETURN_CODE 77 TIMEOUT 180)
+			SKIP_RETURN_CODE 77 TIMEOUT 120)
 
 		# A total outage mid-session resumes in place: same worker,
 		# same SSH session, the punch grafted. Its rendezvous is the
@@ -1004,7 +1004,7 @@ if(COMRADE_BUILD_TOOLS)
 				$<TARGET_FILE:comrade-e2e>
 				$<TARGET_FILE:comrade-dhtseed>)
 		set_tests_properties(resume_e2e PROPERTIES
-			SKIP_RETURN_CODE 77 TIMEOUT 300
+			SKIP_RETURN_CODE 77 TIMEOUT 180
 			FIXTURES_REQUIRED swarm
 			ENVIRONMENT COMRADE_SWARM_FILE=${COMRADE_SWARM_FILE})
 
@@ -1014,7 +1014,7 @@ if(COMRADE_BUILD_TOOLS)
 			COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/rejoin_lan.sh
 				$<TARGET_FILE:comrade-e2e>)
 		set_tests_properties(rejoin_lan_e2e PROPERTIES
-			SKIP_RETURN_CODE 77 TIMEOUT 300)
+			SKIP_RETURN_CODE 77 TIMEOUT 180)
 
 		# The outage the worker does not survive: nothing to resume
 		# into, so the client has to come back as a fresh one.
@@ -1023,7 +1023,7 @@ if(COMRADE_BUILD_TOOLS)
 				$<TARGET_FILE:comrade-e2e>
 				$<TARGET_FILE:comrade-dhtseed>)
 		set_tests_properties(rejoin_e2e PROPERTIES
-			SKIP_RETURN_CODE 77 TIMEOUT 500
+			SKIP_RETURN_CODE 77 TIMEOUT 200
 			FIXTURES_REQUIRED swarm
 			ENVIRONMENT COMRADE_SWARM_FILE=${COMRADE_SWARM_FILE})
 
@@ -1035,7 +1035,7 @@ if(COMRADE_BUILD_TOOLS)
 				$<TARGET_FILE:comrade-e2e>
 				$<TARGET_FILE:comrade-dhtseed>)
 		set_tests_properties(hostroam_e2e PROPERTIES
-			SKIP_RETURN_CODE 77 TIMEOUT 300
+			SKIP_RETURN_CODE 77 TIMEOUT 200
 			FIXTURES_REQUIRED swarm
 			ENVIRONMENT COMRADE_SWARM_FILE=${COMRADE_SWARM_FILE})
 
@@ -1047,7 +1047,7 @@ if(COMRADE_BUILD_TOOLS)
 				$<TARGET_FILE:comrade-e2e>
 				$<TARGET_FILE:comrade-dhtseed>)
 		set_tests_properties(rdvsync_e2e PROPERTIES
-			SKIP_RETURN_CODE 77 TIMEOUT 400
+			SKIP_RETURN_CODE 77 TIMEOUT 240
 			FIXTURES_REQUIRED swarm
 			ENVIRONMENT COMRADE_SWARM_FILE=${COMRADE_SWARM_FILE})
 
