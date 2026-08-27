@@ -1916,25 +1916,35 @@ static struct path *conn_pong_path(struct conn *c, uint64_t nonce)
 /*
  * Tell the claimant that what it has reached is a new worker, not the one it
  * left. Only a client coming back has anything to do with this; one joining
- * for the first time has no session to lose and ignores it. Said on the
- * connection it has just punched, sealed and addressed to its own claimant
- * identity like any other probe.
+ * for the first time has no session to lose and ignores it. Sealed and
+ * addressed to its own claimant identity like any other probe.
+ *
+ * On whichever transport is about to carry it: a punched connection has an
+ * agent, and one admitted over the segment has only the endpoint it announced
+ * itself from, which the caller has to hand. Roaming is how a segment path
+ * ends -- one end leaves the segment the other is on -- so a client that comes
+ * back to a host over the segment is in exactly the position this is for.
  */
-static void conn_tell_fresh(struct conn *c)
+static void conn_tell_fresh(struct conn *c, const struct sockaddr_in6 *lan_to)
 {
+	struct sess *s = c->sess;
 	struct path_probe pr;
 	uint8_t out[PROBE_MAX];
 	size_t o;
 
-	if (!c->nat || !c->claim_ufrag[0])
+	if (!c->claim_ufrag[0])
 		return;
 	memset(&pr, 0, sizeof(pr));
 	pr.type = PROBE_FRESH;
 	random_bytes((uint8_t *)&pr.nonce, sizeof(pr.nonce));
 	snprintf(pr.ufrag, sizeof(pr.ufrag), "%s", c->claim_ufrag);
 	o = conn_probe_seal(c, &pr, out);
-	if (o)
+	if (!o)
+		return;
+	if (c->nat)
 		nat_send(c->nat, out, o);
+	else if (lan_to && s->lan)
+		lanlink_send(s->lan, lan_to, out, o);
 }
 
 static void probe_apply(struct conn *c, const struct path_probe *pr,
@@ -4838,6 +4848,11 @@ static void lan_drain(struct sess *s, struct worker *ws, int *dash_seq)
 		c->dash_id = ++*dash_seq;
 		snprintf(c->status_peer, sizeof(c->status_peer), "%s", addr);
 		s->lan_conns[slot] = c;
+		/* Said here too: a client whose segment path ended because one
+		 * of them roamed comes back this way when they are on a
+		 * segment again, and it is no better placed to tell a new
+		 * worker from its old one than a punched one is. */
+		conn_tell_fresh(c, &mapped);
 		conn_register(s, c);
 		if (o && o->peer) {
 			o->peer(o->arg, c->dash_id, SESSION_PEER_SEEN, addr);
@@ -4929,7 +4944,7 @@ static void punch_scan(struct sess *s, struct worker *ws, struct conn **punching
 			 * was resuming learns here that it is not, and can go
 			 * round again at once rather than waiting out the
 			 * silence that would eventually tell it. */
-			conn_tell_fresh(c);
+			conn_tell_fresh(c, NULL);
 			conn_register(s, c);
 			if (worker_spawn(ws, c)) {
 				s->punch_ufrag[i][0] = '\0';

@@ -966,6 +966,14 @@ if(COMRADE_BUILD_TOOLS)
 			FIXTURES_REQUIRED swarm
 			ENVIRONMENT COMRADE_SWARM_FILE=${COMRADE_SWARM_FILE})
 
+		# The same reap on a segment: no ICE agent to be told on, and a
+		# segment path is what roaming ends.
+		add_test(NAME rejoin_lan_e2e
+			COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/rejoin_lan.sh
+				$<TARGET_FILE:comrade-e2e>)
+		set_tests_properties(rejoin_lan_e2e PROPERTIES
+			SKIP_RETURN_CODE 77 TIMEOUT 300)
+
 		# The outage the worker does not survive: nothing to resume
 		# into, so the client has to come back as a fresh one.
 		add_test(NAME rejoin_e2e

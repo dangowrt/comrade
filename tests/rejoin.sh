@@ -68,8 +68,8 @@ COMRADE_DEBUG="$tmp/client.dbg" "$E2E" client "$tok" \
 clientpid=$!
 i=0
 while [ "$i" -lt 200 ]; do
-	[ "$(grep -c "conn_run: sock_pair" "$tmp/client.dbg" 2>/dev/null)" -ge 2 ] &&
-		break
+	n=$(grep -c "conn_run: sock_pair" "$tmp/client.dbg" 2>/dev/null)
+	[ "${n:-0}" -ge 2 ] && break
 	kill -0 "$clientpid" 2>/dev/null || break
 	sleep 1
 	i=$((i + 1))
