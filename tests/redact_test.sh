@@ -27,13 +27,22 @@ check "a global v4 endpoint keeps its port and loses its address" \
 	"path: srflx 203.0.113.9:41234 chosen" \
 	"path: srflx <v4-1>:41234 chosen"
 
-check "the private ranges are left alone" \
+# A private address names the segment a runner sits on, and a workflow log is
+# read by anyone.
+check "the private ranges are masked too" \
 	"node 192.168.5.164:6881 and 10.1.2.3:5 and 172.16.0.1:1" \
-	"node 192.168.5.164:6881 and 10.1.2.3:5 and 172.16.0.1:1"
+	"node <v4-1>:6881 and <v4-2>:5 and <v4-3>:1"
 
-check "loopback, link-local, ULA and multicast are left alone" \
+# A link-local v6 address carries the MAC it was formed from; a ULA names a
+# site. Only loopback and the multicast groups discovery is defined in terms of
+# say nothing about anyone.
+check "link-local and ULA are masked, loopback and multicast are not" \
 	"[::1]:9000 127.0.0.1:9000 [fe80::1%eth0]:5353 [fd00::1]:1 224.0.0.251" \
-	"[::1]:9000 127.0.0.1:9000 [fe80::1%eth0]:5353 [fd00::1]:1 224.0.0.251"
+	"[::1]:9000 127.0.0.1:9000 [<v6-1>%eth0]:5353 [<v6-2>]:1 224.0.0.251"
+
+check "the multicast groups discovery uses stay readable" \
+	"joined 239.7.7.7:21001 and [ff02::fb]:5353" \
+	"joined 239.7.7.7:21001 and [ff02::fb]:5353"
 
 # Which lines name the same place is most of what a tail is read for, so the
 # alias has to hold across a line and tell two addresses apart.

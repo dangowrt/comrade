@@ -10,8 +10,11 @@
 #
 # A tail is read for the shape rather than the digits, so each address becomes
 # <v4-N>/<v6-N>, numbered in order of first appearance, and the port beside it
-# is kept. Loopback, link-local, ULA, multicast and the private v4 ranges stay
-# as they are: they are the substance of the LAN tests and describe nobody.
+# is kept. Which family, which port, and whether two lines name the same place
+# all still read; nothing about the machine does. A private address is masked
+# with the rest -- it names the segment a runner sits on, and a link-local one
+# carries the MAC it was formed from. Only what a reader already knows is left
+# alone: loopback, and the multicast groups discovery is defined in terms of.
 
 redact() {
 	awk '
@@ -22,28 +25,22 @@ redact() {
 				k++
 		return k
 	}
-	function local4(a,   p) {
+	function known4(a,   p) {
 		split(a, p, ".")
 		if (p[1] + 0 > 255 || p[2] + 0 > 255 ||
 		    p[3] + 0 > 255 || p[4] + 0 > 255)
+			return 1	# not an address at all
+		if (p[1] + 0 == 127 || p[1] + 0 == 0)
 			return 1
-		if (p[1] + 0 == 127 || p[1] + 0 == 10 || p[1] + 0 == 0)
-			return 1
-		if (p[1] + 0 == 192 && p[2] + 0 == 168)
-			return 1
-		if (p[1] + 0 == 172 && p[2] + 0 >= 16 && p[2] + 0 <= 31)
-			return 1
-		if (p[1] + 0 == 169 && p[2] + 0 == 254)
-			return 1
-		if (p[1] + 0 >= 224)
+		if (p[1] + 0 >= 224 && p[1] + 0 <= 239)
 			return 1
 		return 0
 	}
-	function local6(a,   l) {
+	function known6(a,   l) {
 		l = tolower(a)
 		if (l == "::" || l == "::1")
 			return 1
-		if (l ~ /^fe[89ab]/ || l ~ /^f[cd]/ || l ~ /^ff/)
+		if (l ~ /^ff/)
 			return 1
 		return 0
 	}
@@ -63,11 +60,11 @@ redact() {
 			rest = substr(rest, RSTART + RLENGTH)
 			if (index(tok, ":") > 0) {
 				if ((index(tok, "::") > 0 || count(tok, ":") >= 4) &&
-				    !local6(tok))
+				    !known6(tok))
 					out = out alias(tok, 6)
 				else
 					out = out tok
-			} else if (!local4(tok)) {
+			} else if (!known4(tok)) {
 				out = out alias(tok, 4)
 			} else {
 				out = out tok
