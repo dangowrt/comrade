@@ -47,9 +47,26 @@ enum {					/* how a local address was learnt */
 
 /* Quickly while there is no source (an RA or DHCPv6 still finishing), then
  * slowly but forever: an RFC 4941 address rotating changes what the kernel
- * sources from with no interface event to notice. */
+ * sources from with no interface event to notice.
+ *
+ * A source answering ends the fast phase at once, so the count is only the
+ * ceiling for one that never answers: RFC 4861 sends at most
+ * MAX_RTR_SOLICITATIONS, RTR_SOLICITATION_INTERVAL apart, so nothing an RA
+ * will bring can arrive later than that, and a quarter as long again covers a
+ * DHCPv6 exchange running behind it. */
 #define NETSTATE_SRC_FAST_MS 500
-#define NETSTATE_SRC_FAST_TRIES 30	/* ~15s, past any RA/DHCPv6 settle */
+#define NETSTATE_RS_TRIES 3
+#define NETSTATE_RS_INTERVAL_MS 4000
+#define NETSTATE_RA_WINDOW_MS (NETSTATE_RS_TRIES * NETSTATE_RS_INTERVAL_MS)
+#define NETSTATE_SRC_FAST_TRIES ((NETSTATE_RA_WINDOW_MS + \
+				  NETSTATE_RA_WINDOW_MS / 4) / \
+				 NETSTATE_SRC_FAST_MS)
+#if NETSTATE_SRC_FAST_TRIES * NETSTATE_SRC_FAST_MS < NETSTATE_RA_WINDOW_MS
+#error "the hurry must outlast the solicitations it is waiting on"
+#endif
+#if NETSTATE_SRC_FAST_TRIES * NETSTATE_SRC_FAST_MS > 2 * NETSTATE_RA_WINDOW_MS
+#error "twice that window and nothing is still on its way"
+#endif
 #define NETSTATE_SRC_SLOW_MS 5000
 
 /*

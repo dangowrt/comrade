@@ -180,6 +180,42 @@ static void src_survives_the_roam_window(void)
 	netstate_on_src(&ns, 6, netstate_epoch(&ns, 6), a, 16, "the-addr", t);
 	assert(!strcmp(netstate_src_text(&ns, 6), "the-addr"));
 	assert(netstate_conn(&ns, 6) == NET_CONN_PENDING);
+
+	/* An answer is what ends the hurry, not a count of tries: the next
+	 * sample is not due for a slow interval. */
+	t += NETSTATE_SRC_FAST_MS;
+	netstate_tick(&ns, t);
+	assert(!(drain(&ns).f[1] & NSA_SAMPLE_SRC));
+	t += NETSTATE_SRC_SLOW_MS;
+	netstate_tick(&ns, t);
+	assert(drain(&ns).f[1] & NSA_SAMPLE_SRC);
+}
+
+/* And where nothing ever answers, the hurry has an end: past the window an RA
+ * could still arrive in, asking every half second says nothing new. */
+static void an_address_that_never_comes_stops_being_hurried(void)
+{
+	struct netstate ns;
+	int i;
+
+	start(&ns, 1);
+	netstate_on_netmon(&ns, NETMON_CH_V6, 1, 1, t);
+	assert(drain(&ns).f[1] & NSA_SAMPLE_SRC);
+
+	for (i = 0; i < NETSTATE_SRC_FAST_TRIES; i++) {
+		netstate_on_src(&ns, 6, netstate_epoch(&ns, 6), NULL, 0, NULL,
+				t);
+		t += NETSTATE_SRC_FAST_MS;
+		netstate_tick(&ns, t);
+		drain(&ns);
+	}
+	netstate_on_src(&ns, 6, netstate_epoch(&ns, 6), NULL, 0, NULL, t);
+	t += NETSTATE_SRC_FAST_MS;
+	netstate_tick(&ns, t);
+	assert(!(drain(&ns).f[1] & NSA_SAMPLE_SRC));
+	t += NETSTATE_SRC_SLOW_MS;
+	netstate_tick(&ns, t);
+	assert(drain(&ns).f[1] & NSA_SAMPLE_SRC);
 }
 
 /* B6/B12, the visible half: the addresses arrive before the source does, so
@@ -1112,6 +1148,7 @@ int main(void)
 	preserved_anchor_is_not_proof();
 	stale_roundtrip_never_marks_up();
 	src_survives_the_roam_window();
+	an_address_that_never_comes_stops_being_hurried();
 	late_src_retracts_the_wrong_row();
 	src_is_never_stale_on_the_wire();
 	anchor_changes_only_on_replacement();
