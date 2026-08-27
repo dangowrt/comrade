@@ -3315,7 +3315,7 @@ static void peer_in_drain(struct sess *s)
 }
 
 static int net_changed(struct sess *s);
-static int sig_rebuild(struct sess *s);
+static int sig_rebuild(struct sess *s, const char *why);
 static void net_settle(struct sess *s);
 static void ns_take_acks(struct sess *s, uint64_t now);
 
@@ -3379,7 +3379,7 @@ static void resume_tick(struct conn *c)
 	}
 	switch (c->rs_state) {
 	case 0:
-		if (net_changed(s) && sig_rebuild(s))
+		if (net_changed(s) && sig_rebuild(s, "on the new network"))
 			return;
 		conn_drop_ice_path(c);
 		if (c->nat) {
@@ -5050,7 +5050,32 @@ static int sig_arm(struct sess *s)
  * sig_prepare, never from a callback sig_dispatch is still unwinding. Returns 0,
  * or -1 when there is no signalling left to run the session on.
  */
-static int sig_rebuild(struct sess *s)
+/*
+ * The mailbox is engaged and the node behind it has stopped answering: reads
+ * were coming back and now none does. A rendezvous that died, a mapping the
+ * carrier moved, a middlebox that timed the flow out -- none of which changes
+ * an address here, so the move machinery never fires and the session sits on a
+ * slot nobody is serving, with nothing to say so.
+ *
+ * Long enough that an ordinary slow round is not mistaken for it. Rebuilding
+ * is invisible to a peer -- the mailbox is the same, only the socket and the
+ * node behind it are new -- so the cost of being wrong is one bootstrap.
+ */
+#define SIG_SILENT_MS 60000
+
+static int sig_silent(struct sess *s)
+{
+	struct sig_mailbox sm;
+
+	if (!s->sig)
+		return 0;
+	sig_mailbox_state(s->sig, &sm);
+	if (!sm.engaged || !sm.last_get_ms)
+		return 0;
+	return now_ms() - sm.last_get_ms > SIG_SILENT_MS;
+}
+
+static int sig_rebuild(struct sess *s, const char *why)
 {
 	sig_discard(s->sig);
 	s->sig = NULL;
@@ -5059,7 +5084,7 @@ static int sig_rebuild(struct sess *s)
 		return -1;
 	}
 	report_links(s);
-	dbg_logf("sig: rebuilt on the new network");
+	dbg_logf("sig: rebuilt %s", why);
 	return 0;
 }
 
@@ -5136,9 +5161,28 @@ static int host_turnstile(struct sess *s)
 				for (i = 0; i < HOST_MAX_WORKERS; i++)
 					if (ws[i].used)
 						ws[i].c->bh_mute = 1;
-			if (sig_rebuild(s))
+			if (sig_rebuild(s, "on the new network"))
 				break;
 			net_change_reset(s);
+			ts = TS_GATHER;
+		}
+		/*
+		 * Or nothing moved and the rendezvous went quiet anyway. What
+		 * is published stays published, but a mailbox that answers
+		 * nothing serves nobody, so arm a fresh signaller and offer
+		 * through it. The network's own facts -- the egress pool, the
+		 * mapping -- are still this network's and are kept.
+		 */
+		if (sig_silent(s)) {
+			dbg_logf("sig: nothing back from the rendezvous for "
+				 "%ds -- rebuilding", SIG_SILENT_MS / 1000);
+			if (listen) {
+				conn_free(listen);
+				listen = NULL;
+				s->offer_conn = NULL;
+			}
+			if (sig_rebuild(s, "after the rendezvous went quiet"))
+				break;
 			ts = TS_GATHER;
 		}
 
@@ -5743,7 +5787,7 @@ int session_run(const struct session_cfg *cfg)
 		 * callback is in flight.
 		 */
 		if (st != ST_RUN && net_changed(&s)) {
-			if (sig_rebuild(&s)) {
+			if (sig_rebuild(&s, "on the new network")) {
 				st = ST_FAIL;
 				break;
 			}
@@ -5758,6 +5802,21 @@ int session_run(const struct session_cfg *cfg)
 			pthread_mutex_unlock(&s.c.path_lock);
 			net_change_reset(&s);
 			st = ST_WAIT_DHT;
+		}
+		/*
+		 * Or nothing moved and the rendezvous went quiet: the claim is
+		 * written where nothing reads it. Arm a fresh signaller and
+		 * claim through that instead, keeping what this network has
+		 * already told us about itself.
+		 */
+		if (st != ST_RUN && sig_silent(&s)) {
+			dbg_logf("sig: nothing back from the rendezvous for "
+				 "%ds -- rebuilding", SIG_SILENT_MS / 1000);
+			if (sig_rebuild(&s, "after the rendezvous went quiet")) {
+				st = ST_FAIL;
+				break;
+			}
+			st = client_regather(&s) ? ST_FAIL : ST_GATHER;
 		}
 		/*
 		 * No peer has answered yet and the pool server this attempt drew
@@ -6005,7 +6064,8 @@ int session_run(const struct session_cfg *cfg)
 					pthread_mutex_lock(&s.c.path_lock);
 					path_table_clear(&s.c.paths);
 					pthread_mutex_unlock(&s.c.path_lock);
-					if (sig_rebuild(&s)) {
+					if (sig_rebuild(&s,
+							"on the new network")) {
 						st = ST_FAIL;
 						break;
 					}
