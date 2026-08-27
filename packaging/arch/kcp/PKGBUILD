@@ -1,7 +1,6 @@
 # Maintainer: Daniel Golle <daniel@makrotopia.org>
 #
-# One of comrade's two residual dependencies that no distribution packages
-# yet.
+# comrade's one residual dependency that Arch has no package for.
 #
 # Built as a shared library. Upstream's CMakeLists honours BUILD_SHARED_LIBS
 # but sets no VERSION/SOVERSION, so the soname is imposed here: without one

@@ -252,17 +252,17 @@ dependencies (see Dependencies) are in openwrt/packages master, so
     apk add comrade   # hosting a session also needs tmux: apk add tmux
 
 Neither comrade nor libjuice/kcp have been backported to a stable
-release branch (23.05, 24.10) yet -- only libdht has -- so on those,
-build it from source against the dependencies below instead.
+release branch (23.05, 24.10, 25.12) yet -- only libdht has -- so on
+those, build it from source against the dependencies below instead.
 
 ### Arch Linux
 
-Not in the official repositories; build from the in-tree PKGBUILDs. kcp
-and jech/dht are not packaged for Arch either, so build those two first:
+Not in the official repositories; build from the in-tree PKGBUILDs. Every
+dependency but kcp is in the official repositories, so build that one
+first:
 
     git clone https://github.com/dangowrt/comrade
     cd comrade/packaging/arch
-    (cd libdht && makepkg -si)
     (cd kcp && makepkg -si)
     (cd comrade && makepkg -si)
 
@@ -475,19 +475,36 @@ for example:
 
 ## Dependencies
 
-All libraries are system-provided, nothing is vendored. Configure prints
-a summary; a build with libraries missing still configures, but the
-resulting binary lacks the session stack and says so.
+All libraries are system-provided, nothing is vendored. Every one of them
+is load-bearing, so a missing one stops configure with a list of what to
+install, rather than yielding a binary with the session stack cut out of
+it.
 
 | Library | Purpose | Arch Linux | OpenWrt |
 |---------|---------|------------|---------|
 | libssh | SSH server and client | extra/libssh | libssh (packages feed) |
 | libjuice | ICE/STUN hole punching | extra/libjuice | libjuice (packages feed, master only) |
 | a crypto library | ed25519, ChaCha20-Poly1305, BLAKE2b | whichever libssh uses | whichever libssh uses (see below) |
-| kcp | reliable stream over UDP | install from upstream: `cmake -B build && cmake --install build` | libkcp (packages feed, master only) |
-| jech/dht | mainline DHT (Kademlia, BEP 32) | source checkout, pass `-DCOMRADE_DHT_DIR=<path>` | libdht (packages feed) |
+| kcp | reliable stream over UDP | `packaging/arch/kcp` (in-tree PKGBUILD) | libkcp (packages feed, master only) |
+| jech/dht | mainline DHT (Kademlia, BEP 32) | extra/dht | libdht (packages feed) |
 
 Runtime dependency: tmux, on the host side only.
+
+kcp is the one dependency Arch has no package for, so `packaging/arch`
+carries a PKGBUILD for it. jech/dht comes from `extra/dht`, which builds
+it as a static `libdht.a`; the shared `libdht` the OpenWrt, Debian and
+Homebrew recipes install serves the same purpose where a repository
+package does not exist. The apt repository and the Homebrew tap ship
+libjuice, kcp and libdht as their own packages, so installing comrade
+there pulls them in.
+
+An installed libdht is found by configure on its own, static or shared
+alike; a plain jech/dht checkout works too, via `-DCOMRADE_DHT_DIR=<path>`,
+which compiles dht.c straight in. Every route relies on comrade defining
+the four symbols dht.c deliberately leaves to the application
+(`dht_hash`, `dht_random_bytes`, `dht_blacklisted`, `dht_sendto`),
+resolved at link time against the archive and by the dynamic linker
+against the shared library.
 
 jech/dht carries no BEP 44 support and needs none: BEP 44 put/get is
 implemented in-tree (`src/bep44.c`) beside an unpatched jech/dht
