@@ -518,6 +518,33 @@ int sig_link_ifaces(struct sig *s, struct sig_mcast_if *out, int max)
 	return sig_mcast_ifaces(s->mc, out, max);
 }
 
+/*
+ * A handful of read intervals: long enough that a table thinning out between
+ * refreshes is not read as an empty one, short enough that a signaller nothing
+ * can answer is replaced before a peer gives up on finding us.
+ */
+#define SIG_QUIET_GONE_MS (SIG_DHT_GET_MS * 8)
+/* A table that looks healthy but answers nothing: only time tells. */
+#define SIG_QUIET_MS 60000
+#if SIG_QUIET_GONE_MS >= SIG_QUIET_MS
+#error "an unasking node is the quicker verdict of the two"
+#endif
+
+int sig_quiet_due(int node_ready, uint64_t idle_ms)
+{
+	if (!node_ready)
+		return idle_ms > SIG_QUIET_GONE_MS;
+	return idle_ms > SIG_QUIET_MS;
+}
+
+int sig_quiet(struct sig *s)
+{
+	if (!s || !s->dht_engaged || !s->last_get_ms)
+		return 0;
+	return sig_quiet_due(dhtnode_ready(s->node),
+			     now_ms() - s->last_get_ms);
+}
+
 void sig_mailbox_state(struct sig *s, struct sig_mailbox *out)
 {
 	memset(out, 0, sizeof(*out));

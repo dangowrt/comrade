@@ -287,6 +287,9 @@ target_include_directories(comrade_fwdspec PUBLIC src)
 add_library(comrade_nsfacts STATIC src/nsfacts.c)
 target_include_directories(comrade_nsfacts PUBLIC src)
 
+add_library(comrade_hostreap STATIC src/hostreap.c)
+target_include_directories(comrade_hostreap PUBLIC src)
+
 # Per-family reachability: what this host knows about its own network, and what
 # stops being true when it moves. Deliberately links nothing -- no sockets, no
 # threads, no clock -- so it can be driven entirely from synthetic events.
@@ -527,7 +530,7 @@ target_link_libraries(comrade_session PUBLIC
 	comrade_sig comrade_nat comrade_lanlink comrade_stream comrade_ssh
 	comrade_bridge comrade_token comrade_crypto comrade_stunlist
 	comrade_stunprobe comrade_conn comrade_path comrade_ctlproto comrade_dbg
-	comrade_netstate comrade_nsfacts)
+	comrade_netstate comrade_nsfacts comrade_hostreap)
 
 # The view: the only module that draws to the terminal (MVC).
 # Token QR codes for the dashboard. qrcodegen.c is vendored from Project
@@ -690,6 +693,12 @@ if(BUILD_TESTING)
 	add_executable(nsfacts_test tests/nsfacts_test.c)
 	target_link_libraries(nsfacts_test comrade_nsfacts)
 	add_test(NAME nsfacts_test COMMAND nsfacts_test)
+
+	# When a worker gives up on the client it serves, against a clock the
+	# test hands it rather than a live host and a real outage.
+	add_executable(hostreap_test tests/hostreap_test.c)
+	target_link_libraries(hostreap_test comrade_hostreap)
+	add_test(NAME hostreap_test COMMAND hostreap_test)
 
 	add_executable(termfilter_test tests/termfilter_test.c)
 	target_link_libraries(termfilter_test comrade_termfilter)
@@ -1041,7 +1050,8 @@ endif()
 #
 if(BUILD_TESTING)
 	foreach(t IN ITEMS
-		token_test tokgen_test netstate_test nsfacts_test termfilter_test
+		token_test tokgen_test netstate_test nsfacts_test
+		hostreap_test termfilter_test
 		ctlproto_test netmon_test
 		candpolicy_test candpack_test mailbox_test roauth_test
 		stunprobe_test path_test bep44_test

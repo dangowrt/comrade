@@ -286,8 +286,11 @@ struct session_cfg {
 					 * our own sends is enough to make the
 					 * path die at both ends: the probes
 					 * that keep it warm are ours */
-	volatile int *test_stop;	/* wind up a held session now (see
-					 * sshc_opts.stop) */
+	volatile int *test_stop;	/* wind up now (see sshc_opts.stop):
+					 * checked while a session is held and
+					 * again between attempts, so a client
+					 * that is back to rejoining winds up
+					 * with the rest */
 	int test_reap_ms;		/* host: end the worker this long into
 					 * the session (0 = never), as the reap
 					 * does for a client that went quiet.

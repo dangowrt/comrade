@@ -17,6 +17,7 @@
 #include "nat.h"
 #include "netmon.h"
 #include "netstate.h"
+#include "hostreap.h"
 #include "nsfacts.h"
 #include "path.h"
 #include "session.h"
@@ -44,16 +45,6 @@
  */
 #define HB_INTERVAL_MS 700
 #define HB_LOST_MS 2500
-/*
- * A host worker whose client has been silent this long is presumed gone and the
- * worker reaps itself: with no clean disconnect the SSH bridge never ends on its
- * own (KCP buffers a dead path indefinitely), so the heartbeat is what frees the
- * worker (and its tmux client). Well above HB_LOST_MS so a brief outage, during
- * which the client may still be reconnecting, does not tear a live worker down,
- * and well above PATH_DEAD_MS so a client moving between paths is never
- * reaped mid-switch.
- */
-#define HOST_REAP_MS 12000
 /*
  * Rendezvous announcement backstop. Each end tells the other where it
  * rendezvous the moment the set moves -- a family newly qualified, a node
@@ -134,15 +125,6 @@ static int fam_idx(int family)
  */
 #define HOST_PUNCH_MS 15000
 /*
- * How long a link stays lost before the client re-claims in place, and how
- * long each such attempt runs before regathering. Short on purpose: the
- * attempt is non-destructive -- every warm path stays in the table, the SSH
- * session above never pauses more than the outage itself -- so trying early
- * costs nothing and beats the host's reap comfortably.
- */
-#define RESUME_AFTER_MS 3000
-#define RESUME_ATTEMPT_MS 10000
-/*
  * How long a punch is left alone before a fresh ask from the same claimant may
  * replace it. The claimant asks again every RESUME_ATTEMPT_MS and a punch
  * across a carrier NAT can need longer, so replacing it on every ask is how
@@ -153,22 +135,6 @@ static int fam_idx(int family)
     HOST_PUNCH_FLOOR_MS >= HOST_PUNCH_MS
 #error "the punch floor must sit between the claimant's cadence and the budget"
 #endif
-/*
- * How long a punched connection has to become a session before the host gives
- * up on it and frees the claimant.
- *
- * This used to be bounded by connect_timeout_s, which is a different question:
- * that is how long the operator is willing to wait for a session at all, and a
- * host sets it in minutes (or, for a test harness, whatever it likes). Waiting
- * that long here holds the claimant's identity against every attempt it makes
- * in the meantime, so a client whose punch connected on our side but never on
- * its own was locked out for as long as the operator was patient -- the more
- * patient the setting, the longer the lockout.
- *
- * Generous against a slow link's key exchange, short against a session that is
- * never coming.
- */
-#define HOST_HANDSHAKE_MS 30000
 /* Between attempts to gather an offer worth publishing. Gathering costs an
  * agent and a round of STUN, and the thing being waited for -- an interface
  * finishing coming up after a move -- takes about this long anyway. */
@@ -3771,26 +3737,25 @@ static int conn_run(struct conn *c, int drive_sig)
 			    now - conn_start > (uint64_t)s->cfg->test_reap_ms) {
 				done = 1;
 			} else if (s->cfg->is_host) {
-				/* A recent resume pickup restarts the clock: the
-				 * client is actively coming back, and its half of
-				 * the punch may still be completing. */
-				if (pong_seen && c->lost_since_ms &&
-				    !c->resume_pending &&
-				    now - c->lost_since_ms > HOST_REAP_MS &&
-				    (!c->resume_last_ms ||
-				     now - c->resume_last_ms > HOST_REAP_MS))
+				struct host_reap hr;
+				int verdict;
+
+				hr.conn_start_ms = conn_start;
+				hr.lost_since_ms = c->lost_since_ms;
+				hr.resume_last_ms = c->resume_last_ms;
+				hr.resume_pending = c->resume_pending;
+				hr.pong_seen = pong_seen;
+				verdict = host_reap_due(&hr, now);
+				if (verdict != HOST_REAP_KEEP)
 					done = 1;
-				else if (!pong_seen &&
-					 now - conn_start > HOST_HANDSHAKE_MS) {
-					done = 1;
-					if (s->cfg->obs && s->cfg->obs->escalate)
-						s->cfg->obs->escalate(
-							s->cfg->obs->arg,
-							"a peer connected but never "
-							"finished the handshake -- "
-							"check your firewall allows "
-							"comrade");
-				}
+				if (verdict == HOST_REAP_NO_HANDSHAKE &&
+				    s->cfg->obs && s->cfg->obs->escalate)
+					s->cfg->obs->escalate(
+						s->cfg->obs->arg,
+						"a peer connected but never "
+						"finished the handshake -- "
+						"check your firewall allows "
+						"comrade");
 			}
 		}
 	}

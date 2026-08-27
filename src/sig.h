@@ -257,6 +257,23 @@ struct sig_mailbox {
 };
 void sig_mailbox_state(struct sig *s, struct sig_mailbox *out);
 
+/*
+ * Whether the mailbox has gone unanswered for long enough to give up on the
+ * signaller and build a fresh one. `idle_ms` is the age of the last validated
+ * read; `node_ready` is what the DHT node says about its own table.
+ *
+ * Two verdicts, because there are two failures: a node with no good nodes left
+ * is not asking at all, so no read can come back and only a dip between
+ * refreshes has to be ruled out; a node whose table is fine has a rendezvous
+ * that died under it, which takes longer to tell from a slow round.
+ */
+int sig_quiet_due(int node_ready, uint64_t idle_ms);
+
+/* The same question against this signaller's own state; 0 while it has never
+ * had an answer to lose, so a fresh signaller that finds the same dead
+ * network is not given up on again and again. */
+int sig_quiet(struct sig *s);
+
 /* Rendezvous progress for `family`: 0 cold, 1 warmup, 2 store, 3 get, 4 ready
  * (matches the RDV_* enum). The store/get phases are engine-wide; only ready is
  * truly per-family. Advisory, for the view's spinner. */
