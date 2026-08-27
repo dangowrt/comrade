@@ -915,6 +915,15 @@ if(COMRADE_BUILD_TOOLS)
 		set_tests_properties(resume_e2e PROPERTIES
 			SKIP_RETURN_CODE 77 TIMEOUT 300)
 
+		# The outage the worker does not survive: nothing to resume
+		# into, so the client has to come back as a fresh one.
+		add_test(NAME rejoin_e2e
+			COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/rejoin.sh
+				$<TARGET_FILE:comrade-e2e>
+				$<TARGET_FILE:comrade-dhtseed>)
+		set_tests_properties(rejoin_e2e PROPERTIES
+			SKIP_RETURN_CODE 77 TIMEOUT 500)
+
 		# The HOST roams mid-session (sig rebuilt, offer rotated, old
 		# transport silenced); the client resumes in place against the
 		# rotated offer. DHT rendezvous, so SKIPs without the net gate.

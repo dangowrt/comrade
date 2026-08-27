@@ -211,6 +211,39 @@ static void ctl_open(ssh_session s, ssh_event event, const struct sshc_opts *o,
 	ssh_event_add_connector(event, *out);
 }
 
+/*
+ * Silent past the grace: stop waiting on this transport and rejoin as a fresh
+ * client, the session being the host's and not this connection's.
+ *
+ * Silence of the session, not of the path. The host reaps a worker for a
+ * client that has gone quiet and keeps serving, so what the returning claim
+ * gets is a fresh worker with a fresh sshd -- and every session shares one
+ * conversation id and one sealing key, so that worker's frames arrive, open
+ * and are taken by the transport while reaching nothing above it. A path can
+ * therefore read as alive, and a resume can be picked up again and again,
+ * with no session behind any of it. The heartbeat pong crosses the whole
+ * session and nothing else does, so its silence is the one clock that keeps
+ * running through all of that.
+ *
+ * Every loop asks: a client with no terminal is no less entitled to come back
+ * than one with a dashboard.
+ */
+static int rejoin_due(const struct conn_status *cur)
+{
+	return cur->silent_s >= SSHC_REJOIN_GRACE_S;
+}
+
+static int rejoin_now(const struct sshc_opts *o)
+{
+	struct conn_status cur;
+
+	if (!o || !o->status)
+		return 0;
+	memset(&cur, 0, sizeof(cur));
+	o->status(o->status_arg, &cur);
+	return rejoin_due(&cur);
+}
+
 /* Test mode: write the whole request, then read echoed bytes until we have
  * as many as we sent (or the channel ends). */
 static int run_test(ssh_session s, ssh_channel chan, const struct sshc_opts *o)
@@ -254,6 +287,11 @@ static int run_test(ssh_session s, ssh_channel chan, const struct sshc_opts *o)
 		while (mono_ms() < end && ssh_channel_is_open(chan) &&
 		       !ssh_channel_is_eof(chan)) {
 			char sink[4096];
+
+			if (rejoin_now(o)) {
+				rc = SSHC_RECONNECT;
+				break;
+			}
 
 			/* Drain what the command keeps producing, or the
 			 * channel window would idle the very link the hold is
@@ -319,6 +357,10 @@ static int run_forward(ssh_session s, ssh_channel chan,
 	while (ssh_channel_is_open(chan) && !ssh_channel_is_eof(chan)) {
 		char sink[4096];
 
+		if (rejoin_now(o)) {
+			rc = SSHC_RECONNECT;
+			break;
+		}
 		/* Nothing should arrive on the keepalive channel, but drain it
 		 * so a stray byte never wedges the window. */
 		while (ssh_channel_poll(chan, 0) > 0 &&
@@ -475,11 +517,7 @@ static int run_interactive(ssh_session s, ssh_channel chan,
 			memset(&cur, 0, sizeof(cur));
 			o->status(o->status_arg, &cur);
 			interrupted = (cur.state == CONN_LOST);
-			/* Lost past the grace window: stop waiting and rejoin as
-			 * a fresh client (the session lives on the host). A brief
-			 * blip stays under the grace and rides out over KCP. */
-			if (cur.state == CONN_LOST &&
-			    cur.since_s >= SSHC_REJOIN_GRACE_S)
+			if (rejoin_due(&cur))
 				reconnect = 1;
 			if (reserve && (memcmp(&cur, &prev, sizeof(cur)) ||
 			    now - last_status > 2000)) {

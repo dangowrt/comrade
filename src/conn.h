@@ -45,6 +45,12 @@ struct conn_status {
 	char rdv6[80];			/* IPv6 rendezvous node, "" if none */
 	int rtt_ms;			/* smoothed RTT, 0 if unknown */
 	int since_s;			/* seconds in the current state (loss age) */
+	/* How long since the session itself last answered -- the heartbeat
+	 * pong, which is end to end through SSH -- or -1 before the first one.
+	 * A path can be carrying frames while the session behind it is gone,
+	 * so this is the question "is there still a session here", which the
+	 * path's own liveness cannot answer. */
+	int silent_s;
 	int read_only;			/* this side is a view-only guest */
 	/* The warm paths held besides the one in use: the best-ranked of them,
 	 * and how many there are. What the session would move to were the path

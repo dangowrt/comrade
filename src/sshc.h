@@ -102,7 +102,10 @@ struct sshc_opts {
  * session identity within seconds, and the host grafts the punch into the
  * worker it already runs), so this only fires when that keeps failing --
  * the worker reaped, the host gone, the network refusing every punch. */
-#define SSHC_REJOIN_GRACE_S 45
+/* Counted on the heartbeat pong, at tens of pongs to the second of it, so
+ * nothing short of a session's absence reaches it -- and long enough that a
+ * resume which is merely slow finishes first and never trips it. */
+#define SSHC_REJOIN_GRACE_S 75
 
 /*
  * Run one SSH session on fd; blocks until it ends. Returns 0 on a clean end,

@@ -1106,6 +1106,8 @@ static void publish_status(struct conn *c, int state)
 		(c->stream ? stream_rtt(c->stream) : 0);
 	if (state == CONN_LOST && c->lost_since_ms)
 		cs.since_s = (int)((now_ms() - c->lost_since_ms) / 1000);
+	cs.silent_s = c->hb_pong_seen ?
+		(int)((now_ms() - c->hb_last_pong) / 1000) : -1;
 	pthread_mutex_unlock(&c->hb_lock);
 
 	pthread_mutex_lock(&c->status_lock);
@@ -3699,7 +3701,10 @@ static int conn_run(struct conn *c, int drive_sig)
 			 * the comrade-ctl channel may still be mid-handshake, so
 			 * silence is bounded by the handshake grace instead of the
 			 * tighter heartbeat-loss window. */
-			if (s->cfg->is_host) {
+			if (s->cfg->is_host && s->cfg->test_reap_ms > 0 &&
+			    now - conn_start > (uint64_t)s->cfg->test_reap_ms) {
+				done = 1;
+			} else if (s->cfg->is_host) {
 				/* A recent resume pickup restarts the clock: the
 				 * client is actively coming back, and its half of
 				 * the punch may still be completing. */

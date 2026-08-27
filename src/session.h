@@ -286,6 +286,13 @@ struct session_cfg {
 					 * our own sends is enough to make the
 					 * path die at both ends: the probes
 					 * that keep it warm are ours */
+	int test_reap_ms;		/* host: end the worker this long into
+					 * the session (0 = never), as the reap
+					 * does for a client that went quiet.
+					 * The turnstile keeps serving, so what
+					 * the client is left holding is a path
+					 * with no session behind it -- which is
+					 * what it must notice */
 };
 
 /* Run the session to completion; returns 0 on success, non-zero on failure. */

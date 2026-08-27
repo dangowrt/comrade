@@ -167,7 +167,7 @@ int main(int argc, char **argv)
 			"  opts: [--stun-port p] [--timeout s] [--log N]\n"
 			"        [--mcast] [--no-dht] [--roam-ms N] [--roams N] [--roam-hard]\n"
 		"        [--roam-fam 4|6|iface]\n"
-			"        [--blackhole-ms N]\n",
+			"        [--blackhole-ms N] [--reap-ms N]\n",
 			argv[0], argv[0]);
 		return 2;
 	}
@@ -202,6 +202,8 @@ int main(int argc, char **argv)
 					     NETMON_CH_IFACE;
 		} else if (!strcmp(argv[i], "--roam-hard"))
 			cfg.test_roam_hard = 1;
+		else if (!strcmp(argv[i], "--reap-ms") && i + 1 < argc)
+			cfg.test_reap_ms = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--blackhole-ms") && i + 1 < argc)
 			cfg.test_blackhole_ms = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--blackhole-lift-ms") && i + 1 < argc)
