@@ -4,7 +4,7 @@
 #include <assert.h>
 #include <stdint.h>
 #include <string.h>
-#include <sys/socket.h>
+#include "wsock.h"
 
 #include "netmon.h"
 

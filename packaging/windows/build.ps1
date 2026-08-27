@@ -15,7 +15,8 @@ param(
     [string]$Root       = (Join-Path $PWD "winbuild"),      # work directory
     [string]$ComradeSrc = $PWD,                             # comrade checkout
     [string]$Out        = (Join-Path $PWD "winbuild\out"), # where comrade-<arch>.exe lands
-    [string]$Werror     = "OFF"                            # CI passes ON to fail on a comrade warning
+    [string]$Werror     = "OFF",                           # CI passes ON to fail on a comrade warning
+    [string]$Tests      = "OFF"                            # ON to build the test binaries too
 )
 $ErrorActionPreference = "Stop"
 
@@ -169,7 +170,7 @@ Run "cmake" @("-G","Ninja","-S",$ComradeSrc,"-B","$bld\comrade",
     "-DCMAKE_FIND_ROOT_PATH=$pfx;$($tc -replace '\\','/')/$Triple",
     "-DCOMRADE_DHT_DIR=$($src -replace '\\','/')/dht",
     "-DCOMRADE_WERROR=$Werror",
-    "-DBUILD_TESTING=OFF")
+    "-DBUILD_TESTING=$Tests")
 Run "cmake" @("--build","$bld\comrade")
 
 # --- collect the single portable exe, named by architecture ---

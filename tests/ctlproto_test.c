@@ -6,7 +6,7 @@
  * handling of split and coalesced reads and of garbage resync, the big-endian
  * timestamp helpers, and the rendezvous payload round-trip for both families.
  */
-#include <arpa/inet.h>
+#include "wsock.h"
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>

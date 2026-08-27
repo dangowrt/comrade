@@ -764,17 +764,21 @@ if(BUILD_TESTING)
 	target_link_libraries(bep44_test comrade_bep44)
 	add_test(NAME bep44_test COMMAND bep44_test)
 
-	add_executable(bep44_pin_test tests/bep44_pin_test.c)
-	target_link_libraries(bep44_pin_test comrade_bep44)
-	add_test(NAME bep44_pin_test COMMAND bep44_pin_test)
-	set_tests_properties(bep44_pin_test PROPERTIES TIMEOUT 15)
+	if(UNIX)
+		add_executable(bep44_pin_test tests/bep44_pin_test.c)
+		target_link_libraries(bep44_pin_test comrade_bep44)
+		add_test(NAME bep44_pin_test COMMAND bep44_pin_test)
+		set_tests_properties(bep44_pin_test PROPERTIES TIMEOUT 15)
+	endif()
 
 	# The storing side, driven the way the network drives it: crafted
 	# datagrams in, replies read back off a loopback socket.
-	add_executable(bep44_store_test tests/bep44_store_test.c)
-	target_link_libraries(bep44_store_test comrade_bep44)
-	add_test(NAME bep44_store_test COMMAND bep44_store_test)
-	set_tests_properties(bep44_store_test PROPERTIES TIMEOUT 120)
+	if(UNIX)
+		add_executable(bep44_store_test tests/bep44_store_test.c)
+		target_link_libraries(bep44_store_test comrade_bep44)
+		add_test(NAME bep44_store_test COMMAND bep44_store_test)
+		set_tests_properties(bep44_store_test PROPERTIES TIMEOUT 120)
+	endif()
 
 	# Includes bep44.c to reach the static per-source rate bucket, so it
 	# links the crypto pieces directly rather than the comrade_bep44 archive.
@@ -811,35 +815,39 @@ if(BUILD_TESTING)
 		set_tests_properties(stream_cc_test PROPERTIES TIMEOUT 60)
 	endif()
 
-	add_executable(sshloop_test tests/sshloop_test.c)
-	target_link_libraries(sshloop_test comrade_ssh comrade_token Threads::Threads)
-	add_test(NAME sshloop_test COMMAND sshloop_test)
-	set_tests_properties(sshloop_test PROPERTIES TIMEOUT 30)
+	# The bridge tests plumb a session over a socketpair and drive it from
+	# threads, which is POSIX and not the library's own portability layer.
+	if(UNIX)
+		add_executable(sshloop_test tests/sshloop_test.c)
+		target_link_libraries(sshloop_test comrade_ssh comrade_token Threads::Threads)
+		add_test(NAME sshloop_test COMMAND sshloop_test)
+		set_tests_properties(sshloop_test PROPERTIES TIMEOUT 30)
 
-	add_executable(sshfwd_test tests/sshfwd_test.c)
-	target_link_libraries(sshfwd_test comrade_ssh comrade_token Threads::Threads)
-	add_test(NAME sshfwd_test COMMAND sshfwd_test)
-	set_tests_properties(sshfwd_test PROPERTIES TIMEOUT 60)
+		add_executable(sshfwd_test tests/sshfwd_test.c)
+		target_link_libraries(sshfwd_test comrade_ssh comrade_token Threads::Threads)
+		add_test(NAME sshfwd_test COMMAND sshfwd_test)
+		set_tests_properties(sshfwd_test PROPERTIES TIMEOUT 60)
 
-	add_executable(sshexit_test tests/sshexit_test.c)
-	target_link_libraries(sshexit_test comrade_ssh comrade_token Threads::Threads)
-	add_test(NAME sshexit_test COMMAND sshexit_test)
-	set_tests_properties(sshexit_test PROPERTIES TIMEOUT 30)
+		add_executable(sshexit_test tests/sshexit_test.c)
+		target_link_libraries(sshexit_test comrade_ssh comrade_token Threads::Threads)
+		add_test(NAME sshexit_test COMMAND sshexit_test)
+		set_tests_properties(sshexit_test PROPERTIES TIMEOUT 30)
 
-	add_executable(sshro_test tests/sshro_test.c)
-	target_link_libraries(sshro_test
-		comrade_ssh comrade_crypto comrade_token Threads::Threads)
-	add_test(NAME sshro_test COMMAND sshro_test)
-	set_tests_properties(sshro_test PROPERTIES TIMEOUT 30)
+		add_executable(sshro_test tests/sshro_test.c)
+		target_link_libraries(sshro_test
+			comrade_ssh comrade_crypto comrade_token Threads::Threads)
+		add_test(NAME sshro_test COMMAND sshro_test)
+		set_tests_properties(sshro_test PROPERTIES TIMEOUT 30)
 
-	add_executable(sshkcp_test tests/sshkcp_test.c)
-	target_link_libraries(sshkcp_test
-		comrade_ssh comrade_bridge comrade_stream comrade_token Threads::Threads)
-	add_test(NAME sshkcp_test COMMAND sshkcp_test)
-	add_executable(sshctl_test tests/sshctl_test.c)
-	target_link_libraries(sshctl_test comrade_ssh comrade_bridge comrade_stream comrade_token Threads::Threads)
-	add_test(NAME sshctl_test COMMAND sshctl_test)
-	set_tests_properties(sshkcp_test PROPERTIES TIMEOUT 30)
+		add_executable(sshkcp_test tests/sshkcp_test.c)
+		target_link_libraries(sshkcp_test
+			comrade_ssh comrade_bridge comrade_stream comrade_token Threads::Threads)
+		add_test(NAME sshkcp_test COMMAND sshkcp_test)
+		add_executable(sshctl_test tests/sshctl_test.c)
+		target_link_libraries(sshctl_test comrade_ssh comrade_bridge comrade_stream comrade_token Threads::Threads)
+		add_test(NAME sshctl_test COMMAND sshctl_test)
+		set_tests_properties(sshkcp_test PROPERTIES TIMEOUT 30)
+	endif()
 
 	# What the e2e scripts print when they fail goes through a filter first
 	# (tests/redact.sh), since a workflow run publishes that output. Plain
