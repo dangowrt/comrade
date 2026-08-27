@@ -293,6 +293,9 @@ target_include_directories(comrade_hostreap PUBLIC src)
 add_library(comrade_claimlog STATIC src/claimlog.c)
 target_include_directories(comrade_claimlog PUBLIC src)
 
+add_library(comrade_hbeat STATIC src/hbeat.c)
+target_include_directories(comrade_hbeat PUBLIC src)
+
 # Per-family reachability: what this host knows about its own network, and what
 # stops being true when it moves. Deliberately links nothing -- no sockets, no
 # threads, no clock -- so it can be driven entirely from synthetic events.
@@ -533,7 +536,8 @@ target_link_libraries(comrade_session PUBLIC
 	comrade_sig comrade_nat comrade_lanlink comrade_stream comrade_ssh
 	comrade_bridge comrade_token comrade_crypto comrade_stunlist
 	comrade_stunprobe comrade_conn comrade_path comrade_ctlproto comrade_dbg
-	comrade_netstate comrade_nsfacts comrade_hostreap comrade_claimlog)
+	comrade_netstate comrade_nsfacts comrade_hostreap comrade_claimlog
+	comrade_hbeat)
 
 # The view: the only module that draws to the terminal (MVC).
 # Token QR codes for the dashboard. qrcodegen.c is vendored from Project
@@ -713,6 +717,11 @@ if(BUILD_TESTING)
 	add_executable(claimlog_test tests/claimlog_test.c)
 	target_link_libraries(claimlog_test comrade_claimlog)
 	add_test(NAME claimlog_test COMMAND claimlog_test)
+
+	# How long silence may last before a link is given up on.
+	add_executable(hbeat_test tests/hbeat_test.c)
+	target_link_libraries(hbeat_test comrade_hbeat)
+	add_test(NAME hbeat_test COMMAND hbeat_test)
 
 	add_executable(termfilter_test tests/termfilter_test.c)
 	target_link_libraries(termfilter_test comrade_termfilter)
@@ -1065,7 +1074,7 @@ endif()
 if(BUILD_TESTING)
 	foreach(t IN ITEMS
 		token_test tokgen_test netstate_test nsfacts_test
-		hostreap_test sigquiet_test claimlog_test termfilter_test
+		hostreap_test sigquiet_test claimlog_test hbeat_test termfilter_test
 		ctlproto_test netmon_test
 		candpolicy_test candpack_test mailbox_test roauth_test
 		stunprobe_test path_test bep44_test

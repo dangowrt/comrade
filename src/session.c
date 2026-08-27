@@ -18,6 +18,7 @@
 #include "netmon.h"
 #include "netstate.h"
 #include "claimlog.h"
+#include "hbeat.h"
 #include "hostreap.h"
 #include "nsfacts.h"
 #include "path.h"
@@ -33,19 +34,6 @@
 
 #define SESSION_CONV 0x70326531
 
-/*
- * Liveness heartbeat cadence over the comrade-ctl control channel (framing in
- * ctlproto.h): a ping every HB_INTERVAL_MS, and the link is declared lost when
- * nothing at all -- no pong, and no other traffic -- has arrived from the peer
- * for HB_LOST_MS. The pong alone must not carry the verdict: it rides the
- * same stream as bulk data through several queues, so on a saturated slow
- * link it arrives seconds late while the transfer is demonstrably moving
- * (measured at carrier fair-use rates: the link declared lost, and the worker
- * reaped, mid-download). Arriving datagrams are the liveness; the pong's own
- * job is the round-trip figure.
- */
-#define HB_INTERVAL_MS 700
-#define HB_LOST_MS 2500
 /*
  * Rendezvous announcement backstop. Each end tells the other where it
  * rendezvous the moment the set moves -- a family newly qualified, a node
@@ -3700,7 +3688,7 @@ static int conn_run(struct conn *c, int drive_sig)
 				lp = c->hb_last_heard;
 			pong_seen = c->hb_pong_seen;
 			if (pong_seen) {
-				if (now - lp > HB_LOST_MS) {
+				if (now - lp > hb_lost_ms(c->hb_rtt)) {
 					if (!c->lost_since_ms)
 						c->lost_since_ms = now;
 				} else {
@@ -4219,7 +4207,7 @@ static int conn_link_state(const struct sess *s, struct conn *c)
 	if (!seen)
 		return c->nat && nat_connected(c->nat) ? CONN_PUNCHING :
 							 CONN_CONNECTING;
-	if (lost && now - last >= HB_LOST_MS)
+	if (lost && now - last >= hb_lost_ms(c->hb_rtt))
 		return CONN_LOST;
 	if (gen != s->netgen)
 		return CONN_UNKNOWN;	/* proven, but somewhere else */
