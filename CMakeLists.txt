@@ -290,6 +290,9 @@ target_include_directories(comrade_nsfacts PUBLIC src)
 add_library(comrade_hostreap STATIC src/hostreap.c)
 target_include_directories(comrade_hostreap PUBLIC src)
 
+add_library(comrade_claimlog STATIC src/claimlog.c)
+target_include_directories(comrade_claimlog PUBLIC src)
+
 # Per-family reachability: what this host knows about its own network, and what
 # stops being true when it moves. Deliberately links nothing -- no sockets, no
 # threads, no clock -- so it can be driven entirely from synthetic events.
@@ -530,7 +533,7 @@ target_link_libraries(comrade_session PUBLIC
 	comrade_sig comrade_nat comrade_lanlink comrade_stream comrade_ssh
 	comrade_bridge comrade_token comrade_crypto comrade_stunlist
 	comrade_stunprobe comrade_conn comrade_path comrade_ctlproto comrade_dbg
-	comrade_netstate comrade_nsfacts comrade_hostreap)
+	comrade_netstate comrade_nsfacts comrade_hostreap comrade_claimlog)
 
 # The view: the only module that draws to the terminal (MVC).
 # Token QR codes for the dashboard. qrcodegen.c is vendored from Project
@@ -705,6 +708,11 @@ if(BUILD_TESTING)
 	add_executable(sigquiet_test tests/sigquiet_test.c)
 	target_link_libraries(sigquiet_test comrade_sig)
 	add_test(NAME sigquiet_test COMMAND sigquiet_test)
+
+	# Telling a claim the DHT is handing back from a claimant trying again.
+	add_executable(claimlog_test tests/claimlog_test.c)
+	target_link_libraries(claimlog_test comrade_claimlog)
+	add_test(NAME claimlog_test COMMAND claimlog_test)
 
 	add_executable(termfilter_test tests/termfilter_test.c)
 	target_link_libraries(termfilter_test comrade_termfilter)
@@ -1057,7 +1065,7 @@ endif()
 if(BUILD_TESTING)
 	foreach(t IN ITEMS
 		token_test tokgen_test netstate_test nsfacts_test
-		hostreap_test sigquiet_test termfilter_test
+		hostreap_test sigquiet_test claimlog_test termfilter_test
 		ctlproto_test netmon_test
 		candpolicy_test candpack_test mailbox_test roauth_test
 		stunprobe_test path_test bep44_test

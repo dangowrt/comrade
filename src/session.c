@@ -17,6 +17,7 @@
 #include "nat.h"
 #include "netmon.h"
 #include "netstate.h"
+#include "claimlog.h"
 #include "hostreap.h"
 #include "nsfacts.h"
 #include "path.h"
@@ -559,6 +560,7 @@ struct sess {
 	uint64_t adopt_ms;
 	char punch_ufrag[HOST_MAX_WORKERS][40];	/* each punch's claimant id */
 	char last_served_ufrag[40];
+	struct claimlog spent;		/* claims already punched for nothing */
 	int admitted_n;			/* claimants admitted this run (the
 					 * host_admit_max budget) */		/* the most recently served one */
 	int have_served;
@@ -4932,6 +4934,8 @@ static void punch_scan(struct sess *s, struct worker *ws, struct conn **punching
 			   (!punch_stuck[i] && nat_failed(c->nat))) {
 			dbg_logf("host: punch %s -> drop",
 				 punch_stuck[i] ? "wedged (test)" : "failed");
+			claimlog_note(&s->spent, s->punch_ufrag[i],
+				      c->remote_pwd);
 			if (punch_resume[i]) {
 				punch_resume[i]->resume_pending = 0;
 				punch_resume[i] = NULL;
@@ -5498,15 +5502,58 @@ static int host_turnstile(struct sess *s)
 					int just = s->have_served &&
 						   !strcmp(cu,
 							   s->last_served_ufrag);
+					int spent = claimlog_seen(&s->spent,
+								  cu, cp);
+					int made = w && claim_made(w->remote_pwd,
+								   cp);
 
 					/* Named, because which of these decided
 					 * it is the whole story when a client
 					 * cannot get in and nobody can say why. */
 					dbg_logf("host: claim %.8s pwd %.6s: "
 						 "worker=%d again=%d admitted=%d "
-						 "lanq=%d justserved=%d",
+						 "lanq=%d justserved=%d spent=%d "
+						 "made=%d",
 						 cu, cp, w ? 1 : 0, again, adm,
-						 lanq, just);
+						 lanq, just, spent, made);
+
+					/*
+					 * The very attempt this worker was
+					 * punched for, handed back by the
+					 * mailbox a moment later. A client
+					 * that wants a resumption mints a new
+					 * password for it (conn_fresh_pwd), so
+					 * an unchanged one is the DHT talking,
+					 * not the client -- and punching it
+					 * again disturbs the session it just
+					 * got.
+					 */
+					if (made) {
+						dbg_logf("host: claim %.8s is "
+							 "the attempt its worker "
+							 "was made from -- "
+							 "leaving it", cu);
+						sig_release(s->sig);
+						s->have_peer_sdp = 0;
+						break;
+					}
+
+					/*
+					 * This exact attempt has been punched
+					 * already and nothing came of it. What
+					 * is asking is a replica that missed
+					 * the release, not the claimant, whose
+					 * next try brings a password of its
+					 * own.
+					 */
+					if (spent) {
+						dbg_logf("host: claim %.8s is "
+							 "one already spent -- "
+							 "leaving it", cu);
+						sig_release(s->sig);
+						s->have_peer_sdp = 0;
+						break;
+					}
 
 					if (again &&
 					    punch_young(s, punching,
