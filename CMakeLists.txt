@@ -700,6 +700,12 @@ if(BUILD_TESTING)
 	target_link_libraries(hostreap_test comrade_hostreap)
 	add_test(NAME hostreap_test COMMAND hostreap_test)
 
+	# When the signaller is given up on: the node's own view of its table,
+	# and the backstop for a table that looks fine and answers nothing.
+	add_executable(sigquiet_test tests/sigquiet_test.c)
+	target_link_libraries(sigquiet_test comrade_sig)
+	add_test(NAME sigquiet_test COMMAND sigquiet_test)
+
 	add_executable(termfilter_test tests/termfilter_test.c)
 	target_link_libraries(termfilter_test comrade_termfilter)
 	add_test(NAME termfilter_test COMMAND termfilter_test)
@@ -1051,7 +1057,7 @@ endif()
 if(BUILD_TESTING)
 	foreach(t IN ITEMS
 		token_test tokgen_test netstate_test nsfacts_test
-		hostreap_test termfilter_test
+		hostreap_test sigquiet_test termfilter_test
 		ctlproto_test netmon_test
 		candpolicy_test candpack_test mailbox_test roauth_test
 		stunprobe_test path_test bep44_test

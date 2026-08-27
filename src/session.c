@@ -5084,28 +5084,22 @@ static int sig_arm(struct sess *s)
  * or -1 when there is no signalling left to run the session on.
  */
 /*
- * The mailbox is engaged and the node behind it has stopped answering: reads
- * were coming back and now none does. A rendezvous that died, a mapping the
- * carrier moved, a middlebox that timed the flow out -- none of which changes
- * an address here, so the move machinery never fires and the session sits on a
- * slot nobody is serving, with nothing to say so.
- *
- * Long enough that an ordinary slow round is not mistaken for it. Rebuilding
- * is invisible to a peer -- the mailbox is the same, only the socket and the
- * node behind it are new -- so the cost of being wrong is one bootstrap.
+ * The mailbox is engaged and nothing answers it: reads were coming back and
+ * now none does. A rendezvous that died, a mapping the carrier moved, a
+ * middlebox that timed the flow out -- none of which changes an address here,
+ * so the move machinery never fires and the session sits on a slot nobody is
+ * serving, with nothing to say so. Rebuilding is invisible to a peer -- the
+ * mailbox is the same, only the socket and the node behind it are new -- so
+ * the cost of being wrong is one bootstrap. sig_quiet() weighs it.
  */
-#define SIG_SILENT_MS 60000
-
-static int sig_silent(struct sess *s)
+static int sig_idle_s(struct sig *sig)
 {
 	struct sig_mailbox sm;
 
-	if (!s->sig)
-		return 0;
-	sig_mailbox_state(s->sig, &sm);
-	if (!sm.engaged || !sm.last_get_ms)
-		return 0;
-	return now_ms() - sm.last_get_ms > SIG_SILENT_MS;
+	sig_mailbox_state(sig, &sm);
+	if (!sm.last_get_ms)
+		return -1;
+	return (int)((now_ms() - sm.last_get_ms) / 1000);
 }
 
 static int sig_rebuild(struct sess *s, const char *why)
@@ -5206,9 +5200,9 @@ static int host_turnstile(struct sess *s)
 		 * through it. The network's own facts -- the egress pool, the
 		 * mapping -- are still this network's and are kept.
 		 */
-		if (sig_silent(s)) {
+		if (sig_quiet(s->sig)) {
 			dbg_logf("sig: nothing back from the rendezvous for "
-				 "%ds -- rebuilding", SIG_SILENT_MS / 1000);
+				 "%ds -- rebuilding", sig_idle_s(s->sig));
 			if (listen) {
 				conn_free(listen);
 				listen = NULL;
@@ -5842,9 +5836,9 @@ int session_run(const struct session_cfg *cfg)
 		 * claim through that instead, keeping what this network has
 		 * already told us about itself.
 		 */
-		if (st != ST_RUN && sig_silent(&s)) {
+		if (st != ST_RUN && sig_quiet(s.sig)) {
 			dbg_logf("sig: nothing back from the rendezvous for "
-				 "%ds -- rebuilding", SIG_SILENT_MS / 1000);
+				 "%ds -- rebuilding", sig_idle_s(s.sig));
 			if (sig_rebuild(&s, "after the rendezvous went quiet")) {
 				st = ST_FAIL;
 				break;
