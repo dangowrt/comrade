@@ -134,6 +134,14 @@ static int fam_idx(int family)
  */
 #define HOST_PUNCH_MS 15000
 /*
+ * How long a punch is left alone before a fresh ask from the same claimant may
+ * replace it. A claimant asks again on a cadence shorter than a punch across a
+ * carrier NAT can need, so replacing it on every ask is how none of them ever
+ * finishes. Between that cadence and the punch's own budget, which means at
+ * most one ask is turned away per punch.
+ */
+#define HOST_PUNCH_FLOOR_MS 12000
+/*
  * How long a punched connection has to become a session before the host gives
  * up on it and frees the claimant.
  *
@@ -4689,6 +4697,20 @@ static int punch_tried_again(const struct sess *s, struct conn *const *punching,
 	return 0;
 }
 
+/* How long the punch running for this claimant has had, if there is one: a
+ * fresh ask that arrives inside the floor is turned away rather than served,
+ * so the punch already running for it keeps its budget. */
+static int punch_young(const struct sess *s, struct conn *const *punching,
+		       const uint64_t *punch_start, const char *ufrag)
+{
+	int i;
+
+	for (i = 0; i < HOST_MAX_WORKERS; i++)
+		if (punching[i] && !strcmp(s->punch_ufrag[i], ufrag))
+			return now_ms() - punch_start[i] < HOST_PUNCH_FLOOR_MS;
+	return 0;
+}
+
 /* Retire it, so the slot and the identity are free for the attempt that
  * replaces it. Only called where that replacement is about to be admitted:
  * dropping a punch and then refusing the claim would leave the claimant worse
@@ -5415,6 +5437,24 @@ static int host_turnstile(struct sess *s)
 						 cu, cp, w ? 1 : 0, again, adm,
 						 lanq, just);
 
+					if (again &&
+					    punch_young(s, punching,
+							punch_start, cu)) {
+						/*
+						 * Asking again while the punch
+						 * we are running for it is still
+						 * young: let that one finish.
+						 * The ask after this one, if it
+						 * comes, is past the floor and
+						 * takes its place as before.
+						 */
+						dbg_logf("host: claim %.8s again "
+							 "-- letting its punch "
+							 "run", cu);
+						sig_release(s->sig);
+						s->have_peer_sdp = 0;
+						break;
+					}
 					if (w && (conn_is_lost(w) ||
 						  !conn_is_proven(w)) &&
 					    (again ||
