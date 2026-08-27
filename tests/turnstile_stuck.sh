@@ -27,6 +27,9 @@ set -u
 E2E="${1:?path to comrade-e2e}"
 SEED="${2:?path to comrade-dhtseed}"
 
+. "$(dirname "$0")/redact.sh"
+redact_output
+
 . "$(dirname "$0")/swarm.sh"
 
 # A private DHT of our own, unless asked to use the real one.

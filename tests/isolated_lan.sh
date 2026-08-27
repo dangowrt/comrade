@@ -20,6 +20,9 @@ set -u
 
 E2E="${1:?path to comrade-e2e}"
 
+. "$(dirname "$0")/redact.sh"
+redact_output
+
 # Skip cleanly where no multicast interface exists (e.g. a bare CI container).
 "$E2E" mcast-probe
 if [ $? -eq 77 ]; then

@@ -21,6 +21,9 @@ set -u
 CR="${1:?path to comrade}"
 SEED="${2:?path to comrade-dhtseed}"
 
+. "$(dirname "$0")/redact.sh"
+redact_output
+
 command -v nc >/dev/null 2>&1 || {
 	echo "skipped: needs nc for the forward target"
 	exit 77

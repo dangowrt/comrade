@@ -808,6 +808,16 @@ if(BUILD_TESTING)
 	target_link_libraries(sshctl_test comrade_ssh comrade_bridge comrade_stream comrade_token Threads::Threads)
 	add_test(NAME sshctl_test COMMAND sshctl_test)
 	set_tests_properties(sshkcp_test PROPERTIES TIMEOUT 30)
+
+	# What the e2e scripts print when they fail goes through a filter first
+	# (tests/redact.sh), since a workflow run publishes that output. Plain
+	# shell and no network, so it runs in every build rather than with the
+	# e2e tests it serves.
+	if(UNIX)
+		add_test(NAME redact_test
+			COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/redact_test.sh)
+		set_tests_properties(redact_test PROPERTIES TIMEOUT 30)
+	endif()
 endif()
 
 if(COMRADE_BUILD_TOOLS)

@@ -17,6 +17,9 @@ E2E="${1:?path to comrade-e2e}"
 SEED="${2:?path to comrade-dhtseed}"
 N="${3:-2}"
 
+. "$(dirname "$0")/redact.sh"
+redact_output
+
 . "$(dirname "$0")/swarm.sh"
 
 if [ "${COMRADE_E2E_NET:-0}" != 1 ]; then

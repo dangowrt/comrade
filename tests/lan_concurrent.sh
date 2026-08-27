@@ -18,6 +18,9 @@ set -u
 E2E="${1:?path to comrade-e2e}"
 N="${2:-2}"
 
+. "$(dirname "$0")/redact.sh"
+redact_output
+
 "$E2E" mcast-probe
 if [ $? -eq 77 ]; then
 	echo "skipped: no usable multicast interface on this host"
