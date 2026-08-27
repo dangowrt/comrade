@@ -5796,6 +5796,7 @@ int session_run(const struct session_cfg *cfg)
 	}
 
 	while (st != ST_DONE && st != ST_FAIL &&
+	       !(cfg->test_stop && *cfg->test_stop) &&
 	       !deadline_passed(deadline, now_ms())) {
 		char filtered[NAT_SDP_MAX];
 		const struct session_obs *o = cfg->obs;
