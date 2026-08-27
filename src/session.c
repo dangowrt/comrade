@@ -3523,6 +3523,15 @@ static int conn_run(struct conn *c, int drive_sig)
 	c->hb_pong_seen = 0;
 	c->lost_since_ms = 0;
 	pthread_mutex_unlock(&c->hb_lock);
+	/*
+	 * And say so before the session starts. Status is published on a
+	 * cadence, so until the first turn of the loop below the last one
+	 * still standing describes the session that just ended -- which for a
+	 * client that has just been told its worker was replaced reads as
+	 * "rejoin", and it would tear this one down before it carried
+	 * anything.
+	 */
+	publish_status(c, CONN_LIVE);
 	next_hb = now_ms();
 	conn_start = now_ms();
 	c->next_cand_ms = conn_start;
