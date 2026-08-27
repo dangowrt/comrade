@@ -38,16 +38,30 @@
 SWARM_PIDS=""
 SWARM_DIR=""
 
+# A swarm the run already has: COMRADE_SWARM_FILE names a file the fixture
+# wrote with the bootstrap list, and the nodes behind it outlive any one test.
+# Building eight more per test costs a few seconds each and answers the same.
+_swarm_shared() {
+	[ -n "${COMRADE_SWARM_FILE:-}" ] && [ -s "${COMRADE_SWARM_FILE:-}" ]
+}
+
 swarm_start() {
 	_seed="${1:?path to comrade-dhtseed}"
 	_n="${2:-8}"
+	if _swarm_shared; then
+		COMRADE_DHT_BOOTSTRAP=$(cat "$COMRADE_SWARM_FILE")
+		export COMRADE_DHT_BOOTSTRAP
+		SWARM_PIDS=""
+		SWARM_DIR=""
+		return 0
+	fi
 	_peers=""
 	_boot=""
 	SWARM_DIR=$(mktemp -d)
 	_i=0
 	while [ "$_i" -lt "$_n" ]; do
 		# shellcheck disable=SC2086
-		"$_seed" $_peers >"$SWARM_DIR/$_i.out" 2>/dev/null &
+		${SWARM_SPAWN:-} "$_seed" $_peers >"$SWARM_DIR/$_i.out" 2>/dev/null &
 		SWARM_PIDS="$SWARM_PIDS $!"
 		_w=0
 		_port=""
@@ -82,6 +96,7 @@ swarm_start() {
 }
 
 swarm_stop() {
+	# A shared swarm is the fixture's to stop, not the test's.
 	[ -n "$SWARM_PIDS" ] && kill $SWARM_PIDS 2>/dev/null
 	[ -n "$SWARM_DIR" ] && rm -rf "$SWARM_DIR"
 	SWARM_PIDS=""

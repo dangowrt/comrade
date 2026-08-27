@@ -831,20 +831,43 @@ if(COMRADE_BUILD_TOOLS)
 	# so the offline suite is unaffected; the turnstile's race-freedom is
 	# proven deterministically by mailbox_test.
 	if(BUILD_TESTING AND UNIX)
+		# One swarm for the whole run rather than eight nodes per test:
+		# building them answers the same question every time, and the few
+		# seconds it takes are paid by every DHT-gated test below. A test
+		# whose fixture did not run builds its own, exactly as before, so
+		# nothing here is load-bearing.
+		set(COMRADE_SWARM_FILE ${CMAKE_CURRENT_BINARY_DIR}/swarm.boot)
+		add_test(NAME swarm_up
+			COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/swarmfix.sh
+				$<TARGET_FILE:comrade-dhtseed> up)
+		set_tests_properties(swarm_up PROPERTIES
+			FIXTURES_SETUP swarm SKIP_RETURN_CODE 77 TIMEOUT 120
+			ENVIRONMENT COMRADE_SWARM_FILE=${COMRADE_SWARM_FILE})
+		add_test(NAME swarm_down
+			COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/swarmfix.sh
+				$<TARGET_FILE:comrade-dhtseed> down)
+		set_tests_properties(swarm_down PROPERTIES
+			FIXTURES_CLEANUP swarm TIMEOUT 60
+			ENVIRONMENT COMRADE_SWARM_FILE=${COMRADE_SWARM_FILE})
+
 		# Port forwarding over a real path, both arrangements that work.
 		add_test(NAME forward_e2e
 			COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/forward.sh
 				$<TARGET_FILE:comrade>
 				$<TARGET_FILE:comrade-dhtseed>)
 		set_tests_properties(forward_e2e PROPERTIES
-			SKIP_RETURN_CODE 77 TIMEOUT 300)
+			SKIP_RETURN_CODE 77 TIMEOUT 300
+			FIXTURES_REQUIRED swarm
+			ENVIRONMENT COMRADE_SWARM_FILE=${COMRADE_SWARM_FILE})
 
 		add_test(NAME multiuser_e2e
 			COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/multiuser.sh
 				$<TARGET_FILE:comrade-e2e>
 				$<TARGET_FILE:comrade-dhtseed> 2)
 		set_tests_properties(multiuser_e2e PROPERTIES
-			SKIP_RETURN_CODE 77 TIMEOUT 300)
+			SKIP_RETURN_CODE 77 TIMEOUT 300
+			FIXTURES_REQUIRED swarm
+			ENVIRONMENT COMRADE_SWARM_FILE=${COMRADE_SWARM_FILE})
 
 		# Isolated-LAN token mint + connect over real multicast on this host
 		# Needs no DHT and no network beyond one up
@@ -872,7 +895,9 @@ if(COMRADE_BUILD_TOOLS)
 				$<TARGET_FILE:comrade-e2e>
 				$<TARGET_FILE:comrade-dhtseed>)
 		set_tests_properties(lan_mixed_e2e PROPERTIES
-			SKIP_RETURN_CODE 77 TIMEOUT 300)
+			SKIP_RETURN_CODE 77 TIMEOUT 300
+			FIXTURES_REQUIRED swarm
+			ENVIRONMENT COMRADE_SWARM_FILE=${COMRADE_SWARM_FILE})
 
 		# Release-on-pickup: a wedged ICE punch must not head-of-line-block the
 		# next joiner. The wedge is host-controlled
@@ -883,7 +908,9 @@ if(COMRADE_BUILD_TOOLS)
 				$<TARGET_FILE:comrade-e2e>
 				$<TARGET_FILE:comrade-dhtseed>)
 		set_tests_properties(turnstile_stuck_e2e PROPERTIES
-			SKIP_RETURN_CODE 77 TIMEOUT 300)
+			SKIP_RETURN_CODE 77 TIMEOUT 300
+			FIXTURES_REQUIRED swarm
+			ENVIRONMENT COMRADE_SWARM_FILE=${COMRADE_SWARM_FILE})
 
 		# The host turnstile rebuilds its signalling on a move while its
 		# workers keep serving, the move manufactured by --roam-ms. No
@@ -912,7 +939,9 @@ if(COMRADE_BUILD_TOOLS)
 				$<TARGET_FILE:comrade-e2e>
 				$<TARGET_FILE:comrade-dhtseed>)
 		set_tests_properties(roam_client_e2e PROPERTIES
-			SKIP_RETURN_CODE 77 TIMEOUT 300)
+			SKIP_RETURN_CODE 77 TIMEOUT 300
+			FIXTURES_REQUIRED swarm
+			ENVIRONMENT COMRADE_SWARM_FILE=${COMRADE_SWARM_FILE})
 
 		# A roam as a path switch rather than a rejoin: the path
 		# carrying the session is taken away (--blackhole-ms) and the
@@ -933,7 +962,9 @@ if(COMRADE_BUILD_TOOLS)
 				$<TARGET_FILE:comrade-e2e>
 				$<TARGET_FILE:comrade-dhtseed>)
 		set_tests_properties(resume_e2e PROPERTIES
-			SKIP_RETURN_CODE 77 TIMEOUT 300)
+			SKIP_RETURN_CODE 77 TIMEOUT 300
+			FIXTURES_REQUIRED swarm
+			ENVIRONMENT COMRADE_SWARM_FILE=${COMRADE_SWARM_FILE})
 
 		# The outage the worker does not survive: nothing to resume
 		# into, so the client has to come back as a fresh one.
@@ -942,7 +973,9 @@ if(COMRADE_BUILD_TOOLS)
 				$<TARGET_FILE:comrade-e2e>
 				$<TARGET_FILE:comrade-dhtseed>)
 		set_tests_properties(rejoin_e2e PROPERTIES
-			SKIP_RETURN_CODE 77 TIMEOUT 500)
+			SKIP_RETURN_CODE 77 TIMEOUT 500
+			FIXTURES_REQUIRED swarm
+			ENVIRONMENT COMRADE_SWARM_FILE=${COMRADE_SWARM_FILE})
 
 		# The HOST roams mid-session (sig rebuilt, offer rotated, old
 		# transport silenced); the client resumes in place against the
@@ -952,7 +985,9 @@ if(COMRADE_BUILD_TOOLS)
 				$<TARGET_FILE:comrade-e2e>
 				$<TARGET_FILE:comrade-dhtseed>)
 		set_tests_properties(hostroam_e2e PROPERTIES
-			SKIP_RETURN_CODE 77 TIMEOUT 300)
+			SKIP_RETURN_CODE 77 TIMEOUT 300
+			FIXTURES_REQUIRED swarm
+			ENVIRONMENT COMRADE_SWARM_FILE=${COMRADE_SWARM_FILE})
 
 		# Clients join on a token minted before the host had a
 		# rendezvous node, and must be told of the one it qualified
@@ -962,7 +997,9 @@ if(COMRADE_BUILD_TOOLS)
 				$<TARGET_FILE:comrade-e2e>
 				$<TARGET_FILE:comrade-dhtseed>)
 		set_tests_properties(rdvsync_e2e PROPERTIES
-			SKIP_RETURN_CODE 77 TIMEOUT 400)
+			SKIP_RETURN_CODE 77 TIMEOUT 400
+			FIXTURES_REQUIRED swarm
+			ENVIRONMENT COMRADE_SWARM_FILE=${COMRADE_SWARM_FILE})
 
 		# Each of these stands up its own DHT node and multicast
 		# announcer on this host, so under `ctest -j` they contend for
