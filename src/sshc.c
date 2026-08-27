@@ -2,6 +2,7 @@
 /* Copyright (C) 2026 Daniel Golle <daniel@makrotopia.org> */
 
 #include "wsock.h"
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -591,6 +592,7 @@ int sshc_connect_fd(sock_t fd, const struct sshc_opts *o)
 	ssh_session s = NULL;
 	ssh_channel chan = NULL;
 	socket_t sock = fd;
+	bool ssh_config = false;
 	int rc = -1;
 
 	if (!o)
@@ -603,6 +605,13 @@ int sshc_connect_fd(sock_t fd, const struct sshc_opts *o)
 		goto out;
 	ssh_options_set(s, SSH_OPTIONS_HOST, host);
 	ssh_options_set(s, SSH_OPTIONS_FD, &sock);
+	/*
+	 * The token pins the peer and the transport is our own fd: the user's
+	 * ~/.ssh/config and /etc/ssh/ssh_config have nothing to configure here,
+	 * and a `Host *` ProxyCommand/ProxyJump would hijack the connection
+	 * (and exec) on every connect.
+	 */
+	ssh_options_set(s, SSH_OPTIONS_PROCESS_CONFIG, &ssh_config);
 	if (o->connect_timeout_s > 0) {
 		long tov = (long)o->connect_timeout_s;
 
