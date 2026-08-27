@@ -104,6 +104,11 @@ enum {					/* how a local address was learnt */
  * carrier NAT shares the budget.
  */
 #define NETSTATE_ANCHOR_PROVE_MS 10000
+/* Whatever the window is set to, it has to span more re-validation rounds
+ * than the answers it demands, or nothing could qualify inside it. */
+#if NETSTATE_ANCHOR_PROVE_MS < NETSTATE_ANCHOR_QUALIFY * NETSTATE_RDV_MS
+#error "the window must span more rounds than the answers it asks for"
+#endif
 
 /*
  * The same window seen from the other end: how long a node is given to manage
