@@ -585,6 +585,26 @@ if(_cr_hash MATCHES "Format:")
 		execute_process(COMMAND ${_cr_git} log -1 --format=%D HEAD
 			OUTPUT_VARIABLE _cr_refs
 			OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+		# What git said is true of the commit that was checked out when
+		# this ran, and nothing re-runs it on its own: without these a
+		# tree that has moved on since keeps reporting the commit it was
+		# configured at, which is the one identity a binary should never
+		# get wrong. A worktree or submodule keeps .git as a file rather
+		# than a directory, and then there is nothing here to watch.
+		set(_cr_head "${CMAKE_CURRENT_SOURCE_DIR}/.git/HEAD")
+		if(EXISTS "${_cr_head}")
+			set_property(DIRECTORY APPEND PROPERTY
+				CMAKE_CONFIGURE_DEPENDS "${_cr_head}")
+			file(READ "${_cr_head}" _cr_headtxt)
+			string(REGEX MATCH "ref: ([^\r\n]+)" _cr_m
+				"${_cr_headtxt}")
+			set(_cr_ref
+				"${CMAKE_CURRENT_SOURCE_DIR}/.git/${CMAKE_MATCH_1}")
+			if(CMAKE_MATCH_1 AND EXISTS "${_cr_ref}")
+				set_property(DIRECTORY APPEND PROPERTY
+					CMAKE_CONFIGURE_DEPENDS "${_cr_ref}")
+			endif()
+		endif()
 	endif()
 else()
 	# Expanded by `git archive`: trust the baked-in identity, no git needed.

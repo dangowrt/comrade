@@ -104,7 +104,13 @@ static int dir_ok(const char *path)
 static const char *state_ok(char *dir)
 {
 	if (mkdir(dir, 0700) && (errno != EEXIST || !dir_ok(dir))) {
-		fprintf(stderr, "comrade: refusing unsafe state dir %s\n", dir);
+		/* Says where to put it instead, because the usual way to meet
+		 * this is not an attack but a namespace: inside one this
+		 * process is root, takes the path root is pinned to, and finds
+		 * it belongs to the user outside. */
+		fprintf(stderr, "comrade: refusing unsafe state dir %s\n"
+			"comrade: it must be a directory we own with no group "
+			"or other access; set COMRADE_STATE_DIR to one\n", dir);
 		exit(1);
 	}
 	return dir;
