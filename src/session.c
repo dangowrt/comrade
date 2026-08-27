@@ -134,13 +134,25 @@ static int fam_idx(int family)
  */
 #define HOST_PUNCH_MS 15000
 /*
- * How long a punch is left alone before a fresh ask from the same claimant may
- * replace it. A claimant asks again on a cadence shorter than a punch across a
- * carrier NAT can need, so replacing it on every ask is how none of them ever
- * finishes. Between that cadence and the punch's own budget, which means at
- * most one ask is turned away per punch.
+ * How long a link stays lost before the client re-claims in place, and how
+ * long each such attempt runs before regathering. Short on purpose: the
+ * attempt is non-destructive -- every warm path stays in the table, the SSH
+ * session above never pauses more than the outage itself -- so trying early
+ * costs nothing and beats the host's reap comfortably.
  */
-#define HOST_PUNCH_FLOOR_MS 12000
+#define RESUME_AFTER_MS 3000
+#define RESUME_ATTEMPT_MS 10000
+/*
+ * How long a punch is left alone before a fresh ask from the same claimant may
+ * replace it. The claimant asks again every RESUME_ATTEMPT_MS and a punch
+ * across a carrier NAT can need longer, so replacing it on every ask is how
+ * none of them ever finishes.
+ */
+#define HOST_PUNCH_FLOOR_MS (RESUME_ATTEMPT_MS + RESUME_ATTEMPT_MS / 5)
+#if HOST_PUNCH_FLOOR_MS <= RESUME_ATTEMPT_MS || \
+    HOST_PUNCH_FLOOR_MS >= HOST_PUNCH_MS
+#error "the punch floor must sit between the claimant's cadence and the budget"
+#endif
 /*
  * How long a punched connection has to become a session before the host gives
  * up on it and frees the claimant.
@@ -3391,16 +3403,6 @@ static void conn_fresh_pwd(struct conn *c)
 	}
 	c->ice_pwd[32] = '\0';
 }
-
-/*
- * How long a link stays lost before the client re-claims in place, and how
- * long each such attempt runs before regathering. Short on purpose: the
- * attempt is non-destructive -- every warm path stays in the table, the SSH
- * session above never pauses more than the outage itself -- so trying early
- * costs nothing and beats the host's reap comfortably.
- */
-#define RESUME_AFTER_MS 3000
-#define RESUME_ATTEMPT_MS 10000
 
 /*
  * Client-side in-place resume: while the link is lost, run the claim half of
