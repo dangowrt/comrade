@@ -3807,13 +3807,23 @@ static int client_regather(struct sess *s)
  * table). Only for the rotated pool -- an explicit --stun server is the
  * operator's to keep alive -- and only while the rotation budget lasts.
  */
-static int stun_stall(struct sess *s)
+/*
+ * May a rotation be spent at all: an automatic pool with somewhere else to go,
+ * a private v4 to explain a missing public one, and budget left on this
+ * network.
+ */
+static int stun_rotate_ok(const struct sess *s)
 {
 	if (s->cfg->stun_host || !s->cfg->stun_auto || s->stun_count < 2)
 		return 0;
-	if (!s->have_priv4 || s->have_srflx4)
+	if (!s->have_priv4)
 		return 0;
-	if (s->stun_rotations >= STUN_ROTATE_MAX)
+	return s->stun_rotations < STUN_ROTATE_MAX;
+}
+
+static int stun_stall(struct sess *s)
+{
+	if (!stun_rotate_ok(s) || s->have_srflx4)
 		return 0;
 	return now_ms() - s->stun_since_ms > STUN_ROTATE_MS;
 }
@@ -5251,6 +5261,14 @@ static int host_turnstile(struct sess *s)
 		pool_pump(s);
 		if (ts == TS_WAIT_CLAIM && listen && !s->have_peer_sdp &&
 		    stun_stall(s)) {
+			/* Named, like the claim verdicts: an offer with no
+			 * public address in it looks from here exactly like one
+			 * that works, and this is the only thing that says
+			 * which pool server it was gathered through. */
+			dbg_logf("host: no public v4 through pool server %d "
+				 "-- offering through the next (%d of %d)",
+				 s->ice_attempt % s->stun_count,
+				 s->stun_rotations + 1, STUN_ROTATE_MAX);
 			s->ice_attempt++;
 			s->stun_rotations++;
 			conn_free(listen);
@@ -5307,6 +5325,40 @@ static int host_turnstile(struct sess *s)
 				if (!sdp_has_candidate(s->local_sdp)) {
 					dbg_logf("host: gathered no candidates "
 						 "-- not offering, regathering");
+					conn_free(listen);
+					listen = NULL;
+					s->offer_conn = NULL;
+					s->have_local_sdp = 0;
+					s->local_sdp[0] = '\0';
+					s->next_gather_ms = now_ms() +
+							    HOST_REGATHER_MS;
+					break;
+				}
+				/*
+				 * Gathered something, but nothing a peer off
+				 * this segment could aim at: the pool server
+				 * this description was gathered through said
+				 * nothing, and what is left is private host
+				 * candidates. Publishing that fills the one
+				 * mailbox slot with an offer only the segment
+				 * can take up, which is indistinguishable from
+				 * a working one until a punch fails. Gather
+				 * again through the next server instead, while
+				 * the budget lasts; when it is spent, a
+				 * segment-only offer is still better than
+				 * none, and the peer may well be on it.
+				 */
+				if (!cand_sdp_reaches_off_segment(s->local_sdp) &&
+				    stun_rotate_ok(s)) {
+					dbg_logf("host: nothing off-segment to "
+						 "offer through pool server %d "
+						 "-- gathering through the next "
+						 "(%d of %d)",
+						 s->ice_attempt % s->stun_count,
+						 s->stun_rotations + 1,
+						 STUN_ROTATE_MAX);
+					s->ice_attempt++;
+					s->stun_rotations++;
 					conn_free(listen);
 					listen = NULL;
 					s->offer_conn = NULL;

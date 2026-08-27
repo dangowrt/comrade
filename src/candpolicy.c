@@ -262,3 +262,37 @@ void cand_sdp_drop_self(const char *in, const struct netmon_addr *local,
 	}
 	out[o] = '\0';
 }
+
+/*
+ * A description is an offer to somewhere only if something in it can be aimed
+ * at from there. Anything the peer's checks reach through a NAT -- reflexive,
+ * peer-reflexive, relayed -- says yes on its own; a host candidate says yes
+ * only when its address is globally routable, which is how IPv6 usually
+ * arrives, since no reflexive candidate is gathered beside a global host one.
+ */
+int cand_sdp_reaches_off_segment(const char *sdp)
+{
+	struct cand_policy global;
+	const char *line = sdp;
+
+	memset(&global, 0, sizeof(global));
+	global.allow_eui64 = 1;		/* however formed, a global address reaches */
+	while (*line) {
+		const char *nl = strchr(line, '\n');
+		size_t len = nl ? (size_t)(nl - line + 1) : strlen(line);
+		const char *p = os_memmem(line, len, "candidate:", 10);
+		char addr[64], typ[16];
+
+		if (p && sscanf(p, "candidate:%*s %*d %*s %*u %63s %*d typ %15s",
+				addr, typ) == 2) {
+			if (strcmp(typ, "host"))
+				return 1;
+			if (cand_addr_keep(addr, 0, &global, NULL))
+				return 1;
+		}
+		if (!nl)
+			break;
+		line = nl + 1;
+	}
+	return 0;
+}

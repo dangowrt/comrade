@@ -55,4 +55,13 @@ void cand_sdp_drop_self(const char *in, const struct netmon_addr *local,
 void cand_sdp_fan_v4(char *sdp, size_t cap, const uint8_t (*pool)[4],
 		     size_t npool, int mapping_dependent);
 
+/*
+ * Whether a description names an address a peer off this segment could aim at:
+ * a server-reflexive candidate, or a host candidate that is globally routable
+ * (which is how IPv6 usually arrives -- no srflx is gathered when a global
+ * host candidate already exists). A description of private host candidates
+ * alone is an offer only to the segment it was gathered on.
+ */
+int cand_sdp_reaches_off_segment(const char *sdp);
+
 #endif

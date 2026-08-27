@@ -223,8 +223,39 @@ static void mapping_dependent_check(void)
 	assert(!strcmp(sdp, agree));
 }
 
+/* A description is an offer to somewhere only if something in it can be aimed
+ * at from there. */
+static void off_segment_check(void)
+{
+	static const char lan_only[] =
+		"a=candidate:1 1 UDP 2130706431 192.168.1.5 40000 typ host\n"
+		"a=candidate:2 1 UDP 2130706430 10.0.0.7 40000 typ host\n";
+	static const char with_srflx[] =
+		"a=candidate:1 1 UDP 2130706431 192.168.1.5 40000 typ host\n"
+		"a=candidate:2 1 UDP 1678769663 203.0.113.9 40000 typ srflx "
+		"raddr 0.0.0.0 rport 0\n";
+	static const char v6_host[] =
+		"a=candidate:1 1 UDP 2130706431 192.168.1.5 40000 typ host\n"
+		"a=candidate:2 1 UDP 2130706430 2001:db8::279 40000 typ host\n";
+	static const char v6_ula[] =
+		"a=candidate:1 1 UDP 2130706430 fd12:3456::1 40000 typ host\n"
+		"a=candidate:2 1 UDP 2130706429 fe80::1 40000 typ host\n";
+	static const char relayed[] =
+		"a=candidate:1 1 UDP 16777215 203.0.113.1 3478 typ relay "
+		"raddr 0.0.0.0 rport 0\n";
+
+	assert(cand_sdp_reaches_off_segment(lan_only) == 0);
+	assert(cand_sdp_reaches_off_segment(with_srflx) == 1);
+	assert(cand_sdp_reaches_off_segment(v6_host) == 1);
+	assert(cand_sdp_reaches_off_segment(v6_ula) == 0);
+	assert(cand_sdp_reaches_off_segment(relayed) == 1);
+	assert(cand_sdp_reaches_off_segment("") == 0);
+	assert(cand_sdp_reaches_off_segment("v=0\r\na=ice-ufrag:abcd\r\n") == 0);
+}
+
 int main(void)
 {
+	off_segment_check();
 	default_policy_check();
 	opt_in_check();
 	sdp_filter_check();
