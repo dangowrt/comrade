@@ -6,8 +6,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "appdir.h"
 #include "fwdspec.h"
 #include "host.h"
+#include "sandbox.h"
 #include "showfmt.h"
 #include "stunlist.h"
 #include "token.h"
@@ -78,6 +80,7 @@ static int session_connect(const char *arg, int ui_mode, int no_mcast,
 {
 	struct session_cfg cfg;
 	struct session_obs obs;
+	struct sandbox_cfg sb;
 	struct ui *u;
 	int rc;
 
@@ -106,6 +109,20 @@ static int session_connect(const char *arg, int ui_mode, int no_mcast,
 	if (forward_only && !nfwd_l && !nfwd_r)
 		fprintf(stderr, "comrade: -N/--forward-only with no -L/-R "
 			"forwards nothing\n");
+
+	/*
+	 * From here the join is a network program that never spawns anything,
+	 * so confine it before it opens a socket: deny execve outright and drop
+	 * every privilege it will not use. Single-threaded at this point, so the
+	 * confinement covers every thread the session later starts. appdir_data()
+	 * is called first so the data directory exists (and is the one path the
+	 * filesystem confinement will keep writable).
+	 */
+	memset(&sb, 0, sizeof(sb));
+	sb.role = SANDBOX_CLIENT;
+	sb.data_dir = appdir_data();
+	sandbox_apply(&sb);
+
 	u = ui_create(UI_ROLE_CLIENT, ui_mode);	/* the view drives the dashboard */
 	if (u) {
 		ui_bind(u, &obs);

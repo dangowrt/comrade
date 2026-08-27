@@ -267,6 +267,16 @@ target_include_directories(comrade_dbg PUBLIC src)
 target_link_libraries(comrade_dbg PUBLIC comrade_compat)
 
 #
+# Self-sandboxing: the process shrinks its own privileges to what its role
+# needs, using only what the running kernel offers and never a helper binary.
+# Its own library (rather than a place in comrade_compat) so it can use
+# dbg_logf without comrade_compat gaining a dependency back on comrade_dbg.
+#
+add_library(comrade_sandbox STATIC src/sandbox_posix.c src/sandbox_win.c)
+target_include_directories(comrade_sandbox PUBLIC src)
+target_link_libraries(comrade_sandbox PUBLIC comrade_dbg)
+
+#
 # A command running on its own terminal: forkpty plus /bin/sh, or a
 # pseudoconsole plus CreateProcess. Both the SSH server and the host's local
 # attach drive one, and neither contains a platform #ifdef because of this.
@@ -683,6 +693,7 @@ target_link_libraries(comrade
 	comrade_stunlist
 	comrade_statusbar
 	comrade_fwdspec
+	comrade_sandbox
 )
 if(WIN32)
 	# The system import libraries go last so they resolve the references the
@@ -704,6 +715,14 @@ if(BUILD_TESTING)
 	add_executable(qr_test tests/qr_test.c)
 	target_link_libraries(qr_test comrade_qr)
 	add_test(NAME qr_test COMMAND qr_test)
+
+	# Self-sandboxing: a child applies a profile and is then refused the thing
+	# that profile forbids (exec for the client, INET sockets for the
+	# foreground). Skips where the kernel offers no seccomp.
+	add_executable(sandbox_test tests/sandbox_test.c)
+	target_link_libraries(sandbox_test comrade_sandbox)
+	add_test(NAME sandbox_test COMMAND sandbox_test)
+	set_tests_properties(sandbox_test PROPERTIES SKIP_RETURN_CODE 77)
 
 	add_executable(showfmt_test tests/showfmt_test.c src/showfmt.c)
 	target_link_libraries(showfmt_test comrade_token comrade_compat)
@@ -1140,7 +1159,8 @@ if(BUILD_TESTING)
 		bep44_pin_test bep44_store_test bep44_rl_test
 		sig_rebuild_test natstream_test stream_room_test
 		stream_cc_test sshloop_test sshfwd_test sshexit_test sshro_test
-		sshkcp_test sshctl_test qr_test showfmt_test mview_test)
+		sshkcp_test sshctl_test qr_test showfmt_test mview_test
+		sandbox_test)
 		if(TARGET ${t})
 			target_compile_options(${t} PRIVATE -UNDEBUG)
 			# A test binary should run from where it was built, as
