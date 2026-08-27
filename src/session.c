@@ -2838,6 +2838,7 @@ static void *ssh_cli_thread(void *p)
 	o.recv_cap = s->cfg->test_recv_cap;
 	o.recv_len = s->cfg->test_recv_len;
 	o.hold_ms = s->cfg->test_hold_ms;
+	o.stop = s->cfg->test_stop;
 	c->ssh_cli_rc = sshc_connect_fd(c->ssh_fd, &o);
 	return NULL;
 }

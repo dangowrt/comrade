@@ -30,6 +30,14 @@ static struct {
 	struct token tok;
 } host;
 
+static volatile int e2e_stop;
+
+static void on_term(int sig)
+{
+	(void)sig;
+	e2e_stop = 1;
+}
+
 static const char *state_name(int state)
 {
 	static const char *n[4] = { "PENDING", "NONE", "RENDEZVOUS", "DIRECT" };
@@ -113,6 +121,10 @@ int main(int argc, char **argv)
 #ifdef SIGPIPE
 	signal(SIGPIPE, SIG_IGN);
 #endif
+	/* A held session ends when the harness has seen what it was holding it
+	 * for: SIGTERM winds the hold up and the run finishes and reports as it
+	 * would have anyway, rather than being cut off mid-verdict. */
+	signal(SIGTERM, on_term);
 
 	if (argc >= 3 && !strcmp(argv[1], "token"))
 		return inspect_token(argv[2]);
@@ -149,6 +161,7 @@ int main(int argc, char **argv)
 	cfg.log_level = -1;
 	cfg.connect_timeout_s = 120;
 	cfg.sig_flags = SIG_DHT;
+	cfg.test_stop = &e2e_stop;
 
 	if (argc >= 2 && !strcmp(argv[1], "host")) {
 		is_host = 1;

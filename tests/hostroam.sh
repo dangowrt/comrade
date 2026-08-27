@@ -17,7 +17,8 @@ fi
 
 tmp="$(mktemp -d)"
 hostpid=""
-trap 'kill "$hostpid" 2>/dev/null; swarm_stop; rm -rf "$tmp"' EXIT
+clientpid=""
+trap 'kill "$hostpid" "$clientpid" 2>/dev/null; swarm_stop; rm -rf "$tmp"' EXIT
 
 COMRADE_DEBUG="$tmp/host.dbg" "$E2E" host --serve 1 --timeout 300 \
 	--roam-ms 30000 --roams 1 --roam-hard \
@@ -43,8 +44,24 @@ while [ "$i" -lt 120 ]; do
 done
 [ -n "$tok" ] || { echo "no rendezvous token after ${i}s"; exit 1; }
 
+# Held open until the thing it is here to see has happened, not for a span
+# chosen to be longer than it: the roam is staged 30s in, and what follows is
+# the client resuming onto the host's new network. The hold is only an upper
+# bound for a run where that never comes.
 COMRADE_DEBUG="$tmp/client.dbg" "$E2E" client "$tok" \
-	--hold-ms 60000 --timeout 100 > "$tmp/client.out" 2>&1
+	--hold-ms 120000 --timeout 160 > "$tmp/client.out" 2>&1 &
+clientpid=$!
+i=0
+while [ "$i" -lt 120 ]; do
+	grep -q "resume: link back" "$tmp/client.dbg" 2>/dev/null &&
+		grep -q "punch connected -> resume worker" "$tmp/host.dbg" 2>/dev/null &&
+		break
+	kill -0 "$clientpid" 2>/dev/null || break
+	sleep 1
+	i=$((i + 1))
+done
+kill -TERM "$clientpid" 2>/dev/null	# wind up the hold and report
+wait "$clientpid" 2>/dev/null
 
 rc=0
 grep -q "E2E PASS client" "$tmp/client.out" || {

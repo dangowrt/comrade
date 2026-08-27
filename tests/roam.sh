@@ -74,10 +74,12 @@ while [ "$i" -lt 60 ]; do
 done
 if [ -z "$tok" ]; then echo "no settled token after ~30s"; cat "$tmp/host.err"; exit 1; fi
 
-# A, held open long enough to span several rebuilds.
-"$E2E" client "$tok" --mcast --no-dht --stun none --hold-ms 22000 \
-	--timeout 60 >"$tmp/a.out" 2>"$tmp/a.err" &
-cpids="$cpids $!"
+# A, held open across the rebuilds B has to be admitted after. How long that
+# takes is what the loop below waits for, so the hold is only an upper bound.
+"$E2E" client "$tok" --mcast --no-dht --stun none --hold-ms 90000 \
+	--timeout 120 >"$tmp/a.out" 2>"$tmp/a.err" &
+apid=$!
+cpids="$cpids $apid"
 
 # Wait for the rebuilds B has to be admitted after.
 i=0
@@ -94,12 +96,15 @@ fi
 # token was minted.
 "$E2E" client "$tok" --mcast --no-dht --stun none --hold-ms 500 \
 	--timeout 60 >"$tmp/b.out" 2>"$tmp/b.err" &
-cpids="$cpids $!"
+bpid=$!
+cpids="$cpids $bpid"
 
 rc=0
-for p in $cpids; do
-	wait "$p" || rc=1
-done
+# B has either been admitted or has failed to be; either way A has nothing
+# left to hold the host busy for.
+wait "$bpid" || rc=1
+kill -TERM "$apid" 2>/dev/null	# wind up the hold and report
+wait "$apid" || rc=1
 wait "$hpid" 2>/dev/null || rc=1
 
 grep -q "E2E PASS client" "$tmp/a.out" 2>/dev/null || {

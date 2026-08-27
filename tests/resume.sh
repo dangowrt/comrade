@@ -17,7 +17,8 @@ fi
 
 tmp="$(mktemp -d)"
 hostpid=""
-trap 'kill "$hostpid" 2>/dev/null; swarm_stop; rm -rf "$tmp"' EXIT
+clientpid=""
+trap 'kill "$hostpid" "$clientpid" 2>/dev/null; swarm_stop; rm -rf "$tmp"' EXIT
 
 COMRADE_DEBUG="$tmp/host.dbg" "$E2E" host --serve 1 --timeout 300 \
 	> "$tmp/host.out" 2> "$tmp/host.err" &
@@ -42,9 +43,25 @@ while [ "$i" -lt 120 ]; do
 done
 [ -n "$tok" ] || { echo "no rendezvous token after ${i}s"; exit 1; }
 
+# Held until the resume has happened rather than for a span picked to outlast
+# it: the outage is staged 6s in and lifted at 18s, and what this is here to
+# see is the client coming back onto the worker the host still runs. The hold
+# is only an upper bound for a run where that never comes.
 COMRADE_DEBUG="$tmp/client.dbg" "$E2E" client "$tok" \
 	--blackhole-ms 6000 --blackhole-all --blackhole-lift-ms 18000 \
-	--hold-ms 35000 --timeout 70 > "$tmp/client.out" 2>&1
+	--hold-ms 90000 --timeout 120 > "$tmp/client.out" 2>&1 &
+clientpid=$!
+i=0
+while [ "$i" -lt 90 ]; do
+	grep -q "resume: link back" "$tmp/client.dbg" 2>/dev/null &&
+		grep -q "punch connected -> resume worker" "$tmp/host.dbg" 2>/dev/null &&
+		break
+	kill -0 "$clientpid" 2>/dev/null || break
+	sleep 1
+	i=$((i + 1))
+done
+kill -TERM "$clientpid" 2>/dev/null	# wind up the hold and report
+wait "$clientpid" 2>/dev/null
 
 rc=0
 grep -q "E2E PASS client" "$tmp/client.out" || {

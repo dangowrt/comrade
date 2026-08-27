@@ -90,12 +90,25 @@ done
 [ -n "$rdv" ] || { echo "host qualified no rendezvous at all after ${i}s"; exit 1; }
 
 # Both clients join on the early token, so both have to be told.
-COMRADE_DEBUG="$tmp/c1.dbg" "$E2E" client "$early" --hold-ms 20000 \
+COMRADE_DEBUG="$tmp/c1.dbg" "$E2E" client "$early" --hold-ms 90000 \
 	--timeout 150 > "$tmp/c1.out" 2>&1 &
 c1=$!
-COMRADE_DEBUG="$tmp/c2.dbg" "$E2E" client "$early" --hold-ms 20000 \
+COMRADE_DEBUG="$tmp/c2.dbg" "$E2E" client "$early" --hold-ms 90000 \
 	--timeout 150 > "$tmp/c2.out" 2>&1 &
 c2=$!
+# Held until both have been told, not for a span assumed to be long enough:
+# being told is the whole assertion below, so it is also the thing to wait for.
+i=0
+while [ "$i" -lt 90 ]; do
+	grep -qF "rdv: adopted the peer's" "$tmp/c1.dbg" 2>/dev/null &&
+		grep -qF "rdv: adopted the peer's" "$tmp/c2.dbg" 2>/dev/null &&
+		break
+	kill -0 "$c1" 2>/dev/null || break
+	kill -0 "$c2" 2>/dev/null || break
+	sleep 1
+	i=$((i + 1))
+done
+kill -TERM "$c1" "$c2" 2>/dev/null	# wind up the holds and report
 wait "$c1"
 wait "$c2"
 

@@ -73,7 +73,7 @@ if [ -z "$tok" ]; then echo "no rendezvous token after 120s"; cat "$tmp/host.err
 
 # Client A over the LAN only (multicast/lanlink, DHT dropped), holding so its
 # lanlink worker stays live while the host engages the ICE turnstile for B.
-"$E2E" client "$tok" --mcast --no-dht --stun none --hold-ms 40000 --timeout 50 \
+"$E2E" client "$tok" --mcast --no-dht --stun none --hold-ms 90000 --timeout 120 \
 	>"$tmp/a.out" 2>"$tmp/a.err" &
 apid=$!
 sleep 2
@@ -84,6 +84,10 @@ sleep 2
 	>"$tmp/b.out" 2>"$tmp/b.err" &
 bpid=$!
 wait "$bpid" 2>/dev/null || true
+# A was held so the host had a live lanlink worker while it took up B's claim.
+# That has now either happened or is not going to, so there is nothing left to
+# hold for: wind A up and let it report.
+kill -TERM "$apid" 2>/dev/null
 wait "$apid" 2>/dev/null || true
 
 rc=0

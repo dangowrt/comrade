@@ -83,6 +83,11 @@ struct sshc_opts {
 	uint8_t *recv;
 	size_t recv_cap;
 	size_t *recv_len;
+	/* Set by the harness to wind the hold up now. A test holds a session
+	 * open to watch something happen to it, and how long that takes is the
+	 * question, not something to be guessed at in advance: it waits for the
+	 * evidence and then says so here. */
+	volatile int *stop;
 	int hold_ms;			/* after the echo, keep the session open this
 					 * long (test: stay connected while another
 					 * client joins) */

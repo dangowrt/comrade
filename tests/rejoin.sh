@@ -74,10 +74,15 @@ while [ "$i" -lt 200 ]; do
 	sleep 1
 	i=$((i + 1))
 done
-kill "$clientpid" 2>/dev/null
+kill -TERM "$clientpid" 2>/dev/null	# wind up the hold and report
 wait "$clientpid" 2>/dev/null
 
 rc=0
+grep -q "E2E PASS client" "$tmp/client.out" || {
+	echo "the client never carried its session:"
+	tail -3 "$tmp/client.out"
+	rc=1
+}
 grep -q "reap worker" "$tmp/host.dbg" || {
 	echo "the host never reaped the worker"
 	rc=1

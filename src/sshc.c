@@ -285,7 +285,8 @@ static int run_test(ssh_session s, ssh_channel chan, const struct sshc_opts *o)
 		uint64_t end = mono_ms() + (uint64_t)o->hold_ms;
 
 		while (mono_ms() < end && ssh_channel_is_open(chan) &&
-		       !ssh_channel_is_eof(chan)) {
+		       !ssh_channel_is_eof(chan) &&
+		       !(o->stop && *o->stop)) {
 			char sink[4096];
 
 			if (rejoin_now(o)) {
