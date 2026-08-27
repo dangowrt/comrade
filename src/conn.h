@@ -51,6 +51,10 @@ struct conn_status {
 	 * so this is the question "is there still a session here", which the
 	 * path's own liveness cannot answer. */
 	int silent_s;
+	/* The peer said outright that the session this connection carried is
+	 * over: it is serving us from a worker we were never part of. Waiting
+	 * on silence is what this end does when nobody says anything. */
+	int gone;
 	int read_only;			/* this side is a view-only guest */
 	/* The warm paths held besides the one in use: the best-ranked of them,
 	 * and how many there are. What the session would move to were the path

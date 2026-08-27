@@ -212,8 +212,15 @@ static void ctl_open(ssh_session s, ssh_event event, const struct sshc_opts *o,
 }
 
 /*
- * Silent past the grace: stop waiting on this transport and rejoin as a fresh
- * client, the session being the host's and not this connection's.
+ * Told, or silent past the grace: either way stop waiting on this transport and
+ * rejoin as a fresh client, the session being the host's and not this
+ * connection's.
+ *
+ * Being told is the whole of it when it happens: a host that has reaped a
+ * worker and answered the claim that came back with a new one says so on the
+ * path it just punched, and there is nothing left to wait for. The grace below
+ * is what is left for a host that says nothing -- an older one, or one whose
+ * word did not arrive.
  *
  * Silence of the session, not of the path. The host reaps a worker for a
  * client that has gone quiet and keeps serving, so what the returning claim
@@ -230,7 +237,7 @@ static void ctl_open(ssh_session s, ssh_event event, const struct sshc_opts *o,
  */
 static int rejoin_due(const struct conn_status *cur)
 {
-	return cur->silent_s >= SSHC_REJOIN_GRACE_S;
+	return cur->gone || cur->silent_s >= SSHC_REJOIN_GRACE_S;
 }
 
 static int rejoin_now(const struct sshc_opts *o)

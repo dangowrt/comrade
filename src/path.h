@@ -125,6 +125,16 @@ void path_ep_str(const struct path_ep *ep, char *out, size_t n);
 #define PROBE_MAGIC 0x434d5250U	/* "CMRP"; differs from SESSION_CONV */
 #define PROBE_PING 1
 #define PROBE_PONG 2
+/*
+ * The worker answering you is not the one you left. A host reaps a worker for
+ * a client that has gone quiet and keeps serving, so a claim that comes back
+ * is answered by a new one -- and every session shares a conversation id and a
+ * sealing key, so from the returning client's side the path looks exactly as
+ * it did. It carries the claimant's ufrag like any other probe, so it is
+ * addressed rather than broadcast, and it is sealed like any other, so only
+ * this session's peer can say it.
+ */
+#define PROBE_FRESH 3
 #define PROBE_UFRAG_MAX 40
 #define PROBE_TAIL_LEN 22
 #define PROBE_PLAIN_MAX (1 + 8 + 1 + PROBE_UFRAG_MAX + PROBE_TAIL_LEN)

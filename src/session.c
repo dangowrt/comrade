@@ -400,6 +400,8 @@ struct conn {
 	 * dashboard once. Written from the ssh thread, so volatile like done. */
 	volatile int read_only;
 	int ro_reported;		/* main-thread only: sent to the view yet */
+	volatile int peer_fresh;	/* the host said it is serving us from a
+					 * worker we were never part of */
 	volatile int fwd_refused;	/* forwards the ssh thread refused */
 	int fwd_reported;		/* main-thread only: refusal surfaced yet */
 };
@@ -1116,6 +1118,7 @@ static void publish_status(struct conn *c, int state)
 		cs.since_s = (int)((now_ms() - c->lost_since_ms) / 1000);
 	cs.silent_s = c->hb_pong_seen ?
 		(int)((now_ms() - c->hb_last_pong) / 1000) : -1;
+	cs.gone = c->peer_fresh;
 	pthread_mutex_unlock(&c->hb_lock);
 
 	pthread_mutex_lock(&c->status_lock);
@@ -1910,6 +1913,30 @@ static struct path *conn_pong_path(struct conn *c, uint64_t nonce)
  * it ever carries anything, so a late datagram from an address that has gone
  * away cannot flap the binding.
  */
+/*
+ * Tell the claimant that what it has reached is a new worker, not the one it
+ * left. Only a client coming back has anything to do with this; one joining
+ * for the first time has no session to lose and ignores it. Said on the
+ * connection it has just punched, sealed and addressed to its own claimant
+ * identity like any other probe.
+ */
+static void conn_tell_fresh(struct conn *c)
+{
+	struct path_probe pr;
+	uint8_t out[PROBE_MAX];
+	size_t o;
+
+	if (!c->nat || !c->claim_ufrag[0])
+		return;
+	memset(&pr, 0, sizeof(pr));
+	pr.type = PROBE_FRESH;
+	random_bytes((uint8_t *)&pr.nonce, sizeof(pr.nonce));
+	snprintf(pr.ufrag, sizeof(pr.ufrag), "%s", c->claim_ufrag);
+	o = conn_probe_seal(c, &pr, out);
+	if (o)
+		nat_send(c->nat, out, o);
+}
+
 static void probe_apply(struct conn *c, const struct path_probe *pr,
 			enum path_kind kind, const struct sockaddr_in6 *src)
 {
@@ -1965,6 +1992,22 @@ static void probe_apply(struct conn *c, const struct path_probe *pr,
 				nat_send(c->nat, out, o);
 		} else if (src && s->lan) {
 			lanlink_send(s->lan, src, out, o);
+		}
+		return;
+	}
+	if (pr->type == PROBE_FRESH) {
+		int had;
+
+		pthread_mutex_lock(&c->hb_lock);
+		had = c->hb_pong_seen;
+		pthread_mutex_unlock(&c->hb_lock);
+		/* A connection that never carried a session has none to be
+		 * told about: this is the answer to a resume, and a first join
+		 * is not one. */
+		if (had && !c->sess->cfg->is_host && !c->peer_fresh) {
+			c->peer_fresh = 1;
+			dbg_logf("peer: served by a new worker -- this session "
+				 "is over, rejoining");
 		}
 		return;
 	}
@@ -3504,7 +3547,9 @@ static int conn_run(struct conn *c, int drive_sig)
 	br = sshbridge_create(sp[0], c->stream,
 			      s->cfg->is_host ? LINGER_HOST_MS : LINGER_CLIENT_MS);
 
-	/* The path is up on entry, so start the liveness clock as alive. */
+	/* The path is up on entry, so start the liveness clock as alive, and
+	 * what was said about the session before this one is spent. */
+	c->peer_fresh = 0;
 	pthread_mutex_lock(&c->hb_lock);
 	c->hb_last_pong = now_ms();
 	c->hb_last_heard = c->hb_last_pong;
@@ -4880,6 +4925,11 @@ static void punch_scan(struct sess *s, struct worker *ws, struct conn **punching
 					addr);
 			}
 			punching[i] = NULL;
+			/* Said before it is served: a claimant that thought it
+			 * was resuming learns here that it is not, and can go
+			 * round again at once rather than waiting out the
+			 * silence that would eventually tell it. */
+			conn_tell_fresh(c);
 			conn_register(s, c);
 			if (worker_spawn(ws, c)) {
 				s->punch_ufrag[i][0] = '\0';
