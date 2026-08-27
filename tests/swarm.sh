@@ -23,9 +23,14 @@
 # The nodes are addressed at one of this machine's own interface addresses,
 # never 127.0.0.1: jech/dht drops any datagram whose source is a martian and
 # counts loopback among them, so a loopback swarm never forms -- each member
-# ignores every other, comrade ignores all of them, and the run silently falls
-# back on whatever real DHT nodes the on-disk cache still holds. Each node
-# reports the address it can be reached at, and this agrees with them.
+# ignores every other and comrade ignores all of them. Each node reports the
+# address it can be reached at, and this agrees with them.
+#
+# The run also gets a data dir of its own: COMRADE_DHT_BOOTSTRAP replaces the
+# built-in routers, but the on-disk node cache is loaded whatever the bootstrap
+# says, so a run without it pings every real mainline node this machine has
+# cached, and a v4-only swarm leaves the v6 rendezvous to land on one of them.
+# It also keeps what a run learns out of the cache the user's sessions read.
 #
 # jech/dht keeps its state in globals, so each node is its own process. Each is
 # told where the previous ones are, which is enough for them to find each other.
@@ -45,6 +50,15 @@ _swarm_shared() {
 	[ -n "${COMRADE_SWARM_FILE:-}" ] && [ -s "${COMRADE_SWARM_FILE:-}" ]
 }
 
+# Everything the run starts reads its node cache from here, so nothing the
+# machine already knows about the real DHT joins the swarm. Exported, so the
+# comrade processes a test starts inherit it as well as the nodes.
+_swarm_data() {
+	XDG_DATA_HOME="$SWARM_DIR/data"
+	mkdir -p "$XDG_DATA_HOME" || return 1
+	export XDG_DATA_HOME
+}
+
 swarm_start() {
 	_seed="${1:?path to comrade-dhtseed}"
 	_n="${2:-8}"
@@ -52,12 +66,14 @@ swarm_start() {
 		COMRADE_DHT_BOOTSTRAP=$(cat "$COMRADE_SWARM_FILE")
 		export COMRADE_DHT_BOOTSTRAP
 		SWARM_PIDS=""
-		SWARM_DIR=""
+		SWARM_DIR=$(mktemp -d)
+		_swarm_data || return 1
 		return 0
 	fi
 	_peers=""
 	_boot=""
 	SWARM_DIR=$(mktemp -d)
+	_swarm_data || return 1
 	_i=0
 	while [ "$_i" -lt "$_n" ]; do
 		# shellcheck disable=SC2086
