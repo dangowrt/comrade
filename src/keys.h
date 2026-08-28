@@ -24,6 +24,21 @@ int msg_seal(uint8_t *dst, size_t dst_len, const uint8_t key[32],
 	     const uint8_t *plain, size_t plain_len);
 int msg_open(uint8_t *dst, size_t dst_len, const uint8_t key[32],
 	     const uint8_t *sealed, size_t sealed_len);
+
+/*
+ * The same, with a header the sender wants bound to the ciphertext without
+ * hiding it: the AEAD covers `ad` even though it stays in the clear, so a
+ * frame relabelled in transit no longer opens. Used where framing outside the
+ * seal decides what the plaintext means -- the multicast slot a value belongs
+ * to, for one, which decides whether a description is read as an offer or an
+ * answer.
+ */
+int msg_seal_ad(uint8_t *dst, size_t dst_len, const uint8_t key[32],
+		const uint8_t *ad, size_t ad_len,
+		const uint8_t *plain, size_t plain_len);
+int msg_open_ad(uint8_t *dst, size_t dst_len, const uint8_t key[32],
+		const uint8_t *ad, size_t ad_len,
+		const uint8_t *sealed, size_t sealed_len);
 int random_bytes(void *buf, size_t len);
 
 #endif

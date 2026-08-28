@@ -98,21 +98,29 @@ void keys_derive_ro_auth(uint8_t ro[TOKEN_AUTH_LEN],
 	memcpy(ro, full, TOKEN_AUTH_LEN);
 }
 
-int msg_seal(uint8_t *dst, size_t dst_len, const uint8_t key[32],
-	     const uint8_t *plain, size_t plain_len)
+int msg_seal_ad(uint8_t *dst, size_t dst_len, const uint8_t key[32],
+		const uint8_t *ad, size_t ad_len,
+		const uint8_t *plain, size_t plain_len)
 {
 	if (dst_len < plain_len + SEAL_OVERHEAD)
 		return -1;
 	if (random_bytes(dst, 24))
 		return -1;
-	if (cc_aead_lock(dst + 40, dst + 24, key, dst, NULL, 0,
+	if (cc_aead_lock(dst + 40, dst + 24, key, dst, ad, ad_len,
 			 plain, plain_len))
 		return -1;
 	return (int)(plain_len + SEAL_OVERHEAD);
 }
 
-int msg_open(uint8_t *dst, size_t dst_len, const uint8_t key[32],
-	     const uint8_t *sealed, size_t sealed_len)
+int msg_seal(uint8_t *dst, size_t dst_len, const uint8_t key[32],
+	     const uint8_t *plain, size_t plain_len)
+{
+	return msg_seal_ad(dst, dst_len, key, NULL, 0, plain, plain_len);
+}
+
+int msg_open_ad(uint8_t *dst, size_t dst_len, const uint8_t key[32],
+		const uint8_t *ad, size_t ad_len,
+		const uint8_t *sealed, size_t sealed_len)
 {
 	size_t plain_len;
 
@@ -121,8 +129,14 @@ int msg_open(uint8_t *dst, size_t dst_len, const uint8_t key[32],
 	plain_len = sealed_len - SEAL_OVERHEAD;
 	if (dst_len < plain_len)
 		return -1;
-	if (cc_aead_unlock(dst, sealed + 24, key, sealed, NULL, 0,
+	if (cc_aead_unlock(dst, sealed + 24, key, sealed, ad, ad_len,
 			   sealed + 40, plain_len))
 		return -1;
 	return (int)plain_len;
+}
+
+int msg_open(uint8_t *dst, size_t dst_len, const uint8_t key[32],
+	     const uint8_t *sealed, size_t sealed_len)
+{
+	return msg_open_ad(dst, dst_len, key, NULL, 0, sealed, sealed_len);
 }

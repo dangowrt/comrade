@@ -265,6 +265,7 @@ int sig_post(struct sig *s, const uint8_t *data, size_t len)
 	uint8_t packed[SIG_MAX_VALUE];
 	uint8_t sealed[SIG_SEALED_MAX];
 	uint8_t mc[2 + SIG_MAX_VALUE];
+	char ms[2];
 	int plen, slen;
 
 	/* Pack for the DHT slot: global and shared-private (nested-NAT) reachable
@@ -292,8 +293,17 @@ int sig_post(struct sig *s, const uint8_t *data, size_t len)
 	mc[0] = (uint8_t)(s->direct_port >> 8);
 	mc[1] = (uint8_t)s->direct_port;
 	memcpy(mc + 2, packed, (size_t)plen);
-	slen = msg_seal(s->mcast_mine, sizeof(s->mcast_mine), s->keys.sig_key,
-			mc, (size_t)plen + 2);
+	/*
+	 * Bound to the slot letter it goes out under. That letter frames the
+	 * value on the wire, outside the seal, and it is what says whether a
+	 * description is an offer or an answer -- so without binding it, a
+	 * frame captured from one slot opens in the other, and a client can be
+	 * handed its own description as the peer's.
+	 */
+	ms[0] = my_slot(s);
+	ms[1] = '\0';
+	slen = msg_seal_ad(s->mcast_mine, sizeof(s->mcast_mine), s->keys.sig_key,
+			   (const uint8_t *)ms, 1, mc, (size_t)plen + 2);
 	if (slen > 0)
 		s->mcast_mine_len = (size_t)slen;
 
@@ -759,7 +769,13 @@ static void deliver_peer_mcast(struct sig *s, const uint8_t *sealed, size_t len,
 	uint8_t plain[2 + SIG_MAX_VALUE];
 	char sdp[SIG_SDP_MAX];
 	struct sockaddr_storage ep;
-	int n = msg_open(plain, sizeof(plain), s->keys.sig_key, sealed, len);
+	char ps[2];
+	int n;
+
+	ps[0] = peer_slot(s);
+	ps[1] = '\0';
+	n = msg_open_ad(plain, sizeof(plain), s->keys.sig_key,
+			(const uint8_t *)ps, 1, sealed, len);
 	int slen;
 	uint16_t dport;
 
