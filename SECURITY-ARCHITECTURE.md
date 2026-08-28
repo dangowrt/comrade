@@ -143,14 +143,35 @@ and that counter (`src/dataauth.c`), keyed to the connection like the probes,
 with the counter judged once by a replay window. KCP is given 24 bytes less of
 the budget, so nothing grew on the wire.
 
-**What remains.** The KCP header is still readable: an observer on the path
-sees segment sizes and sequence numbers. Sealing the datagram instead would
-hide them, at 40 bytes a datagram rather than 24. On x86 with OpenSSL the two
-constructions are within a tenth of each other in cost, so overhead is what
-decides it; on a scalar target -- the OpenWrt case, which is the one that
-matters for cost -- the measurement has not been taken, and both live behind
-one interface so the choice can be revisited there. The gain is small either
-way: packet sizes and timing are on the wire regardless.
+**What remains, and the measurement says the choice was wrong.** The KCP header
+is still readable: an observer on the path sees segment sizes and sequence
+numbers. The reason for a MAC rather than a seal was that it should be cheaper
+on a slow target. It is not. Measured on an MT7621 (MIPS 1004Kc, 880 MHz,
+monocypher), per 1200-byte datagram:
+
+| | ns/datagram | throughput |
+|---|---|---|
+| XChaCha20-Poly1305 seal | 84,285 | 14.2 MB/s |
+| XChaCha20-Poly1305 open | 84,612 | 14.2 MB/s |
+| keyed BLAKE2b (what is shipped) | 121,931 | 9.8 MB/s |
+
+The MAC is 45% slower than the seal on the target it was chosen for. BLAKE2b
+works in 64-bit words, which a 32-bit MIPS core emulates in register pairs,
+while ChaCha20 is 32-bit-native. On x86 with OpenSSL the seal is also slightly
+ahead (1441 ns against 1545). So the seal is faster on both backends measured,
+and would hide the KCP header as well.
+
+What stops it being a straight swap is the demux: a stream datagram is told
+from a probe by the conversation id in its first four bytes, and sealing the
+datagram puts ciphertext there. The shape that keeps both is a cleartext
+framing prefix -- `[conv 4][counter 8][sealed datagram + tag 16]`, 28 bytes
+against today's 24 -- with the nonce built from the counter. That needs the
+counter never to repeat under one key: true under a connection key, which is
+unique to a pair, but not automatically true under the invitation's key, which
+every connection of a session shares before it binds. Getting that wrong is
+silent and total, so it wants deciding rather than assuming. Both constructions
+live behind `dataauth.{c,h}`, so the swap is contained once the nonce rule is
+settled.
 
 ## 4. An outage is indistinguishable from an adversary
 
