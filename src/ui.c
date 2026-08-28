@@ -60,9 +60,21 @@ struct peerrow {
 	int state;			/* SESSION_PEER_* -- how far it got */
 	int link;			/* enum conn_state -- how it is now */
 	int rtt_ms;
+	int rtt_known;			/* 0ms is then under a millisecond */
 	int read_only;
 	char addr[80];
 };
+
+/* A link is timed in whole milliseconds, which is all one that answers in
+ * under one needs; say that rather than printing a bare zero. */
+static const char *rtt_text(int ms, char *out, size_t n)
+{
+	if (ms <= 0)
+		snprintf(out, n, "<1ms");
+	else
+		snprintf(out, n, "%dms", ms);
+	return out;
+}
 
 /* What the host foreground shows: the dashboard, or one token full-screen
  * as a QR code. Q cycles, ESC returns. */
@@ -635,11 +647,12 @@ static void draw(struct ui *u)
 			line(DIM "  none yet -- you can enter and wait" RST);
 		for (i = 0; i < u->npeer; i++) {
 			struct peerrow *p = &u->peer[i];
-			char rtt[24];
+			char rtt[24], buf[16];
 
 			rtt[0] = '\0';
-			if (p->link == CONN_LIVE && p->rtt_ms > 0)
-				snprintf(rtt, sizeof(rtt), "  %dms", p->rtt_ms);
+			if (p->link == CONN_LIVE && p->rtt_known)
+				snprintf(rtt, sizeof(rtt), "  %s",
+					 rtt_text(p->rtt_ms, buf, sizeof(buf)));
 			line("  " BGR "#%d" RST " %s  " CYN "%s" RST DIM "%s" RST
 			     "%s", i + 1, link_word(p), p->addr[0] &&
 			     p->addr[0] != '-' ? p->addr : "", rtt,
@@ -878,10 +891,12 @@ static void um_peer_link(struct ui *u, int id, int state, int rtt_ms)
 	for (i = 0; i < u->npeer; i++) {
 		if (u->peer[i].id != id)
 			continue;
-		if (u->peer[i].link == state && u->peer[i].rtt_ms == rtt_ms)
+		if (u->peer[i].link == state && u->peer[i].rtt_ms == rtt_ms &&
+		    u->peer[i].rtt_known)
 			return;
 		u->peer[i].link = state;
 		u->peer[i].rtt_ms = rtt_ms;
+		u->peer[i].rtt_known = 1;
 		if (u->anim)
 			u->dirty = 1;
 		else

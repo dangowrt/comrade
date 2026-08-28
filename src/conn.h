@@ -44,6 +44,8 @@ struct conn_status {
 	char rdv[80];			/* IPv4 rendezvous node, "" if none */
 	char rdv6[80];			/* IPv6 rendezvous node, "" if none */
 	int rtt_ms;			/* smoothed RTT, 0 if unknown */
+	int rtt_known;			/* and it was measured: 0ms means under
+					 * a millisecond, not unknown */
 	int since_s;			/* seconds in the current state (loss age) */
 	/* How long since the session itself last answered -- the heartbeat
 	 * pong, which is end to end through SSH -- or -1 before the first one.

@@ -23,10 +23,11 @@ int conn_write(const char *path, const struct conn_status *st)
 	 * newer one reading an older line leaves the rest zero, so the host's
 	 * service and a differently-versioned operator process still read each
 	 * other. */
-	fprintf(f, "%d\t%s\t%s\t%d\t%d\t%s\t%d\t%s\t%d\n", st->state,
+	fprintf(f, "%d\t%s\t%s\t%d\t%d\t%s\t%d\t%s\t%d\t%d\n", st->state,
 		st->peer[0] ? st->peer : "-", st->rdv[0] ? st->rdv : "-",
 		st->rtt_ms, st->since_s, st->rdv6[0] ? st->rdv6 : "-",
-		st->read_only, st->alt[0] ? st->alt : "-", st->warm_alt);
+		st->read_only, st->alt[0] ? st->alt : "-", st->warm_alt,
+		st->rtt_known);
 	fclose(f);
 	if (os_rename_replace(tmp, path)) {
 		remove(tmp);
@@ -39,7 +40,7 @@ int conn_read(const char *path, struct conn_status *st)
 {
 	FILE *f = fopen(path, "r");
 	char line[600], *nl, *tok;
-	int i = 0;
+	int i = 0, seen_known = 0;
 
 	if (!f)
 		return -1;
@@ -85,9 +86,18 @@ int conn_read(const char *path, struct conn_status *st)
 		case 8:
 			st->warm_alt = atoi(tok);
 			break;
+		case 9:
+			st->rtt_known = atoi(tok);
+			seen_known = 1;
+			break;
 		default:
 			break;
 		}
 	}
+	/* An older writer's line stops before the field. There, a round trip
+	 * was only ever reported when it was above zero, so that is what it
+	 * meant. */
+	if (!seen_known)
+		st->rtt_known = st->rtt_ms > 0;
 	return 0;
 }

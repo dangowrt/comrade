@@ -739,6 +739,7 @@ struct path_pick {
 	int kind;			/* -1 when no path can carry one */
 	int blackholed;			/* the test hook has taken this one away */
 	int qualified;			/* something has actually answered on it */
+	int srtt_ms;			/* its round trip, as the probes see it */
 	struct sockaddr_in6 remote;
 	struct nat_agent *agent;
 	char label[PATH_LABEL_MAX];
@@ -814,6 +815,7 @@ static int conn_pick(struct conn *c, struct path_pick *out)
 		out->remote = p->remote;
 		out->agent = p->agent;
 		out->qualified = p->qualified;
+		out->srtt_ms = path_srtt_ms(p);
 		out->blackholed = path_blackholed(c, out->kind, &p->remote);
 		snprintf(out->label, sizeof(out->label), "%s", p->label);
 		if (sel != prev) {
@@ -840,6 +842,41 @@ static void conn_path_label(struct conn *c, char *out, size_t n)
 	out[0] = '\0';
 	if (!conn_pick(c, &pick) && pick.qualified)
 		snprintf(out, n, "%s", pick.label);
+}
+
+/*
+ * The round trip to show for this connection, and whether there is one to
+ * show. It is the carrying path's, as its probes measured it on the wire, so
+ * it is the figure ping would give; 0 there means under a millisecond rather
+ * than unknown, the probes being timed in whole ones.
+ *
+ * The heartbeat's own figure stands in until a path has been probed, and only
+ * then. That one crosses the control stream through KCP, which flushes on its
+ * own interval at each end, so it reads tens of milliseconds on a link that
+ * answers in under one -- fine for deciding a link has gone quiet, which is
+ * what it is for, and misleading as a link's round trip.
+ *
+ * Reads the selection rather than running it, so any thread may ask.
+ */
+static int conn_rtt_ms(struct conn *c, int *out)
+{
+	int sel, known = 0;
+
+	pthread_mutex_lock(&c->path_lock);
+	sel = c->paths.sel;
+	if (sel >= 0 && c->paths.p[sel].qualified) {
+		*out = path_srtt_ms(&c->paths.p[sel]);
+		known = 1;
+	}
+	pthread_mutex_unlock(&c->path_lock);
+	if (known)
+		return 1;
+	pthread_mutex_lock(&c->hb_lock);
+	*out = c->hb_rtt;
+	pthread_mutex_unlock(&c->hb_lock);
+	if (!*out && c->stream)
+		*out = stream_rtt(c->stream);
+	return *out > 0;
 }
 
 /*
@@ -1093,11 +1130,17 @@ static void publish_status(struct conn *c, int state)
 	 * other once the in-band rendezvous exchange propagates it. */
 	fmt_rdv_fam(s, 4, cs.rdv, sizeof(cs.rdv));
 	fmt_rdv_fam(s, 6, cs.rdv6, sizeof(cs.rdv6));
-	/* Prefer the heartbeat's round trip (measured even when idle); the stream
-	 * RTT only moves when SSH data flows. Report how long a loss has lasted. */
+	/*
+	 * The round trip is the path's, measured by the probes on the wire, so
+	 * it is the same figure ping would give. The heartbeat's is not: it
+	 * rides the control stream through KCP, which flushes on its own
+	 * interval at each end and adds tens of milliseconds to a link that
+	 * answers in one. It stands in only while no path has been probed yet,
+	 * where a figure that is too high beats none at all. Report how long a
+	 * loss has lasted.
+	 */
+	cs.rtt_known = conn_rtt_ms(c, &cs.rtt_ms);
 	pthread_mutex_lock(&c->hb_lock);
-	cs.rtt_ms = c->hb_rtt > 0 ? c->hb_rtt :
-		(c->stream ? stream_rtt(c->stream) : 0);
 	if (state == CONN_LOST && c->lost_since_ms)
 		cs.since_s = (int)((now_ms() - c->lost_since_ms) / 1000);
 	cs.silent_s = c->hb_pong_seen ?
@@ -4599,9 +4642,8 @@ static void report_peer_links(struct sess *s, struct worker *ws)
 		if (!c)
 			continue;
 		st = conn_link_state(s, c);
-		pthread_mutex_lock(&c->hb_lock);
-		rtt = c->hb_rtt;
-		pthread_mutex_unlock(&c->hb_lock);
+		rtt = 0;
+		conn_rtt_ms(c, &rtt);
 		if (c->link_told_any && c->link_told == st &&
 		    c->rtt_told == rtt)
 			continue;

@@ -78,9 +78,17 @@ void statusbar_render(int rows, int cols, const struct conn_status *st)
 	if (p > 0 && p < (int)sizeof(text) && st->rdv6[0])
 		p += snprintf(text + p, sizeof(text) - p, "  rdv6 %s", st->rdv6);
 	if (p > 0 && p < (int)sizeof(text) && st->state == CONN_LIVE &&
-	    st->rtt_ms > 0)
-		p += snprintf(text + p, sizeof(text) - p, "  rtt %dms",
-			      st->rtt_ms);
+	    st->rtt_known) {
+		char ms[16];
+
+		/* Timed in whole milliseconds, so a link that answers in under
+		 * one says so rather than reading zero. */
+		if (st->rtt_ms > 0)
+			snprintf(ms, sizeof(ms), "%dms", st->rtt_ms);
+		else
+			snprintf(ms, sizeof(ms), "<1ms");
+		p += snprintf(text + p, sizeof(text) - p, "  rtt %s", ms);
+	}
 	if (p > 0 && p < (int)sizeof(text) && st->state == CONN_LOST)
 		p += snprintf(text + p, sizeof(text) - p,
 			      "  [ESC or ^C to quit]");
