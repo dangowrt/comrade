@@ -1,10 +1,12 @@
 # What the raw-path review found that a patch cannot fix
 
 Two adversarial reviews of the probe parser, path selection and the transport
-under them (2026-08-28) turned up eleven defects with contained fixes, which
-are the commits on this branch, and four findings that are properties of the
-design rather than bugs in it. Those four are written up here, with options
-and their costs, and none of them is implemented.
+under them (2026-08-28) turned up sixteen defects with contained fixes, which
+are the code commits on this branch, and four findings that reach into the
+design rather than sitting in one place in it. Three are written up here with
+options and their costs, and none of those three is implemented. The fourth,
+section 4, held one contained defect inside a general truth about networks;
+that defect is fixed, and the truth is stated.
 
 The threat models were: a holder of the invitation who is not the peer --
 including someone handed a view-only link -- and the ISP or hoster, who sees
@@ -109,42 +111,32 @@ have not chosen to block. SSH over TCP is no better off -- a blackholed
 connection is equally indistinguishable from a dead network -- and comrade,
 holding several paths, can at least tell one dead path from a dead network.
 
-One part of it is a defect, and it is not a small patch. `hb_lost_ms()` is
-`HB_SILENT_TRIES * HB_INTERVAL_MS + rtt`, so 2.1 to 3.1 s of silence sets
-`lost_since_ms`; `RESUME_AFTER_MS` adds 3 s; then `resume_tick` case 0
-(src/session.c) destroys the ICE agent outright and re-punches. Around 6 s of
-total inbound drop therefore costs a working agent and its NAT bindings, and
-an adversary dropping for 6 s at intervals keeps comrade re-punching, re-running
-STUN and the DHT claim each time -- paying cost and emitting fingerprint on
-demand.
+One part of it was a defect, and is fixed rather than proposed. `hb_lost_ms()`
+is `HB_SILENT_TRIES * HB_INTERVAL_MS + rtt`, so 2.1 to 3.1 s of silence sets
+`lost_since_ms`, and `RESUME_AFTER_MS` added 3 s before `resume_tick` case 0
+destroyed the ICE agent and re-punched. Around 6 s of total inbound drop
+therefore cost a working agent and its bindings, and an adversary dropping for
+6 s at intervals could ask for a re-punch each time, re-running STUN and the
+DHT claim on demand.
 
-**Options, and why neither is a one-liner.**
+The replaced agent is now set aside instead: it keeps its path and is probed
+like any other, so the ranking decides whether it still carries, and if it does
+it takes the current role back while the punch built in its place is let go.
+One is held at a time, for `RESUME_ATTEMPT_MS`. Holding two agents required the
+receive side to stop crediting a datagram to whichever agent is current --
+libjuice reports no source, so the receiving agent is the only thing that says
+which path a frame arrived on -- which is threaded from the transport callback
+to the path lookup.
 
-*Park the agent instead of destroying it.* Build the replacement while the old
-agent stays alive and receiving, and adopt whichever proves out; a drop that
-ends inside the window then costs nothing. libjuice has no ICE restart and
-`conn_fresh_pwd` mints new credentials, so the replacement must be a new agent
-either way -- parking does not fight that. What it does fight is the receive
-path: `conn_recv_path` (src/session.c:1969) resolves an ICE datagram to
-`path_table_find_agent(&c->paths, c->nat)`, i.e. to whatever agent is current,
-not to the one that received it. With two agents alive the parked agent's
-traffic would credit the new agent's path, which is the same
-liveness-on-the-wrong-path defect this branch closed elsewhere. Parking is
-therefore gated on giving the receive callback an agent identity and keying
-the ICE path on it.
-
-*Back off repeated teardowns.* Cheaper to write, but it collides with a stated
-contract: `HOST_REAP_MS` is defined as `RESUME_AFTER_MS + RESUME_ATTEMPT_MS +
-RESUME_ATTEMPT_MS / 2` precisely so a worker outlives the claimant's second
-attempt. Raising the claimant's delay to *N* requires raising the reap to
-*N* + 15 s, so a vanished client holds its worker, tmux client and dashboard
-row that much longer. The security gain is paid for in reaping latency, which
-is a product call rather than a security one.
-
-Of the two, parking is the one worth doing: it removes the reward without
-changing any timing contract. It is listed here rather than fixed because the
-receive-attribution rework it needs is exactly the code this branch has just
-been hardening, and landing both at once would make neither reviewable.
+What is *not* covered: no test stages an outage that also blocks the
+replacement punch, so the parked agent is never the one that recovers in the
+suite. `tests/resume.sh` blackholes application data but not ICE, so its
+re-punch completes inside the staged outage and parking correctly stands
+aside; `--stuck` wedges the *first* punches, not a later one, so it cannot
+express "wedge the resume punch". Deciding coverage would need a hook that
+does, which is production test machinery nobody asked for. The two-agent
+attribution it rests on is unit-tested (`agent_paths_check`, tests/path_test.c)
+and both mutants of the rule are killed.
 
 ---
 
