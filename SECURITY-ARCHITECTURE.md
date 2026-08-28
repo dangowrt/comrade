@@ -102,10 +102,49 @@ Selective dropping is available to the ISP by definition, and the design
 responds to loss by moving, re-probing and eventually rejoining. On this
 branch the responses are no longer *triggerable* by spoofed traffic, but they
 are still driveable by dropping: silence a path and it is left, silence
-everything and the session rejoins. There is no fix for this and it is not a
-defect; it is worth stating in the threat model that comrade's availability
+everything and the session rejoins. For the general case there is no fix and
+no defect; it is worth stating in the threat model that comrade's availability
 against an on-path adversary is exactly the availability of some path they
-have not chosen to block.
+have not chosen to block. SSH over TCP is no better off -- a blackholed
+connection is equally indistinguishable from a dead network -- and comrade,
+holding several paths, can at least tell one dead path from a dead network.
+
+One part of it is a defect, and it is not a small patch. `hb_lost_ms()` is
+`HB_SILENT_TRIES * HB_INTERVAL_MS + rtt`, so 2.1 to 3.1 s of silence sets
+`lost_since_ms`; `RESUME_AFTER_MS` adds 3 s; then `resume_tick` case 0
+(src/session.c) destroys the ICE agent outright and re-punches. Around 6 s of
+total inbound drop therefore costs a working agent and its NAT bindings, and
+an adversary dropping for 6 s at intervals keeps comrade re-punching, re-running
+STUN and the DHT claim each time -- paying cost and emitting fingerprint on
+demand.
+
+**Options, and why neither is a one-liner.**
+
+*Park the agent instead of destroying it.* Build the replacement while the old
+agent stays alive and receiving, and adopt whichever proves out; a drop that
+ends inside the window then costs nothing. libjuice has no ICE restart and
+`conn_fresh_pwd` mints new credentials, so the replacement must be a new agent
+either way -- parking does not fight that. What it does fight is the receive
+path: `conn_recv_path` (src/session.c:1969) resolves an ICE datagram to
+`path_table_find_agent(&c->paths, c->nat)`, i.e. to whatever agent is current,
+not to the one that received it. With two agents alive the parked agent's
+traffic would credit the new agent's path, which is the same
+liveness-on-the-wrong-path defect this branch closed elsewhere. Parking is
+therefore gated on giving the receive callback an agent identity and keying
+the ICE path on it.
+
+*Back off repeated teardowns.* Cheaper to write, but it collides with a stated
+contract: `HOST_REAP_MS` is defined as `RESUME_AFTER_MS + RESUME_ATTEMPT_MS +
+RESUME_ATTEMPT_MS / 2` precisely so a worker outlives the claimant's second
+attempt. Raising the claimant's delay to *N* requires raising the reap to
+*N* + 15 s, so a vanished client holds its worker, tmux client and dashboard
+row that much longer. The security gain is paid for in reaping latency, which
+is a product call rather than a security one.
+
+Of the two, parking is the one worth doing: it removes the reward without
+changing any timing contract. It is listed here rather than fixed because the
+receive-attribution rework it needs is exactly the code this branch has just
+been hardening, and landing both at once would make neither reviewable.
 
 ---
 
