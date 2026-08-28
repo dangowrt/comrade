@@ -85,12 +85,39 @@ read-only to read-only, read-only to read-write, and read-write to read-write.
 
 It needs no token change, no second mailbox, no second rendezvous plane and no
 key distribution: the one key that has to travel is already travelling, in a
-slot everyone is entitled to read. The costs are a 32-byte public key in the
-offer, an ephemeral public key and tag on each answer in place of its nonce and
-tag, and an X25519 primitive in `ccrypto.h`, which currently exposes BLAKE2b,
-the AEAD and Ed25519 but no key agreement -- so three backend implementations.
-The same treatment is wanted for the multicast announcement, which carries the
-same candidates to everyone on the segment.
+slot everyone is entitled to read.
+
+*Both layers, not one.* Sealing to a public key gives confidentiality and not
+sender authentication -- anyone can encrypt to a public key. The outer seal
+under the invitation's key is what says a token holder wrote a slot at all, and
+it is what the mailbox's parse and compare-and-swap are built on. So the shape
+is an inner box to the host's key inside the outer seal that is already there:
+every property today survives, and one is added. It goes in at a single point,
+between `candpack_encode` and `msg_seal` in `sig_post`, and its mirror on the
+host's read.
+
+*Room.* The plaintext cap is `SIG_MAX_VALUE` 440 and a sealed slot is that plus
+`SEAL_OVERHEAD`, so two of them are 960 in a BEP 44 value of about a thousand:
+roughly 40 bytes of slack against the 48 an inner box costs (32-byte ephemeral
+public key, 16-byte tag). Real slots are nowhere near the cap, since candpack
+reduces a description to a handful of bytes per candidate, so the fix is to
+lower the answer slot's own cap by the overhead rather than to find space.
+
+*Freshness.* If the host mints the keypair per offer rotation and keeps the
+private half only while claims may arrive under that offer, a recorded claim
+stays unreadable to anyone who obtains the invitation later.
+
+The costs are a 32-byte public key in the offer, 48 bytes on each answer, and
+an X25519 primitive in `ccrypto.h`, which currently exposes BLAKE2b, the AEAD
+and Ed25519 but no key agreement -- so three backend implementations. The same
+treatment is wanted for the multicast announcement, which carries the same
+candidates to everyone on the segment.
+
+*A second thing it buys.* The per-connection key binds only once the SSH
+handshake completes, so until then a guest can still aim probes at another
+guest's punch. What it aimed with came out of the mailbox. Sealing the claim
+takes the endpoints away, so the interference loses its targeting even though
+the raw path in that window is unchanged.
 
 **What it does not fix.** Occupancy is inherent to a mutex: any guest can still
 see that the slot is taken, and can still take it. A view-only guest starving
