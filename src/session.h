@@ -12,6 +12,7 @@
 #include "token.h"
 
 struct fwdspec;
+struct spawner;
 
 /*
  * One comrade session: rendezvous over sig (DHT and/or multicast), punch a path
@@ -199,6 +200,12 @@ struct session_cfg {
 	const char *ssh_command;	/* command to serve; NULL => tmux default */
 	const char *ssh_command_ro;	/* command for a read-only client; NULL => none */
 	int use_pty;			/* allocate a pty (interactive/tmux) */
+	/*
+	 * Optional tmux spawner (see spawner.h): when set, the host serves each
+	 * client's shell through it instead of execing tmux from this sandboxed
+	 * process. NULL keeps the direct path. Set by the host only.
+	 */
+	struct spawner *spawner;
 	/*
 	 * Optional end-of-session fd, polled while a client is attached. It
 	 * becoming readable (EOF from a liveness monitor that exits with the

@@ -5,6 +5,8 @@
 
 #ifndef _WIN32
 
+#include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,6 +22,7 @@
 #include <sys/wait.h>
 
 #include "dbg.h"
+#include "spawner.h"
 
 /*
  * The POSIX half: exactly the forkpty()/fork()+pipe() this used to be inside
@@ -34,6 +37,9 @@ struct cpty {
 	int pty;			/* in == out == the pty master */
 	int reaped;			/* cpty_exited took its status */
 	int status;
+	struct spawner *sp;		/* non-NULL: child lives in the spawner */
+	int handle;			/* the spawner's handle for it */
+	int exit_fd;			/* readable (1 byte) when it exits */
 };
 
 struct cpty *cpty_spawn(const char *command, int use_pty, int rows, int cols,
@@ -123,6 +129,39 @@ struct cpty *cpty_spawn(const char *command, int use_pty, int rows, int cols,
 	}
 }
 
+struct cpty *cpty_spawn_sp(struct spawner *sp, int ro, int use_pty, int rows,
+			   int cols, const char *term)
+{
+	struct cpty *p;
+	sock_t in = INVALID_SOCK, out = INVALID_SOCK, ex = INVALID_SOCK;
+	int h = -1, fl;
+
+	if (!sp)
+		return NULL;
+	p = calloc(1, sizeof(*p));
+	if (!p)
+		return NULL;
+	p->in = p->out = p->exit_fd = -1;
+	dbg_logf("cpty spawn_sp: ro=%d use_pty=%d size=%dx%d TERM=[%s]", ro,
+		 use_pty, rows, cols, term ? term : "");
+	if (spawner_spawn(sp, ro, use_pty, rows, cols, term, &in, &out, &ex,
+			  &h) != 0) {
+		free(p);
+		return NULL;
+	}
+	/* cpty_exited polls the exit fd without blocking. */
+	fl = fcntl(ex, F_GETFL);
+	if (fl >= 0)
+		fcntl(ex, F_SETFL, fl | O_NONBLOCK);
+	p->sp = sp;
+	p->handle = h;
+	p->in = in;
+	p->out = out;
+	p->exit_fd = ex;
+	p->pty = use_pty ? 1 : 0;
+	return p;
+}
+
 sock_t cpty_in(const struct cpty *p)
 {
 	return p ? p->in : INVALID_SOCK;
@@ -149,9 +188,29 @@ int cpty_exited(struct cpty *p)
 {
 	int status = 0;
 
-	if (!p || p->pid <= 0)
+	if (!p)
 		return 1;
 	if (p->reaped)
+		return 1;
+	if (p->sp) {
+		unsigned char b;
+		ssize_t r;
+
+		if (p->exit_fd < 0)
+			return 1;
+		r = read(p->exit_fd, &b, 1);
+		if (r == 1) {
+			p->reaped = 1;
+			p->status = b;
+			return 1;
+		}
+		if (r == 0) {			/* closed without a byte */
+			p->reaped = 1;
+			return 1;
+		}
+		return 0;			/* EAGAIN: still running */
+	}
+	if (p->pid <= 0)
 		return 1;
 	if (waitpid(p->pid, &status, WNOHANG) != p->pid)
 		return 0;
@@ -166,6 +225,38 @@ int cpty_close(struct cpty *p)
 
 	if (!p)
 		return 0;
+	if (p->sp) {
+		/* Ask the spawner to stop it, then block for its exit byte
+		 * (bounded by the spawner's hang-up-then-kill grace). */
+		if (p->reaped) {
+			status = p->status;
+		} else {
+			unsigned char b;
+			ssize_t r;
+			int fl;
+
+			spawner_close(p->sp, p->handle);
+			if (p->exit_fd >= 0) {
+				fl = fcntl(p->exit_fd, F_GETFL);
+				if (fl >= 0)
+					fcntl(p->exit_fd, F_SETFL,
+					      fl & ~O_NONBLOCK);
+				do {
+					r = read(p->exit_fd, &b, 1);
+				} while (r < 0 && errno == EINTR);
+				if (r == 1)
+					status = b;
+			}
+		}
+		if (p->in >= 0)
+			close(p->in);
+		if (p->out >= 0 && p->out != p->in)
+			close(p->out);
+		if (p->exit_fd >= 0)
+			close(p->exit_fd);
+		free(p);
+		return status;
+	}
 	if (p->in >= 0)
 		close(p->in);
 	if (p->out >= 0 && p->out != p->in)

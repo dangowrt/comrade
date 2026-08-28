@@ -243,9 +243,19 @@ static int spawn_shell(struct pump_ctx *c)
 {
 	const char *cmd = (c->read_only && c->o->command_ro) ?
 			  c->o->command_ro : c->o->command;
+	int use_pty = c->o->use_pty || c->want_pty;
 
-	c->child = cpty_spawn(cmd, c->o->use_pty || c->want_pty, c->rows,
-			      c->cols, c->term);
+	/*
+	 * With a spawner the sandboxed service does not exec: the tmux attach is
+	 * run in the spawner, which selects read-only itself from the flag (the
+	 * command it runs is pinned, not passed). Without one, the shell is
+	 * spawned here as before.
+	 */
+	if (c->o->spawner)
+		c->child = cpty_spawn_sp(c->o->spawner, c->read_only, use_pty,
+					 c->rows, c->cols, c->term);
+	else
+		c->child = cpty_spawn(cmd, use_pty, c->rows, c->cols, c->term);
 	if (!c->child) {
 		dbg_logf("sshd: cpty_spawn failed");
 		return -1;

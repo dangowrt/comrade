@@ -18,6 +18,8 @@
  * token's 16-byte auth secret, offered as an SSH password.
  */
 
+struct spawner;
+
 struct sshd_opts {
 	void *hostkey;			/* ssh_key (private), from sshd_hostkey_new */
 	uint8_t auth[TOKEN_AUTH_LEN];	/* session password material */
@@ -91,6 +93,13 @@ struct sshd_opts {
 	 * worker read-only in the view. Read from another thread, so volatile.
 	 */
 	volatile int *ro_out;
+	/*
+	 * Optional tmux spawner (see spawner.h). When set, the shell is spawned
+	 * through it rather than by this -- sandboxed -- process execing tmux
+	 * directly, so the service can deny its own exec. NULL keeps the direct
+	 * path. Windows never sets it.
+	 */
+	struct spawner *spawner;
 };
 
 /*

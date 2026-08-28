@@ -3452,6 +3452,7 @@ static void *ssh_srv_thread(void *p)
 	o.command = s->cfg->ssh_command;	/* NULL => tmux default */
 	o.command_ro = s->cfg->ssh_command_ro;
 	o.use_pty = s->cfg->use_pty;
+	o.spawner = s->cfg->spawner;
 	o.end_fd = s->cfg->ssh_end_fd;
 	o.ctl_fd = c->ssh_ctl_fd;
 	o.no_fwd = s->cfg->no_fwd;

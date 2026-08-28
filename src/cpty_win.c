@@ -311,6 +311,21 @@ struct cpty *cpty_spawn(const char *command, int use_pty, int rows, int cols,
 	return p;
 }
 
+/* The Windows connection service is not sandboxed against exec, so it never
+ * has a spawner and drives tmux directly; this is here only so the shared
+ * cpty.h has one implementation on every platform. */
+struct cpty *cpty_spawn_sp(struct spawner *sp, int ro, int use_pty, int rows,
+			   int cols, const char *term)
+{
+	(void)sp;
+	(void)ro;
+	(void)use_pty;
+	(void)rows;
+	(void)cols;
+	(void)term;
+	return NULL;
+}
+
 sock_t cpty_in(const struct cpty *p)
 {
 	return p ? p->app_in : INVALID_SOCK;

@@ -32,6 +32,7 @@
  */
 
 struct cpty;
+struct spawner;
 
 /*
  * Run `command` on a terminal `rows` x `cols` (0 for a default), with TERM set
@@ -46,6 +47,19 @@ struct cpty;
  */
 struct cpty *cpty_spawn(const char *command, int use_pty, int rows, int cols,
 			const char *term);
+
+/*
+ * The same terminal, but spawned by `sp` (see spawner.h) in a separate,
+ * unsandboxed process, so a sandboxed caller that may not exec still gets one.
+ * The command is not passed -- the spawner runs only the tmux attach it was
+ * created with -- so ro is all the caller says: 1 for the read-only attach.
+ * The returned handle behaves exactly like cpty_spawn's (same cpty_in/out,
+ * resize, exited, close), only its child lives in and is reaped through the
+ * spawner. Returns NULL if sp is NULL or the spawn failed. POSIX only; the
+ * Windows connection service is not sandboxed this way and uses cpty_spawn.
+ */
+struct cpty *cpty_spawn_sp(struct spawner *sp, int ro, int use_pty, int rows,
+			   int cols, const char *term);
 
 /* The end to write toward the child, and the end to read from it. On POSIX
  * with a pty these are the same descriptor. */
