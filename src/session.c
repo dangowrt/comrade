@@ -3722,8 +3722,16 @@ static void rdv_adopt(struct sess *s, struct conn *c)
 		if (netstate_anchor(&s->ns, famv[i], node, &nlen, NULL)) {
 			if (s->cfg->is_host)
 				continue;
-			if (nlen == in[i].len && !memcmp(node, &in[i].sa, nlen))
+			if (nlen == in[i].len &&
+			    !memcmp(node, &in[i].sa, nlen)) {
+				/* The same node by our own route. Nothing to
+				 * adopt, and the end state is what matters, so
+				 * say it rather than leave the two ways of
+				 * arriving at it looking different. */
+				dbg_logf("rdv: already holding the peer's v%d "
+					 "node %s", famv[i], b);
 				continue;
+			}
 		}
 		netstate_on_rdv_offered(&s->ns, famv[i],
 					(const uint8_t *)&in[i].sa,

@@ -101,11 +101,21 @@ COMRADE_DEBUG="$tmp/c2.dbg" "$E2E" client "$early" --hold-ms 90000 \
 c2=$!
 # Held until both have been told, not for a span assumed to be long enough:
 # being told is the whole assertion below, so it is also the thing to wait for.
+told_both() {
+	for _n in 1 2; do
+		grep -qF "rdv: adopted the peer's" "$tmp/c$_n.dbg" 2>/dev/null ||
+			grep -qF "rdv: already holding the peer's" \
+				"$tmp/c$_n.dbg" 2>/dev/null ||
+			return 1
+	done
+	# The reach reports are asserted below too, and a client killed the
+	# moment it is told may not have sent one yet: wait for everything the
+	# assertions want, not for the first of them to arrive.
+	[ "$(grep -c "reach: peer [0-9][0-9]* v4 " "$tmp/host.dbg")" -ge 2 ]
+}
 i=0
 while [ "$i" -lt 90 ]; do
-	grep -qF "rdv: adopted the peer's" "$tmp/c1.dbg" 2>/dev/null &&
-		grep -qF "rdv: adopted the peer's" "$tmp/c2.dbg" 2>/dev/null &&
-		break
+	told_both && break
 	kill -0 "$c1" 2>/dev/null || break
 	kill -0 "$c2" 2>/dev/null || break
 	sleep 1
@@ -124,8 +134,12 @@ for n in 1 2; do
 	}
 	# -F: a v6 endpoint is written [addr]:port, which as a pattern is a
 	# bracket expression matching one character.
-	grep -qF "rdv: adopted the peer's v$fam node $rdv" "$tmp/c$n.dbg" || {
-		echo "client $n was never told the host rendezvous at $rdv"
+	# Either route to the same end state: told and adopted it, or told and
+	# already holding it because its own search landed on the same node.
+	grep -qF "rdv: adopted the peer's v$fam node $rdv" "$tmp/c$n.dbg" ||
+	grep -qF "rdv: already holding the peer's v$fam node $rdv" \
+		"$tmp/c$n.dbg" || {
+		echo "client $n does not hold the host rendezvous at $rdv"
 		grep "rdv:" "$tmp/c$n.dbg" | tail -3
 		rc=1
 	}
