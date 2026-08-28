@@ -2876,8 +2876,19 @@ static int offer_moved_on(struct conn *c)
 		return 0;
 	if (!strcmp(s->cur_offer_ufrag, c->remote_ufrag))
 		return 0;
-	if (!c->claim_lost &&
-	    now_ms() - s->ice_attempt_start <= PATH_PROBE_MS)
+	/*
+	 * A claim that a rival queued over is re-entered sooner than one merely
+	 * unanswered, but not without a floor. The host mints a fresh offer
+	 * every time it picks a claimant up, so on a host with two joiners the
+	 * ufrag changes about once a second; with no floor at all the loser
+	 * throws its agent away on each of those and starts over, and an
+	 * attempt that is reset every second can never round-trip the one probe
+	 * that would settle it. The floor is the span the loss path already
+	 * judges a lost claim over, so the two agree on what "long enough"
+	 * means and path_probe_expired stays the thing that decides.
+	 */
+	if (now_ms() - s->ice_attempt_start <=
+	    (uint64_t)(c->claim_lost ? PATH_LOST_MS : PATH_PROBE_MS))
 		return 0;
 	/*
 	 * Only a client that has actually reached the answer slot is queued
