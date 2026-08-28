@@ -2438,6 +2438,14 @@ static void client_lan_recv(void *arg, const struct sockaddr *src,
 		return;
 	if (!probe_gate(c->sess, c, &ep, data, len))
 		return;
+	/*
+	 * A probe brings its own proof and may arrive from an address this
+	 * connection has never held -- that is how the peer's other address is
+	 * picked up. Stream data may not: it is accepted from an endpoint we
+	 * hold, or the socket is open to anyone who can reach the port.
+	 */
+	if (!path_probe_is(data, len) && !conn_holds_ep(c, &ep, 1))
+		return;
 	deliver_stream_from(c, data, len, PATH_SEGMENT, &mapped);
 }
 
@@ -2483,14 +2491,24 @@ static void on_direct_peer(void *arg, const struct sockaddr *peer, socklen_t len
 
 /*
  * Which connection of `tab` holds this endpoint? The whole endpoint first, so
- * two clients that happen to share a lanlink port are told apart, then the port
- * alone. Host main thread.
+ * two clients that happen to share a lanlink port are told apart.
+ *
+ * `by_port` then allows the port alone, which is how the same peer heard from
+ * a second address of its own is folded into the one connection rather than
+ * admitted twice. That is a claim about identity made by nothing but a source
+ * port, so it is offered only where the datagram carries its own proof: a
+ * sealed probe. Stream data is taken from an endpoint we hold outright or not
+ * at all, since a stranger may choose its source port as freely as anything
+ * else it puts in a datagram.
+ *
+ * Host main thread.
  */
-static struct conn *ep_owner(struct conn *const *tab, const struct path_ep *ep)
+static struct conn *ep_owner(struct conn *const *tab, const struct path_ep *ep,
+			     int by_port)
 {
 	int i, exact;
 
-	for (exact = 1; exact >= 0; exact--)
+	for (exact = 1; exact >= (by_port ? 0 : 1); exact--)
 		for (i = 0; i < HOST_MAX_WORKERS; i++)
 			if (tab[i] && conn_holds_ep(tab[i], ep, exact))
 				return tab[i];
@@ -2501,7 +2519,7 @@ static struct conn *ep_owner(struct conn *const *tab, const struct path_ep *ep)
  * served over the segment is not a fresh claimant. Host main thread. */
 static struct conn *lan_owner(struct sess *s, const struct path_ep *ep)
 {
-	return ep_owner(s->lan_conns, ep);
+	return ep_owner(s->lan_conns, ep, 1);
 }
 
 /* Is this endpoint already an active LAN worker? (host main thread only) */
@@ -2654,7 +2672,7 @@ static void host_lan_recv(void *arg, const struct sockaddr *src, socklen_t srcle
 	    path_ep_from_sockaddr(&ep, (struct sockaddr *)&mapped,
 				  sizeof(mapped)))
 		return;
-	c = ep_owner(s->conns, &ep);
+	c = ep_owner(s->conns, &ep, path_probe_is(data, len));
 	if (!probe_gate(s, c, &ep, data, len))
 		return;
 	if (c)
