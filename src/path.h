@@ -127,8 +127,12 @@ void path_ep_str(const struct path_ep *ep, char *out, size_t n);
  *
  * The seal is not defending against the peer, who holds the token and is
  * trusted by construction; it stops a stranger who can guess an endpoint from
- * forging a reply. The nonce must be unpredictable, being the only thing that
- * stops a forged PONG.
+ * forging a reply. What it does not establish is WHICH holder of the token
+ * sent a frame -- the key comes from the invitation and every guest has it,
+ * read-only ones included -- so the ufrag names the connection, the sequence
+ * refuses a repeat, and a pong is taken only from the endpoint its ping went
+ * to. The nonce must still be unpredictable: it is what stops a pong being
+ * guessed rather than replayed.
  *
  * seq counts this sender's frames on this connection, from one. The seal says
  * a frame was written by somebody holding the key; it never said when, so a
@@ -140,8 +144,11 @@ void path_ep_str(const struct path_ep *ep, char *out, size_t n);
  * winner of a turnstile round from the losers whose checks its agent answered
  * on the way past.
  *
- * The tail is present when the plaintext runs past 10 + ulen; a peer that omits
- * it merely shares no measurements, which costs accuracy and never correctness.
+ * The tail is present when the plaintext runs past the fixed head and ufrag; a
+ * peer that omits it merely shares no measurements. An absent tail costs
+ * accuracy and never correctness; a dishonest one is bounded rather than
+ * trusted (PATH_PEER_SRTT_MAX), since the cost takes the worse of the two
+ * views and a claim would otherwise be a say over which path carries.
  * echo is the source this path's last inbound datagram was observed arriving
  * from, all-zero when nothing has arrived yet, so a prober reading a PONG
  * learns its own reflexive endpoint on that path for free.
@@ -159,8 +166,10 @@ void path_ep_str(const struct path_ep *ep, char *out, size_t n);
  * is answered by a new one -- and every session shares a conversation id and a
  * sealing key, so from the returning client's side the path looks exactly as
  * it did. It carries the claimant's ufrag like any other probe, so it is
- * addressed rather than broadcast, and it is sealed like any other, so only
- * this session's peer can say it.
+ * addressed rather than broadcast, and it is sealed like any other. The seal
+ * says a token holder said it, which is not the same as the peer: it is
+ * therefore acted on only when it arrives on a path this connection is
+ * actually being carried on, and only once per sequence.
  */
 #define PROBE_FRESH 3
 #define PROBE_UFRAG_MAX 40
@@ -332,7 +341,8 @@ void path_saw_inbound(struct path *p, const struct path_ep *src);
 void path_fill_tail(const struct path *p, struct path_probe *pr);
 /* The far end's view of the path, out of the tail of one that arrived. A peer
  * that omits the tail leaves both views standing: it shares no measurements,
- * which costs accuracy and never correctness. */
+ * which costs accuracy and never correctness. A tail that arrives is a claim,
+ * so it is clamped rather than believed. */
 void path_apply_tail(struct path *p, const struct path_probe *pr,
 		     const uint8_t sig_key[32]);
 
@@ -374,6 +384,12 @@ int path_bucket(const struct path *p);
  * qualified and no cost is known, so the order falls through to the id --
  * deterministic, role-free and identical on both ends. Returns < 0 when a ranks
  * ahead of b.
+ *
+ * Deterministic is not unguessable: the id is a function of the session key
+ * and the endpoint pair, so a token holder can search endpoints until one
+ * sorts ahead. That decides only which of several unqualified paths is tried
+ * first, in the moment before anything has answered, and never takes the
+ * session from a path that has. It is a head start, not a seat.
  */
 int path_cmp(const struct path *a, const struct path *b, uint64_t now);
 int path_best(const struct path_table *t, uint64_t now);
