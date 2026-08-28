@@ -301,6 +301,8 @@ struct conn {
 	/* The claimant's ICE ufrag, carried for the worker's whole lifetime so the
 	 * host recognises the same client arriving over the other transport. */
 	char claim_ufrag[40];
+	volatile int ice_up;		/* the agent is connected, for readers
+					 * that may not touch the agent */
 	uint64_t probe_seq;		/* our frames on this conn, from 1 */
 	struct replay_win probe_win;	/* and the peer's, each acted on once */
 	/* The path deliberately made to die (test_blackhole_ms); bh_kind is -1
@@ -815,6 +817,15 @@ static int conn_pick(struct conn *c, struct path_pick *out)
 {
 	char from[PATH_LABEL_MAX + 64], to[PATH_LABEL_MAX + 64];
 	int ice_ok = c->nat && nat_connected(c->nat);
+
+	/*
+	 * Published for the threads that may not touch the agent: it belongs to
+	 * this connection's own thread, which destroys it on a resume graft, so
+	 * a reader elsewhere holding the pointer holds freed memory. An int can
+	 * only ever be a turn out of date, which is what a status line is
+	 * anyway.
+	 */
+	c->ice_up = ice_ok;
 	int i, prev, sel;
 
 	memset(out, 0, sizeof(*out));
@@ -4487,8 +4498,7 @@ static int conn_link_state(const struct sess *s, struct conn *c)
 	pthread_mutex_unlock(&c->hb_lock);
 
 	if (!seen)
-		return c->nat && nat_connected(c->nat) ? CONN_PUNCHING :
-							 CONN_CONNECTING;
+		return c->ice_up ? CONN_PUNCHING : CONN_CONNECTING;
 	if (lost && now - last >= hb_lost_ms(c->hb_rtt))
 		return CONN_LOST;
 	if (gen != s->netgen)

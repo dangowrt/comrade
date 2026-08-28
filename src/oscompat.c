@@ -25,6 +25,16 @@ long os_getpid(void)
 	return (long)GetCurrentProcessId();
 }
 
+unsigned long os_thread_id(void)
+{
+	return (unsigned long)GetCurrentThreadId();
+}
+
+void os_chmod_private(const char *path)
+{
+	(void)path;		/* the ACL the file inherits is the user's */
+}
+
 double os_uptime_s(void)
 {
 	return (double)GetTickCount64() / 1000.0;
@@ -65,9 +75,12 @@ uint64_t os_mono_ms(void)
 
 #else /* !_WIN32 */
 
+#include <pthread.h>
+#include <stdint.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
-#include <sys/wait.h>
 
 int os_rename_replace(const char *tmp, const char *dst)
 {
@@ -77,6 +90,18 @@ int os_rename_replace(const char *tmp, const char *dst)
 long os_getpid(void)
 {
 	return (long)getpid();
+}
+
+unsigned long os_thread_id(void)
+{
+	/* Only ever used to keep two threads from choosing one name, so the
+	 * bits of the handle are as good as any identifier. */
+	return (unsigned long)(uintptr_t)pthread_self();
+}
+
+void os_chmod_private(const char *path)
+{
+	chmod(path, S_IRUSR | S_IWUSR);
 }
 
 double os_uptime_s(void)

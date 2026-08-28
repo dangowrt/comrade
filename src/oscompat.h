@@ -21,6 +21,14 @@
  */
 int os_rename_replace(const char *tmp, const char *dst);
 
+/* This thread, as a number: enough to keep two threads of one process from
+ * choosing the same temporary name. */
+unsigned long os_thread_id(void);
+
+/* Readable and writable by this user and nobody else. A no-op where the
+ * filesystem has no such notion. */
+void os_chmod_private(const char *path);
+
 /* getpid() / GetCurrentProcessId(). */
 long os_getpid(void);
 

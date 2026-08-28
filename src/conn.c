@@ -13,7 +13,14 @@ int conn_write(const char *path, const struct conn_status *st)
 	char tmp[700];
 	FILE *f;
 
-	snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+	/*
+	 * The temporary name carries the writer, not just the destination: a
+	 * host writes one of these per served connection, from each worker's
+	 * own thread, and a single fixed name meant two of them writing the
+	 * same file and renaming each other's half-written lines into place.
+	 */
+	snprintf(tmp, sizeof(tmp), "%s.%lu.tmp", path,
+		 (unsigned long)os_thread_id());
 	/* stdio rather than open()+dprintf(): dprintf is POSIX-only and the
 	 * write is one short line, so the buffering costs nothing. */
 	f = fopen(tmp, "w");
@@ -29,6 +36,12 @@ int conn_write(const char *path, const struct conn_status *st)
 		st->read_only, st->alt[0] ? st->alt : "-", st->warm_alt,
 		st->rtt_known);
 	fclose(f);
+	/*
+	 * The line names the peer's address and both rendezvous nodes. The
+	 * directory it sits in is the user's own, but the file need not be
+	 * readable beyond them either.
+	 */
+	os_chmod_private(tmp);
 	if (os_rename_replace(tmp, path)) {
 		remove(tmp);
 		return -1;
