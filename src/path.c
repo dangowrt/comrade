@@ -602,8 +602,21 @@ int path_probe_pong(struct path *p, uint64_t nonce, uint64_t now)
 
 void path_peer_view(struct path *p, int srtt_ms, int loss_ppt)
 {
-	p->peer_srtt_ms = srtt_ms < 0 ? 0 : srtt_ms;
-	p->peer_loss_ppt = loss_ppt < 0 ? 0 : loss_ppt;
+	int mine = path_srtt_ms(p);
+	int cap = PATH_PEER_SRTT_MAX;
+
+	if (srtt_ms < 0)
+		srtt_ms = 0;
+	if (loss_ppt < 0)
+		loss_ppt = 0;
+	if (loss_ppt > 1000)
+		loss_ppt = 1000;	/* a proportion, not a number */
+	if (p->qualified && mine > 0 && mine * PATH_PEER_SRTT_RATIO < cap)
+		cap = mine * PATH_PEER_SRTT_RATIO;
+	if (srtt_ms > cap)
+		srtt_ms = cap;
+	p->peer_srtt_ms = srtt_ms;
+	p->peer_loss_ppt = loss_ppt;
 }
 
 int path_cost_of(int srtt_a, int loss_a, int srtt_b, int loss_b)

@@ -58,6 +58,20 @@ enum path_warmth {
 #define PATH_WARM_MS 3000		/* WARM becomes COLD past this */
 #define PATH_DEAD_MS 8000		/* COLD becomes DEAD past this */
 #define PATH_LOSS_PENALTY_MS 200	/* cost added by total loss */
+
+/*
+ * What a peer's own figures may say about a path. They arrive in a frame the
+ * peer sealed, so they are its claim and not our measurement, and the cost
+ * takes the worse of the two -- which means a claim can only ever argue a path
+ * down. That is the safe direction against a peer that is merely wrong, and
+ * the useful one for a peer that is hostile: a token holder that wants the
+ * session on a path of its choosing has only to say every other path is
+ * dreadful. A ceiling bounds how far one claim can move the ranking, and a
+ * path we have measured ourselves is not argued more than a few multiples
+ * away from what we measured.
+ */
+#define PATH_PEER_SRTT_MAX 2000		/* ms a peer may claim */
+#define PATH_PEER_SRTT_RATIO 4		/* times our own, where we have one */
 #define PATH_COST_QUANTUM_MS 5		/* ranking bucket width */
 #define PATH_SWITCH_MARGIN 1		/* buckets a candidate must win by */
 #define PATH_SWITCH_HOLD 2		/* evaluations it must hold that by */

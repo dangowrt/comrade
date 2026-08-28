@@ -636,7 +636,26 @@ static void order_check(void)
 	assert(path_best(&a, 12) == 0);
 	path_peer_view(&a.p[0], 300, 0);
 	assert(path_best(&a, 12) == 1);
-	assert(path_cost(&a.p[0]) == 300);
+	/*
+	 * But only so far. The figure is the peer's claim, not our
+	 * measurement, and the cost takes the worse of the two -- so an
+	 * unbounded claim is an unbounded say over which path carries the
+	 * session. Where we have measured the path ourselves, the claim is
+	 * heard within a few multiples of what we measured.
+	 */
+	assert(path_cost(&a.p[0]) == 10 * PATH_PEER_SRTT_RATIO);
+
+	/* And on a path we have not measured, up to the ceiling and no
+	 * further, whatever the sixteen bits on the wire can say. */
+	path_table_init(&a);
+	p = add(&a, addr[0], 5000, 0);
+	path_peer_view(p, 65535, 0);
+	assert(p->peer_srtt_ms == PATH_PEER_SRTT_MAX);
+
+	/* Loss is a proportion, so a thousand parts per thousand is all of
+	 * it; a peer claiming more is claiming nothing extra. */
+	path_peer_view(p, 0, 65535);
+	assert(p->peer_loss_ppt == 1000);
 }
 
 static void warm(struct path *p, uint64_t now)
