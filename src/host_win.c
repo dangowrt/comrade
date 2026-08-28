@@ -17,6 +17,7 @@
 #include "dbg.h"
 #include "keys.h"
 #include "oscompat.h"
+#include "sandbox.h"
 #include "session.h"
 #include "sig.h"
 #include "sshd.h"
@@ -475,11 +476,19 @@ static void run_service(struct svc *v, void *hostkey, sock_t wfd)
 	char cmd[600];
 	char cmd_ro[600];
 	struct session_cfg cfg;
+	struct sandbox_cfg sb;
 	sock_t end_fd;
 
 	attach_cmd(cmd, sizeof(cmd), v->sock);
 	attach_cmd_ro(cmd_ro, sizeof(cmd_ro), v->sock);
 	end_fd = spawn_end_monitor(v->sock);
+
+	/* Harden this network-facing service before it opens a socket. Windows
+	 * cannot deny it CreateProcess (it still launches tmux), so this is the
+	 * mitigation policies rather than the client's child-process ban. */
+	memset(&sb, 0, sizeof(sb));
+	sb.role = SANDBOX_SERVICE;
+	sandbox_apply(&sb);
 
 	ui_emitter(&v->obs, wfd);	/* progress -> the foreground view */
 
