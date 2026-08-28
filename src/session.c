@@ -5600,6 +5600,9 @@ static void punch_scan(struct sess *s, struct worker *ws, struct conn **punching
 				t->resume_pending = 0;
 				punching[i] = NULL;
 				punch_resume[i] = NULL;
+				s->punch_ufrag[i][0] = '\0';	/* grafted: the
+								 * worker holds
+								 * it now */
 				conn_free(c);
 				continue;
 			}
@@ -5635,10 +5638,20 @@ static void punch_scan(struct sess *s, struct worker *ws, struct conn **punching
 				conn_tell_fresh(c, NULL);
 			claim_served_note(&s->served, s->punch_ufrag[i]);
 			conn_register(s, c);
-			if (worker_spawn(ws, c)) {
-				s->punch_ufrag[i][0] = '\0';
+			if (worker_spawn(ws, c))
 				conn_free(c);		/* table full */
-			}
+			/*
+			 * The punch is over whichever way that went, so the
+			 * slot stops naming this claimant: from here the worker
+			 * is what holds the identity, and worker_by_ufrag is
+			 * what answers for it. Left set, the slot goes on
+			 * saying a punch is in flight long after the worker it
+			 * made has been reaped, and ufrag_admitted then refuses
+			 * that claimant every time it comes back -- a client
+			 * whose session never carried asking once a second and
+			 * being ignored for as long as it cares to ask.
+			 */
+			s->punch_ufrag[i][0] = '\0';
 		/*
 		 * A resumption gets the long budget because a client coming
 		 * back may be slow to reappear -- but only one that has a
