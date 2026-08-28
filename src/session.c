@@ -2034,8 +2034,15 @@ static void probe_apply(struct conn *c, const struct path_probe *pr,
 		}
 		p = conn_recv_path(c, kind, &from);
 		if (!p && src && kind != PATH_ICE) {
-			p = path_table_add(&c->paths, srck, src, NULL,
-					   now_ms());
+			/*
+			 * A source nothing has been seen from before takes a
+			 * free slot or a dead one, and displaces nothing: the
+			 * probe proves only that somebody holding the session
+			 * key once sent it, which a replay satisfies too, and
+			 * that is not grounds to throw away a path this
+			 * session has been carried on.
+			 */
+			p = path_table_offer(&c->paths, srck, src, now_ms());
 			if (p)
 				snprintf(added, sizeof(added), "%s", p->label);
 		}
