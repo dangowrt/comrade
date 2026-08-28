@@ -37,10 +37,22 @@ timer, because the halves travel over the stream the key protects.
 
 **Open for the setup phase.** Before a session exists there is only the
 invitation's key, and that is what the rendezvous, the multicast announcement
-and the punch run under. So a guest -- a view-only one included -- can still
-read another guest's announcement, and with it the ICE candidates naming where
-that peer is. For a view-only guest that is a disclosure of the operator's
-addresses, which is the part `--read-only` most obviously ought to prevent.
+and the punch run under. Being precise about what that exposes, since the
+mailbox has two slots and they are not alike:
+
+- The *offer* slot is the host's own description. Every invited guest needs it
+  to reach the host, view-only ones included, so reading it is not a leak --
+  it is the invitation working.
+- The *answer* slot is whichever guest is currently claiming. A view-only guest
+  can read it, and so learns the addresses of the read-write guests as they
+  come and go. That is a disclosure between guests, not of the operator.
+- The answer slot is also a mutex, and a view-only guest can take it. It is
+  entitled to a session, so holding it once is legitimate; holding it
+  repeatedly starves read-write clients of the turnstile. A view-only
+  credential should not be able to decide who else gets in.
+
+The second and third are the case for splitting the classes. The first is not,
+and the write-up previously said it was.
 
 **The option, not implemented.** Derive the read-only rendezvous secret
 one-way from the read-write one, exactly as `keys_derive_ro_auth` already does
@@ -70,6 +82,13 @@ node's lifetime is not a signaller's.
 
 So the DHT cost of a second plane is one more keypair and one more put/get
 stream on the same node, not a second presence in the DHT.
+
+One wrinkle the mailbox comment already names: a DHT stores a key on the nodes
+closest to it, so two mailbox keys live in two different places. A token that
+pins a rendezvous node (`TOKEN_FLAG_EP6_RDV`) accelerates whichever key that
+node happens to hold; a pinned node is queried directly on every lookup rather
+than by proximity, so it can serve both, but that is a property to keep rather
+than assume.
 
 What is left is the host's own machinery. A client is unaffected: one token is
 one class, so it drives one plane exactly as now. The host is the end that
