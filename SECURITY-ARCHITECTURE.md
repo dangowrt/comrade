@@ -5,14 +5,15 @@ under them (2026-08-28) turned up defects with contained fixes, which are the
 code commits on this branch, and four findings that reach into the design
 rather than sitting in one place in it.
 
-Three of the four are now closed in code: the transport is keyed per
-connection rather than per invitation (1), the stream says who sent it (3), and
-an outage no longer costs a working agent (4). What is left here is what those
-changes do not reach: the setup phase still runs under the invitation's key
-(1), comrade is UDP-only with no fallback (2), the KCP header is still readable
-(3), and an adversary who drops everything is indistinguishable from a dead
-network (4). Each says what the remaining option is and what it would cost.
-None of those options is implemented.
+Three of the four are now closed in code: nothing on the transport or in the
+mailbox can be read by a holder of the invitation who is not a party to it (1),
+the stream says who sent it (3), and an outage no longer costs a working agent
+(4). What is left here is what those changes do not reach: a holder can still
+take the turnstile and delay somebody else's exchange, though not read it (1);
+comrade is UDP-only with no fallback (2); the KCP header is still readable (3);
+and an adversary who drops everything is indistinguishable from a dead network
+(4). Each says what the remaining option is and what it would cost. None of
+those options is implemented.
 
 The threat models were: a holder of the invitation who is not the peer --
 including someone handed a view-only link -- and the ISP or hoster, who sees
@@ -35,89 +36,38 @@ No guest can reach another guest's path plane or stream once a session is up,
 whatever the invitation says. The switch is clocked by the peer rather than a
 timer, because the halves travel over the stream the key protects.
 
-**Open for the setup phase.** Before a session exists there is only the
-invitation's key, and that is what the rendezvous, the multicast announcement
-and the punch run under. The mailbox has two slots and they are not alike:
+**Closed for the mailbox too.** The rendezvous still runs under the
+invitation's key, and both slots are still sealed with it, so a token holder
+can still tell a claim is present and can still take the turnstile. What it can
+no longer do is read one. The mailbox has two slots and they were not alike:
 
 - The *offer* slot is the host's own description. Every invited guest needs it
   to reach the host, view-only ones included, so reading it is not a leak -- it
   is the invitation working.
-- The *answer* slot is whichever guest is currently claiming, and it carries
-  that guest's ICE candidates: its LAN addresses and its public address and
-  port. Any holder of the invitation can open it, because it is sealed under
-  the key the invitation derives.
+- The *answer* slot is whichever guest is currently claiming, and it carried
+  that guest's ICE candidates in the clear to every other holder. Between
+  read-write guests that was a small matter, since the host has trusted each
+  of them with a shell and they are trusted accordingly by each other. Between
+  read-only guests it was the worst case in the design: a read-only link is
+  the one handed to a room, and a crowd with no reason to trust each other was
+  publishing its addresses to itself.
 
-Who that hurts depends on who holds the invitation, and the two classes are not
-symmetric:
+A claim is now boxed to the host (`box_seal`, keys.c) inside the seal the slot
+already carried. The host publishes an X25519 public key in its own slot -- the
+one every guest fetches anyway -- and holds the secret half alone, so the outer
+seal still says a token holder wrote the slot and the box says only the host
+may read it. It closes all three pairs at once, read-only to read-only included,
+and needs no token change, no second mailbox and no per-guest keys.
 
-- *Between read-write guests* it is a small matter. The host has trusted each
-  of them with a shell, so they are already trusted to a degree by each other;
-  learning one another's addresses discloses nothing the shell would not.
-- *Between read-only guests it is the worst case in the whole design.* A
-  read-only link is the one that gets handed to a crowd -- an audience, a
-  demonstration, a room of people who have no reason to trust each other and
-  may not even know who else is watching. Every one of them can read every
-  other's claim as it passes through the answer slot, so a view-only invitation
-  handed to twenty people publishes each attendee's home address to the other
-  nineteen.
-- *From read-only to read-write* is the boundary crossing: a credential given
-  strictly less can read the addresses of the guests given more.
+The claimant's ufrag rides in the clear beside the box: the rule that lets a
+client overwrite its own superseded claim is about which claimant holds the
+slot, not where that claimant is. A client cannot open even its own box, the
+ephemeral secret being gone the moment it is sealed.
 
-The answer slot is also the turnstile mutex, and occupancy is visible to
-everyone by construction, so any guest can also see when others are joining and
-can take the mutex itself.
-
-**The option that was proposed here does not fix the worst case.** Giving the
-read-only class its own rendezvous secret, derived one-way from the read-write
-one, separates the two classes -- so a view-only guest could no longer read
-read-write claims. But every read-only guest would still share the read-only
-key, so the crowd would still be reading each other. Splitting by class solves
-the second problem and leaves the first exactly as it is.
-
-**What does fix it: seal a claim to the host, not to the invitation.** The
-answer slot is written by a claimant and read by nobody but the host. It is
-symmetric today only because the invitation's key was the one key to hand. If
-the host publishes an ephemeral public key in the *offer* slot -- which every
-guest already fetches, since it is how they reach the host -- then a claimant
-can seal its answer to that key, and no other guest can open it whatever
-invitation it holds. That closes all three relationships above at once:
-read-only to read-only, read-only to read-write, and read-write to read-write.
-
-It needs no token change, no second mailbox, no second rendezvous plane and no
-key distribution: the one key that has to travel is already travelling, in a
-slot everyone is entitled to read.
-
-*Both layers, not one.* Sealing to a public key gives confidentiality and not
-sender authentication -- anyone can encrypt to a public key. The outer seal
-under the invitation's key is what says a token holder wrote a slot at all, and
-it is what the mailbox's parse and compare-and-swap are built on. So the shape
-is an inner box to the host's key inside the outer seal that is already there:
-every property today survives, and one is added. It goes in at a single point,
-between `candpack_encode` and `msg_seal` in `sig_post`, and its mirror on the
-host's read.
-
-*Room.* The plaintext cap is `SIG_MAX_VALUE` 440 and a sealed slot is that plus
-`SEAL_OVERHEAD`, so two of them are 960 in a BEP 44 value of about a thousand:
-roughly 40 bytes of slack against the 48 an inner box costs (32-byte ephemeral
-public key, 16-byte tag). Real slots are nowhere near the cap, since candpack
-reduces a description to a handful of bytes per candidate, so the fix is to
-lower the answer slot's own cap by the overhead rather than to find space.
-
-*Freshness.* If the host mints the keypair per offer rotation and keeps the
-private half only while claims may arrive under that offer, a recorded claim
-stays unreadable to anyone who obtains the invitation later.
-
-The costs are a 32-byte public key in the offer, 48 bytes on each answer, and
-an X25519 primitive in `ccrypto.h`, which currently exposes BLAKE2b, the AEAD
-and Ed25519 but no key agreement -- so three backend implementations. The same
-treatment is wanted for the multicast announcement, which carries the same
-candidates to everyone on the segment.
-
-*A second thing it buys.* The per-connection key binds only once the SSH
-handshake completes, so until then a guest can still aim probes at another
-guest's punch. What it aimed with came out of the mailbox. Sealing the claim
-takes the endpoints away, so the interference loses its targeting even though
-the raw path in that window is unchanged.
+It also takes away what the pre-handshake probe interference used to aim with.
+The per-connection key binds only once the SSH handshake completes, so until
+then a guest can still send probes at another guest's punch -- but the
+endpoints it would send them to came out of the mailbox.
 
 **What it does not fix, and that is where the line is drawn.** Occupancy is
 inherent to a mutex: any guest can still see that the slot is taken, and can
@@ -130,8 +80,36 @@ holder delaying an exchange it can no longer read is not worth it. The attack
 that remains needs a valid invitation, achieves delay rather than disclosure,
 and is visible as a mailbox that will not settle.
 
-The class split (below) is the cheaper half-answer to it and stays an option,
-along with per-class admission limits.
+**The option that remains, not implemented: a rendezvous secret per class.**
+Derive the read-only one one-way from the read-write one, exactly as
+`keys_derive_ro_auth` already does for the auth secret, and put it in the
+read-only token's `rdv` field. The token format does not change at all -- same
+16 bytes, a different value, with `TOKEN_FLAG_RO` already telling them apart.
+The host holds the read-write secret and can derive the read-only twin; the
+reverse is impossible, which is the point.
+
+It would not stop a read-only guest taking the read-only turnstile, since that
+class would still share one mailbox -- but it would stop one taking the
+read-write turnstile, which is the part that lets an audience interfere with
+the operator's own people. Per-class admission limits are the other half.
+
+What it costs, since the obvious estimate is wrong twice over. It does *not*
+need a second DHT node: a `dhtnode` is transport and holds no identity, while
+`bep44_put(e, sk, pk, ...)` and `bep44_get(e, pk, salt, ...)` take the keypair
+per call, so one node serves any number of mailboxes. `sig` touches its node in
+twelve places, all "ready?", poll or free, and `sig_discard` exists precisely
+because a node's lifetime is not a signaller's -- so letting a signaller borrow
+a node is small. It does need the host's own machinery: `session.c` makes 71
+calls into `sig_*` across some thirty entry points, all written as "the"
+signaller, and those on the host's path would have to become per-plane, with
+admission recording which plane a worker was claimed on. A client is
+unaffected, one token being one class. And it is only needed once a read-only
+invitation has actually been minted, which the host knows where it mints one.
+
+One wrinkle the mailbox comment already names: a DHT stores a key on the nodes
+closest to it, so two mailbox keys live in two different places. A pinned
+rendezvous node is queried directly on every lookup rather than by proximity,
+so one node can serve both, but that is a property to keep rather than assume.
 
 **What is not worth doing.** Per-invitation keys would separate the crowd from
 each other, but a crowd is exactly what one link handed to many people is; the
