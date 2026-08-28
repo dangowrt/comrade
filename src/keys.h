@@ -15,6 +15,21 @@ struct session_keys {
 	uint8_t sig_key[32];
 	uint8_t bep44_pk[32];
 	uint8_t bep44_sk[64];
+	/*
+	 * What this session's datagrams open with. Both were fixed constants,
+	 * one per frame kind, identical in every build -- so every comrade
+	 * datagram anywhere announced itself in its first four bytes, and a
+	 * single stateless rule dropped all of them at line rate, with no flow
+	 * state and no false positives. For a tool whose whole purpose is
+	 * reaching your own machine from wherever you are, that is the cheapest
+	 * possible thing to take away.
+	 *
+	 * Derived from the same secret the sealing key comes from, so both ends
+	 * agree without another exchange, and forced apart from each other so
+	 * the demux that tells a probe from stream data still works.
+	 */
+	uint32_t probe_magic;
+	uint32_t conv;
 };
 
 int keys_derive(struct session_keys *keys, const uint8_t rdv[TOKEN_RDV_LEN]);

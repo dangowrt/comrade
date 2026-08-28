@@ -12,6 +12,9 @@
 #include <string.h>
 
 #include "path.h"
+
+/* The tag is the session's now, so a test picks its own. */
+#define TEST_MAGIC 0x434d5250U
 #include "wsock.h"
 
 static const uint8_t key[32] = {
@@ -130,10 +133,10 @@ static void probe_codec_check(void)
 	out.nonce = 0x0123456789abcdefULL;
 	out.seq = 0xfedcba9876543210ULL;
 	snprintf(out.ufrag, sizeof(out.ufrag), "a1b2c3d4");
-	n = path_probe_build(buf, sizeof(buf), key, &out);
+	n = path_probe_build(buf, sizeof(buf), TEST_MAGIC, key, &out);
 	assert(n > 4 && n <= PROBE_MAX);
-	assert(path_probe_is(buf, n));
-	assert(path_probe_parse(&in, key, buf, n) == 0);
+	assert(path_probe_is(TEST_MAGIC, buf, n));
+	assert(path_probe_parse(&in, TEST_MAGIC, key, buf, n) == 0);
 	assert(in.type == PROBE_PING && in.nonce == out.nonce);
 	/* The sequence is what the receiver's window is kept against, so it has
 	 * to survive the round trip whole. */
@@ -148,9 +151,9 @@ static void probe_codec_check(void)
 	out.echo = ep6("2001:db8::99", 61000);
 	out.srtt_ms = 37;
 	out.loss_ppt = 125;
-	n = path_probe_build(buf, sizeof(buf), key, &out);
+	n = path_probe_build(buf, sizeof(buf), TEST_MAGIC, key, &out);
 	assert(n > 4 && n <= PROBE_MAX);
-	assert(path_probe_parse(&in, key, buf, n) == 0);
+	assert(path_probe_parse(&in, TEST_MAGIC, key, buf, n) == 0);
 	assert(in.type == PROBE_PONG && in.have_tail);
 	assert(path_ep_eq(&in.echo, &out.echo));
 	assert(in.srtt_ms == 37 && in.loss_ppt == 125);
@@ -158,19 +161,19 @@ static void probe_codec_check(void)
 	/* The longest ufrag still fits alongside the tail. */
 	memset(out.ufrag, 'z', PROBE_UFRAG_MAX);
 	out.ufrag[PROBE_UFRAG_MAX] = '\0';
-	n = path_probe_build(buf, sizeof(buf), key, &out);
+	n = path_probe_build(buf, sizeof(buf), TEST_MAGIC, key, &out);
 	assert(n == PROBE_MAX);
-	assert(path_probe_parse(&in, key, buf, n) == 0);
+	assert(path_probe_parse(&in, TEST_MAGIC, key, buf, n) == 0);
 	assert(strlen(in.ufrag) == PROBE_UFRAG_MAX && in.have_tail);
 
 	/* Not a probe, and a probe a stranger could not have sealed. */
-	assert(!path_probe_is(buf, 3));
+	assert(!path_probe_is(TEST_MAGIC, buf, 3));
 	buf[0] ^= 0xff;
-	assert(!path_probe_is(buf, n));
-	assert(path_probe_parse(&in, key, buf, n) == -1);
+	assert(!path_probe_is(TEST_MAGIC, buf, n));
+	assert(path_probe_parse(&in, TEST_MAGIC, key, buf, n) == -1);
 	buf[0] ^= 0xff;
 	buf[n - 1] ^= 0xff;
-	assert(path_probe_parse(&in, key, buf, n) == -1);
+	assert(path_probe_parse(&in, TEST_MAGIC, key, buf, n) == -1);
 }
 
 /*
@@ -545,8 +548,8 @@ static void tail_check(void)
 	snprintf(out.ufrag, sizeof(out.ufrag), "%s", "c0ffee00");
 	path_fill_tail(pb, &out);
 	assert(out.have_tail && path_ep_eq(&out.echo, &ea) && out.srtt_ms == 6);
-	n = path_probe_build(buf, sizeof(buf), key, &out);
-	assert(n && path_probe_parse(&in, key, buf, n) == 0);
+	n = path_probe_build(buf, sizeof(buf), TEST_MAGIC, key, &out);
+	assert(n && path_probe_parse(&in, TEST_MAGIC, key, buf, n) == 0);
 	assert(in.have_tail && path_ep_eq(&in.echo, &ea));
 	path_apply_tail(pa, &in, key);
 	assert(pa->have_self_ep && path_ep_eq(&pa->self_ep, &ea));
@@ -561,8 +564,8 @@ static void tail_check(void)
 	out.type = PROBE_PING;
 	out.nonce = 9;
 	path_fill_tail(pa, &out);
-	n = path_probe_build(buf, sizeof(buf), key, &out);
-	assert(n && path_probe_parse(&in, key, buf, n) == 0);
+	n = path_probe_build(buf, sizeof(buf), TEST_MAGIC, key, &out);
+	assert(n && path_probe_parse(&in, TEST_MAGIC, key, buf, n) == 0);
 	path_apply_tail(pb, &in, key);
 	assert(path_ep_eq(&pb->self_ep, &eb));
 	assert(!memcmp(pa->id, pb->id, PATH_ID_LEN));
@@ -571,8 +574,8 @@ static void tail_check(void)
 	memset(&out, 0, sizeof(out));
 	out.type = PROBE_PING;
 	out.nonce = 10;
-	n = path_probe_build(buf, sizeof(buf), key, &out);
-	assert(n && path_probe_parse(&in, key, buf, n) == 0);
+	n = path_probe_build(buf, sizeof(buf), TEST_MAGIC, key, &out);
+	assert(n && path_probe_parse(&in, TEST_MAGIC, key, buf, n) == 0);
 	assert(!in.have_tail);
 	path_apply_tail(pa, &in, key);
 	assert(pa->peer_srtt_ms == 6 && path_ep_eq(&pa->self_ep, &ea));

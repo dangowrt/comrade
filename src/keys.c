@@ -69,13 +69,31 @@ int keys_derive(struct session_keys *keys, const uint8_t rdv[TOKEN_RDV_LEN])
 {
 	static const char sig_info[] = "comrade1 sig key";
 	static const char seed_info[] = "comrade1 bep44 seed";
+	static const char wire_info[] = "comrade1 wire tags";
 	uint8_t seed[32];
+	uint8_t tags[8];
+	int i;
 
 	cc_blake2b_keyed(keys->sig_key, sizeof(keys->sig_key),
 			 rdv, TOKEN_RDV_LEN,
 			 (const uint8_t *)sig_info, sizeof(sig_info) - 1);
 	cc_blake2b_keyed(seed, sizeof(seed), rdv, TOKEN_RDV_LEN,
 			 (const uint8_t *)seed_info, sizeof(seed_info) - 1);
+	cc_blake2b_keyed(tags, sizeof(tags), rdv, TOKEN_RDV_LEN,
+			 (const uint8_t *)wire_info, sizeof(wire_info) - 1);
+	keys->probe_magic = 0;
+	keys->conv = 0;
+	for (i = 0; i < 4; i++) {
+		keys->probe_magic = (keys->probe_magic << 8) | tags[i];
+		keys->conv = (keys->conv << 8) | tags[4 + i];
+	}
+	/*
+	 * The demux tells a probe from stream data by this one compare, so the
+	 * two must differ; derived values agree only by chance, and chance is
+	 * not a thing to leave in a parser.
+	 */
+	if (keys->probe_magic == keys->conv)
+		keys->conv ^= 0x5f5f5f5fU;
 	return cc_ed25519_key_pair(keys->bep44_sk, keys->bep44_pk, seed);
 }
 

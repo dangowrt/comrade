@@ -141,7 +141,11 @@ void path_ep_str(const struct path_ep *ep, char *out, size_t n);
  * from, all-zero when nothing has arrived yet, so a prober reading a PONG
  * learns its own reflexive endpoint on that path for free.
  */
-#define PROBE_MAGIC 0x434d5250U	/* "CMRP"; differs from SESSION_CONV */
+/*
+ * The frame no longer opens with a constant: the tag is this session's, from
+ * keys.h, so a datagram says nothing about which program sent it to anyone
+ * without the token. Callers pass it in; the codec keeps no opinion of its own.
+ */
 #define PROBE_PING 1
 #define PROBE_PONG 2
 /*
@@ -171,16 +175,19 @@ struct path_probe {
 	int loss_ppt;
 };
 
-/* Does this datagram open with PROBE_MAGIC? Every KCP datagram opens with the
- * fixed SESSION_CONV instead, so the two are unambiguous. */
-int path_probe_is(const uint8_t *data, size_t len);
+/* Does this datagram open with the session's probe tag? A KCP datagram opens
+ * with that session's conversation id instead, and the two are derived apart,
+ * so one compare tells them apart. */
+int path_probe_is(uint32_t magic, const uint8_t *data, size_t len);
 
 /* Build one probe into out (>= PROBE_MAX); returns its length, or 0. */
-size_t path_probe_build(uint8_t *out, size_t out_len, const uint8_t sig_key[32],
+size_t path_probe_build(uint8_t *out, size_t out_len, uint32_t magic,
+			const uint8_t sig_key[32],
 			const struct path_probe *pr);
 
 /* Unseal one probe. Returns 0 and fills pr, or -1 if it is not ours. */
-int path_probe_parse(struct path_probe *pr, const uint8_t sig_key[32],
+int path_probe_parse(struct path_probe *pr, uint32_t magic,
+		     const uint8_t sig_key[32],
 		     const uint8_t *data, size_t len);
 
 /*

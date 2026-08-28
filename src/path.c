@@ -122,12 +122,13 @@ static void path_put16(uint8_t *p, int v)
 	p[1] = (uint8_t)v;
 }
 
-int path_probe_is(const uint8_t *data, size_t len)
+int path_probe_is(uint32_t magic, const uint8_t *data, size_t len)
 {
-	return len >= 4 && path_get32(data) == PROBE_MAGIC;
+	return len >= 4 && path_get32(data) == magic;
 }
 
-size_t path_probe_build(uint8_t *out, size_t out_len, const uint8_t sig_key[32],
+size_t path_probe_build(uint8_t *out, size_t out_len, uint32_t magic,
+			const uint8_t sig_key[32],
 			const struct path_probe *pr)
 {
 	uint8_t plain[PROBE_PLAIN_MAX];
@@ -151,12 +152,13 @@ size_t path_probe_build(uint8_t *out, size_t out_len, const uint8_t sig_key[32],
 		path_put16(plain + pl + 20, pr->loss_ppt);
 		pl += PROBE_TAIL_LEN;
 	}
-	path_put32(out, PROBE_MAGIC);
+	path_put32(out, magic);
 	n = msg_seal(out + 4, out_len - 4, sig_key, plain, pl);
 	return n < 0 ? 0 : (size_t)n + 4;
 }
 
-int path_probe_parse(struct path_probe *pr, const uint8_t sig_key[32],
+int path_probe_parse(struct path_probe *pr, uint32_t magic,
+		     const uint8_t sig_key[32],
 		     const uint8_t *data, size_t len)
 {
 	uint8_t plain[PROBE_PLAIN_MAX + 1];
@@ -164,7 +166,7 @@ int path_probe_parse(struct path_probe *pr, const uint8_t sig_key[32],
 	int n, i;
 
 	memset(pr, 0, sizeof(*pr));
-	if (!path_probe_is(data, len))
+	if (!path_probe_is(magic, data, len))
 		return -1;
 	n = msg_open(plain, sizeof(plain), sig_key, data + 4, len - 4);
 	if (n < PROBE_HEAD_FIXED)

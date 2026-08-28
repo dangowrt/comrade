@@ -33,7 +33,6 @@
 #include "stunprobe.h"
 #include "tokgen.h"
 
-#define SESSION_CONV 0x70326531
 
 /*
  * Rendezvous announcement backstop. Each end tells the other where it
@@ -1917,7 +1916,8 @@ static size_t conn_probe_seal(struct conn *c, struct path_probe *pr,
 {
 	snprintf(pr->ufrag, sizeof(pr->ufrag), "%s", c->claim_ufrag);
 	pr->seq = ++c->probe_seq;
-	return path_probe_build(out, PROBE_MAX, c->sess->keys.sig_key, pr);
+	return path_probe_build(out, PROBE_MAX, c->sess->keys.probe_magic,
+				c->sess->keys.sig_key, pr);
 }
 
 /*
@@ -2218,7 +2218,7 @@ static void probe_recv(struct conn *c, const uint8_t *data, size_t len,
 {
 	struct path_probe pr;
 
-	if (path_probe_parse(&pr, c->sess->keys.sig_key, data, len))
+	if (path_probe_parse(&pr, c->sess->keys.probe_magic, c->sess->keys.sig_key, data, len))
 		return;
 	if (strcmp(pr.ufrag, c->claim_ufrag))
 		return;			/* not the claimant this conn serves */
@@ -2307,8 +2307,8 @@ static int adopt_allow(struct sess *s, uint64_t now)
 }
 
 /*
- * May this datagram be opened? Only a frame opening with PROBE_MAGIC is a
- * candidate for adoption at all; anything else is stream data, which
+ * May this datagram be opened? Only a frame opening with this session's probe
+ * tag is a candidate for adoption at all; anything else is stream data, which
  * ikcp_input rejects for the cost of one compare. A probe from a source one of
  * `c`'s paths already names is ordinary traffic, and one from any other source
  * is admitted to the seal only while the budget has a token. c may be NULL,
@@ -2317,7 +2317,7 @@ static int adopt_allow(struct sess *s, uint64_t now)
 static int probe_gate(struct sess *s, struct conn *c, const struct path_ep *ep,
 		      const uint8_t *data, size_t len)
 {
-	if (!path_probe_is(data, len))
+	if (!path_probe_is(s->keys.probe_magic, data, len))
 		return 1;
 	if (c && conn_holds_ep(c, ep, 1))
 		return 1;
@@ -2337,7 +2337,7 @@ static void probe_adopt(struct sess *s, const uint8_t *data, size_t len,
 	struct path_probe pr;
 	int i;
 
-	if (path_probe_parse(&pr, s->keys.sig_key, data, len) ||
+	if (path_probe_parse(&pr, s->keys.probe_magic, s->keys.sig_key, data, len) ||
 	    pr.type != PROBE_PING || !pr.ufrag[0])
 		return;
 	for (i = 0; i < HOST_MAX_WORKERS; i++)
@@ -2364,7 +2364,7 @@ static void deliver_stream_from(struct conn *c, const uint8_t *data, size_t len,
 
 	if (c->bh_mute)		/* a staged total outage swallows receives */
 		return;
-	if (path_probe_is(data, len)) {
+	if (path_probe_is(c->sess->keys.probe_magic, data, len)) {
 		probe_recv(c, data, len, kind, src);
 		return;
 	}
@@ -2592,7 +2592,7 @@ static void client_lan_recv(void *arg, const struct sockaddr *src,
 	 * picked up. Stream data may not: it is accepted from an endpoint we
 	 * hold, or the socket is open to anyone who can reach the port.
 	 */
-	if (!path_probe_is(data, len) && !conn_holds_ep(c, &ep, 1))
+	if (!path_probe_is(c->sess->keys.probe_magic, data, len) && !conn_holds_ep(c, &ep, 1))
 		return;
 	deliver_stream_from(c, data, len, PATH_SEGMENT, &mapped);
 }
@@ -2820,12 +2820,12 @@ static void host_lan_recv(void *arg, const struct sockaddr *src, socklen_t srcle
 	    path_ep_from_sockaddr(&ep, (struct sockaddr *)&mapped,
 				  sizeof(mapped)))
 		return;
-	c = ep_owner(s->conns, &ep, path_probe_is(data, len));
+	c = ep_owner(s->conns, &ep, path_probe_is(s->keys.probe_magic, data, len));
 	if (!probe_gate(s, c, &ep, data, len))
 		return;
 	if (c)
 		deliver_stream_from(c, data, len, PATH_SEGMENT, &mapped);
-	else if (path_probe_is(data, len))
+	else if (path_probe_is(s->keys.probe_magic, data, len))
 		probe_adopt(s, data, len, &mapped);
 }
 
@@ -3759,7 +3759,7 @@ static int conn_run(struct conn *c, int drive_sig)
 	if (nosigpipe(cp[0])) {		/* see ctl_send */
 		/* best effort: without it a closed channel raises SIGPIPE */
 	}
-	c->stream = stream_create(SESSION_CONV, on_stream_output, c);
+	c->stream = stream_create(s->keys.conv, on_stream_output, c);
 	if (!c->stream) {
 		sock_close(sp[0]);
 		sock_close(sp[1]);
