@@ -36,6 +36,7 @@
 #define MCAST_MAX_SALT 64
 #define MCAST_MAX_PKT 1300
 #define DRAIN_MAX_ERRS 16	/* see lanlink.c: bound a drain that keeps erroring */
+#define DRAIN_MAX_PKTS 64	/* and one that keeps succeeding */
 
 struct sig_mcast {
 	sock_t s4;
@@ -410,9 +411,9 @@ static void drain(sock_t s, sig_mcast_recv_cb *cb, void *arg)
 {
 	uint8_t buf[MCAST_MAX_PKT + 1];
 	char salt[MCAST_MAX_SALT + 1];
-	int errs = 0;
+	int errs = 0, got = 0;
 
-	for (;;) {
+	for (; got < DRAIN_MAX_PKTS; ) {
 		struct sockaddr_storage src;
 		socklen_t srclen = sizeof(src);
 		int rc = recvfrom(s, (char *)buf, (int)sizeof(buf), 0,
@@ -426,6 +427,7 @@ static void drain(sock_t s, sig_mcast_recv_cb *cb, void *arg)
 				break;
 			continue;
 		}
+		got++;
 		if (rc <= MCAST_MAGIC_LEN + 1)
 			continue;
 		if (memcmp(buf, MCAST_MAGIC, MCAST_MAGIC_LEN))

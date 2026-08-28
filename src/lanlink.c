@@ -15,6 +15,16 @@
  * either. Bound the run, and let the next poll pick up whatever is left.
  */
 #define DRAIN_MAX_ERRS 16
+/*
+ * And a bound on the successes, which the errors alone never gave. While
+ * datagrams arrive faster than they are taken this loop never returned, and on
+ * a client -- or a host serving one connection -- it is the same thread that
+ * pumps the SSH bridge and sends the probes, so a flood at the socket stopped
+ * the session it was meant to be carrying. Come back for the rest on the next
+ * turn: the socket buffer holds them meanwhile, and every other caller of this
+ * poll gets its turn.
+ */
+#define DRAIN_MAX_PKTS 64
 
 struct lanlink {
 	sock_t fd;			/* dual-stack v6 UDP socket, shared */
@@ -126,7 +136,7 @@ int lanlink_prepare(struct lanlink *l, struct pollfd *fds, int maxfds,
 void lanlink_dispatch(struct lanlink *l, const struct pollfd *fds, int nfds)
 {
 	uint8_t buf[2048];
-	int i, errs;
+	int i, errs, got;
 
 	for (i = 0; i < nfds; i++) {
 		/* POLLHUP/POLLERR arrive without POLLIN under WSAPoll, so they
@@ -134,7 +144,8 @@ void lanlink_dispatch(struct lanlink *l, const struct pollfd *fds, int nfds)
 		if (fds[i].fd != l->fd ||
 		    !(fds[i].revents & (POLLIN | POLLHUP | POLLERR)))
 			continue;
-		for (errs = 0; errs < DRAIN_MAX_ERRS; ) {
+		for (errs = 0, got = 0;
+		     errs < DRAIN_MAX_ERRS && got < DRAIN_MAX_PKTS; ) {
 			struct sockaddr_storage src;
 			socklen_t srclen = sizeof(src);
 			int rc = recvfrom(l->fd, (char *)buf, (int)sizeof(buf), 0,
@@ -148,6 +159,7 @@ void lanlink_dispatch(struct lanlink *l, const struct pollfd *fds, int nfds)
 			}
 			if (rc == 0)
 				continue;
+			got++;
 			if (l->on_recv)
 				l->on_recv(l->arg, (struct sockaddr *)&src,
 					   srclen, buf, (size_t)rc);
