@@ -1997,6 +1997,14 @@ static void conn_tell_fresh(struct conn *c, const struct sockaddr_in6 *lan_to)
 	pr.type = PROBE_FRESH;
 	random_bytes((uint8_t *)&pr.nonce, sizeof(pr.nonce));
 	snprintf(pr.ufrag, sizeof(pr.ufrag), "%s", c->claim_ufrag);
+	/*
+	 * Carry the tail every other type carries, though nothing reads it
+	 * here. Without it this frame is the only short one on the wire, so
+	 * the one datagram that ends a session announces itself by its length
+	 * to anyone counting bytes -- and dropping exactly those is cheaper
+	 * for an adversary than dropping anything else.
+	 */
+	pr.have_tail = 1;
 	o = conn_probe_seal(c, &pr, out);
 	if (!o)
 		return;
@@ -2078,8 +2086,20 @@ static void probe_apply(struct conn *c, const struct path_probe *pr,
 		return;
 	}
 	if (pr->type == PROBE_FRESH) {
-		int had;
+		int had, held;
 
+		pthread_mutex_lock(&c->path_lock);
+		held = kind == PATH_ICE || conn_recv_path(c, kind, &from) != NULL;
+		pthread_mutex_unlock(&c->path_lock);
+		/*
+		 * Only from where this session is actually being carried. The
+		 * sequence window already refuses a copy of an old frame; this
+		 * refuses one delivered down a path nothing has been seen to
+		 * arrive from, which is what an address the peer never used
+		 * looks like.
+		 */
+		if (!held)
+			return;
 		pthread_mutex_lock(&c->hb_lock);
 		had = c->hb_pong_seen;
 		pthread_mutex_unlock(&c->hb_lock);
