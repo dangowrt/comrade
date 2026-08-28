@@ -1920,6 +1920,28 @@ static struct path *conn_recv_path(struct conn *c, enum path_kind kind,
  * answer came back from -- which a multi-homed peer's need not match. Called
  * with path_lock held.
  */
+/*
+ * Is this nonce one we are waiting on an answer for? Every probe we send
+ * carries our own claimant ufrag, so one of ours reflected back at us opens,
+ * passes for this connection and would be answered -- and that answer, sent
+ * back to us in turn, is a pong for a nonce we really are waiting on. Two
+ * bounces and a path nobody has ever answered on is qualified. Answering our
+ * own outstanding nonce is the step to refuse; a peer never has cause to ask
+ * us the question we are asking it.
+ *
+ * Call with path_lock held.
+ */
+static int conn_nonce_outstanding(const struct conn *c, uint64_t nonce)
+{
+	int i;
+
+	for (i = 0; i < PATH_TABLE_MAX; i++)
+		if (c->paths.p[i].used && c->paths.p[i].outstanding &&
+		    c->paths.p[i].nonce == nonce)
+			return 1;
+	return 0;
+}
+
 static struct path *conn_pong_path(struct conn *c, uint64_t nonce)
 {
 	int i;
@@ -2004,6 +2026,12 @@ static void probe_apply(struct conn *c, const struct path_probe *pr,
 		rp.type = PROBE_PONG;
 		rp.nonce = pr->nonce;
 		pthread_mutex_lock(&c->path_lock);
+		if (conn_nonce_outstanding(c, pr->nonce)) {
+			pthread_mutex_unlock(&c->path_lock);
+			dbg_logf("path: ping carries a nonce we are waiting on "
+				 "-- our own, reflected");
+			return;
+		}
 		p = conn_recv_path(c, kind, &from);
 		if (!p && src && kind != PATH_ICE) {
 			p = path_table_add(&c->paths, srck, src, NULL,
@@ -2059,6 +2087,20 @@ static void probe_apply(struct conn *c, const struct path_probe *pr,
 	label[0] = '\0';
 	pthread_mutex_lock(&c->path_lock);
 	p = conn_pong_path(c, pr->nonce);
+	/*
+	 * The nonce names which question this answers, not who answered it. Off
+	 * ICE we know where the question went, so require the answer to come
+	 * from there: otherwise an answer relayed from anywhere qualifies the
+	 * path it was carried over, which is how a path that has never carried
+	 * a byte between the two ends can be made to look like the best one.
+	 */
+	if (p && kind != PATH_ICE && src && !path_ep_any(&from) &&
+	    !path_ep_eq(&from, &p->peer_ep)) {
+		pthread_mutex_unlock(&c->path_lock);
+		dbg_logf("path: pong for %s arrived from somewhere else",
+			 p->label);
+		return;
+	}
 	if (p) {
 		int fresh = !p->qualified;
 
