@@ -719,21 +719,28 @@ if(BUILD_TESTING)
 	target_link_libraries(qr_test comrade_qr)
 	add_test(NAME qr_test COMMAND qr_test)
 
-	# Self-sandboxing: a child applies a profile and is then refused the thing
-	# that profile forbids (exec for the client, INET sockets for the
-	# foreground). Skips where the kernel offers no seccomp.
-	add_executable(sandbox_test tests/sandbox_test.c)
-	target_link_libraries(sandbox_test comrade_sandbox)
-	add_test(NAME sandbox_test COMMAND sandbox_test)
-	set_tests_properties(sandbox_test PROPERTIES SKIP_RETURN_CODE 77)
+	# The sandbox and spawner are POSIX (fork, pthreads, forkpty, the
+	# resolver and socket headers), and the Windows service is not sandboxed
+	# this way, so their tests are built on Unix only.
+	if(UNIX)
+		# Self-sandboxing: a child applies a profile and is then refused
+		# the thing that profile forbids (exec for the client, INET
+		# sockets for the foreground). Skips where the kernel offers no
+		# seccomp.
+		add_executable(sandbox_test tests/sandbox_test.c)
+		target_link_libraries(sandbox_test comrade_sandbox)
+		add_test(NAME sandbox_test COMMAND sandbox_test)
+		set_tests_properties(sandbox_test PROPERTIES SKIP_RETURN_CODE 77)
 
-	# The tmux spawner under concurrent load: many threads spawning and
-	# closing while another queries liveness, proving the one control channel
-	# never crosses a reply to the wrong caller.
-	add_executable(spawner_test tests/spawner_test.c)
-	target_link_libraries(spawner_test comrade_cpty)
-	add_test(NAME spawner_test COMMAND spawner_test)
-	set_tests_properties(spawner_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+		# The tmux spawner under concurrent load: many threads spawning
+		# and closing while another queries liveness, proving the one
+		# control channel never crosses a reply to the wrong caller.
+		add_executable(spawner_test tests/spawner_test.c)
+		target_link_libraries(spawner_test comrade_cpty)
+		add_test(NAME spawner_test COMMAND spawner_test)
+		set_tests_properties(spawner_test PROPERTIES
+			SKIP_RETURN_CODE 77 TIMEOUT 60)
+	endif()
 
 	add_executable(showfmt_test tests/showfmt_test.c src/showfmt.c)
 	target_link_libraries(showfmt_test comrade_token comrade_compat)
