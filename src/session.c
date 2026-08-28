@@ -686,6 +686,28 @@ static void fmt_sockaddr(const struct sockaddr *sa, socklen_t len,
 		snprintf(out, n, "%s:%s", host, serv);
 }
 
+/*
+ * Our own listening endpoint: both ends of one session hold the same key, so a
+ * probe sent there is answered by us and the path looks alive while carrying
+ * nothing. Only this exact endpoint is refused -- our address on another port
+ * is another process, which is what a peer sharing this machine looks like,
+ * and what a peer that merely shares an address (a VM and its host under
+ * passt) offers is left to fail its probes like any other dead path.
+ *
+ * An endpoint reaches the table from a peer that names one, from the source of
+ * a sealed announcement and from the source of a probe, and a source is as
+ * freely chosen as anything else in a datagram. The test is the same at each.
+ */
+static int sess_ep_is_self(struct sess *s, const struct path_ep *ep)
+{
+	struct netmon_addr local[NETMON_MAX_ADDRS];
+
+	if (!s->lan || ep->port != lanlink_port(s->lan))
+		return 0;
+	return cand_ep_is_local(ep->addr, local,
+				netmon_snapshot(local, NETMON_MAX_ADDRS));
+}
+
 /* Enter one endpoint on the shared lanlink socket as a path, or find the path
  * already naming it; its printable form goes to label when one is asked for.
  * Returns 0 when the connection holds the path afterwards. */
@@ -693,8 +715,15 @@ static int conn_add_lan_path(struct conn *c, enum path_kind kind,
 			     const struct sockaddr_in6 *remote,
 			     char *label, size_t label_len)
 {
+	struct path_ep ep;
 	struct path *p;
 
+	if (!path_ep_from_sockaddr(&ep, (const struct sockaddr *)remote,
+				   sizeof(*remote)) &&
+	    sess_ep_is_self(c->sess, &ep)) {
+		dbg_logf("path: declined, it is our own endpoint");
+		return -1;
+	}
 	pthread_mutex_lock(&c->path_lock);
 	p = path_table_add(&c->paths, kind, remote, NULL, now_ms());
 	if (p && label)
@@ -1004,7 +1033,6 @@ static enum path_kind ep_kind(const struct path_ep *ep)
 static void conn_offer_path(struct conn *c, const struct sockaddr *sa,
 			    socklen_t len)
 {
-	struct netmon_addr local[NETMON_MAX_ADDRS];
 	char added[PATH_LABEL_MAX];
 	struct sockaddr_in6 remote;
 	struct path_ep ep;
@@ -1026,18 +1054,7 @@ static void conn_offer_path(struct conn *c, const struct sockaddr *sa,
 		dbg_logf("path advertised: declined, not one host");
 		return;
 	}
-	/*
-	 * Our own listening endpoint, advertised back at us: both ends of one
-	 * session hold the same key, so a probe sent there is answered by us
-	 * and the path looks alive while carrying nothing. Only this exact
-	 * endpoint is refused -- our address on another port is another
-	 * process, which is what a peer sharing this machine looks like, and
-	 * what a peer that merely shares an address (a VM and its host under
-	 * passt) offers is left to fail its probes like any other dead path.
-	 */
-	if (c->sess->lan && ep.port == lanlink_port(c->sess->lan) &&
-	    cand_ep_is_local(ep.addr, local,
-			     netmon_snapshot(local, NETMON_MAX_ADDRS))) {
+	if (sess_ep_is_self(c->sess, &ep)) {
 		dbg_logf("path advertised: declined, it is our own endpoint");
 		return;
 	}
@@ -2081,7 +2098,8 @@ static void probe_apply(struct conn *c, const struct path_probe *pr,
 			return;
 		}
 		p = conn_recv_path(c, kind, &from);
-		if (!p && src && kind != PATH_ICE) {
+		if (!p && src && kind != PATH_ICE &&
+		    !sess_ep_is_self(c->sess, &from)) {
 			/*
 			 * A source nothing has been seen from before takes a
 			 * free slot or a dead one, and displaces nothing: the
@@ -5077,6 +5095,7 @@ static void lan_drain(struct sess *s, struct worker *ws, int *dash_seq)
 	for (p = 0; p < s->lan_pending_n; p++) {
 		struct sockaddr_in6 mapped;
 		char addr[PATH_LABEL_MAX];
+		struct path_ep self_ep;
 		struct conn *c;
 		int slot = -1;
 
@@ -5085,6 +5104,11 @@ static void lan_drain(struct sess *s, struct worker *ws, int *dash_seq)
 			continue;
 		if (lan_conn_active(s, &mapped))
 			continue;		/* a re-broadcast during setup */
+		if (!path_ep_from_sockaddr(&self_ep,
+					   (const struct sockaddr *)&mapped,
+					   sizeof(mapped)) &&
+		    sess_ep_is_self(s, &self_ep))
+			continue;		/* a claim aimed at ourselves */
 		if (s->cfg->host_admit_max &&
 		    s->admitted_n >= s->cfg->host_admit_max)
 			continue;		/* the admission budget is spent */
