@@ -50,12 +50,25 @@ format does not change at all: same 16 bytes, a different value, with
 secret and can derive the read-only twin; the reverse is impossible, which is
 the point.
 
-The cost is that the host then runs two rendezvous planes -- two BEP 44
-identities, two mailboxes, two multicast announcement streams, and a demux that
-tries both -- and only needs to when a read-only invitation has actually been
-minted, which it knows at the point it mints one (`host.c`). That is the piece
-of work, and it is why this is written down rather than done: it is a change to
-how the host meets people, not a rule inside a parser.
+The cost is the whole of it, and two facts fix how large it is.
+
+*One mailbox cannot carry both classes.* The rendezvous is a single BEP 44
+value holding two sealed slots, the host's offer and the client's answer, and
+`SIG_MAX_VALUE` says those two "plus framing fit one BEP44 value". There is no
+room for a third and fourth, so the classes cannot share a mailbox with
+per-class slots; each needs its own.
+
+*A second mailbox is a second signaller, and a signaller owns a DHT node.*
+`sig_create` calls `dhtnode_create` (src/sig.c), so the host would run two DHT
+nodes: two bootstraps, two node caches, two sets of puts and gets, and a main
+loop polling both. Add per-class multicast announcements and a demux that tries
+both keys.
+
+It only needs doing when a read-only invitation has actually been minted, which
+the host knows at the point it mints one (`host.c`), so the cost is not paid by
+sessions that never hand one out. But it is a change to how the host meets
+people rather than a rule inside a parser, which is why this one is written
+down and the other three were done.
 
 **What it would not buy.** Nothing within a class. All read-write guests would
 still share one setup key, and that is correct: they all have a shell, so there
