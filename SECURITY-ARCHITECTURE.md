@@ -119,12 +119,19 @@ guest's punch. What it aimed with came out of the mailbox. Sealing the claim
 takes the endpoints away, so the interference loses its targeting even though
 the raw path in that window is unchanged.
 
-**What it does not fix.** Occupancy is inherent to a mutex: any guest can still
-see that the slot is taken, and can still take it. A view-only guest starving
-read-write clients of the turnstile therefore remains, and *that* is what the
-class split is genuinely for -- along with per-class admission limits. So the
-two options are complementary rather than alternatives, and the sealing one is
-both smaller and aimed at the larger problem.
+**What it does not fix, and that is where the line is drawn.** Occupancy is
+inherent to a mutex: any guest can still see that the slot is taken, and can
+still take it, so a holder can delay another's candidate exchange or deny it
+for as long as it keeps claiming. Closing that means mailboxes that are
+single-use, or private per guest, and the price is the property the whole tool
+rests on -- one token is one BEP 44 key, so a link can be handed to whoever you
+like and simply works. Trading that for protection against an *authenticated*
+holder delaying an exchange it can no longer read is not worth it. The attack
+that remains needs a valid invitation, achieves delay rather than disclosure,
+and is visible as a mailbox that will not settle.
+
+The class split (below) is the cheaper half-answer to it and stays an option,
+along with per-class admission limits.
 
 **What is not worth doing.** Per-invitation keys would separate the crowd from
 each other, but a crowd is exactly what one link handed to many people is; the
