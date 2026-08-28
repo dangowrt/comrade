@@ -356,6 +356,15 @@ int sig_rotate(struct sig *s, const uint8_t *offer, size_t len)
 void sig_release(struct sig *s)
 {
 	mailbox_arm_release(&s->mb);
+	/*
+	 * Emptying the slot means the next answer is new business even if it is
+	 * the same bytes, exactly as after a rotate. A client whose claim was
+	 * let go re-puts the one it already has -- nothing about it changed --
+	 * so a delivery de-duplicated against the copy we just released is one
+	 * the host never sees, and the claimant goes on writing into a mailbox
+	 * that is answering nobody.
+	 */
+	s->have_last = 0;
 }
 
 void sig_redeliver(struct sig *s)
