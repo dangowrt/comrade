@@ -102,6 +102,9 @@ static int apply_macos(const struct sandbox_cfg *cfg)
 #ifndef PR_SET_NO_NEW_PRIVS
 #define PR_SET_NO_NEW_PRIVS 38
 #endif
+#ifndef PR_GET_SECCOMP
+#define PR_GET_SECCOMP 21
+#endif
 #ifndef PR_SET_MDWE
 #define PR_SET_MDWE 65
 #endif
@@ -326,14 +329,17 @@ static int seccomp_nonet(void)
 #endif /* SB_AUDIT_ARCH */
 #endif /* SYS_seccomp */
 
-static int seccomp_apply(int role)
+static int seccomp_apply(int role, int confine)
 {
 #if defined(SYS_seccomp) && defined(SB_AUDIT_ARCH)
 	if (role == SANDBOX_FOREGROUND)
 		return seccomp_nonet();
-	return seccomp_noexec();
+	if (confine)
+		return seccomp_noexec();
+	return 0;
 #else
 	(void)role;
+	(void)confine;
 	return 0;
 #endif
 }
@@ -898,6 +904,14 @@ static int fs_confine(const struct sandbox_cfg *cfg)
 static int apply_linux(const struct sandbox_cfg *cfg)
 {
 	int layers = 0;
+	/*
+	 * Confine the filesystem and deny exec only for a process that will not
+	 * exec: the client, and the service when a spawner does its spawning.
+	 * A service without a spawner forks tmux itself, so those layers would
+	 * be inherited by the shells and must not apply; the rest still do.
+	 */
+	int confine = (cfg->role == SANDBOX_CLIENT) ||
+		(cfg->role == SANDBOX_SERVICE && cfg->have_spawner);
 
 	/*
 	 * Order matters. The filesystem confinement enters a user namespace and
@@ -920,12 +934,12 @@ static int apply_linux(const struct sandbox_cfg *cfg)
 #endif
 	}
 	layers |= mdwe();
-	if (cfg->role != SANDBOX_FOREGROUND)
+	if (confine)
 		layers |= fs_confine(cfg);
 	layers |= no_dumpable();
 	layers |= drop_caps();
 	layers |= no_new_privs();
-	layers |= seccomp_apply(cfg->role);
+	layers |= seccomp_apply(cfg->role, confine);
 	return layers;
 }
 
@@ -956,6 +970,19 @@ int sandbox_apply(const struct sandbox_cfg *cfg)
 #endif
 	dbg_logf("sandbox: role=%d layers=0x%x", cfg->role, layers);
 	return layers;
+}
+
+int sandbox_needs_spawner(void)
+{
+	if (sandbox_disabled())
+		return 0;
+#if defined(__APPLE__)
+	return 1;			/* the Seatbelt profile denies exec */
+#elif defined(__linux__)
+	return prctl(PR_GET_SECCOMP) >= 0;	/* seccomp is compiled in */
+#else
+	return 0;
+#endif
 }
 
 #endif /* !_WIN32 */

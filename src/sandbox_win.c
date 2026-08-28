@@ -22,4 +22,11 @@ int sandbox_apply(const struct sandbox_cfg *cfg)
 	return 0;
 }
 
+/* Windows cannot deny an already-running process CreateProcess, so its service
+ * drives tmux directly and needs no spawner. */
+int sandbox_needs_spawner(void)
+{
+	return 0;
+}
+
 #endif /* _WIN32 */

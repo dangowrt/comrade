@@ -77,7 +77,23 @@ struct sandbox_cfg {
 					 * NULL to grant no data directory */
 	const char *state_dir;		/* host state dir, writable; NULL unless
 					 * role == SANDBOX_SERVICE */
+	/*
+	 * SANDBOX_SERVICE only: whether the service has a spawner doing its
+	 * exec (see spawner.h). The filesystem confinement and the exec denial
+	 * apply only when it does -- without one the service forks tmux itself,
+	 * and those layers would wrongly be inherited by the shells. The other
+	 * layers apply either way.
+	 */
+	int have_spawner;
 };
+
+/*
+ * Whether the host should fork a spawner before sandboxing its service: true
+ * where the service profile will actually deny exec (Linux with seccomp
+ * available; macOS), false where it will not (a seccompless kernel; Windows).
+ * Lets the host skip the broker where it would add nothing.
+ */
+int sandbox_needs_spawner(void);
 
 /*
  * Confine this process according to cfg. Returns the OR of the SANDBOX_L_*

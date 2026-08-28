@@ -43,13 +43,16 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "appdir.h"
 #include "conn.h"
 #include "mview.h"
 #include "dbg.h"
 #include "keys.h"
 #include "oscompat.h"
+#include "sandbox.h"
 #include "session.h"
 #include "sig.h"
+#include "spawner.h"
 #include "sshd.h"
 #include "statusbar.h"
 #include "termfilter.h"
@@ -84,6 +87,7 @@ struct svc {
 	volatile int stop;		/* forward-only: end the serve loop */
 	sock_t stop_wfd;		/* shut to release the turnstile promptly */
 	struct session_obs obs;		/* view-event emitter to the foreground */
+	struct spawner *sp;		/* runs tmux for the sandboxed service */
 };
 
 /* True only for a real directory we own with no group/other access -- not a
@@ -702,6 +706,48 @@ static void on_token_state(void *arg, int family, int state,
 	svc_emit_token(v);
 }
 
+/* Is the shared tmux session alive? Through the spawner when there is one; a
+ * spawner that has itself died is read as the session ending, which ends the
+ * serve loop without taking the tmux server (the operator or a sweep collects
+ * it). */
+static int svc_alive(struct svc *v)
+{
+	int r;
+
+	if (!v->sp)
+		return tmux_alive(v->sock);
+	r = spawner_alive(v->sp);
+	if (r == SPAWNER_GONE) {
+		dbg_logf("host: spawner gone -- ending the service");
+		return 0;
+	}
+	return r == SPAWNER_ALIVE;
+}
+
+/*
+ * Fork the spawner and then confine this network-facing service. Called at a
+ * single-threaded moment -- before the emitter thread and before the first
+ * socket -- so the confinement covers every thread that follows and the spawner
+ * inherits none of it. Where the platform will not deny exec there is no
+ * spawner, and the service keeps running tmux directly.
+ */
+static void svc_confine(struct svc *v)
+{
+	struct sandbox_cfg sb;
+
+	/* A forwarding-only host runs no tmux and execs nothing, so it needs no
+	 * spawner; every other service hands its tmux to one where the platform
+	 * can then deny the service's own exec. */
+	if (!v->forward_only && sandbox_needs_spawner())
+		v->sp = spawner_create(v->sock);
+	memset(&sb, 0, sizeof(sb));
+	sb.role = SANDBOX_SERVICE;
+	sb.data_dir = appdir_data();
+	sb.state_dir = state_dir();
+	sb.have_spawner = (v->sp != NULL);
+	sandbox_apply(&sb);
+}
+
 /* The serving core: sessions over the shared tmux, again after each client,
  * until the tmux server is gone. The observer in v->obs is already bound. */
 static void svc_serve(struct svc *v, void *hostkey, int no_mcast, int no_dht)
@@ -711,6 +757,7 @@ static void svc_serve(struct svc *v, void *hostkey, int no_mcast, int no_dht)
 	struct session_cfg cfg;
 	sock_t end_fd = INVALID_SOCK;
 	pid_t end_pid = -1;
+	int end_handle = -1;
 
 	if (v->forward_only) {
 		/* No tmux to anchor on, so a socketpair is the end signal: the
@@ -727,7 +774,10 @@ static void svc_serve(struct svc *v, void *hostkey, int no_mcast, int no_dht)
 			 v->sock);
 		snprintf(cmd_ro, sizeof(cmd_ro),
 			 "tmux -S %s attach -r -t comrade", v->sock);
-		end_fd = spawn_end_monitor(v->sock, &end_pid);
+		if (v->sp)
+			end_fd = spawner_endmon(v->sp, &end_handle);
+		else
+			end_fd = spawn_end_monitor(v->sock, &end_pid);
 	}
 
 	memset(&cfg, 0, sizeof(cfg));
@@ -753,6 +803,7 @@ static void svc_serve(struct svc *v, void *hostkey, int no_mcast, int no_dht)
 	cfg.on_token_state = on_token_state;
 	cfg.arg = v;
 	cfg.obs = &v->obs;
+	cfg.spawner = v->sp;
 
 	/*
 	 * Non-forward-only is anchored to tmux: the shared session is the
@@ -760,7 +811,7 @@ static void svc_serve(struct svc *v, void *hostkey, int no_mcast, int no_dht)
 	 * tmux, so it runs until stopped (v->stop, set by the supervisor's
 	 * signal watcher or the operator) or the bounded grant is spent.
 	 */
-	while (v->forward_only ? !v->stop : tmux_alive(v->sock)) {
+	while (v->forward_only ? !v->stop : svc_alive(v)) {
 		cfg.tok = v->tok;	/* carry the located anchor forward, so the
 					 * next idle attempt reinforces it rather
 					 * than locating (and churning) a new one */
@@ -769,14 +820,20 @@ static void svc_serve(struct svc *v, void *hostkey, int no_mcast, int no_dht)
 			/* The bounded grant is spent: end for good, taking
 			 * the shared tmux (if any) with us. */
 			if (!v->forward_only) {
-				char *k[] = { "tmux", "-S", v->sock,
-					      "kill-server", NULL };
+				if (v->sp) {
+					spawner_kill_server(v->sp);
+				} else {
+					char *k[] = { "tmux", "-S", v->sock,
+						      "kill-server", NULL };
 
-				run_wait(k);
+					run_wait(k);
+				}
 			}
 			break;
 		}
 	}
+	if (v->sp && end_handle >= 0)
+		spawner_close(v->sp, end_handle);
 	if (sock_isset(end_fd))
 		sock_close(end_fd);
 	if (sock_isset(v->stop_wfd)) {
@@ -807,8 +864,10 @@ static void run_service(struct svc *v, void *hostkey, int wfd, int no_mcast,
 		if (devnull > STDERR_FILENO)
 			close(devnull);
 	}
+	svc_confine(v);			/* spawner, then sandbox: before threads */
 	ui_emitter(&v->obs, wfd);	/* progress -> the foreground view */
 	svc_serve(v, hostkey, no_mcast, no_dht);
+	spawner_destroy(v->sp);
 	_exit(0);
 }
 
@@ -1146,8 +1205,7 @@ static void on_stop_sig(int sig)
  * returns. A signal handler cannot run tmux, so this thread does.
  */
 struct stop_watch {
-	struct svc *v;			/* forward-only: set v->stop; else NULL */
-	const char *sock;
+	struct svc *v;			/* the service to end */
 	uint64_t deadline;		/* --expire, as mono_ms; 0 = none */
 	volatile int done;
 };
@@ -1171,13 +1229,17 @@ static void *stop_watch_thread(void *arg)
 		usleep(200 * 1000);
 	}
 	if (fire && !w->done) {
-		if (w->v) {
-			w->v->stop = 1;
+		struct svc *v = w->v;
+
+		if (v->forward_only) {
+			v->stop = 1;
 			/* Wake the turnstile's end-fd so it returns at once. */
-			if (sock_isset(w->v->stop_wfd))
-				sock_shutdown(w->v->stop_wfd, SHUT_RDWR);
+			if (sock_isset(v->stop_wfd))
+				sock_shutdown(v->stop_wfd, SHUT_RDWR);
+		} else if (v->sp) {
+			spawner_kill_server(v->sp);
 		} else {
-			char *k[] = { "tmux", "-S", (char *)w->sock,
+			char *k[] = { "tmux", "-S", (char *)v->sock,
 				      "kill-server", NULL };
 
 			run_wait(k);
@@ -1253,25 +1315,29 @@ int host_headless(const char *id_opt, int no_mcast, int no_dht, int no_fwd,
 		fprintf(pf, "%ld\n", os_getpid());
 		fclose(pf);
 	}
+	/* Fork the spawner and confine, while still single-threaded and before
+	 * the first socket -- the stop-watch thread and the serving come after. */
+	svc_confine(&v);
 	signal(SIGTERM, on_stop_sig);
 	signal(SIGINT, on_stop_sig);
 	signal(SIGPIPE, SIG_IGN);
 
 	mview_limits(m, expire_s, max_clients);
 	mview_bind(m, &v.obs);
-	w.v = forward_only ? &v : NULL;
-	w.sock = v.sock;
+	w.v = &v;
 	w.deadline = expire_s > 0 ? mono_ms() + (uint64_t)expire_s * 1000 : 0;
 	w.done = 0;
 	if (pthread_create(&th, NULL, stop_watch_thread, &w)) {
 		fprintf(stderr, "comrade: thread creation failed\n");
 		unlink(pidp);
 		mview_destroy(m);
+		spawner_destroy(v.sp);
 		return 1;
 	}
 	svc_serve(&v, hostkey, no_mcast, no_dht);
 	w.done = 1;
 	pthread_join(th, NULL);
+	spawner_destroy(v.sp);
 	unlink(pidp);
 	mview_destroy(m);
 	sshd_hostkey_free(hostkey);
