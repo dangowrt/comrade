@@ -280,6 +280,64 @@ static void src_is_never_stale_on_the_wire(void)
 /* R2: losing the rendezvous is worst exactly when a move needs it most, so it
  * is given up only once it has been asked and failed, and only for one that
  * has answered. */
+/*
+ * A client with a session up is never ticked -- nothing watches the interfaces
+ * while a link holds -- so the answer that completes the case has to be what
+ * confirms it. Until it did, such a client could hold a rendezvous it was
+ * using and never be able to tell its peer where it was.
+ */
+static void an_answer_confirms_without_a_tick(void)
+{
+	struct netstate ns;
+	uint8_t a[16], got[NETSTATE_SA_MAX];
+	uint8_t glen;
+	int confirmed = 0, i;
+
+	start(&ns, 1);
+	fill(a, 16, 90);
+	give_src(&ns, 6, 20);
+
+	for (i = 0; i < NETSTATE_ANCHOR_QUALIFY; i++) {
+		netstate_on_dht_ack(&ns, 6, netstate_epoch(&ns, 6), a, 16, t);
+		t += NETSTATE_ANCHOR_PROVE_MS / NETSTATE_ANCHOR_QUALIFY + 1;
+	}
+	/* The window has passed and the answers are in, but nothing has
+	 * ticked. */
+	assert(netstate_anchor(&ns, 6, got, &glen, &confirmed));
+	assert(!confirmed);
+	netstate_on_dht_ack(&ns, 6, netstate_epoch(&ns, 6), a, 16, t);
+	assert(netstate_anchor(&ns, 6, got, &glen, &confirmed) && confirmed);
+	assert(!memcmp(got, a, 16));
+}
+
+/* And it is still the answers and the window that decide, not the arrival of
+ * one more answer: too few, or too soon, confirms nothing. */
+static void an_answer_alone_confirms_nothing(void)
+{
+	struct netstate ns;
+	uint8_t a[16], got[NETSTATE_SA_MAX];
+	uint8_t glen;
+	int confirmed = 1, i;
+
+	start(&ns, 1);
+	fill(a, 16, 91);
+	give_src(&ns, 6, 20);
+
+	/* Every answer this family will ever need, all inside the window. */
+	for (i = 0; i < NETSTATE_ANCHOR_QUALIFY * 3; i++)
+		netstate_on_dht_ack(&ns, 6, netstate_epoch(&ns, 6), a, 16, t);
+	assert(netstate_anchor(&ns, 6, got, &glen, &confirmed));
+	assert(!confirmed);
+
+	/* And the window on its own, with the answers already in, waits for
+	 * the next one to say so. */
+	t += NETSTATE_ANCHOR_PROVE_MS + 1;
+	assert(netstate_anchor(&ns, 6, got, &glen, &confirmed));
+	assert(!confirmed);
+	netstate_on_dht_ack(&ns, 6, netstate_epoch(&ns, 6), a, 16, t);
+	assert(netstate_anchor(&ns, 6, got, &glen, &confirmed) && confirmed);
+}
+
 static void anchor_changes_only_on_replacement(void)
 {
 	struct netstate ns;
@@ -1151,6 +1209,8 @@ int main(void)
 	an_address_that_never_comes_stops_being_hurried();
 	late_src_retracts_the_wrong_row();
 	src_is_never_stale_on_the_wire();
+	an_answer_confirms_without_a_tick();
+	an_answer_alone_confirms_nothing();
 	anchor_changes_only_on_replacement();
 	only_another_answer_condemns();
 	quiet_searches_without_giving_up();

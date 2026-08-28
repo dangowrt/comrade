@@ -320,6 +320,30 @@ static int anchor_set(struct netstate *ns, int i, const uint8_t *node, int len,
 	return 1;
 }
 
+/*
+ * Has the anchor answered often enough, for long enough, to be named in a
+ * token? Applied both on the tick and wherever an answer lands: a client with
+ * a session up is not ticked -- nothing watches the interfaces while a link
+ * holds -- so an anchor of its own could never qualify there, and it could
+ * never tell its peer where it rendezvous.
+ */
+static void anchor_confirm(struct netstate *ns, int i, uint64_t now)
+{
+	struct netstate_fam *f = &ns->f[i];
+
+	if (!f->anchor_len || f->anchor_confirmed)
+		return;
+	if (f->anchor_acks < NETSTATE_ANCHOR_QUALIFY ||
+	    now - f->anchor_first_ms < NETSTATE_ANCHOR_PROVE_MS)
+		return;
+	f->anchor_confirmed = 1;
+	/* From here it may be named in a token, so it stops being ours to drop
+	 * and can only be replaced. */
+	f->anchor_candidate = 0;
+	raise_act(ns, i, NSA_EMIT_RDV);
+	facts_moved(ns, i);
+}
+
 void netstate_on_dht_ack(struct netstate *ns, int family, uint32_t epoch,
 			 const uint8_t *node, int len, uint64_t now)
 {
@@ -347,7 +371,8 @@ void netstate_on_dht_ack(struct netstate *ns, int family, uint32_t epoch,
 			f->anchor_first_ms = now;
 		if (f->anchor_acks < NETSTATE_ANCHOR_QUALIFY)
 			f->anchor_acks++;
-		return;			/* the tick confirms, once it has lasted */
+		anchor_confirm(ns, i, now);
+		return;
 	}
 	/*
 	 * A different node. A client does not get to pick: the rendezvous is
@@ -507,16 +532,7 @@ void netstate_tick(struct netstate *ns, uint64_t now)
 			    ++f->anchor_quiet >= NETSTATE_ANCHOR_QUIET)
 				raise_act(ns, i, NSA_RDV_RELOCATE);
 		}
-		if (f->anchor_len && !f->anchor_confirmed &&
-		    f->anchor_acks >= NETSTATE_ANCHOR_QUALIFY &&
-		    now - f->anchor_first_ms >= NETSTATE_ANCHOR_PROVE_MS) {
-			f->anchor_confirmed = 1;
-			/* From here it may be named in a token, so it stops
-			 * being ours to drop and can only be replaced. */
-			f->anchor_candidate = 0;
-			raise_act(ns, i, NSA_EMIT_RDV);
-			facts_moved(ns, i);
-		}
+		anchor_confirm(ns, i, now);
 		/*
 		 * A candidate that did not qualify in the time it was given.
 		 * Nobody has been shown it, so it simply goes, and the search
