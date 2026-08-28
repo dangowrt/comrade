@@ -37,6 +37,14 @@ void cc_blake2b_keyed(uint8_t *out, size_t out_len,
 
 /* RFC 8032 Ed25519. sk is seed || public key (64 bytes); seed is wiped.
  * check returns 0 for a good signature, non-zero otherwise. */
+/*
+ * X25519 (RFC 7748). A claim in the mailbox is sealed to the host, which is
+ * the only holder of the secret half, so no other holder of the invitation can
+ * read where a peer is. Interop-critical, like the rest of this header.
+ */
+int cc_x25519_public(uint8_t pk[32], const uint8_t sk[32]);
+int cc_x25519(uint8_t out[32], const uint8_t sk[32], const uint8_t peer[32]);
+
 int cc_ed25519_key_pair(uint8_t sk[64], uint8_t pk[32], uint8_t seed[32]);
 int cc_ed25519_sign(uint8_t sig[64], const uint8_t sk[64],
 		    const uint8_t *msg, size_t msg_len);

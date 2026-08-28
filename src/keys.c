@@ -25,6 +25,72 @@
  * linking a crypto library -- bcrypt.dll is a system DLL and libjuice already
  * imports it.
  */
+/* The box key: the agreement, bound to both public keys so one ephemeral can
+ * never produce the same key for two recipients. */
+static void box_key(uint8_t key[32], const uint8_t shared[32],
+		    const uint8_t epk[32], const uint8_t pk[32])
+{
+	static const char info[] = "comrade1 claim box";
+	uint8_t buf[sizeof(info) - 1 + 64];
+
+	memcpy(buf, info, sizeof(info) - 1);
+	memcpy(buf + sizeof(info) - 1, epk, 32);
+	memcpy(buf + sizeof(info) - 1 + 32, pk, 32);
+	cc_blake2b_keyed(key, 32, shared, 32, buf, sizeof(buf));
+}
+
+int box_seal(uint8_t *dst, size_t dst_len, const uint8_t pk[32],
+	     const uint8_t *plain, size_t plain_len)
+{
+	uint8_t esk[32], epk[32], shared[32], key[32];
+	static const uint8_t nonce[24];		/* the key is used once */
+	int rc = -1;
+
+	if (dst_len < plain_len + BOX_OVERHEAD)
+		return -1;
+	if (random_bytes(esk, sizeof(esk)))
+		return -1;
+	if (cc_x25519_public(epk, esk) || cc_x25519(shared, esk, pk))
+		goto out;
+	box_key(key, shared, epk, pk);
+	memcpy(dst, epk, 32);
+	if (cc_aead_lock(dst + BOX_OVERHEAD, dst + 32, key, nonce, epk, 32,
+			 plain, plain_len))
+		goto out;
+	rc = (int)(plain_len + BOX_OVERHEAD);
+out:
+	memset(esk, 0, sizeof(esk));
+	memset(shared, 0, sizeof(shared));
+	memset(key, 0, sizeof(key));
+	return rc;
+}
+
+int box_open(uint8_t *dst, size_t dst_len, const uint8_t sk[32],
+	     const uint8_t *sealed, size_t sealed_len)
+{
+	uint8_t pk[32], shared[32], key[32];
+	static const uint8_t nonce[24];
+	size_t n;
+	int rc = -1;
+
+	if (sealed_len < BOX_OVERHEAD)
+		return -1;
+	n = sealed_len - BOX_OVERHEAD;
+	if (dst_len < n)
+		return -1;
+	if (cc_x25519_public(pk, sk) || cc_x25519(shared, sk, sealed))
+		goto out;
+	box_key(key, shared, sealed, pk);
+	if (cc_aead_unlock(dst, sealed + 32, key, nonce, sealed, 32,
+			   sealed + BOX_OVERHEAD, n))
+		goto out;
+	rc = (int)n;
+out:
+	memset(shared, 0, sizeof(shared));
+	memset(key, 0, sizeof(key));
+	return rc;
+}
+
 int random_bytes(void *buf, size_t len)
 {
 	uint8_t *p = buf;

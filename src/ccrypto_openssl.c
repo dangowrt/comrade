@@ -95,6 +95,58 @@ out:
 	EVP_MAC_free(mac);
 }
 
+/* RFC 7748 says a shared secret of all zeros means the peer sent a low-order
+ * point, which agrees on nothing. Refuse rather than derive from it. */
+static int x25519_degenerate(const uint8_t out[32])
+{
+	uint8_t d = 0;
+	int i;
+
+	for (i = 0; i < 32; i++)
+		d = (uint8_t)(d | out[i]);
+	return d == 0;
+}
+
+int cc_x25519_public(uint8_t pk[32], const uint8_t sk[32])
+{
+	EVP_PKEY *key;
+	size_t plen = 32;
+	int ok;
+
+	key = EVP_PKEY_new_raw_private_key(EVP_PKEY_X25519, NULL, sk, 32);
+	if (!key)
+		return -1;
+	ok = EVP_PKEY_get_raw_public_key(key, pk, &plen) == 1 && plen == 32;
+	EVP_PKEY_free(key);
+	return ok ? 0 : -1;
+}
+
+int cc_x25519(uint8_t out[32], const uint8_t sk[32], const uint8_t peer[32])
+{
+	EVP_PKEY *mine = NULL, *theirs = NULL;
+	EVP_PKEY_CTX *ctx = NULL;
+	size_t len = 32;
+	int ok = 0;
+
+	mine = EVP_PKEY_new_raw_private_key(EVP_PKEY_X25519, NULL, sk, 32);
+	theirs = EVP_PKEY_new_raw_public_key(EVP_PKEY_X25519, NULL, peer, 32);
+	if (!mine || !theirs)
+		goto out;
+	ctx = EVP_PKEY_CTX_new(mine, NULL);
+	if (!ctx || EVP_PKEY_derive_init(ctx) != 1 ||
+	    EVP_PKEY_derive_set_peer(ctx, theirs) != 1 ||
+	    EVP_PKEY_derive(ctx, out, &len) != 1 || len != 32)
+		goto out;
+	ok = !x25519_degenerate(out);
+out:
+	EVP_PKEY_CTX_free(ctx);
+	EVP_PKEY_free(theirs);
+	EVP_PKEY_free(mine);
+	if (!ok)
+		OPENSSL_cleanse(out, 32);
+	return ok ? 0 : -1;
+}
+
 int cc_ed25519_key_pair(uint8_t sk[64], uint8_t pk[32], uint8_t seed[32])
 {
 	EVP_PKEY *key;

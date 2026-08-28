@@ -214,6 +214,37 @@ static int sexp_copy32(uint8_t out[32], gcry_sexp_t sig, const char *token)
 	return rc;
 }
 
+/* RFC 7748 says a shared secret of all zeros means the peer sent a low-order
+ * point, which agrees on nothing. Refuse rather than derive from it. */
+static int x25519_degenerate(const uint8_t out[32])
+{
+	uint8_t d = 0;
+	int i;
+
+	for (i = 0; i < 32; i++)
+		d = (uint8_t)(d | out[i]);
+	return d == 0;
+}
+
+int cc_x25519_public(uint8_t pk[32], const uint8_t sk[32])
+{
+	cc_init();
+	/* A NULL point is the curve's base point, so this is the public key. */
+	if (gcry_ecc_mul_point(GCRY_ECC_CURVE25519, pk, sk, NULL))
+		return -1;
+	return 0;
+}
+
+int cc_x25519(uint8_t out[32], const uint8_t sk[32], const uint8_t peer[32])
+{
+	cc_init();
+	if (gcry_ecc_mul_point(GCRY_ECC_CURVE25519, out, sk, peer))
+		return -1;
+	if (x25519_degenerate(out))
+		return -1;
+	return 0;
+}
+
 int cc_ed25519_key_pair(uint8_t sk[64], uint8_t pk[32], uint8_t seed[32])
 {
 	gcry_sexp_t s_sk = NULL;

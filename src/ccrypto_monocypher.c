@@ -53,6 +53,30 @@ void cc_blake2b_keyed(uint8_t *out, size_t out_len,
 	crypto_blake2b_keyed(out, out_len, key, key_len, msg, msg_len);
 }
 
+/* RFC 7748 says a shared secret of all zeros means the peer sent a low-order
+ * point, which agrees on nothing. Refuse rather than derive from it. */
+static int x25519_degenerate(const uint8_t out[32])
+{
+	uint8_t d = 0;
+	int i;
+
+	for (i = 0; i < 32; i++)
+		d = (uint8_t)(d | out[i]);
+	return d == 0;
+}
+
+int cc_x25519_public(uint8_t pk[32], const uint8_t sk[32])
+{
+	crypto_x25519_public_key(pk, sk);
+	return 0;
+}
+
+int cc_x25519(uint8_t out[32], const uint8_t sk[32], const uint8_t peer[32])
+{
+	crypto_x25519(out, sk, peer);
+	return x25519_degenerate(out) ? -1 : 0;
+}
+
 int cc_ed25519_key_pair(uint8_t sk[64], uint8_t pk[32], uint8_t seed[32])
 {
 	crypto_ed25519_key_pair(sk, pk, seed);	/* wipes the seed */

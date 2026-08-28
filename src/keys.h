@@ -68,6 +68,29 @@ int msg_seal_ad(uint8_t *dst, size_t dst_len, const uint8_t key[32],
 int msg_open_ad(uint8_t *dst, size_t dst_len, const uint8_t key[32],
 		const uint8_t *ad, size_t ad_len,
 		const uint8_t *sealed, size_t sealed_len);
+/*
+ * Seal to a recipient rather than to a shared secret.
+ *
+ * A claim in the mailbox names where a peer is, and the mailbox is read by
+ * every holder of the invitation -- which, for a read-only link handed to a
+ * room, is a crowd with no reason to trust each other. So a claim is boxed to
+ * a key the host publishes in its own slot and whose secret half it alone
+ * holds: the outer seal still says a token holder wrote the slot, and this
+ * says only the host may read it.
+ *
+ *   box = [ephemeral public key 32][tag 16][ciphertext]
+ *
+ * The key is derived from the agreement and both public keys, so it is fresh
+ * for every box and belongs to exactly one recipient; the nonce is therefore
+ * fixed and costs nothing to carry.
+ */
+#define BOX_OVERHEAD (32 + 16)
+
+int box_seal(uint8_t *dst, size_t dst_len, const uint8_t pk[32],
+	     const uint8_t *plain, size_t plain_len);
+int box_open(uint8_t *dst, size_t dst_len, const uint8_t sk[32],
+	     const uint8_t *sealed, size_t sealed_len);
+
 int random_bytes(void *buf, size_t len);
 
 #endif

@@ -10,6 +10,7 @@
 #include "bep44.h"
 #include "dbg.h"
 #include "candpack.h"
+#include "ccrypto.h"
 #include "dhtnode.h"
 #include "keys.h"
 #include "mailbox.h"
@@ -88,6 +89,24 @@ struct sig {
 	uint8_t last_peer[SIG_MAX_VALUE];
 	size_t last_peer_len;
 	int have_last;
+	/*
+	 * A claim names where a peer is, and every holder of the invitation can
+	 * read the mailbox -- a read-only link handed to a room is a crowd with
+	 * no reason to trust each other. So the host publishes a key in its own
+	 * slot and holds the secret half alone, and a claim is boxed to it
+	 * inside the seal the slot already carries: the seal still says a token
+	 * holder wrote it, the box says only the host may read it.
+	 *
+	 * The claimant's ufrag rides in the clear beside the box, because the
+	 * turnstile rule that lets a client overwrite its own superseded claim
+	 * is about identity, not about where that claimant is.
+	 */
+	uint8_t claim_sk[32];		/* host: the half nobody else has */
+	uint8_t claim_pk[32];
+	uint8_t peer_claim_pk[32];	/* client: taken from the host's slot */
+	int have_peer_claim_pk;
+	uint8_t my_packed[SIG_MAX_VALUE];	/* staged before it can be boxed */
+	size_t my_packed_len;
 	char my_ufrag[64];		/* our claim's ICE ufrag: recognises our
 					 * own (possibly superseded) answer in
 					 * the slot, see mailbox_note_own_answer */
@@ -144,6 +163,8 @@ static uint64_t now_ms(void)
 	return (uint64_t)ts.tv_sec * 1000 + (uint64_t)(ts.tv_nsec / 1000000);
 }
 
+static int sig_stage(struct sig *s);
+
 static char my_slot(const struct sig *s)
 {
 	return s->is_host ? 'o' : 'a';
@@ -172,6 +193,18 @@ struct sig *sig_create(const uint8_t rdv[TOKEN_RDV_LEN], unsigned flags,
 	if (!s)
 		return NULL;
 	if (keys_derive(&s->keys, rdv)) {
+		free(s);
+		return NULL;
+	}
+	/*
+	 * The key claims are boxed to. Minted once per signaller rather than
+	 * per offer: a rotation that changed it would strand a claim already in
+	 * flight against the old one, and a rebuild -- which is what a move or
+	 * a new network produces -- mints a fresh one anyway.
+	 */
+	if (is_host &&
+	    (random_bytes(s->claim_sk, sizeof(s->claim_sk)) ||
+	     cc_x25519_public(s->claim_pk, s->claim_sk))) {
 		free(s);
 		return NULL;
 	}
@@ -262,11 +295,7 @@ static void sdp_ufrag_of(const char *sdp, char *out, size_t outlen)
 int sig_post(struct sig *s, const uint8_t *data, size_t len)
 {
 	char sdp[SIG_SDP_MAX];
-	uint8_t packed[SIG_MAX_VALUE];
-	uint8_t sealed[SIG_SEALED_MAX];
-	uint8_t mc[2 + SIG_MAX_VALUE];
-	char ms[2];
-	int plen, slen;
+	int plen;
 
 	/* Pack for the DHT slot: global and shared-private (nested-NAT) reachable
 	 * candidates, dropping only what cannot help off our own L2 segment. */
@@ -275,37 +304,12 @@ int sig_post(struct sig *s, const uint8_t *data, size_t len)
 	memcpy(sdp, data, len);
 	sdp[len] = '\0';
 	sdp_ufrag_of(sdp, s->my_ufrag, sizeof(s->my_ufrag));
-	plen = candpack_encode(sdp, 1, packed, sizeof(packed));
+	plen = candpack_encode(sdp, 1, s->my_packed, sizeof(s->my_packed));
 	if (plen <= 0)
 		return -1;
-	slen = msg_seal(sealed, sizeof(sealed), s->keys.sig_key, packed,
-			(size_t)plen);
-	if (slen < 0)
-		return -1;
-	mailbox_set_mine(&s->mb, sealed, (size_t)slen);
+	s->my_packed_len = (size_t)plen;
+	sig_stage(s);
 
-	/*
-	 * The multicast announcement is the same routable candpack for ICE, with
-	 * our direct-transport port prepended. On a shared segment the peer takes
-	 * our address from the packet source; the port lets it reach our direct
-	 * transport for the link-local bypass.
-	 */
-	mc[0] = (uint8_t)(s->direct_port >> 8);
-	mc[1] = (uint8_t)s->direct_port;
-	memcpy(mc + 2, packed, (size_t)plen);
-	/*
-	 * Bound to the slot letter it goes out under. That letter frames the
-	 * value on the wire, outside the seal, and it is what says whether a
-	 * description is an offer or an answer -- so without binding it, a
-	 * frame captured from one slot opens in the other, and a client can be
-	 * handed its own description as the peer's.
-	 */
-	ms[0] = my_slot(s);
-	ms[1] = '\0';
-	slen = msg_seal_ad(s->mcast_mine, sizeof(s->mcast_mine), s->keys.sig_key,
-			   (const uint8_t *)ms, 1, mc, (size_t)plen + 2);
-	if (slen > 0)
-		s->mcast_mine_len = (size_t)slen;
 
 	s->next_put_ms = 0;
 	s->next_mcast_ms = 0;
@@ -585,10 +589,120 @@ int sig_rdv_stage(struct sig *s, int family)
 	return s->rdv_stage;			/* 0 cold .. 3 get, engine-wide */
 }
 
+/*
+ * Build what goes in our slot from the packed description we hold, and stage
+ * it. The host prefixes the key claims are boxed to; a client boxes to that
+ * key and puts its ufrag in the clear beside it. A client that has not seen
+ * the host's slot yet cannot box anything, so it stages nothing and is called
+ * again when the slot arrives -- which is before it could have written, since
+ * a write is only decided against a container that has been read.
+ */
+static int sig_stage(struct sig *s)
+{
+	uint8_t val[SIG_MAX_VALUE];
+	uint8_t sealed[SIG_SEALED_MAX];
+	uint8_t mc[2 + SIG_MAX_VALUE];
+	char ms[2];
+	size_t ulen, n;
+	int slen;
+
+	if (!s->my_packed_len)
+		return -1;
+	if (s->is_host) {
+		if (32 + s->my_packed_len > sizeof(val))
+			return -1;
+		memcpy(val, s->claim_pk, 32);
+		memcpy(val + 32, s->my_packed, s->my_packed_len);
+		n = 32 + s->my_packed_len;
+	} else {
+		if (!s->have_peer_claim_pk)
+			return -1;
+		ulen = strlen(s->my_ufrag);
+		if (ulen > 255 ||
+		    1 + ulen + s->my_packed_len + BOX_OVERHEAD > sizeof(val))
+			return -1;
+		val[0] = (uint8_t)ulen;
+		memcpy(val + 1, s->my_ufrag, ulen);
+		slen = box_seal(val + 1 + ulen, sizeof(val) - 1 - ulen,
+				s->peer_claim_pk, s->my_packed,
+				s->my_packed_len);
+		if (slen < 0)
+			return -1;
+		n = 1 + ulen + (size_t)slen;
+	}
+	slen = msg_seal(sealed, sizeof(sealed), s->keys.sig_key, val, n);
+	if (slen < 0)
+		return -1;
+	mailbox_set_mine(&s->mb, sealed, (size_t)slen);
+
+	/*
+	 * The multicast announcement carries the same value with our
+	 * direct-transport port prepended, bound to the slot letter it goes out
+	 * under: that letter frames the value outside the seal and is what says
+	 * whether a description is an offer or an answer, so without binding it
+	 * a frame captured from one slot opens in the other.
+	 */
+	mc[0] = (uint8_t)(s->direct_port >> 8);
+	mc[1] = (uint8_t)s->direct_port;
+	memcpy(mc + 2, val, n);
+	ms[0] = my_slot(s);
+	ms[1] = '\0';
+	slen = msg_seal_ad(s->mcast_mine, sizeof(s->mcast_mine),
+			   s->keys.sig_key, (const uint8_t *)ms, 1, mc, n + 2);
+	if (slen > 0)
+		s->mcast_mine_len = (size_t)slen;
+	return 0;
+}
+
+/*
+ * The peer's slot value -> its packed description. A client reads the host's
+ * slot, which carries the key claims are boxed to ahead of the description; a
+ * host reads a claim, which is its claimant's ufrag in the clear and then a box
+ * only the host can open. Returns the packed length, or -1.
+ *
+ * `uf`, when asked for, receives the claimant's ufrag -- empty on the host's
+ * slot, which has none.
+ */
+static int slot_unwrap(struct sig *s, const uint8_t *val, size_t n,
+		       uint8_t *out, size_t out_max, char *uf, size_t uf_max)
+{
+	size_t ulen;
+
+	if (uf && uf_max)
+		uf[0] = '\0';
+	if (!s->is_host) {
+		if (n < 32)
+			return -1;
+		if (memcmp(s->peer_claim_pk, val, 32)) {
+			memcpy(s->peer_claim_pk, val, 32);
+			s->have_peer_claim_pk = 1;
+			sig_stage(s);	/* now it can be boxed */
+		}
+		n -= 32;
+		if (n > out_max)
+			return -1;
+		memcpy(out, val + 32, n);
+		return (int)n;
+	}
+	if (!n)
+		return -1;
+	ulen = val[0];
+	if (1 + ulen > n)
+		return -1;
+	if (uf && uf_max) {
+		if (ulen >= uf_max)
+			return -1;
+		memcpy(uf, val + 1, ulen);
+		uf[ulen] = '\0';
+	}
+	return box_open(out, out_max, s->claim_sk, val + 1 + ulen,
+			n - 1 - ulen);
+}
+
 /* Open the peer's sealed slot and deliver it once, de-duplicated. */
 static void deliver_peer(struct sig *s, const uint8_t *sealed, size_t len)
 {
-	uint8_t plain[SIG_MAX_VALUE];
+	uint8_t plain[SIG_MAX_VALUE], packed[SIG_MAX_VALUE];
 	char sdp[SIG_SDP_MAX];
 	int n = msg_open(plain, sizeof(plain), s->keys.sig_key, sealed, len);
 	int slen;
@@ -602,7 +716,10 @@ static void deliver_peer(struct sig *s, const uint8_t *sealed, size_t len)
 	memcpy(s->last_peer, plain, (size_t)n);
 	s->last_peer_len = (size_t)n;
 	s->have_last = 1;
-	slen = candpack_decode(plain, (size_t)n, sdp, sizeof(sdp));
+	n = slot_unwrap(s, plain, (size_t)n, packed, sizeof(packed), NULL, 0);
+	if (n < 0)
+		return;
+	slen = candpack_decode(packed, (size_t)n, sdp, sizeof(sdp));
 	if (slen < 0)
 		return;
 	if (s->cb)
@@ -644,16 +761,27 @@ static void on_dht_get(void *arg, const uint8_t *v, size_t v_len, int64_t seq,
 	 * out behind it. */
 	if (!s->mb.is_host && s->mb.slot_a_len && s->my_ufrag[0]) {
 		uint8_t plain[SIG_MAX_VALUE];
-		char sdp[SIG_SDP_MAX];
 		char uf[64];
 		int n = msg_open(plain, sizeof(plain), s->keys.sig_key,
 				 s->mb.slot_a, s->mb.slot_a_len);
+		size_t ulen;
 
-		if (n >= 0 &&
-		    candpack_decode(plain, (size_t)n, sdp, sizeof(sdp)) >= 0) {
-			sdp_ufrag_of(sdp, uf, sizeof(uf));
-			mailbox_note_own_answer(&s->mb, uf[0] &&
-						!strcmp(uf, s->my_ufrag));
+		/*
+		 * A claim is boxed to the host, so a client cannot read one --
+		 * not even its own, whose ephemeral secret is long gone. The
+		 * ufrag beside the box is what this rule was ever about: it
+		 * says which claimant holds the slot, and nothing about where.
+		 */
+		if (n > 0) {
+			ulen = plain[0];
+			if (1 + ulen <= (size_t)n && ulen < sizeof(uf)) {
+				memcpy(uf, plain + 1, ulen);
+				uf[ulen] = '\0';
+				mailbox_note_own_answer(&s->mb,
+							uf[0] &&
+							!strcmp(uf,
+								s->my_ufrag));
+			}
 		}
 	}
 
@@ -766,23 +894,25 @@ static int addr_is_lan_scope(const struct sockaddr *sa)
 static void deliver_peer_mcast(struct sig *s, const uint8_t *sealed, size_t len,
 			       const struct sockaddr *src, socklen_t srclen)
 {
-	uint8_t plain[2 + SIG_MAX_VALUE];
+	uint8_t plain[2 + SIG_MAX_VALUE], packed[SIG_MAX_VALUE];
 	char sdp[SIG_SDP_MAX];
 	struct sockaddr_storage ep;
 	char ps[2];
-	int n;
+	int n, slen;
+	uint16_t dport;
 
 	ps[0] = peer_slot(s);
 	ps[1] = '\0';
 	n = msg_open_ad(plain, sizeof(plain), s->keys.sig_key,
 			(const uint8_t *)ps, 1, sealed, len);
-	int slen;
-	uint16_t dport;
-
 	if (n < 3)
 		return;
 	dport = (uint16_t)((plain[0] << 8) | plain[1]);
-	slen = candpack_decode(plain + 2, (size_t)n - 2, sdp, sizeof(sdp));
+	n = slot_unwrap(s, plain + 2, (size_t)n - 2, packed, sizeof(packed),
+			NULL, 0);
+	if (n < 0)
+		return;
+	slen = candpack_decode(packed, (size_t)n, sdp, sizeof(sdp));
 	if (slen >= 0 && s->cb && !(s->is_host && s->mcast_claims))
 		s->cb(s->arg, (const uint8_t *)sdp, (size_t)slen);
 
