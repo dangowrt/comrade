@@ -376,6 +376,21 @@ struct conn {
 	int fwd_reported;		/* main-thread only: refusal surfaced yet */
 };
 
+/*
+ * One source's share of the adoption budget, kept in a small ring so a flood
+ * from one address cannot spend everyone else's.
+ */
+#define ADOPT_SRC_MAX 8
+
+struct adopt_src {
+	uint8_t addr[16];
+	uint16_t port;
+	int used;
+	int tokens;			/* thousandths, as the shared bucket */
+	uint64_t ms;			/* last refill */
+	uint64_t seen_ms;		/* last use, for eviction */
+};
+
 struct sess {
 	const struct session_cfg *cfg;
 
@@ -548,6 +563,7 @@ struct sess {
 	 */
 	struct conn *conns[HOST_MAX_WORKERS];
 	int adopt_tokens;			/* thousandths of a token */
+	struct adopt_src adopt_src[ADOPT_SRC_MAX];	/* and each source's own */
 	uint64_t adopt_ms;
 	char punch_ufrag[HOST_MAX_WORKERS][40];	/* each punch's claimant id */
 	char last_served_ufrag[40];
@@ -2213,12 +2229,67 @@ static void probe_recv(struct conn *c, const uint8_t *data, size_t len,
 }
 
 /*
- * The adoption budget: PATH_ADOPT_RATE datagrams a second from sources no path
- * names, in bursts of PATH_ADOPT_DEPTH. A stranger who can seal nothing must
- * not be the one setting the rate at which we open seals, so this is consulted
- * before the AEAD open rather than after. It belongs to the listening socket,
- * and only the thread dispatching that socket ever touches it.
+ * A source's share of the adoption budget. One bucket for the whole session
+ * was one bucket for everyone: a stranger sending four plaintext bytes at the
+ * refill rate kept it empty for every served connection at once, and the
+ * pickup of a peer's new address -- the thing the budget exists to allow --
+ * stopped working for all of them. Spend from a small per-source ring first,
+ * so a flood from one address starves only itself, and keep the shared bucket
+ * behind it as the ceiling on the whole socket.
+ *
+ * The ring is tiny and evicts the oldest: a flood from many addresses still
+ * reaches the shared bucket, which is the ceiling it was always meant to be.
+ * Only the thread dispatching the socket touches either.
  */
+static int adopt_allow_src(struct sess *s, const struct path_ep *ep,
+			   uint64_t now)
+{
+	struct adopt_src *slot = NULL, *oldest = &s->adopt_src[0];
+	int i;
+
+	for (i = 0; i < ADOPT_SRC_MAX; i++) {
+		struct adopt_src *a = &s->adopt_src[i];
+
+		if (a->used && a->port == ep->port &&
+		    !memcmp(a->addr, ep->addr, sizeof(a->addr))) {
+			slot = a;
+			break;
+		}
+		if (!a->used) {
+			slot = a;
+			break;
+		}
+		if (a->seen_ms < oldest->seen_ms)
+			oldest = a;
+	}
+	if (!slot)
+		slot = oldest;
+	if (!slot->used || slot->port != ep->port ||
+	    memcmp(slot->addr, ep->addr, sizeof(slot->addr))) {
+		memset(slot, 0, sizeof(*slot));
+		memcpy(slot->addr, ep->addr, sizeof(slot->addr));
+		slot->port = ep->port;
+		slot->used = 1;
+		slot->tokens = PATH_ADOPT_DEPTH * 1000;
+		slot->ms = now;
+	}
+	slot->seen_ms = now;
+	{
+		const int cap = PATH_ADOPT_DEPTH * 1000;
+		uint64_t gained = (now - slot->ms) * PATH_ADOPT_RATE;
+
+		slot->ms = now;
+		if (gained >= (uint64_t)cap || slot->tokens + (int)gained >= cap)
+			slot->tokens = cap;
+		else
+			slot->tokens += (int)gained;
+		if (slot->tokens < 1000)
+			return 0;
+		slot->tokens -= 1000;
+	}
+	return 1;
+}
+
 static int adopt_allow(struct sess *s, uint64_t now)
 {
 	const int cap = PATH_ADOPT_DEPTH * 1000;
@@ -2250,7 +2321,7 @@ static int probe_gate(struct sess *s, struct conn *c, const struct path_ep *ep,
 		return 1;
 	if (c && conn_holds_ep(c, ep, 1))
 		return 1;
-	return adopt_allow(s, now_ms());
+	return adopt_allow_src(s, ep, now_ms()) && adopt_allow(s, now_ms());
 }
 
 /*
