@@ -137,6 +137,21 @@ as much as what an outsider can do:
 The wire protocol and the reasoning behind these properties are in
 PROTOCOL.md.
 
+### sandboxing
+
+comrade shrinks its own privileges to what it needs, using only what the running
+kernel already offers and never a helper binary. It does so right after
+launching tmux and before opening any network socket, so the shared tmux session
+and the shells it runs keep the caller's full privileges while comrade's own
+network-facing process does not. Every layer is best-effort -- one the platform
+lacks is skipped, never fatal -- and `COMRADE_SANDBOX=0` turns it all off.
+
+|         | joining client | host service | operator foreground |
+|---------|----------------|--------------|---------------------|
+| Linux   | drop capabilities, `no_new_privs`, W^X, a seccomp filter denying `execve`, and a mount-namespace (or Landlock) filesystem confinement | the same, with tmux launched through a small unsandboxed broker | a seccomp filter denying the network |
+| macOS   | a Seatbelt `deny default` profile, `fork` blocked, `ptrace` refused | the same, through the broker | a Seatbelt profile denying the network |
+| Windows | a one-process job object (no child processes) plus process-mitigation policies | the mitigation policies (it launches tmux directly) | the mitigation policies |
+
 ## what works
 
 comrade works end to end and is usable today. The core peer discovery,
