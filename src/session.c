@@ -2119,6 +2119,27 @@ static void probe_apply(struct conn *c, const struct path_probe *pr,
 			 label[0] ? label : "ICE", rtt);
 }
 
+/*
+ * Something arrived that this end could make sense of. Liveness is the whole
+ * traffic and not the pong alone -- a pong crosses the same queues as bulk
+ * data and arrives late on a busy link -- but it has to be traffic that
+ * authenticated: a datagram anyone can send is not evidence a peer is there,
+ * and taking it as such lets a spoofed packet every couple of seconds hold a
+ * dead session open, with the resume machinery never arming and the panel
+ * reporting the link as live throughout.
+ *
+ * The unlocked read only coarsens the update to ~100ms; the store is what the
+ * liveness verdict reads, and it is taken under the lock.
+ */
+static void conn_heard(struct conn *c, uint64_t now)
+{
+	if (now - c->hb_last_heard < 100)
+		return;
+	pthread_mutex_lock(&c->hb_lock);
+	c->hb_last_heard = now;
+	pthread_mutex_unlock(&c->hb_lock);
+}
+
 /* Unseal a probe and act on it, if it names the claimant this connection
  * serves. Anything else is dropped in silence. */
 static void probe_recv(struct conn *c, const uint8_t *data, size_t len,
@@ -2130,6 +2151,7 @@ static void probe_recv(struct conn *c, const uint8_t *data, size_t len,
 		return;
 	if (strcmp(pr.ufrag, c->claim_ufrag))
 		return;			/* not the claimant this conn serves */
+	conn_heard(c, now_ms());
 	probe_apply(c, &pr, kind, src);
 }
 
@@ -2208,24 +2230,20 @@ static void deliver_stream_from(struct conn *c, const uint8_t *data, size_t len,
 				const struct sockaddr_in6 *src)
 {
 	uint64_t now = now_ms();
+	int took = 0;
 
 	if (c->bh_mute)		/* a staged total outage swallows receives */
 		return;
-	/* The unlocked read only coarsens the update to ~100ms; the store is
-	 * what the liveness verdict reads, and it is taken under the lock. */
-	if (now - c->hb_last_heard >= 100) {
-		pthread_mutex_lock(&c->hb_lock);
-		c->hb_last_heard = now;
-		pthread_mutex_unlock(&c->hb_lock);
-	}
 	if (path_probe_is(data, len)) {
 		probe_recv(c, data, len, kind, src);
 		return;
 	}
 	pthread_mutex_lock(&c->stream_lock);
 	if (c->stream)
-		stream_input(c->stream, data, len);
+		took = stream_input(c->stream, data, len) >= 0;
 	pthread_mutex_unlock(&c->stream_lock);
+	if (took)
+		conn_heard(c, now);
 }
 
 static void deliver_stream(struct conn *c, const uint8_t *data, size_t len)
