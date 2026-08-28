@@ -154,9 +154,9 @@ void path_ep_str(const struct path_ep *ep, char *out, size_t n);
  * learns its own reflexive endpoint on that path for free.
  */
 /*
- * The frame no longer opens with a constant: the tag is this session's, from
- * keys.h, so a datagram says nothing about which program sent it to anyone
- * without the token. Callers pass it in; the codec keeps no opinion of its own.
+ * The frame opens with this session's tag, from keys.h, rather than a constant,
+ * so a datagram says nothing about which program sent it to anyone without the
+ * token. Callers pass it in; the codec keeps no opinion of its own.
  */
 #define PROBE_PING 1
 #define PROBE_PONG 2
