@@ -58,17 +58,29 @@ value holding two sealed slots, the host's offer and the client's answer, and
 room for a third and fourth, so the classes cannot share a mailbox with
 per-class slots; each needs its own.
 
-*A second mailbox is a second signaller, and a signaller owns a DHT node.*
-`sig_create` calls `dhtnode_create` (src/sig.c), so the host would run two DHT
-nodes: two bootstraps, two node caches, two sets of puts and gets, and a main
-loop polling both. Add per-class multicast announcements and a demux that tries
-both keys.
+*A second mailbox does not need a second DHT node.* `sig_create` calls
+`dhtnode_create` today, but that is how the code is wired rather than what the
+protocol needs: a `dhtnode` is transport -- routing table, socket, bootstrap --
+and holds no identity, while `bep44_put(e, sk, pk, ...)` and
+`bep44_get(e, pk, salt, ...)` take the keypair per call. One node serves any
+number of mailboxes. `sig` touches its node in twelve places, all of them
+"ready?", poll, or free, so letting a signaller borrow a node instead of owning
+one is a small change -- and `sig_discard` already exists precisely because a
+node's lifetime is not a signaller's.
+
+So the DHT cost of a second plane is one more keypair and one more put/get
+stream on the same node, not a second presence in the DHT.
+
+What is left is the host's own machinery. A client is unaffected: one token is
+one class, so it drives one plane exactly as now. The host is the end that
+would hold two, and `session.c` makes 71 calls into `sig_*` across some thirty
+entry points, written throughout as "the" signaller. Those on the host's path
+have to become per-plane, and admission has to record which plane a worker was
+claimed on. Multicast needs the same split.
 
 It only needs doing when a read-only invitation has actually been minted, which
-the host knows at the point it mints one (`host.c`), so the cost is not paid by
-sessions that never hand one out. But it is a change to how the host meets
-people rather than a rule inside a parser, which is why this one is written
-down and the other three were done.
+the host knows at the point it mints one (`host.c`), so nothing is paid by
+sessions that never hand one out.
 
 **What it would not buy.** Nothing within a class. All read-write guests would
 still share one setup key, and that is correct: they all have a shell, so there
