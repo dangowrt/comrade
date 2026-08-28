@@ -242,13 +242,6 @@ struct cap_data {
 	unsigned int inheritable;
 };
 
-/* Discard a best-effort call's result where a fortified libc would otherwise
- * warn that it must be used; a (void) cast does not satisfy that attribute. */
-static void ignore_result(long r)
-{
-	(void)r;
-}
-
 /* Refuse core dumps and same-uid ptrace attach. */
 static int no_dumpable(void)
 {
@@ -558,9 +551,14 @@ static void remount_ro(const char *path)
 #endif
 	/* The remount only takes read-only in a second call, and must not try to
 	 * relax a flag the namespace locked; adding rdonly/nosuid/nodev never is
-	 * relaxing, and no atime flag is touched. */
-	mount(NULL, path, NULL,
-	      MS_REMOUNT | MS_BIND | MS_RDONLY | MS_NOSUID | MS_NODEV, NULL);
+	 * relaxing, and no atime flag is touched. A failure here is not fatal but
+	 * does leave the mount writable -- weaker than intended -- so it is worth
+	 * a word in the log. */
+	if (mount(NULL, path, NULL,
+		  MS_REMOUNT | MS_BIND | MS_RDONLY | MS_NOSUID | MS_NODEV,
+		  NULL) != 0)
+		dbg_logf("sandbox: %s left writable (read-only remount failed: "
+			 "%d)", path, errno);
 }
 
 /*
@@ -604,8 +602,10 @@ static int bind_at(const char *root, const char *src, const char *at,
 	unsigned long fl = MS_BIND | (recursive ? (unsigned long)MS_REC : 0UL);
 	int fd;
 
-	if (stat(src, &st) != 0)
+	if (stat(src, &st) != 0) {
+		dbg_logf("sandbox: bind source %s is missing (%d)", src, errno);
 		return -1;
+	}
 	if ((size_t)snprintf(dst, sizeof(dst), "%s%s", root, at) >= sizeof(dst))
 		return -1;
 	if (S_ISDIR(st.st_mode)) {
@@ -621,8 +621,10 @@ static int bind_at(const char *root, const char *src, const char *at,
 		if (fd >= 0)
 			close(fd);
 	}
-	if (mount(src, dst, NULL, fl, NULL) != 0)
+	if (mount(src, dst, NULL, fl, NULL) != 0) {
+		dbg_logf("sandbox: could not bind %s (%d)", at, errno);
 		return -1;
+	}
 	if (ro)
 		remount_ro(dst);
 	return 0;
@@ -634,7 +636,7 @@ static int bind_at(const char *root, const char *src, const char *at,
  * whose own target is not staged, like a zoneinfo file, simply dangles, which
  * is cosmetic), otherwise bind the file or directory. Absent paths are skipped.
  */
-static void stage_ro(const char *root, const char *path)
+static int stage_ro(const char *root, const char *path)
 {
 	struct stat st;
 	char dst[PATH_MAX];
@@ -643,25 +645,27 @@ static void stage_ro(const char *root, const char *path)
 	ssize_t n;
 
 	if (lstat(path, &st) != 0)
-		return;
+		return 0;			/* absent: nothing to stage */
 	if (S_ISLNK(st.st_mode)) {
 		n = readlink(path, target, sizeof(target) - 1);
 		if (n <= 0)
-			return;
+			return 0;
 		target[n] = '\0';
 		if ((size_t)snprintf(dst, sizeof(dst), "%s%s", root, path) >=
 		    sizeof(dst))
-			return;
+			return 0;
 		slash = strrchr(dst, '/');
 		if (slash && slash != dst) {
 			*slash = '\0';
 			mkdir_p(dst);
 			*slash = '/';
 		}
-		ignore_result(symlink(target, dst));
-		return;
+		if (symlink(target, dst) != 0)
+			dbg_logf("sandbox: could not recreate %s -> %s (%d)",
+				 path, target, errno);
+		return 0;
 	}
-	bind_at(root, path, path, 1, 1);
+	return bind_at(root, path, path, 1, 1);
 }
 
 /*
@@ -699,67 +703,90 @@ static int resolv_dir(char *dir, size_t dn, char *target, size_t tn)
  * only on a desktop, where comrade is a normal user and /etc's secrets stay
  * behind their own permissions.
  */
-static void stage_etc(const char *root)
+static int stage_etc(const char *root)
 {
 	char rdir[PATH_MAX];
 	char target[PATH_MAX];
 	char dst[PATH_MAX];
 	char etc[PATH_MAX];
 	int have_resolv;
+	int fail = 0;
 	size_t i;
 
 	have_resolv = (resolv_dir(rdir, sizeof(rdir), target,
 				  sizeof(target)) == 0);
-	if (have_resolv && strcmp(rdir, "/etc") == 0) {
-		stage_ro(root, "/etc");
-		return;
-	}
+	if (have_resolv && strcmp(rdir, "/etc") == 0)
+		return stage_ro(root, "/etc");
 	for (i = 0; i < sizeof(sb_etc_files) / sizeof(sb_etc_files[0]); i++)
-		stage_ro(root, sb_etc_files[i]);
+		if (stage_ro(root, sb_etc_files[i]) < 0)
+			fail = 1;
 	if (!have_resolv) {
+		/* No resolv.conf to follow; its absence is not fatal (the C
+		 * library resolver falls back), so this bind is best-effort. */
 		bind_at(root, "/etc/resolv.conf", "/etc/resolv.conf", 0, 1);
-		return;
+		return fail ? -1 : 0;
 	}
-	stage_ro(root, rdir);
+	if (stage_ro(root, rdir) < 0)
+		fail = 1;
 	if ((size_t)snprintf(etc, sizeof(etc), "%s/etc", root) < sizeof(etc))
 		mkdir_p(etc);
 	if ((size_t)snprintf(dst, sizeof(dst), "%s/etc/resolv.conf", root) <
-	    sizeof(dst))
-		ignore_result(symlink(target, dst));
+	    sizeof(dst) && symlink(target, dst) != 0)
+		dbg_logf("sandbox: could not link /etc/resolv.conf -> %s (%d)",
+			 target, errno);
+	return fail ? -1 : 0;
 }
 
 /* Bind a single host device node into the new root's /dev, left writable --
  * /dev/null is written and /dev/urandom is read, and a musl TLS backend reads
  * /dev/urandom throughout the run. */
-static void bind_dev(const char *root, const char *node)
+static int bind_dev(const char *root, const char *node)
 {
 	char dst[PATH_MAX];
+	char *slash;
 	int fd;
 
 	if ((size_t)snprintf(dst, sizeof(dst), "%s%s", root, node) >=
 	    sizeof(dst))
-		return;
+		return -1;
+	/* Create the /dev directory in the new root before the mount point:
+	 * without it the mount target does not exist and the bind fails ENOENT. */
+	slash = strrchr(dst, '/');
+	if (slash && slash != dst) {
+		*slash = '\0';
+		mkdir_p(dst);
+		*slash = '/';
+	}
 	fd = open(dst, O_WRONLY | O_CREAT | O_EXCL, 0600);
 	if (fd >= 0)
 		close(fd);
-	mount(node, dst, NULL, MS_BIND, NULL);
+	if (mount(node, dst, NULL, MS_BIND, NULL) != 0) {
+		dbg_logf("sandbox: could not bind %s (%d)", node, errno);
+		return -1;
+	}
+	return 0;
 }
 
 /* Bind the writable directories -- the data dir (non-recursively, so the tmpfs
  * staged on its own .ns does not nest into the bind), a host state dir, and the
  * debug log's directory. Shared by the namespace builder below. */
-static void bind_writable(const char *root, const struct sandbox_cfg *cfg)
+static int bind_writable(const char *root, const struct sandbox_cfg *cfg)
 {
 	const char *dbg;
+	int fail = 0;
 
-	bind_at(root, cfg->data_dir, cfg->data_dir, 0, 0);
-	if (cfg->state_dir && cfg->state_dir[0])
-		bind_at(root, cfg->state_dir, cfg->state_dir, 0, 0);
+	if (bind_at(root, cfg->data_dir, cfg->data_dir, 0, 0) < 0)
+		fail = 1;		/* without it the program cannot persist */
+	if (cfg->state_dir && cfg->state_dir[0] &&
+	    bind_at(root, cfg->state_dir, cfg->state_dir, 0, 0) < 0)
+		fail = 1;
 	dbg = getenv("COMRADE_DEBUG");
 	if (dbg && dbg[0] == '/') {
 		char dir[PATH_MAX];
 		char *slash;
 
+		/* The debug log's directory is convenient, not essential -- its
+		 * bind failing (bind_at logs it) does not fail the confinement. */
 		if ((size_t)snprintf(dir, sizeof(dir), "%s", dbg) < sizeof(dir)) {
 			slash = strrchr(dir, '/');
 			if (slash && slash != dir) {
@@ -768,6 +795,7 @@ static void bind_writable(const char *root, const struct sandbox_cfg *cfg)
 			}
 		}
 	}
+	return fail ? -1 : 0;
 }
 
 /*
@@ -784,6 +812,7 @@ static int fs_confine_ns(const struct sandbox_cfg *cfg)
 	char root[PATH_MAX];
 	uid_t uid;
 	gid_t gid;
+	int fail;
 	size_t i;
 
 	uid = getuid();
@@ -815,23 +844,43 @@ static int fs_confine_ns(const struct sandbox_cfg *cfg)
 		return 0;
 	}
 
+	fail = 0;
 	for (i = 0; i < sizeof(sb_lib_dirs) / sizeof(sb_lib_dirs[0]); i++)
-		stage_ro(root, sb_lib_dirs[i]);
-	stage_etc(root);
+		if (stage_ro(root, sb_lib_dirs[i]) < 0)
+			fail = 1;
+	if (stage_etc(root) < 0)
+		fail = 1;
+	if (bind_dev(root, "/dev/null") < 0)
+		fail = 1;
+	if (bind_dev(root, "/dev/urandom") < 0)
+		fail = 1;
+	if (bind_writable(root, cfg) < 0)
+		fail = 1;
 
-	bind_dev(root, "/dev/null");
-	bind_dev(root, "/dev/urandom");
-	bind_writable(root, cfg);
+	/*
+	 * If a piece the program needs could not be staged, do not pivot into a
+	 * root that would break it: detach the half-built tree and run
+	 * unconfined but working. The sandbox is defence in depth, so a broken
+	 * confinement is worse than none -- and each failure was already logged.
+	 */
+	if (fail) {
+		dbg_logf("sandbox: confined root incomplete; leaving the "
+			 "filesystem open");
+		umount2(root, MNT_DETACH);
+		return 0;
+	}
 
 	if (chdir(root) != 0 || syscall(SYS_pivot_root, ".", ".") != 0) {
 		dbg_logf("sandbox: pivot_root failed (%d); filesystem left open",
 			 errno);
-		ignore_result(chdir("/"));	/* best effort */
+		if (chdir("/") != 0)
+			dbg_logf("sandbox: chdir / failed (%d)", errno);
 		umount2(root, MNT_DETACH);
 		return 0;
 	}
 	umount2(".", MNT_DETACH);
-	ignore_result(chdir("/"));		/* best effort */
+	if (chdir("/") != 0)
+		dbg_logf("sandbox: chdir / after pivot failed (%d)", errno);
 	return SANDBOX_L_USERNS | SANDBOX_L_MOUNTNS;
 }
 
@@ -904,8 +953,10 @@ static void ll_allow(int rs, const char *path, uint64_t access)
 	memset(&pb, 0, sizeof(pb));
 	pb.allowed_access = access;
 	pb.parent_fd = fd;
-	syscall(__NR_landlock_add_rule, rs, SB_LANDLOCK_RULE_PATH_BENEATH,
-		&pb, 0U);
+	if (syscall(__NR_landlock_add_rule, rs, SB_LANDLOCK_RULE_PATH_BENEATH,
+		    &pb, 0U) != 0)
+		dbg_logf("sandbox: landlock rule for %s failed (%d)", path,
+			 errno);
 	close(fd);
 }
 
