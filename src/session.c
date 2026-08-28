@@ -18,6 +18,7 @@
 #include "netmon.h"
 #include "netstate.h"
 #include "claimlog.h"
+#include "replay.h"
 #include "hbeat.h"
 #include "hostreap.h"
 #include "nsfacts.h"
@@ -301,6 +302,8 @@ struct conn {
 	/* The claimant's ICE ufrag, carried for the worker's whole lifetime so the
 	 * host recognises the same client arriving over the other transport. */
 	char claim_ufrag[40];
+	uint64_t probe_seq;		/* our frames on this conn, from 1 */
+	struct replay_win probe_win;	/* and the peer's, each acted on once */
 	/* The path deliberately made to die (test_blackhole_ms); bh_kind is -1
 	 * while none is, bh_done once one has been (so a lift does not re-arm
 	 * it). */
@@ -1897,6 +1900,7 @@ static size_t conn_probe_seal(struct conn *c, struct path_probe *pr,
 			      uint8_t *out)
 {
 	snprintf(pr->ufrag, sizeof(pr->ufrag), "%s", c->claim_ufrag);
+	pr->seq = ++c->probe_seq;
 	return path_probe_build(out, PROBE_MAX, c->sess->keys.sig_key, pr);
 }
 
@@ -2147,6 +2151,30 @@ static void conn_heard(struct conn *c, uint64_t now)
 	pthread_mutex_unlock(&c->hb_lock);
 }
 
+/*
+ * Is this frame one we have not acted on? The seal says the peer wrote it; the
+ * sequence says which of its frames this is, and the window refuses a repeat.
+ * A frame from a sender that predates this connection carries a sequence the
+ * window has never seen and is taken once, which is all a fresh connection can
+ * honestly do.
+ *
+ * Runs on whichever thread received the datagram; the window is the
+ * connection's, so it is kept under the same lock as the rest of its
+ * heartbeat state.
+ */
+static int conn_probe_fresh(struct conn *c, const struct path_probe *pr)
+{
+	int ok;
+
+	pthread_mutex_lock(&c->hb_lock);
+	ok = replay_ok(&c->probe_win, pr->seq);
+	pthread_mutex_unlock(&c->hb_lock);
+	if (!ok)
+		dbg_logf("path: probe %llu again -- dropped",
+			 (unsigned long long)pr->seq);
+	return ok;
+}
+
 /* Unseal a probe and act on it, if it names the claimant this connection
  * serves. Anything else is dropped in silence. */
 static void probe_recv(struct conn *c, const uint8_t *data, size_t len,
@@ -2158,6 +2186,8 @@ static void probe_recv(struct conn *c, const uint8_t *data, size_t len,
 		return;
 	if (strcmp(pr.ufrag, c->claim_ufrag))
 		return;			/* not the claimant this conn serves */
+	if (!conn_probe_fresh(c, &pr))
+		return;
 	conn_heard(c, now_ms());
 	probe_apply(c, &pr, kind, src);
 }
@@ -2222,6 +2252,8 @@ static void probe_adopt(struct sess *s, const uint8_t *data, size_t len,
 	for (i = 0; i < HOST_MAX_WORKERS; i++)
 		if (s->conns[i] &&
 		    !strcmp(s->conns[i]->claim_ufrag, pr.ufrag)) {
+			if (!conn_probe_fresh(s->conns[i], &pr))
+				return;
 			probe_apply(s->conns[i], &pr, PATH_SEGMENT, src);
 			return;
 		}
@@ -4688,6 +4720,16 @@ static struct conn *conn_alloc(struct sess *s)
 	pthread_mutex_init(&c->stream_lock, NULL);
 	pthread_mutex_init(&c->path_lock, NULL);
 	path_table_init(&c->paths);
+	/*
+	 * Frames are counted from the clock, not from one. A host that reaps a
+	 * worker serves the returning client from a new connection while the
+	 * client keeps the one it had, so its window would refuse a counter
+	 * that started over -- and a counter that started over is exactly what
+	 * a replayed frame looks like. Starting where the clock is means every
+	 * new connection counts above the one it replaced, and every copy of
+	 * an old frame counts below.
+	 */
+	c->probe_seq = now_ms();
 	conn_gen_ice(c);
 	return c;
 }
@@ -5908,6 +5950,7 @@ int session_run(const struct session_cfg *cfg)
 	s.c.sess = &s;
 	s.c.ctl_fd = INVALID_SOCK;		/* no control channel until run_ssh */
 	s.c.bh_kind = -1;
+	s.c.probe_seq = now_ms();		/* see conn_alloc */
 	memcpy(s.auth, cfg->tok.auth, TOKEN_AUTH_LEN);
 	/* Seed each family from the token handed in, so a re-serve carries the
 	 * anchor it already published forward instead of wiping the slot. */

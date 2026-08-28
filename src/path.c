@@ -140,9 +140,11 @@ size_t path_probe_build(uint8_t *out, size_t out_len, const uint8_t sig_key[32],
 	plain[0] = (uint8_t)pr->type;
 	for (i = 0; i < 8; i++)
 		plain[1 + i] = (uint8_t)(pr->nonce >> (8 * (7 - i)));
-	plain[9] = (uint8_t)ul;
-	memcpy(plain + 10, pr->ufrag, ul);
-	pl = 10 + ul;
+	for (i = 0; i < 8; i++)
+		plain[9 + i] = (uint8_t)(pr->seq >> (8 * (7 - i)));
+	plain[17] = (uint8_t)ul;
+	memcpy(plain + PROBE_HEAD_FIXED, pr->ufrag, ul);
+	pl = PROBE_HEAD_FIXED + ul;
 	if (pr->have_tail) {
 		path_ep_pack(&pr->echo, plain + pl);
 		path_put16(plain + pl + 18, pr->srtt_ms);
@@ -165,18 +167,20 @@ int path_probe_parse(struct path_probe *pr, const uint8_t sig_key[32],
 	if (!path_probe_is(data, len))
 		return -1;
 	n = msg_open(plain, sizeof(plain), sig_key, data + 4, len - 4);
-	if (n < 10)
+	if (n < PROBE_HEAD_FIXED)
 		return -1;
 	pr->type = plain[0];
 	for (i = 0; i < 8; i++)
 		pr->nonce = (pr->nonce << 8) | plain[1 + i];
-	ul = plain[9];
-	if (ul > PROBE_UFRAG_MAX || (size_t)n < 10 + ul)
+	for (i = 0; i < 8; i++)
+		pr->seq = (pr->seq << 8) | plain[9 + i];
+	ul = plain[17];
+	if (ul > PROBE_UFRAG_MAX || (size_t)n < PROBE_HEAD_FIXED + ul)
 		return -1;
-	memcpy(pr->ufrag, plain + 10, ul);
+	memcpy(pr->ufrag, plain + PROBE_HEAD_FIXED, ul);
 	pr->ufrag[ul] = '\0';
-	if ((size_t)n >= 10 + ul + PROBE_TAIL_LEN) {
-		const uint8_t *t = plain + 10 + ul;
+	if ((size_t)n >= PROBE_HEAD_FIXED + ul + PROBE_TAIL_LEN) {
+		const uint8_t *t = plain + PROBE_HEAD_FIXED + ul;
 
 		path_ep_unpack(&pr->echo, t);
 		pr->srtt_ms = ((int)t[18] << 8) | t[19];

@@ -103,13 +103,18 @@ void path_ep_str(const struct path_ep *ep, char *out, size_t n);
  * The probe frame.
  *
  *   [4 magic][seal(sig_key, plain)]
- *   plain = [1 type][8 nonce][1 ulen][ulen claimant ufrag]      head
- *           [16 addr][2 port BE][2 srtt_ms BE][2 loss_ppt BE]   tail, optional
+ *   plain = [1 type][8 nonce][8 seq][1 ulen][ulen claimant ufrag]  head
+ *           [16 addr][2 port BE][2 srtt_ms BE][2 loss_ppt BE]      tail, optional
  *
  * The seal is not defending against the peer, who holds the token and is
  * trusted by construction; it stops a stranger who can guess an endpoint from
  * forging a reply. The nonce must be unpredictable, being the only thing that
  * stops a forged PONG.
+ *
+ * seq counts this sender's frames on this connection, from one. The seal says
+ * a frame was written by somebody holding the key; it never said when, so a
+ * copy taken off the wire opened again whenever its holder chose. The receiver
+ * keeps a window (replay.h) and acts on each sequence once.
  *
  * The claimant ufrag ties a frame to one connection: a host worker answers only
  * for the claimant it was admitted for, and that single test separates the
@@ -137,12 +142,14 @@ void path_ep_str(const struct path_ep *ep, char *out, size_t n);
 #define PROBE_FRESH 3
 #define PROBE_UFRAG_MAX 40
 #define PROBE_TAIL_LEN 22
-#define PROBE_PLAIN_MAX (1 + 8 + 1 + PROBE_UFRAG_MAX + PROBE_TAIL_LEN)
+#define PROBE_HEAD_FIXED 18		/* type(1) nonce(8) seq(8) ulen(1) */
+#define PROBE_PLAIN_MAX (PROBE_HEAD_FIXED + PROBE_UFRAG_MAX + PROBE_TAIL_LEN)
 #define PROBE_MAX (4 + PROBE_PLAIN_MAX + SEAL_OVERHEAD)
 
 struct path_probe {
 	int type;
 	uint64_t nonce;
+	uint64_t seq;			/* the sender's frame count, from 1 */
 	char ufrag[PROBE_UFRAG_MAX + 1];
 	int have_tail;
 	struct path_ep echo;

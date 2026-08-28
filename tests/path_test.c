@@ -123,17 +123,21 @@ static void probe_codec_check(void)
 	uint8_t buf[PROBE_MAX];
 	size_t n;
 
-	assert(PROBE_PLAIN_MAX == 1 + 8 + 1 + 40 + 22);
+	assert(PROBE_PLAIN_MAX == 1 + 8 + 8 + 1 + 40 + 22);
 
 	memset(&out, 0, sizeof(out));
 	out.type = PROBE_PING;
 	out.nonce = 0x0123456789abcdefULL;
+	out.seq = 0xfedcba9876543210ULL;
 	snprintf(out.ufrag, sizeof(out.ufrag), "a1b2c3d4");
 	n = path_probe_build(buf, sizeof(buf), key, &out);
 	assert(n > 4 && n <= PROBE_MAX);
 	assert(path_probe_is(buf, n));
 	assert(path_probe_parse(&in, key, buf, n) == 0);
 	assert(in.type == PROBE_PING && in.nonce == out.nonce);
+	/* The sequence is what the receiver's window is kept against, so it has
+	 * to survive the round trip whole. */
+	assert(in.seq == out.seq);
 	assert(!strcmp(in.ufrag, "a1b2c3d4"));
 	assert(!in.have_tail);
 
