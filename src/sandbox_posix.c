@@ -553,33 +553,67 @@ static void stage_ro(const char *root, const char *path)
 }
 
 /*
- * Make the resolver config reachable without exposing its whole directory: bind
- * the real target file where it lives (creating just that path), and point
- * /etc/resolv.conf at it when the two differ. Binding the file rather than its
- * directory keeps the rest of that directory -- /tmp on OpenWrt, /run elsewhere
- * -- out of view; the trade is that a resolver replacing the file by rename
- * rather than rewriting it is read stale, which for a fixed stub address it
- * never is.
+ * The directory the live resolv.conf sits in, following symlinks to its real
+ * target (which is also returned when `target` is given). It is the DIRECTORY,
+ * not the file, that must be bound or granted: a roam installs a new resolver
+ * config by writing a fresh file and renaming it into place, so a bind or an
+ * open of the old file is left pointing at the unlinked inode and reads stale,
+ * while the directory sees the replacement. Returns 0 on success.
  */
-static void stage_resolv(const char *root)
+static int resolv_dir(char *dir, size_t dn, char *target, size_t tn)
 {
+	char t[PATH_MAX];
+	char *slash;
+
+	if (!realpath("/etc/resolv.conf", t))
+		return -1;
+	if (target && tn)
+		snprintf(target, tn, "%s", t);
+	slash = strrchr(t, '/');
+	if (!slash || slash == t)
+		return -1;
+	*slash = '\0';
+	if ((size_t)snprintf(dir, dn, "%s", t) >= dn)
+		return -1;
+	return 0;
+}
+
+/*
+ * Stage the resolver, loader and TLS files. Where resolv.conf is a symlink out
+ * of /etc (systemd-resolved's /run, OpenWrt's /tmp) only its own directory is
+ * bound, keeping the rest of /etc out of view. Where it is a plain file managed
+ * inside /etc, /etc is bound whole -- catching a rename within a directory
+ * needs that directory bound and no narrower mount would, and this case arises
+ * only on a desktop, where comrade is a normal user and /etc's secrets stay
+ * behind their own permissions.
+ */
+static void stage_etc(const char *root)
+{
+	char rdir[PATH_MAX];
 	char target[PATH_MAX];
 	char dst[PATH_MAX];
 	char etc[PATH_MAX];
+	int have_resolv;
+	size_t i;
 
-	if (!realpath("/etc/resolv.conf", target)) {
+	have_resolv = (resolv_dir(rdir, sizeof(rdir), target,
+				  sizeof(target)) == 0);
+	if (have_resolv && strcmp(rdir, "/etc") == 0) {
+		stage_ro(root, "/etc");
+		return;
+	}
+	for (i = 0; i < sizeof(sb_etc_files) / sizeof(sb_etc_files[0]); i++)
+		stage_ro(root, sb_etc_files[i]);
+	if (!have_resolv) {
 		bind_at(root, "/etc/resolv.conf", "/etc/resolv.conf", 0, 1);
 		return;
 	}
-	bind_at(root, target, target, 0, 1);
-	if (strcmp(target, "/etc/resolv.conf") != 0) {
-		if ((size_t)snprintf(etc, sizeof(etc), "%s/etc", root) <
-		    sizeof(etc))
-			mkdir_p(etc);
-		if ((size_t)snprintf(dst, sizeof(dst), "%s/etc/resolv.conf",
-				     root) < sizeof(dst))
-			symlink(target, dst);
-	}
+	stage_ro(root, rdir);
+	if ((size_t)snprintf(etc, sizeof(etc), "%s/etc", root) < sizeof(etc))
+		mkdir_p(etc);
+	if ((size_t)snprintf(dst, sizeof(dst), "%s/etc/resolv.conf", root) <
+	    sizeof(dst))
+		symlink(target, dst);
 }
 
 /* Bind a single host device node into the new root's /dev, left writable --
@@ -671,9 +705,7 @@ static int fs_confine_ns(const struct sandbox_cfg *cfg)
 
 	for (i = 0; i < sizeof(sb_lib_dirs) / sizeof(sb_lib_dirs[0]); i++)
 		stage_ro(root, sb_lib_dirs[i]);
-	for (i = 0; i < sizeof(sb_etc_files) / sizeof(sb_etc_files[0]); i++)
-		stage_ro(root, sb_etc_files[i]);
-	stage_resolv(root);
+	stage_etc(root);
 
 	bind_dev(root, "/dev/null");
 	bind_dev(root, "/dev/urandom");
@@ -775,6 +807,7 @@ static int fs_confine_landlock(const struct sandbox_cfg *cfg)
 	uint64_t handled, ro, rwx, rw;
 	long abi;
 	int rs;
+	int have_resolv;
 	size_t i;
 
 	abi = syscall(__NR_landlock_create_ruleset, (void *)0, (size_t)0,
@@ -802,10 +835,18 @@ static int fs_confine_landlock(const struct sandbox_cfg *cfg)
 
 	for (i = 0; i < sizeof(sb_lib_dirs) / sizeof(sb_lib_dirs[0]); i++)
 		ll_allow(rs, sb_lib_dirs[i], rwx);
-	for (i = 0; i < sizeof(sb_etc_files) / sizeof(sb_etc_files[0]); i++)
-		ll_allow(rs, sb_etc_files[i], ro);
-	if (realpath("/etc/resolv.conf", resolv))
-		ll_allow(rs, resolv, SB_FS_READ_FILE & handled);
+	/* Grant the resolver's directory, not its file, so a roam's rename is
+	 * followed; /etc whole only where resolv.conf is a plain /etc file. */
+	have_resolv = (resolv_dir(resolv, sizeof(resolv), (char *)0, 0) == 0);
+	if (have_resolv && strcmp(resolv, "/etc") == 0) {
+		ll_allow(rs, "/etc", ro);
+	} else {
+		for (i = 0; i < sizeof(sb_etc_files) / sizeof(sb_etc_files[0]);
+		     i++)
+			ll_allow(rs, sb_etc_files[i], ro);
+		if (have_resolv)
+			ll_allow(rs, resolv, ro);
+	}
 	ll_allow(rs, "/dev/urandom", SB_FS_READ_FILE & handled);
 	ll_allow(rs, "/dev/null", (SB_FS_READ_FILE | SB_FS_WRITE_FILE) & handled);
 	ll_allow(rs, cfg->data_dir, rw);
