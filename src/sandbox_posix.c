@@ -451,17 +451,64 @@ static void remount_ro(const char *path)
 	      MS_REMOUNT | MS_BIND | MS_RDONLY | MS_NOSUID | MS_NODEV, NULL);
 }
 
-/* Bind src onto <root><at>, creating the mount point. recursive carries
- * submounts; ro turns the result read-only. Returns 0 on the bind succeeding. */
+/*
+ * The exact surface the confined process is allowed to see. Both the mount
+ * namespace and the Landlock ruleset are built from these two lists, so the two
+ * backends grant the same thing. Neither list contains a whole system
+ * directory: read-only access to all of /etc or /usr would still let a
+ * compromised process read /etc/shadow, an OpenWrt device's wireless keys, or
+ * another user's files -- exactly the extraction surface the sandbox is meant
+ * to remove. The client never executes anything, so no /bin or /sbin is here
+ * at all.
+ */
+
+/* Directories holding the shared objects the loader maps and later dlopen()s
+ * (the NSS and TLS-provider modules); read-only, but execution preserved. */
+static const char *const sb_lib_dirs[] = {
+	"/lib", "/lib64", "/usr/lib", "/usr/lib64",
+	"/usr/local/lib", "/usr/local/lib64", "/nix/store", "/gnu/store"
+};
+
+/* The individual loader, resolver and TLS files the C library reads at runtime.
+ * resolv.conf is handled apart (it is usually a symlink to a volatile file). */
+static const char *const sb_etc_files[] = {
+	"/etc/ld.so.cache", "/etc/ld.so.conf", "/etc/ld.so.conf.d",
+	"/etc/ld-musl-x86_64.path", "/etc/ld-musl-aarch64.path",
+	"/etc/nsswitch.conf", "/etc/hosts", "/etc/host.conf", "/etc/gai.conf",
+	"/etc/services", "/etc/protocols", "/etc/passwd", "/etc/group",
+	"/etc/ssl/openssl.cnf", "/etc/ssl/certs", "/etc/pki",
+	"/etc/crypto-policies", "/etc/localtime"
+};
+
+/* Bind src (a file or a directory) onto <root><at>, creating the mount point of
+ * the right kind. recursive carries submounts; ro turns the result read-only.
+ * Returns 0 on the bind succeeding, -1 otherwise. */
 static int bind_at(const char *root, const char *src, const char *at,
 		   int recursive, int ro)
 {
+	struct stat st;
 	char dst[PATH_MAX];
+	char *slash;
 	unsigned long fl = MS_BIND | (recursive ? (unsigned long)MS_REC : 0UL);
+	int fd;
 
+	if (stat(src, &st) != 0)
+		return -1;
 	if ((size_t)snprintf(dst, sizeof(dst), "%s%s", root, at) >= sizeof(dst))
 		return -1;
-	mkdir_p(dst);
+	if (S_ISDIR(st.st_mode)) {
+		mkdir_p(dst);
+	} else {
+		slash = strrchr(dst, '/');
+		if (slash && slash != dst) {
+			*slash = '\0';
+			mkdir_p(dst);
+			*slash = '/';
+		}
+		fd = open(dst, O_WRONLY | O_CREAT, 0600);
+		if (fd >= 0)
+			close(fd);
+	}
 	if (mount(src, dst, NULL, fl, NULL) != 0)
 		return -1;
 	if (ro)
@@ -470,36 +517,74 @@ static int bind_at(const char *root, const char *src, const char *at,
 }
 
 /*
- * Stage one top-level system directory into the new root: recreate it as a
- * symlink if that is what the host has (so /bin -> usr/bin layouts survive),
- * otherwise bind it read-only. Absent directories are skipped.
+ * Stage one allowed path into the new root read-only: recreate it as a symlink
+ * if that is what the host has (so a /lib -> usr/lib layout survives; a symlink
+ * whose own target is not staged, like a zoneinfo file, simply dangles, which
+ * is cosmetic), otherwise bind the file or directory. Absent paths are skipped.
  */
-static void stage_sysdir(const char *root, const char *name)
+static void stage_ro(const char *root, const char *path)
 {
 	struct stat st;
 	char dst[PATH_MAX];
 	char target[PATH_MAX];
+	char *slash;
 	ssize_t n;
 
-	if (lstat(name, &st) != 0)
+	if (lstat(path, &st) != 0)
 		return;
 	if (S_ISLNK(st.st_mode)) {
-		n = readlink(name, target, sizeof(target) - 1);
+		n = readlink(path, target, sizeof(target) - 1);
 		if (n <= 0)
 			return;
 		target[n] = '\0';
-		if ((size_t)snprintf(dst, sizeof(dst), "%s%s", root, name) >=
+		if ((size_t)snprintf(dst, sizeof(dst), "%s%s", root, path) >=
 		    sizeof(dst))
 			return;
+		slash = strrchr(dst, '/');
+		if (slash && slash != dst) {
+			*slash = '\0';
+			mkdir_p(dst);
+			*slash = '/';
+		}
 		symlink(target, dst);
 		return;
 	}
-	bind_at(root, name, name, 1, 1);
+	bind_at(root, path, path, 1, 1);
 }
 
-/* Bind a single host device node (character device) into the new root's /dev,
- * left writable -- /dev/null is written and /dev/urandom is read, and some TLS
- * backends on musl read /dev/urandom throughout the run. */
+/*
+ * Make the resolver config reachable without exposing its whole directory: bind
+ * the real target file where it lives (creating just that path), and point
+ * /etc/resolv.conf at it when the two differ. Binding the file rather than its
+ * directory keeps the rest of that directory -- /tmp on OpenWrt, /run elsewhere
+ * -- out of view; the trade is that a resolver replacing the file by rename
+ * rather than rewriting it is read stale, which for a fixed stub address it
+ * never is.
+ */
+static void stage_resolv(const char *root)
+{
+	char target[PATH_MAX];
+	char dst[PATH_MAX];
+	char etc[PATH_MAX];
+
+	if (!realpath("/etc/resolv.conf", target)) {
+		bind_at(root, "/etc/resolv.conf", "/etc/resolv.conf", 0, 1);
+		return;
+	}
+	bind_at(root, target, target, 0, 1);
+	if (strcmp(target, "/etc/resolv.conf") != 0) {
+		if ((size_t)snprintf(etc, sizeof(etc), "%s/etc", root) <
+		    sizeof(etc))
+			mkdir_p(etc);
+		if ((size_t)snprintf(dst, sizeof(dst), "%s/etc/resolv.conf",
+				     root) < sizeof(dst))
+			symlink(target, dst);
+	}
+}
+
+/* Bind a single host device node into the new root's /dev, left writable --
+ * /dev/null is written and /dev/urandom is read, and a musl TLS backend reads
+ * /dev/urandom throughout the run. */
 static void bind_dev(const char *root, const char *node)
 {
 	char dst[PATH_MAX];
@@ -514,74 +599,13 @@ static void bind_dev(const char *root, const char *node)
 	mount(node, dst, NULL, MS_BIND, NULL);
 }
 
-static int fs_confine(const struct sandbox_cfg *cfg)
+/* Bind the writable directories -- the data dir (non-recursively, so the tmpfs
+ * staged on its own .ns does not nest into the bind), a host state dir, and the
+ * debug log's directory. Shared by the namespace builder below. */
+static void bind_writable(const char *root, const struct sandbox_cfg *cfg)
 {
-	static const char *sysdirs[] = {
-		"/usr", "/etc", "/bin", "/sbin", "/lib", "/lib64",
-		"/lib32", "/opt", "/run", "/var", "/nix", "/gnu"
-	};
-	char root[PATH_MAX];
-	char resolv[PATH_MAX];
 	const char *dbg;
-	uid_t uid;
-	gid_t gid;
-	size_t i;
 
-	if (!cfg->data_dir || !cfg->data_dir[0])
-		return 0;		/* no writable home to build around */
-
-	uid = getuid();
-	gid = getgid();
-
-	if (unshare(CLONE_NEWUSER | CLONE_NEWNS) != 0) {
-		dbg_logf("sandbox: no user namespace (%d); filesystem left open",
-			 errno);
-		return 0;
-	}
-	map_ids(uid, gid);
-
-	/* Keep every mount from here private to this process. */
-	if (mount(NULL, "/", NULL, MS_REC | MS_SLAVE, NULL) != 0) {
-		dbg_logf("sandbox: could not privatise mounts (%d)", errno);
-		return 0;
-	}
-
-	/* The new root is a small tmpfs under the data dir, not /tmp, which on
-	 * OpenWrt holds the resolver config we still need to bind from. */
-	if ((size_t)snprintf(root, sizeof(root), "%s/.ns", cfg->data_dir) >=
-	    sizeof(root))
-		return 0;
-	mkdir(root, 0700);
-	if (mount("tmpfs", root, "tmpfs", MS_NOSUID | MS_NODEV,
-		  "mode=0755,size=1M") != 0) {
-		dbg_logf("sandbox: could not mount the confined root (%d)",
-			 errno);
-		return 0;
-	}
-
-	for (i = 0; i < sizeof(sysdirs) / sizeof(sysdirs[0]); i++)
-		stage_sysdir(root, sysdirs[i]);
-
-	/* If resolv.conf resolves outside /etc (systemd-resolved, or OpenWrt's
-	 * /tmp), bind that directory read-only so the C library can keep reading
-	 * it -- and never the file itself, whose inode a rename would leave
-	 * stale. */
-	if (realpath("/etc/resolv.conf", resolv) &&
-	    strncmp(resolv, "/etc/", 5) != 0) {
-		char *slash = strrchr(resolv, '/');
-
-		if (slash && slash != resolv) {
-			*slash = '\0';
-			bind_at(root, resolv, resolv, 1, 1);
-		}
-	}
-
-	bind_dev(root, "/dev/null");
-	bind_dev(root, "/dev/urandom");
-
-	/* Writable: the data dir (bound non-recursively so the tmpfs staged on
-	 * its own .ns does not nest into the bind), the host state dir for a
-	 * service, and the debug log's directory when one is set. */
 	bind_at(root, cfg->data_dir, cfg->data_dir, 0, 0);
 	if (cfg->state_dir && cfg->state_dir[0])
 		bind_at(root, cfg->state_dir, cfg->state_dir, 0, 0);
@@ -598,11 +622,64 @@ static int fs_confine(const struct sandbox_cfg *cfg)
 			}
 		}
 	}
+}
 
-	/* Pivot into the new root and drop the old one. From here the process
-	 * cannot see anything outside what was bound above. */
-	if (chdir(root) != 0 ||
-	    syscall(SYS_pivot_root, ".", ".") != 0) {
+/*
+ * Build the confined root in a private mount namespace and pivot into it. An
+ * unprivileged user namespace grants the mount privilege; a root process for
+ * which even that is unavailable (a tiny-flash OpenWrt build) falls back to a
+ * bare mount namespace carried by its real CAP_SYS_ADMIN. Every bind is
+ * best-effort; only pivot_root, which runs last over the finished tree, could
+ * strand the program, and a failure there detaches the half-built tree and
+ * leaves the normal view.
+ */
+static int fs_confine_ns(const struct sandbox_cfg *cfg)
+{
+	char root[PATH_MAX];
+	uid_t uid;
+	gid_t gid;
+	size_t i;
+
+	uid = getuid();
+	gid = getgid();
+
+	if (unshare(CLONE_NEWUSER | CLONE_NEWNS) == 0) {
+		map_ids(uid, gid);
+	} else if (geteuid() == 0 && unshare(CLONE_NEWNS) == 0) {
+		/* Root without a user namespace: the real CAP_SYS_ADMIN carries
+		 * the mounts and no id map is needed. */
+	} else {
+		dbg_logf("sandbox: no mount namespace (%d); trying Landlock",
+			 errno);
+		return 0;
+	}
+
+	if (mount(NULL, "/", NULL, MS_REC | MS_SLAVE, NULL) != 0) {
+		dbg_logf("sandbox: could not privatise mounts (%d)", errno);
+		return 0;
+	}
+	if ((size_t)snprintf(root, sizeof(root), "%s/.ns", cfg->data_dir) >=
+	    sizeof(root))
+		return 0;
+	mkdir(root, 0700);
+	if (mount("tmpfs", root, "tmpfs", MS_NOSUID | MS_NODEV,
+		  "mode=0755,size=1M") != 0) {
+		dbg_logf("sandbox: could not mount the confined root (%d)",
+			 errno);
+		return 0;
+	}
+
+	for (i = 0; i < sizeof(sb_lib_dirs) / sizeof(sb_lib_dirs[0]); i++)
+		stage_ro(root, sb_lib_dirs[i]);
+	for (i = 0; i < sizeof(sb_etc_files) / sizeof(sb_etc_files[0]); i++)
+		stage_ro(root, sb_etc_files[i]);
+	stage_resolv(root);
+
+	bind_dev(root, "/dev/null");
+	bind_dev(root, "/dev/urandom");
+	bind_writable(root, cfg);
+
+	if (chdir(root) != 0 || syscall(SYS_pivot_root, ".", ".") != 0) {
 		dbg_logf("sandbox: pivot_root failed (%d); filesystem left open",
 			 errno);
 		(void)chdir("/");	/* best effort */
@@ -611,8 +688,170 @@ static int fs_confine(const struct sandbox_cfg *cfg)
 	}
 	umount2(".", MNT_DETACH);
 	(void)chdir("/");		/* best effort */
-
 	return SANDBOX_L_USERNS | SANDBOX_L_MOUNTNS;
+}
+
+/*
+ * The desktop filesystem path: a Landlock ruleset, for kernels that refuse an
+ * unprivileged user namespace (a hardened desktop, a locked-down container). It
+ * confines by access, not by visibility -- the paths stay listable but only the
+ * ones granted here can be read, and only the data dir written -- so it is a
+ * weaker boundary than the namespace, yet still keeps the program out of every
+ * file it was not handed. Landlock does not exist on OpenWrt, so this is purely
+ * the fallback for where the namespace could not be built. Raw syscalls, since
+ * the UAPI header cannot be assumed; best-effort and ABI-aware.
+ */
+
+#ifndef __NR_landlock_create_ruleset
+#define __NR_landlock_create_ruleset 444
+#endif
+#ifndef __NR_landlock_add_rule
+#define __NR_landlock_add_rule 445
+#endif
+#ifndef __NR_landlock_restrict_self
+#define __NR_landlock_restrict_self 446
+#endif
+#define SB_LANDLOCK_VERSION_QUERY 1U
+#define SB_LANDLOCK_RULE_PATH_BENEATH 1
+
+#define SB_FS_EXECUTE		(1ULL << 0)
+#define SB_FS_WRITE_FILE	(1ULL << 1)
+#define SB_FS_READ_FILE		(1ULL << 2)
+#define SB_FS_READ_DIR		(1ULL << 3)
+#define SB_FS_REMOVE_DIR	(1ULL << 4)
+#define SB_FS_REMOVE_FILE	(1ULL << 5)
+#define SB_FS_MAKE_DIR		(1ULL << 7)
+#define SB_FS_MAKE_REG		(1ULL << 8)
+#define SB_FS_TRUNCATE		(1ULL << 14)
+
+struct sb_ruleset_attr {
+	uint64_t handled_access_fs;
+};
+
+struct sb_path_beneath {
+	uint64_t allowed_access;
+	int32_t parent_fd;
+} __attribute__((packed));
+
+/* The rights that apply to a regular file; the rest are directory-only and the
+ * kernel rejects a rule that grants them on a file. */
+#define SB_FS_FILE (SB_FS_EXECUTE | SB_FS_WRITE_FILE | SB_FS_READ_FILE | \
+		    SB_FS_TRUNCATE)
+
+/* Grant `access` beneath `path`; a path that is not present is skipped, and a
+ * file keeps only the file-applicable rights so the rule is not rejected. */
+static void ll_allow(int rs, const char *path, uint64_t access)
+{
+	struct sb_path_beneath pb;
+	struct stat st;
+	int fd;
+
+	if (access == 0)
+		return;
+	fd = open(path, O_PATH | O_CLOEXEC);
+	if (fd < 0)
+		return;
+	if (fstat(fd, &st) == 0 && !S_ISDIR(st.st_mode))
+		access &= SB_FS_FILE;
+	if (access == 0) {
+		close(fd);
+		return;
+	}
+	memset(&pb, 0, sizeof(pb));
+	pb.allowed_access = access;
+	pb.parent_fd = fd;
+	syscall(__NR_landlock_add_rule, rs, SB_LANDLOCK_RULE_PATH_BENEATH,
+		&pb, 0U);
+	close(fd);
+}
+
+static int fs_confine_landlock(const struct sandbox_cfg *cfg)
+{
+	struct sb_ruleset_attr attr;
+	char resolv[PATH_MAX];
+	char dir[PATH_MAX];
+	const char *dbg;
+	char *slash;
+	uint64_t handled, ro, rwx, rw;
+	long abi;
+	int rs;
+	size_t i;
+
+	abi = syscall(__NR_landlock_create_ruleset, (void *)0, (size_t)0,
+		      SB_LANDLOCK_VERSION_QUERY);
+	if (abi < 1)
+		return 0;		/* no Landlock on this kernel */
+
+	handled = SB_FS_EXECUTE | SB_FS_WRITE_FILE | SB_FS_READ_FILE |
+		  SB_FS_READ_DIR | SB_FS_REMOVE_DIR | SB_FS_REMOVE_FILE |
+		  SB_FS_MAKE_DIR | SB_FS_MAKE_REG;
+	if (abi >= 3)
+		handled |= SB_FS_TRUNCATE;
+
+	memset(&attr, 0, sizeof(attr));
+	attr.handled_access_fs = handled;
+	rs = (int)syscall(__NR_landlock_create_ruleset, &attr, sizeof(attr), 0U);
+	if (rs < 0)
+		return 0;
+
+	ro = (SB_FS_READ_FILE | SB_FS_READ_DIR) & handled;
+	rwx = (SB_FS_READ_FILE | SB_FS_READ_DIR | SB_FS_EXECUTE) & handled;
+	rw = (SB_FS_READ_FILE | SB_FS_WRITE_FILE | SB_FS_READ_DIR |
+	      SB_FS_REMOVE_FILE | SB_FS_MAKE_REG | SB_FS_MAKE_DIR |
+	      SB_FS_REMOVE_DIR | SB_FS_TRUNCATE) & handled;
+
+	for (i = 0; i < sizeof(sb_lib_dirs) / sizeof(sb_lib_dirs[0]); i++)
+		ll_allow(rs, sb_lib_dirs[i], rwx);
+	for (i = 0; i < sizeof(sb_etc_files) / sizeof(sb_etc_files[0]); i++)
+		ll_allow(rs, sb_etc_files[i], ro);
+	if (realpath("/etc/resolv.conf", resolv))
+		ll_allow(rs, resolv, SB_FS_READ_FILE & handled);
+	ll_allow(rs, "/dev/urandom", SB_FS_READ_FILE & handled);
+	ll_allow(rs, "/dev/null", (SB_FS_READ_FILE | SB_FS_WRITE_FILE) & handled);
+	ll_allow(rs, cfg->data_dir, rw);
+	if (cfg->state_dir && cfg->state_dir[0])
+		ll_allow(rs, cfg->state_dir, rw);
+	dbg = getenv("COMRADE_DEBUG");
+	if (dbg && dbg[0] == '/' &&
+	    (size_t)snprintf(dir, sizeof(dir), "%s", dbg) < sizeof(dir)) {
+		slash = strrchr(dir, '/');
+		if (slash && slash != dir) {
+			*slash = '\0';
+			ll_allow(rs, dir, rw);
+		}
+	}
+
+	/* Landlock enforcement requires no_new_privs; setting it here is
+	 * harmless -- apply_linux sets it again for the other layers. */
+	prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+	if (syscall(__NR_landlock_restrict_self, rs, 0U) != 0) {
+		close(rs);
+		return 0;
+	}
+	close(rs);
+	return SANDBOX_L_LANDLOCK;
+}
+
+/*
+ * Confine the visible filesystem: the mount namespace first (the strong,
+ * OpenWrt-viable boundary), and where that cannot be built, the Landlock
+ * ruleset. COMRADE_SANDBOX_NO_USERNS forces the Landlock path -- for exercising
+ * it, and for a host where a mount namespace is unwanted.
+ */
+static int fs_confine(const struct sandbox_cfg *cfg)
+{
+	const char *nons;
+	int r = 0;
+
+	if (!cfg->data_dir || !cfg->data_dir[0])
+		return 0;		/* no writable home to build around */
+
+	nons = getenv("COMRADE_SANDBOX_NO_USERNS");
+	if (!(nons && nons[0] && nons[0] != '0'))
+		r = fs_confine_ns(cfg);
+	if (r)
+		return r;
+	return fs_confine_landlock(cfg);
 }
 
 static int apply_linux(const struct sandbox_cfg *cfg)
