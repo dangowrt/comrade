@@ -21,6 +21,15 @@ expected in, specify behaviour this tree does not implement yet; everything
 unmarked is implemented as described. Each mark is removed when its change
 lands.
 
+**Wire compatibility.** Nothing here is stable across 0.1.x. This revision
+changes the probe frame (a sequence number, §9), what a datagram opens with
+(both tags derived from the token rather than fixed, §2), the stream datagram
+(a counter and tag, §9), the mailbox slots (a key in the offer, a box in the
+answer, §4), the multicast announcement (the slot letter bound into the seal,
+§6) and the control channel (two new message types and a larger frame bound,
+§10). Two peers must be built from the same revision; there is no version
+negotiation and none is planned before the format settles.
+
 ---
 
 ## 1. Crypto primitives (`src/ccrypto.h`)
@@ -40,6 +49,11 @@ below.
 - **Keyed BLAKE2b** (RFC 7693 keyed mode, digest length in the parameter
   block): `cc_blake2b_keyed(out, out_len, key, key_len, msg, msg_len)`. Used as
   the KDF and BEP44 seed. Interop-critical.
+- **X25519** (RFC 7748): `cc_x25519_public(pk, sk)` and
+  `cc_x25519(out, sk, peer)`. A shared secret of all zeros is refused, since it
+  means the peer sent a low-order point. Used only to seal a claim to the host
+  (§4). Interop-critical, and pinned to RFC 7748's own vector by
+  `tests/box_test.c`, because two peers need not share a backend.
 - **SHA-1** (`src/sha1.c`, RFC 3174, standard IVs `0x67452301…`), namespaced
   `cc_sha1_*`. Used only for BEP44 target derivation.
 
@@ -57,6 +71,29 @@ associated data. `msg_open` reverses it; a bad tag fails. Total length =
 `plain_len + 40`. This layout (nonce, then MAC, then ciphertext) is the single
 highest-risk interop detail.
 
+`msg_seal_ad`/`msg_open_ad` are the same with associated data: the AD is
+covered by the tag while staying in the clear, for framing outside the seal
+that decides what the plaintext means (the multicast slot letter, §6).
+
+### The box (`src/keys.c:box_seal`/`box_open`, `BOX_OVERHEAD = 32+16 = 48`)
+
+Sealed **to a recipient** rather than to a shared secret, so that only the
+holder of one secret key can open it:
+
+```
+  ephemeral public key (32)  ||  mac (16)  ||  ciphertext (len bytes)
+```
+
+`box_seal(pk, plain)`: draw an ephemeral X25519 pair `(esk, epk)`;
+`shared = X25519(esk, pk)`;
+`key = BLAKE2b_keyed(key=shared, len=32, msg="comrade1 claim box" || epk || pk)`;
+then `cc_aead_lock(ct=dst+48, mac=dst+32, key, nonce=24 zero bytes, ad=epk,
+ad_len=32, pt=plain)`. The nonce is fixed and costs nothing to carry because
+the key is fresh for every box and belongs to exactly one recipient; binding
+both public keys into the KDF is what makes that true. `box_open(sk, ...)`
+recomputes `pk` from `sk`, agrees against the carried `epk`, and fails on a bad
+tag. Used for the answer slot (§4).
+
 ---
 
 ## 2. Key derivation (`src/keys.c:keys_derive`)
@@ -70,9 +107,42 @@ All session keys derive from the token's 16-byte rendezvous secret `R`
   (bep44_pk, bep44_sk) = Ed25519_keypair_from_seed(seed)
 ```
 
+The two wire tags come from the same secret, so no datagram opens with a
+constant that would identify comrade to anyone without the token:
+
+```
+  tags(8)      = BLAKE2b_keyed(key=R, len=8, msg="comrade1 wire tags")  # 18 bytes, no NUL
+  probe_magic  = tags[0..4]  as big-endian uint32
+  conv         = tags[4..8]  as big-endian uint32
+  if probe_magic == conv: conv ^= 0x5f5f5f5f
+```
+
+`probe_magic` opens a probe (§9) and `conv` is the KCP conversation id, and the
+demux that tells one from the other is a single compare of the first four
+bytes -- so they are forced apart rather than left to chance.
+
 `sig_key` seals every mailbox/multicast payload (§4, §6). `bep44_pk/sk` are the
 BEP44 mutable-item identity (§5). Both peers derive the **same** keys from the
 same token, so the mailbox is a shared rendezvous only they can read or write.
+
+### Per-connection key (`src/keys.c:keys_conn_key`)
+
+`sig_key` is derived from the invitation, so every guest of a host holds it and
+"sealed" never said *which* guest wrote a frame. Once a session exists, the raw
+path leaves it behind. Each end draws 32 random bytes and sends them over the
+in-band control channel (`CTLM_KEY`, §10), which is a stream inside the
+authenticated SSH session under a pinned host key, and both derive:
+
+```
+  lo, hi   = the two halves ordered by memcmp (not by role)
+  conn_key = BLAKE2b_keyed(key=sig_key, len=32,
+                           msg="comrade1 conn key" || lo || hi)   # 17 bytes, no NUL
+```
+
+Ordering by value rather than by role is what lets both ends compute the same
+key with neither deciding. `conn_key` then seals the probes (§9) and keys the
+stream tag (§9), so no other holder of the invitation can reach or read a
+connection it is not part of.
 
 The **read-only auth secret** is a one-way derivation of the read-write one
 (`src/keys.c:keys_derive_ro_auth`):
@@ -195,14 +265,43 @@ sorted order (`mailbox.c:mailbox_build`):
 ```
 
 - `o` (offer) is written by the **host**, `a` (answer) by the **client**.
-- Each slot value is a **sealed blob** (§1): `seal(sig_key, candpack)`.
-- `candpack` is the compact ICE description (§7). For the DHT it is packed with
-  `for_dht=1` (segment-local addresses dropped); the seal makes the DHT value
-  opaque.
+- Each slot value is a **sealed blob** (§1) under `sig_key`, but the two slots
+  do not carry the same thing:
 
-Publishing (`sig.c:sig_post`): pack the local SDP → `candpack` →
-`seal(sig_key, candpack)` → set as this side's slot. Reading a peer slot:
-`msg_open(sig_key, sealed)` → `candpack` → rebuilt SDP handed to libjuice.
+```
+  offer  = seal(sig_key,  claim_pk(32) || candpack )
+  answer = seal(sig_key,  ulen(1) || ufrag(ulen) || box(claim_pk, candpack) )
+```
+
+- `candpack` is the compact ICE description (§7). For the DHT it is packed with
+  `for_dht=1` (segment-local addresses dropped).
+- `claim_pk` is an X25519 public key the host mints once per signaller and whose
+  secret half it alone holds. **A claim is boxed to it** (§1), so the outer seal
+  still says a token holder wrote the slot -- which is what the container's
+  compare-and-swap rests on -- while only the host can read where a claimant
+  is. Every holder of the invitation can read the mailbox, and a read-only link
+  is the one handed to a room, so without this a crowd of mutually untrusting
+  guests published its addresses to itself.
+- The claimant's **ufrag rides in the clear** beside the box. The rule that lets
+  a client overwrite its own superseded claim is about which claimant holds the
+  slot, not where it is; a client cannot open even its own box, the ephemeral
+  secret being gone the moment it is sealed.
+
+Publishing (`sig.c:sig_post` → `sig_stage`): pack the local SDP → `candpack`,
+then build the slot value for this role and seal it. A client can only box once
+it has seen the host's slot, so the value is built **when it can be** rather
+than when it is posted; nothing is lost by waiting, because a write is only ever
+decided against a container that has been read
+(`mailbox.c:recompute_need_write`). Reading a peer slot: `msg_open(sig_key, …)`
+→ `slot_unwrap` (take `claim_pk` as a client, open the box as a host) →
+`candpack` → rebuilt SDP handed to libjuice.
+
+What this does **not** hide is occupancy: the slot being non-empty is the
+turnstile mutex (§12), so any holder can still see a claim is in progress and
+can still take the slot. Closing that would mean single-use or per-guest
+mailboxes, and the one-token-one-BEP44-key property is worth more than
+protecting against an authenticated holder delaying an exchange it can no
+longer read.
 
 The host can release the answer slot on offer rotation
 (`mailbox.c`: `clear_peer` drops `a` once, `mailbox_arm_release`).
@@ -273,10 +372,17 @@ Multicast (`sig_mcast.c`):
 - Packet: `MCAST_MAGIC "pMc1"` (4 bytes) `|| salt_len(1) || salt || payload`.
 - **Salt = the sender's own role slot character**: `"o"` (host) or `"a"`
   (client); a receiver listens for the *peer's* slot char (`sig.c` `peer_slot`,
-  `ps`). `payload` = `seal(sig_key, mcast_plain)`.
-- `mcast_plain` (`sig.c:sig_post`) = `direct_port(2, BE) || candpack`, where
-  `candpack` is the **same `for_dht=1` routable set as the DHT slot** (`sig_post`
-  reuses the identical packed buffer, not a wider `for_dht=0` one). The peer takes
+  `ps`).
+- `payload` = `seal_ad(sig_key, ad=salt(1), mcast_plain)`. The salt frames the
+  value on the wire outside the seal and is what says whether a description is
+  an offer or an answer, so it is **bound into the tag**: without that, a frame
+  captured from one slot opens in the other and a client can be handed its own
+  description as the peer's.
+- `mcast_plain` (`sig.c:sig_stage`) = `direct_port(2, BE) || slot value`, where
+  the slot value is **exactly what the DHT slot carries** (§4) -- `claim_pk ||
+  candpack` from a host, `ulen || ufrag || box(...)` from a client -- built from
+  the same packed buffer, not a wider `for_dht=0` one. So a claim announced on
+  the segment is sealed to the host just as one in the mailbox is. The peer takes
   the sender address from the packet source and the direct port from the payload.
 
 **Role split on receive** (`sig.c:deliver_peer_mcast`): both roles adopt an
@@ -354,9 +460,9 @@ Exact config (`stream_create`), **all must match for interop**:
 
 | parameter | value | call |
 |-----------|-------|------|
-| conv | `SESSION_CONV = 0x70326531` | `#define` (`session.c:28`), `ikcp_create(conv,…)` (`stream.c:44`) |
-| MTU | `STREAM_MTU = 1200` | `ikcp_setmtu` |
-| window (snd/rcv) | `STREAM_WND = 256` / 256 | `ikcp_wndsize` |
+| conv | `keys.conv`, derived per session (§2) | `ikcp_create(conv,…)` (`stream.c`) |
+| MTU | `STREAM_MTU - STREAM_OVERHEAD = 1200 - 24 = 1176` | `ikcp_setmtu` |
+| window (snd/rcv) | `STREAM_WND = 1024` / 1024 | `ikcp_wndsize` |
 | nodelay | 1 | `ikcp_nodelay(kcp, 1, 10, 2, 0)` |
 | interval | 10 ms | ” |
 | fast resend | 2 | ” |
@@ -364,9 +470,41 @@ Exact config (`stream_create`), **all must match for interop**:
 | stream mode | 1 | `kcp->stream = 1` |
 | dead_link | `STREAM_DEAD_LINK = 1000` | `kcp->dead_link` |
 
-`conv` is a fixed constant shared by both ends. `stream=1` means byte-stream
+`conv` is derived from the token (§2), not a constant, so a datagram's first
+four bytes say nothing about which program sent it. `stream=1` means byte-stream
 (not message) framing. `stream_update` drives `ikcp_update`/`ikcp_check`; a
 finished receiver LINGERS on `ikcp_waitsnd` until its own sent tail is acked.
+
+KCP is given 24 bytes less than the wire budget because the transport puts a
+counter and a tag under every datagram, so nothing grew on the wire.
+
+### Stream datagram origin (`src/dataauth.c`)
+
+KCP carries SSH, so its bytes are already unreadable on the path; what they
+lacked was any statement of who sent them. That matters more here than
+elsewhere: dropping is what the path model survives by moving, while a forged
+segment corrupts the byte stream and ends the SSH session above **every** path
+at once, so injection is strictly the stronger move against this design.
+
+```
+  [kcp datagram][counter(8, BE)][tag(16)]      DATAAUTH_OVERHEAD = 24
+  tag = BLAKE2b_keyed(key, len=32, msg = kcp datagram || counter)[0:16]
+```
+
+The key is the connection's (§2) once both ends have agreed one, and `sig_key`
+before that. The tag goes **last** so a datagram still opens with `conv`, which
+is what tells stream data from a probe. The counter is covered by the tag, so a
+frame cannot be replayed under a different number, and is judged once by the
+same sliding window as the probes (`src/replay.c`, 64 wide). It is seeded from
+the clock rather than from one, for the reason given for the probe sequence
+below. Comparison of the tag does not say where two differ.
+
+It authenticates and does not encrypt: sealing instead would hide the KCP
+header, whose segment sizes and timing are on the wire regardless, and cost 40
+bytes rather than 24. On an MT7621 (MIPS 1004Kc, monocypher) the seal is in
+fact the *faster* of the two -- 84 us against 122 us per 1200-byte datagram,
+BLAKE2b working in 64-bit words that a 32-bit core emulates in pairs -- so if
+the trade is ever revisited, overhead is not the argument for the tag.
 
 ---
 
@@ -380,6 +518,15 @@ sealed datagrams for one connection can be sent. Three kinds exist:
 | `SEGMENT` | the shared lanlink socket (§6) | a peer endpoint on the link, learnt from a sealed multicast announcement |
 | `ROUTED` | the shared lanlink socket | any other peer endpoint, learnt from a probe that arrived from it |
 | `ICE` | a libjuice agent (§8) | its nominated pair |
+
+A connection can hold **two** ICE agents at once: a resume replaces the agent,
+and the one being replaced is not known to be dead -- it stopped answering,
+which is also what a drop lasting a moment looks like. It is set aside with its
+path rather than destroyed, for one claim's worth of time, so the ranking can
+find it still alive and keep carrying on it; libjuice reports no source with a
+datagram, so the agent that received one is the only thing that says which path
+it arrived on, and that identity is carried from the transport callback through
+to the path lookup (`session.c`, `struct ice_ctx`).
 
 The kind is a description, not a rank: it names how a path was come by and
 nothing else, and plays no part in choosing between paths. A connection tracks up
@@ -416,21 +563,40 @@ deciding for the other.
 #### Probe frame
 
 ```
-  PROBE_MAGIC 0x434d5250 ("CMRP")
-  [4 magic][seal(sig_key, plain)]
+  [4 magic][seal(key, plain)]                  magic = keys.probe_magic (§2)
 
-  plain = [1 type][8 nonce][1 ulen][ulen claimant ufrag]      head
-          [16 addr][2 port BE][2 srtt_ms BE][2 loss_ppt BE]   tail, optional
-  type: 1 = PING, 2 = PONG (echoes the nonce)
+  plain = [1 type][8 nonce][8 seq][1 ulen][ulen claimant ufrag]   head, 18+ulen
+          [16 addr][2 port BE][2 srtt_ms BE][2 loss_ppt BE]       tail, optional
+  type: 1 = PING, 2 = PONG (echoes the nonce), 3 = FRESH
 ```
 
-`deliver_stream()` splits probes off ahead of `stream_input()`: every KCP
-datagram opens with the fixed `SESSION_CONV` and `ikcp_input` rejects a mismatch,
-so a datagram opening with a different magic is unambiguously not stream data.
+`deliver_stream_from()` splits probes off ahead of `stream_input()`: every KCP
+datagram opens with `conv` and the magic is forced to differ from it (§2), so a
+datagram opening with the magic is unambiguously not stream data. Neither value
+is a constant, so neither identifies comrade to anyone without the token.
 
-The head is unchanged from 0.1.0. The 22-byte tail is present when the plaintext
-runs past `10 + ulen`; a peer that omits it merely shares no measurements, which
-costs accuracy and never correctness.
+The 22-byte tail is present when the plaintext runs past `18 + ulen`; a peer
+that omits it merely shares no measurements, which costs accuracy and never
+correctness. A `FRESH` carries a tail it never reads, so that the one datagram
+which ends a session is not also the only short one on the wire.
+
+**`seq` counts this sender's frames on this connection.** The seal says a frame
+was written by a key holder; it never said *when*, so a copy taken off the wire
+could be opened again whenever its holder chose. The receiver keeps a 64-wide
+sliding window (`src/replay.c`) and acts on each sequence once. The counter is
+seeded from the clock, not from one: a host that reaps a worker serves the
+returning client from a new connection while the client keeps its window, so a
+counter starting over is exactly what a replayed frame looks like.
+
+**Which key seals it.** Before the two ends have agreed a connection key it is
+`sig_key`, which every holder of the invitation has. After (§2) it is
+`conn_key`, and the invitation's key then opens only two things: any frame in
+the moment before the far end has switched too, and a `FRESH`, which by
+construction comes from a worker the host started after reaping the one we had
+and so shares no key with us. A `FRESH` is still refused unless it arrives on a
+path this connection is actually carried on. The switch is clocked by the peer
+rather than by a timer -- see `CTLM_KEYOK` (§10) -- because the halves that
+derive the key travel over the stream the key protects.
 
 - **addr/port** is the source this path's last inbound datagram was observed
   arriving from, v4 carried v4-mapped, all-zero when nothing has arrived yet. On
@@ -444,10 +610,12 @@ costs accuracy and never correctness.
 - **srtt_ms** is the sender's current smoothed round trip for this path, 0 when
   unmeasured; **loss_ppt** its probe loss in parts per thousand.
 
-The seal is not defending against the peer, who holds the token and is trusted by
-construction (§12); it stops a stranger who can guess an endpoint from forging a
-reply. The **nonce must be unpredictable**, being the only thing that stops a
-forged PONG.
+The seal under `sig_key` was never a defence against another holder of the
+invitation, only against a stranger who can guess an endpoint; the connection
+key is what makes a frame provably from *this* peer. The **nonce must be
+unpredictable**, being what stops a PONG being guessed rather than replayed, and
+a PING carrying a nonce this end is itself waiting on is refused -- otherwise
+the handler is an oracle that re-signs any nonce shown to it.
 
 The **claimant ufrag** ties a frame to one connection: a host worker answers only
 for the claimant it was admitted for, and that single test separates the winner
@@ -584,16 +752,30 @@ keeps the connections it serves in `sess.conns[]`, registered at admission and
 cleared before the connection is freed, and matches the ufrag against them
 (`session.c:probe_adopt`). A client has one connection and needs no such lookup.
 
-**Bounding the cost.** Only a frame opening with `PROBE_MAGIC` is a candidate at
-all, and unknown-source attempts are rate-limited by a `PATH_ADOPT_RATE` token
-bucket, consulted **before** the AEAD open rather than after
-(`session.c:adopt_allow`, `probe_gate`); the bucket belongs to the listening
-socket and is touched only by the thread that dispatches it. The cost being
-bounded is one open per junk datagram, not one per live connection: every conn
-of a session shares `sig_key`, derived once from `R` (§2), so a single open
-either authenticates the frame or does not, however many connections are live.
-The bound is still worth having -- it is what stops a stranger who can seal
-nothing from setting the rate of that work.
+A host has many connections and, once each has agreed its own key (§2), the
+frame is opened against them in turn until one opens: which connection a frame
+belongs to is answered by **which key opens it**, and the ufrag inside then has
+to agree. A worker that has bound will not open a frame meant for another, which
+is the point of binding.
+
+**Bounding the cost.** Only a frame opening with this session's `probe_magic`
+is a candidate at all; a frame from an endpoint the connection already holds is
+free; and everything else must pass two token buckets before any AEAD work,
+consulted **before** the open rather than after (`session.c:probe_gate`):
+
+- `adopt_allow_src` -- a `PATH_ADOPT_RATE` bucket **per source endpoint**, in a
+  small ring, so one address flooding spends only its own budget;
+- `adopt_allow` -- the session-wide bucket behind it, the ceiling on the whole
+  of this work.
+
+The per-source bucket is what the shared one alone could not give: without it a
+single spoofing source spends the budget every real peer needs. Both belong to
+the listening socket and are touched only by the thread that dispatches it.
+
+The cost of one admitted junk datagram is now **up to one open per live
+connection** rather than exactly one, since the connections no longer share a
+key. That is the price of a claim being unreachable by other guests, and it is
+why the buckets sit in front of it rather than behind.
 
 **What this does and does not recover.** It recovers an address change that
 leaves the peer's endpoint reachable: a DHCP renewal, a move between interfaces
@@ -676,8 +858,23 @@ Message types (`ctlproto.h`): `CTLM_PING 0` payload `timestamp(8, BE)`;
 for the peer to reuse on a roam); `CTLM_CAND 3`, the same 19-byte payload shape
 and so the same codec, one local endpoint at the sender's lanlink port for the
 peer to probe and hold as a path (§9), re-sent every `CAND_TELL_MS 5000` so an
-interface brought up mid-session is advertised within one period. `CTL_HDR = 2`,
-`CTL_FRAME_MAX = 21`.
+interface brought up mid-session is advertised within one period; `CTLM_REACH 4`
+and `CTLM_RDVASK 5` (§11).
+
+`CTLM_KEY 6` payload `half(32)` = `CTL_KEY_PLEN`, and `CTLM_KEYOK 7` with no
+payload, carry the per-connection key exchange (§2). Each end sends its half as
+soon as the channel is up; on receiving the peer's it can derive the key, says
+so with `CTLM_KEYOK`, and only starts **sealing** with the key once the peer has
+said the same. That order is not optional: the halves ride this channel, which
+rides the stream the key protects, so an end that switched as soon as it could
+would seal the very datagram carrying a half with the key that half is needed to
+derive, and neither end would ever bind. The invitation's key stays acceptable
+for opening until the first frame arrives under the connection's, which is the
+peer proving it switched rather than a clock guessing. A new control channel is
+a new pair of ends, so the binding does not outlive the session that agreed it.
+
+`CTL_HDR = 2`, `CTL_FRAME_MAX = CTL_HDR + CTL_KEY_PLEN = 34` -- the key half is
+the largest message, and the reframer rejects anything claiming more.
 
 ---
 
@@ -685,12 +882,18 @@ interface brought up mid-session is advertised within one period. `CTL_HDR = 2`,
 
 - Heartbeat over comrade-ctl: `HB_INTERVAL_MS 700`, and the link is lost when
   **nothing at all** -- pong or any other datagram from the peer -- has arrived
-  for `HB_LOST_MS 2500`. The pong alone must not carry the verdict: it rides
-  the same stream and queues as bulk data, so on a saturated slow link it
-  arrives seconds late while the transfer demonstrably moves; the pong's own
-  job is the round-trip figure. A vanished host worker is reaped after
-  `HOST_REAP_MS 12000`, deferred while a resumption punch for it is in flight
-  (§12).
+  for `hb_lost_ms(rtt)` = `HB_SILENT_TRIES(3) * HB_INTERVAL_MS + rtt`, the round
+  trip capped at `HB_RTT_CAP_MS 1000`, so 2.1 s on a fast link and up to 3.1 s
+  on a slow one. It is a count of missed beats plus the link's own measured
+  latency rather than a fixed span, because a fixed one is either too tight for
+  a slow link or too slack for a fast one. The pong alone must not carry the
+  verdict: it rides the same stream and queues as bulk data, so on a saturated
+  slow link it arrives seconds late while the transfer demonstrably moves; the
+  pong's own job is the round-trip figure. A vanished host worker is reaped
+  after `HOST_REAP_MS`, itself derived from the claimant's own cadence
+  (`RESUME_AFTER_MS + RESUME_ATTEMPT_MS + RESUME_ATTEMPT_MS / 2` = 18 s) so a
+  worker always outlives the claimant's second attempt, and deferred while a
+  resumption punch for it is in flight (§12).
 - Network changes are polled (`netmon`, `NETMON_POLL_MS 2000`).
 - Each end keeps a **warm rendezvous node per address family** and exchanges it
   over `CTLM_RDV`, so either side can re-signal quickly after a move. This is
