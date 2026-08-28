@@ -8,7 +8,6 @@
 
 #include "stream.h"
 
-#define STREAM_MTU 1200
 #define STREAM_WND 1024
 #define STREAM_DEAD_LINK 1000
 
@@ -285,7 +284,7 @@ struct stream *stream_create(uint32_t conv, stream_output_fn *out, void *arg)
 	s->kcp->output = kcp_output;
 	s->kcp->stream = 1;
 	s->kcp->dead_link = STREAM_DEAD_LINK;
-	ikcp_setmtu(s->kcp, STREAM_MTU);
+	ikcp_setmtu(s->kcp, STREAM_MTU - STREAM_OVERHEAD);
 	ikcp_wndsize(s->kcp, STREAM_WND, STREAM_WND);
 	ikcp_nodelay(s->kcp, 1, 10, 2, 0);
 #ifdef COMRADE_HAVE_KCP_CC

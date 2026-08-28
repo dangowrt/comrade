@@ -303,6 +303,12 @@ target_include_directories(comrade_hbeat PUBLIC src)
 add_library(comrade_replay STATIC src/replay.c)
 target_include_directories(comrade_replay PUBLIC src)
 
+# Origin for stream datagrams: SSH inside KCP is already unreadable on the
+# path, so what it needs is a statement of who sent it, not another cipher.
+add_library(comrade_dataauth STATIC src/dataauth.c)
+target_include_directories(comrade_dataauth PUBLIC src)
+target_link_libraries(comrade_dataauth comrade_crypto)
+
 # Per-family reachability: what this host knows about its own network, and what
 # stops being true when it moves. Deliberately links nothing -- no sockets, no
 # threads, no clock -- so it can be driven entirely from synthetic events.
@@ -544,7 +550,7 @@ target_link_libraries(comrade_session PUBLIC
 	comrade_bridge comrade_token comrade_crypto comrade_stunlist
 	comrade_stunprobe comrade_conn comrade_path comrade_ctlproto comrade_dbg
 	comrade_netstate comrade_nsfacts comrade_hostreap comrade_claimlog
-	comrade_hbeat comrade_replay)
+	comrade_hbeat comrade_replay comrade_dataauth)
 
 # The view: the only module that draws to the terminal (MVC).
 # Token QR codes for the dashboard. qrcodegen.c is vendored from Project
@@ -778,6 +784,10 @@ if(BUILD_TESTING)
 	add_executable(connkey_test tests/connkey_test.c)
 	target_link_libraries(connkey_test comrade_crypto comrade_token)
 	add_test(NAME connkey_test COMMAND connkey_test)
+
+	add_executable(dataauth_test tests/dataauth_test.c)
+	target_link_libraries(dataauth_test comrade_dataauth)
+	add_test(NAME dataauth_test COMMAND dataauth_test)
 
 	# Both exercise the BEP 44 engine alone, which needs no DHT library.
 	add_executable(bep44_test tests/bep44_test.c)
@@ -1110,7 +1120,7 @@ if(BUILD_TESTING)
 		termfilter_test
 		ctlproto_test netmon_test
 		candpolicy_test candpack_test mailbox_test roauth_test
-		connkey_test
+		connkey_test dataauth_test
 		stunprobe_test path_test bep44_test
 		bep44_pin_test bep44_store_test bep44_rl_test
 		sig_rebuild_test natstream_test stream_room_test

@@ -7,6 +7,17 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* What a datagram may be on the wire, transport framing included. */
+#define STREAM_MTU 1200
+
+/*
+ * What the transport adds under us on every datagram: a counter and a tag that
+ * say a datagram came from the far end of this connection (session.c). KCP is
+ * given the rest of the budget, so a datagram is the same size on the wire as
+ * it would be without them.
+ */
+#define STREAM_OVERHEAD 24
+
 struct stream;
 
 typedef int stream_output_fn(void *arg, const uint8_t *data, size_t len);

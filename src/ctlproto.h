@@ -29,6 +29,14 @@
  */
 #define CTLM_KEY 6
 #define CTL_KEY_PLEN 32
+/*
+ * payload: none. "I can open frames under the connection key now." The
+ * exchange rides this channel, which rides the stream the key protects, so
+ * neither end may seal under the new key until the other says it can open one
+ * -- otherwise the datagram carrying a half is sealed with the key that half
+ * is needed to derive.
+ */
+#define CTLM_KEYOK 7
 #define CTL_HDR 2
 #define CTL_TS_LEN 8
 #define CTL_RDV_PLEN 19
