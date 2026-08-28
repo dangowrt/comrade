@@ -111,6 +111,11 @@ void path_ep_unpack(struct path_ep *ep, const uint8_t in[PATH_EP_LEN]);
 int path_ep_eq(const struct path_ep *a, const struct path_ep *b);
 int path_ep_any(const struct path_ep *ep);
 int path_ep_is_v4(const struct path_ep *ep);
+
+/* One host, rather than a group: not multicast, not broadcast, not the
+ * unspecified address. What a peer claims about where it is has to be
+ * somewhere a session could be carried to. */
+int path_ep_is_unicast(const struct path_ep *ep);
 void path_ep_str(const struct path_ep *ep, char *out, size_t n);
 
 /*

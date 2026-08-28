@@ -17,6 +17,24 @@ int path_ep_is_v4(const struct path_ep *ep)
 	return !memcmp(ep->addr, v4_prefix, sizeof(v4_prefix));
 }
 
+int path_ep_is_unicast(const struct path_ep *ep)
+{
+	if (path_ep_is_v4(ep)) {
+		const uint8_t *a = ep->addr + 12;
+
+		if (a[0] >= 224)		/* multicast, and the rest */
+			return 0;
+		if (a[0] == 255 && a[1] == 255 && a[2] == 255 && a[3] == 255)
+			return 0;
+		if (!a[0])			/* 0.0.0.0/8 names no host */
+			return 0;
+		return 1;
+	}
+	if (ep->addr[0] == 0xff)		/* ff00::/8 */
+		return 0;
+	return !path_ep_any(ep);
+}
+
 int path_ep_any(const struct path_ep *ep)
 {
 	static const uint8_t zero[16] = { 0 };

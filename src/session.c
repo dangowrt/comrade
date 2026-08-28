@@ -1018,6 +1018,15 @@ static void conn_offer_path(struct conn *c, const struct sockaddr *sa,
 	if (path_ep_any(&ep) || !ep.port)
 		return;
 	/*
+	 * A peer may say where it is; it may not say "everywhere". A group or
+	 * broadcast address here would have us probing, and then carrying a
+	 * session to, every host that listens on that port.
+	 */
+	if (!path_ep_is_unicast(&ep)) {
+		dbg_logf("path advertised: declined, not one host");
+		return;
+	}
+	/*
 	 * Our own listening endpoint, advertised back at us: both ends of one
 	 * session hold the same key, so a probe sent there is answered by us
 	 * and the path looks alive while carrying nothing. Only this exact

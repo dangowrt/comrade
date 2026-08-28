@@ -15,6 +15,10 @@
 
 /* The tag is the session's now, so a test picks its own. */
 #define TEST_MAGIC 0x434d5250U
+
+static const uint8_t v4map[12] = {
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff
+};
 #include "wsock.h"
 
 static const uint8_t key[32] = {
@@ -116,6 +120,25 @@ static void endpoint_check(void)
 	assert(path_ep_any(&e));
 	e.port = 1;
 	assert(!path_ep_any(&e));
+
+	/* A peer may say where it is, not "everywhere": an address that names
+	 * a group would have us probing, and carrying a session to, every host
+	 * listening on that port. */
+	memset(&e, 0, sizeof(e));
+	e.port = 5000;
+	assert(inet_pton(AF_INET, "192.168.5.7", &e.addr[12]) == 1);
+	memcpy(e.addr, v4map, 12);
+	assert(path_ep_is_unicast(&e));
+	assert(inet_pton(AF_INET, "239.7.7.7", &e.addr[12]) == 1);
+	assert(!path_ep_is_unicast(&e));
+	assert(inet_pton(AF_INET, "255.255.255.255", &e.addr[12]) == 1);
+	assert(!path_ep_is_unicast(&e));
+	assert(inet_pton(AF_INET, "0.0.0.9", &e.addr[12]) == 1);
+	assert(!path_ep_is_unicast(&e));
+	assert(inet_pton(AF_INET6, "2001:db8::1", e.addr) == 1);
+	assert(path_ep_is_unicast(&e));
+	assert(inet_pton(AF_INET6, "ff02::fb", e.addr) == 1);
+	assert(!path_ep_is_unicast(&e));
 }
 
 /* The head round-trips, the optional tail round-trips, and a frame that is not

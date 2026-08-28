@@ -27,6 +27,13 @@ void dbg_logf(const char *fmt, ...)
 	f = fopen(path, "a");
 	if (!f)
 		return;
+	/*
+	 * This log carries every endpoint the session touches, and its default
+	 * home is the shared temporary directory, where anyone with an account
+	 * can read what the mode allows. Nobody but its owner has business in
+	 * it.
+	 */
+	os_chmod_private(path);
 	clock_gettime(CLOCK_REALTIME, &ts);
 	fprintf(f, "[%ld.%03ld pid %ld] ", (long)ts.tv_sec,
 		ts.tv_nsec / 1000000, os_pid());
