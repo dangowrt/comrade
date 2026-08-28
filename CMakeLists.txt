@@ -80,9 +80,13 @@ if(WIN32)
 	# and static winpthreads, so the only imports left are system DLLs.
 	set(COMRADE_WIN_LINK -static -static-libgcc)
 
-	# The suite drives the host path (forkpty, tmux) and the tools are
-	# POSIX-only; neither is part of the client milestone.
-	set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+	# The tools are POSIX-only. The tests are not all of them: what needs a
+	# socketpair, a pty or a shell says so where it is defined, and the rest
+	# builds here. A Windows build is usually the release one, so they stay
+	# off unless asked for -- but asking now works.
+	if(NOT DEFINED CACHE{BUILD_TESTING})
+		set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+	endif()
 	set(COMRADE_BUILD_TOOLS OFF)
 else()
 	set(COMRADE_BUILD_TOOLS ON)
@@ -685,9 +689,13 @@ if(BUILD_TESTING)
 	target_link_libraries(showfmt_test comrade_token comrade_compat)
 	add_test(NAME showfmt_test COMMAND showfmt_test)
 
-	add_executable(mview_test tests/mview_test.c src/mview.c src/showfmt.c)
-	target_link_libraries(mview_test comrade_token comrade_compat)
-	add_test(NAME mview_test COMMAND mview_test)
+	# Writes its status file through mkstemp under /tmp, which is the one
+	# POSIX thing about it.
+	if(UNIX)
+		add_executable(mview_test tests/mview_test.c src/mview.c src/showfmt.c)
+		target_link_libraries(mview_test comrade_token comrade_compat)
+		add_test(NAME mview_test COMMAND mview_test)
+	endif()
 
 	add_executable(tokgen_test tests/tokgen_test.c)
 	target_link_libraries(tokgen_test comrade_token)
@@ -791,12 +799,16 @@ if(BUILD_TESTING)
 	# address, nothing sent) and stalls their bootstrap resolve, so it needs
 	# no network; SKIPs (77) where no socket can be had. XDG_DATA_HOME keeps
 	# the node cache it persists out of the developer's data dir.
-	add_executable(sig_rebuild_test tests/sig_rebuild_test.c)
-	target_link_libraries(sig_rebuild_test comrade_sig)
-	add_test(NAME sig_rebuild_test COMMAND sig_rebuild_test)
-	set_tests_properties(sig_rebuild_test PROPERTIES
-		SKIP_RETURN_CODE 77 TIMEOUT 30
-		ENVIRONMENT XDG_DATA_HOME=${CMAKE_CURRENT_BINARY_DIR}/test-data)
+	# Stalls the bootstrap by defining getaddrinfo over the C library's,
+	# which is a POSIX linker's behaviour; the Windows one refuses it.
+	if(UNIX)
+		add_executable(sig_rebuild_test tests/sig_rebuild_test.c)
+		target_link_libraries(sig_rebuild_test comrade_sig)
+		add_test(NAME sig_rebuild_test COMMAND sig_rebuild_test)
+		set_tests_properties(sig_rebuild_test PROPERTIES
+			SKIP_RETURN_CODE 77 TIMEOUT 30
+			ENVIRONMENT XDG_DATA_HOME=${CMAKE_CURRENT_BINARY_DIR}/test-data)
+	endif()
 
 	add_executable(natstream_test tests/natstream_test.c)
 	target_link_libraries(natstream_test comrade_nat comrade_stream)
@@ -1092,6 +1104,14 @@ if(BUILD_TESTING)
 		sshkcp_test sshctl_test qr_test showfmt_test mview_test)
 		if(TARGET ${t})
 			target_compile_options(${t} PRIVATE -UNDEBUG)
+			# A test binary should run from where it was built, as
+			# comrade.exe does: without this the toolchain's
+			# winpthread and libgcc are looked for beside it and
+			# the test dies before main with 0xc0000135.
+			if(WIN32)
+				target_link_options(${t} PRIVATE
+					${COMRADE_WIN_LINK})
+			endif()
 		endif()
 	endforeach()
 endif()

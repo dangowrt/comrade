@@ -25,12 +25,12 @@
  */
 
 #include <assert.h>
-#include <netdb.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <time.h>
 
 #include "sig.h"
+#include "wsock.h"
 
 #define STALL_MS 1000		/* per bootstrap router, as a slow uplink would */
 #define ROUNDS 10

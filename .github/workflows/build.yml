@@ -304,7 +304,15 @@ jobs:
           pwsh packaging/windows/build.ps1
           -Triple x86_64-w64-mingw32 -Toolchain $env:LLVM_MINGW
           -Root "$env:RUNNER_TEMP\winbuild" -Out "$env:RUNNER_TEMP\out"
-          -Werror ON
+          -Werror ON -Tests ON
+
+      # The unit tests, which are the portable ones: the bridge tests want a
+      # socketpair and the end-to-end harness is shell, and both are left to
+      # the POSIX jobs by the CMake. This is a native x64 build on an x64
+      # worker, so what it builds it can also run.
+      - name: Test
+        shell: pwsh
+        run: ctest --test-dir "$env:RUNNER_TEMP\winbuild\build\x86_64-w64-mingw32\comrade" --output-on-failure --timeout 120
 
       - name: Smoke test
         shell: pwsh

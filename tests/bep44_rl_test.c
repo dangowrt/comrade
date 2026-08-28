@@ -198,7 +198,7 @@ static void fail_closed(void)
 static void admission(void)
 {
 	uint64_t now = now_ms();
-	uint8_t t[20], far[20], near[20];
+	uint8_t t[20], far_id[20], near_id[20];
 	int i, slot;
 
 	E->store_cap = 8;
@@ -208,12 +208,12 @@ static void admission(void)
 		E->store[i] = item_new(t, (const uint8_t *)"3:abc", 5, now);
 		assert(E->store[i]);
 	}
-	memcpy(far, E->myid, 20);
-	far[0] ^= 0xff;					/* far: high bit set */
-	assert(store_free_slot(E, far) == -1);		/* not admitted */
+	memcpy(far_id, E->myid, 20);
+	far_id[0] ^= 0xff;					/* far_id: high bit set */
+	assert(store_free_slot(E, far_id) == -1);		/* not admitted */
 
-	memcpy(near, E->myid, 20);			/* distance 0: nearer than all */
-	slot = store_free_slot(E, near);
+	memcpy(near_id, E->myid, 20);			/* distance 0: nearer than all */
+	slot = store_free_slot(E, near_id);
 	assert(slot >= 0 && E->store[slot] == NULL);	/* the furthest was evicted */
 }
 
