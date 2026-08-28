@@ -21,6 +21,8 @@
 #include <string.h>
 #include <unistd.h>
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -50,9 +52,15 @@ static int child_client_no_exec(void)
 	layers = sandbox_apply(&sb);
 	if (!(layers & SANDBOX_L_SECCOMP))
 		return RC_SKIP;
-	execl("/bin/true", "true", (char *)NULL);
-	/* Reached only because exec was denied. */
-	return errno == EPERM ? RC_OK : RC_FAIL;
+	/*
+	 * Were exec allowed, this child would become `exit 42` and never return;
+	 * that it returns at all means exec was refused. The two sandboxes refuse
+	 * it differently: Linux seccomp with EPERM, macOS Seatbelt with ENOENT
+	 * (it hides the unreadable binary).
+	 */
+	execl("/bin/sh", "sh", "-c", "exit 42", (char *)NULL);
+	return (errno == EPERM || errno == EACCES || errno == ENOENT)
+		? RC_OK : RC_FAIL;
 }
 
 /*
@@ -72,13 +80,28 @@ static int child_foreground(void)
 	if (!(layers & SANDBOX_L_SECCOMP))
 		return RC_SKIP;
 
-	s = socket(AF_INET, SOCK_DGRAM, 0);
+	/*
+	 * No route to the network -- but the two sandboxes stop it differently:
+	 * Linux seccomp refuses to make the INET socket at all, while macOS
+	 * Seatbelt makes it but refuses to reach an address. Either is a pass.
+	 */
+	s = socket(AF_INET, SOCK_STREAM, 0);
 	if (s >= 0) {
+		struct sockaddr_in a;
+
+		memset(&a, 0, sizeof(a));
+		a.sin_family = AF_INET;
+		a.sin_port = htons(53);
+		a.sin_addr.s_addr = inet_addr("1.1.1.1");
+		if (connect(s, (struct sockaddr *)&a, sizeof(a)) == 0 ||
+		    (errno != EPERM && errno != EACCES)) {
+			close(s);
+			return RC_FAIL;	/* the network was reachable */
+		}
 		close(s);
-		return RC_FAIL;		/* INET should have been denied */
-	}
-	if (errno != EPERM && errno != EACCES)
+	} else if (errno != EPERM && errno != EACCES) {
 		return RC_FAIL;
+	}
 
 	s = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (s < 0)

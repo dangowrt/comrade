@@ -61,8 +61,12 @@
  */
 #define SANDBOX_L_USERNS	0x0001	/* entered a user namespace */
 #define SANDBOX_L_MOUNTNS	0x0002	/* confined the mount namespace */
-#define SANDBOX_L_LANDLOCK	0x0004	/* Landlock filesystem ruleset */
-#define SANDBOX_L_SECCOMP	0x0008	/* seccomp syscall filter */
+#define SANDBOX_L_LANDLOCK	0x0004	/* access-based filesystem confinement:
+					 * Linux Landlock, or a macOS Seatbelt
+					 * file ruleset */
+#define SANDBOX_L_SECCOMP	0x0008	/* a syscall/operation filter is active:
+					 * a Linux seccomp filter, or a macOS
+					 * Seatbelt profile */
 #define SANDBOX_L_CAPS		0x0010	/* capabilities + bounding set dropped */
 #define SANDBOX_L_NONEWPRIVS	0x0020	/* PR_SET_NO_NEW_PRIVS / equivalent */
 #define SANDBOX_L_MDWE		0x0040	/* memory write-xor-execute enforced */

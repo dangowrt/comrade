@@ -65,20 +65,119 @@ static int limit_core(void)
  * lifted afterwards.
  */
 
+#include <limits.h>
+#include <sys/ptrace.h>
+
 extern int sandbox_init_with_parameters(const char *profile, uint64_t flags,
 					const char *const parameters[],
 					char **errorbuf);
+extern void sandbox_free_error(char *errorbuf);
 
-/* Filled in a later commit: compose the per-role SBPL and apply it, plus the
- * fork-blocking RLIMIT_NPROC=0 (macOS threads are not processes, so unlike
- * Linux it does not strangle pthread_create). Kept a stub so the file builds
- * and links on macOS from the first commit. */
+/*
+ * The confining profile (client and service): deny everything, then allow the
+ * narrow set the work needs -- the system and Homebrew library trees to map and
+ * read, the resolver's pieces, the process's own data (and state) directory to
+ * read and write, and the network. process-exec and process-fork are left
+ * denied by the default, so a compromised process cannot run anything; the host
+ * service does its spawning from a separate process forked before this applies.
+ * DATA_DIR and STATE_DIR are passed as parameters so the one profile serves any
+ * path.
+ */
+static const char sb_profile_confine[] =
+"(version 1)\n"
+"(deny default)\n"
+"(allow file-read-metadata)\n"
+"(allow process-info* (target self))\n"
+"(allow signal (target self))\n"
+"(allow sysctl-read)\n"
+"(allow mach-per-user-lookup)\n"
+"(allow file-read* file-map-executable\n"
+"  (subpath \"/usr/lib\") (subpath \"/usr/share\") (subpath \"/System\")\n"
+"  (subpath \"/private/etc\") (subpath \"/opt/homebrew\")\n"
+"  (subpath \"/usr/local\") (subpath \"/Library/Preferences/Logging\")\n"
+"  (subpath \"/System/Cryptexes\")\n"
+"  (subpath \"/System/Volumes/Preboot/Cryptexes\"))\n"
+"(allow file-read*\n"
+"  (literal \"/dev/null\") (literal \"/dev/zero\") (literal \"/dev/random\")\n"
+"  (literal \"/dev/urandom\") (literal \"/dev/dtracehelper\"))\n"
+"(allow file-write-data (literal \"/dev/null\"))\n"
+"(allow file-ioctl (subpath \"/dev\"))\n"
+"(allow file-read* file-write* file-ioctl (subpath (param \"DATA_DIR\")))\n"
+"(allow file-read* file-write* file-ioctl (subpath (param \"STATE_DIR\")))\n"
+"(allow mach-lookup\n"
+"  (global-name \"com.apple.dnssd.service\")\n"
+"  (global-name \"com.apple.SystemConfiguration.configd\")\n"
+"  (global-name \"com.apple.SystemConfiguration.DNSConfiguration\")\n"
+"  (global-name \"com.apple.system.notification_center\")\n"
+"  (global-name \"com.apple.system.opendirectoryd.libinfo\")\n"
+"  (global-name \"com.apple.system.logger\"))\n"
+"(allow ipc-posix-shm-read-data\n"
+"  (ipc-posix-name \"apple.shm.notification_center\"))\n"
+"(allow network-outbound (literal \"/private/var/run/mDNSResponder\"))\n"
+"(allow network*)\n"
+"(allow system-socket)\n";
+
+/*
+ * The foreground profile: it runs the operator's local tmux, so it keeps
+ * everything a program normally does -- exec, files, a pty, local (unix)
+ * sockets -- and loses only the network, denied to any IP peer. UNIX-domain
+ * sockets are path-based, not (remote ip), so the tmux connection is untouched.
+ */
+static const char sb_profile_nonet[] =
+"(version 1)\n"
+"(allow default)\n"
+"(deny network-inbound (remote ip \"*:*\"))\n"
+"(deny network-outbound (remote ip \"*:*\"))\n";
+
+/* Apply an SBPL profile; returns 1 on success, 0 (logged) on failure. */
+static int seatbelt(const char *profile, const char *const *params)
+{
+	char *err = NULL;
+
+	if (sandbox_init_with_parameters(profile, 0, params, &err) == 0)
+		return 1;
+	dbg_logf("sandbox: seatbelt failed: %s", err ? err : "?");
+	if (err)
+		sandbox_free_error(err);
+	return 0;
+}
+
 static int apply_macos(const struct sandbox_cfg *cfg)
 {
 	int layers = 0;
+	char dd[PATH_MAX];
+	char sd[PATH_MAX];
+	const char *params[5];
+	struct rlimit rl;
 
-	(void)cfg;
 	layers |= limit_core();
+	if (ptrace(PT_DENY_ATTACH, 0, 0, 0) == 0)	/* refuse a debugger */
+		layers |= SANDBOX_L_NODUMP;
+
+	if (cfg->role == SANDBOX_FOREGROUND) {
+		if (seatbelt(sb_profile_nonet, (const char *const *)0))
+			layers |= SANDBOX_L_SECCOMP;
+		return layers;
+	}
+
+	/* Block fork (the spawner is already made); macOS threads are not
+	 * processes, so this does not touch pthread_create. */
+	rl.rlim_cur = 0;
+	rl.rlim_max = 0;
+	if (setrlimit(RLIMIT_NPROC, &rl) == 0)
+		layers |= SANDBOX_L_RLIMIT;
+
+	if (!cfg->data_dir || !realpath(cfg->data_dir, dd))
+		snprintf(dd, sizeof(dd), "/nonexistent");
+	if (!cfg->state_dir || !realpath(cfg->state_dir, sd))
+		snprintf(sd, sizeof(sd), "%s", dd);
+	params[0] = "DATA_DIR";
+	params[1] = dd;
+	params[2] = "STATE_DIR";
+	params[3] = sd;
+	params[4] = (const char *)0;
+	if (seatbelt(sb_profile_confine, params))
+		layers |= SANDBOX_L_SECCOMP | SANDBOX_L_LANDLOCK;
 	return layers;
 }
 
