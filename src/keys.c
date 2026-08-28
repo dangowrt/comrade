@@ -102,6 +102,21 @@ int keys_derive(struct session_keys *keys, const uint8_t rdv[TOKEN_RDV_LEN])
  * read-write secret can mint and accept the read-only credential, while a
  * read-only guest can never walk this back to the read-write secret it was
  * cut from, so handing it out grants observation without control. */
+void keys_conn_key(uint8_t out[32], const uint8_t sig_key[32],
+		   const uint8_t a[KEYS_HALF_LEN],
+		   const uint8_t b[KEYS_HALF_LEN])
+{
+	static const char info[] = "comrade1 conn key";
+	uint8_t buf[sizeof(info) - 1 + 2 * KEYS_HALF_LEN];
+	const uint8_t *lo = memcmp(a, b, KEYS_HALF_LEN) <= 0 ? a : b;
+	const uint8_t *hi = lo == a ? b : a;
+
+	memcpy(buf, info, sizeof(info) - 1);
+	memcpy(buf + sizeof(info) - 1, lo, KEYS_HALF_LEN);
+	memcpy(buf + sizeof(info) - 1 + KEYS_HALF_LEN, hi, KEYS_HALF_LEN);
+	cc_blake2b_keyed(out, 32, sig_key, 32, buf, sizeof(buf));
+}
+
 void keys_derive_ro_auth(uint8_t ro[TOKEN_AUTH_LEN],
 			 const uint8_t rw[TOKEN_AUTH_LEN])
 {

@@ -62,6 +62,26 @@ int main(void)
 		assert(ctl_frame(out, CTLM_RDV, big, sizeof(big)) == 0);
 	}
 
+	/*
+	 * The largest message is the connection key half, which is what
+	 * CTL_FRAME_MAX is sized for: it frames to exactly that, and a payload
+	 * one byte longer has nowhere to go.
+	 */
+	{
+		uint8_t half[CTL_KEY_PLEN], f[CTL_FRAME_MAX], over[CTL_KEY_PLEN + 1];
+		size_t n;
+
+		memset(half, 0xa5, sizeof(half));
+		n = ctl_frame(f, CTLM_KEY, half, sizeof(half));
+		assert(n == CTL_FRAME_MAX);
+		reset(&r);
+		ctl_reframer_feed(&r, f, n, collect, NULL);
+		assert(nseen == 1 && seen[0].type == CTLM_KEY);
+		assert(seen[0].plen == CTL_KEY_PLEN);
+		assert(!memcmp(seen[0].pl, half, CTL_KEY_PLEN));
+		assert(ctl_frame(f, CTLM_KEY, over, sizeof(over)) == 0);
+	}
+
 	/* One whole frame in one feed -> one message, payload intact. */
 	reset(&r);
 	ctl_reframer_feed(&r, f1, n1, collect, NULL);
@@ -164,8 +184,8 @@ int main(void)
 
 	/*
 	 * A candidate advertisement is one endpoint in the same 19-byte shape,
-	 * so it frames to exactly CTL_FRAME_MAX and needs no more room than the
-	 * rendezvous message the framing was sized for.
+	 * so it frames to the same length as the rendezvous message and needs
+	 * no more room than the framing already has.
 	 */
 	{
 		struct sockaddr_in a;
@@ -180,7 +200,7 @@ int main(void)
 		assert(inet_pton(AF_INET, "198.51.100.9", &a.sin_addr) == 1);
 		ctl_rdv_encode(rdv, 4, (struct sockaddr *)&a);
 		n = ctl_frame(f, CTLM_CAND, rdv, CTL_RDV_PLEN);
-		assert(n == CTL_FRAME_MAX);
+		assert(n == CTL_HDR + CTL_RDV_PLEN);
 		reset(&r);
 		ctl_reframer_feed(&r, f, n, collect, NULL);
 		assert(nseen == 1 && seen[0].type == CTLM_CAND);

@@ -31,7 +31,22 @@ struct session_keys {
 	uint32_t conv;
 };
 
+#define KEYS_HALF_LEN 32
+
 int keys_derive(struct session_keys *keys, const uint8_t rdv[TOKEN_RDV_LEN]);
+/*
+ * The key one connection's probes are sealed under: the session key, which
+ * says a token holder is speaking, and a random half from each end, which says
+ * which two. The halves travel inside the SSH session, so a third token holder
+ * never sees them and cannot reach a connection it is not part of -- what the
+ * token alone buys is the right to start one.
+ *
+ * The halves are ordered by value rather than by role, so both ends compute
+ * the same key with neither being the one that decides.
+ */
+void keys_conn_key(uint8_t out[32], const uint8_t sig_key[32],
+		   const uint8_t a[KEYS_HALF_LEN],
+		   const uint8_t b[KEYS_HALF_LEN]);
 void keys_derive_ro_auth(uint8_t ro[TOKEN_AUTH_LEN],
 			 const uint8_t rw[TOKEN_AUTH_LEN]);
 int msg_seal(uint8_t *dst, size_t dst_len, const uint8_t key[32],

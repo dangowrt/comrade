@@ -775,6 +775,10 @@ if(BUILD_TESTING)
 	target_link_libraries(roauth_test comrade_crypto comrade_token)
 	add_test(NAME roauth_test COMMAND roauth_test)
 
+	add_executable(connkey_test tests/connkey_test.c)
+	target_link_libraries(connkey_test comrade_crypto comrade_token)
+	add_test(NAME connkey_test COMMAND connkey_test)
+
 	# Both exercise the BEP 44 engine alone, which needs no DHT library.
 	add_executable(bep44_test tests/bep44_test.c)
 	target_link_libraries(bep44_test comrade_bep44)
@@ -1106,6 +1110,7 @@ if(BUILD_TESTING)
 		termfilter_test
 		ctlproto_test netmon_test
 		candpolicy_test candpack_test mailbox_test roauth_test
+		connkey_test
 		stunprobe_test path_test bep44_test
 		bep44_pin_test bep44_store_test bep44_rl_test
 		sig_rebuild_test natstream_test stream_room_test

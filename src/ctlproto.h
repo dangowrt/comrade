@@ -21,12 +21,20 @@
 #define CTLM_CAND 3		/* payload: family(1) port(2) addr(16) */
 #define CTLM_REACH 4		/* payload: v4 state(1) flags(1), then v6 */
 #define CTLM_RDVASK 5		/* payload: family(1) -- 4 or 6 */
+/*
+ * payload: a random half (KEYS_HALF_LEN). Each end sends one once the channel
+ * is up, and the pair keys this connection's probes (keys.h). It is sent here
+ * rather than on the raw path because here it is already confidential and
+ * bound to a pinned host key.
+ */
+#define CTLM_KEY 6
+#define CTL_KEY_PLEN 32
 #define CTL_HDR 2
 #define CTL_TS_LEN 8
 #define CTL_RDV_PLEN 19
 #define CTL_REACH_PLEN 4
 #define CTL_RDVASK_PLEN 1
-#define CTL_FRAME_MAX (CTL_HDR + CTL_RDV_PLEN)
+#define CTL_FRAME_MAX (CTL_HDR + CTL_KEY_PLEN)
 
 /*
  * What one end can reach, per family, as the other end reads it. The values are
