@@ -286,7 +286,10 @@ if(WIN32)
 	add_library(comrade_cpty STATIC
 		src/cpty_win.c src/win_proc.c src/tmuxpath.c)
 else()
-	add_library(comrade_cpty STATIC src/cpty_posix.c)
+	# The spawner rides with cpty: it is the same terminal-backed tmux child,
+	# forked in a separate unsandboxed process so the connection service can
+	# deny its own exec (see spawner.h). POSIX only.
+	add_library(comrade_cpty STATIC src/cpty_posix.c src/spawner.c)
 endif()
 target_include_directories(comrade_cpty PUBLIC src)
 target_link_libraries(comrade_cpty PUBLIC comrade_compat comrade_dbg)
@@ -724,6 +727,14 @@ if(BUILD_TESTING)
 	add_test(NAME sandbox_test COMMAND sandbox_test)
 	set_tests_properties(sandbox_test PROPERTIES SKIP_RETURN_CODE 77)
 
+	# The tmux spawner under concurrent load: many threads spawning and
+	# closing while another queries liveness, proving the one control channel
+	# never crosses a reply to the wrong caller.
+	add_executable(spawner_test tests/spawner_test.c)
+	target_link_libraries(spawner_test comrade_cpty)
+	add_test(NAME spawner_test COMMAND spawner_test)
+	set_tests_properties(spawner_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+
 	add_executable(showfmt_test tests/showfmt_test.c src/showfmt.c)
 	target_link_libraries(showfmt_test comrade_token comrade_compat)
 	add_test(NAME showfmt_test COMMAND showfmt_test)
@@ -1160,7 +1171,7 @@ if(BUILD_TESTING)
 		sig_rebuild_test natstream_test stream_room_test
 		stream_cc_test sshloop_test sshfwd_test sshexit_test sshro_test
 		sshkcp_test sshctl_test qr_test showfmt_test mview_test
-		sandbox_test)
+		sandbox_test spawner_test)
 		if(TARGET ${t})
 			target_compile_options(${t} PRIVATE -UNDEBUG)
 			# A test binary should run from where it was built, as
