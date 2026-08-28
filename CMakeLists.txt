@@ -169,12 +169,23 @@ if(COMRADE_CRYPTO_RESOLVED STREQUAL "monocypher")
 elseif(COMRADE_CRYPTO_RESOLVED STREQUAL "openssl")
 	find_package(OpenSSL QUIET)
 elseif(COMRADE_CRYPTO_RESOLVED STREQUAL "gcrypt")
-	pkg_check_modules(GCRYPT IMPORTED_TARGET libgcrypt)
+	# 1.10 is the floor: gcry_ecc_mul_point, which the X25519 half of the
+	# backend is written against, arrived there. Without the version the
+	# build would reach the compiler and fail on an implicit declaration,
+	# which says nothing about what to install.
+	pkg_check_modules(GCRYPT IMPORTED_TARGET libgcrypt>=1.10)
 	if(NOT GCRYPT_FOUND)
 		find_path(GCRYPT_INCLUDE_DIR gcrypt.h)
 		find_library(GCRYPT_LIBRARY gcrypt)
 		if(GCRYPT_INCLUDE_DIR AND GCRYPT_LIBRARY)
-			set(GCRYPT_FOUND 1)
+			include(CheckSymbolExists)
+			set(CMAKE_REQUIRED_INCLUDES ${GCRYPT_INCLUDE_DIR})
+			check_symbol_exists(gcry_ecc_mul_point "gcrypt.h"
+					    GCRYPT_HAS_MUL_POINT)
+			unset(CMAKE_REQUIRED_INCLUDES)
+			if(GCRYPT_HAS_MUL_POINT)
+				set(GCRYPT_FOUND 1)
+			endif()
 		endif()
 	endif()
 else()

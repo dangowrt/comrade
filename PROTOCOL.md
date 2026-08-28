@@ -822,7 +822,8 @@ libssh server (host) and client (joiner) over the KCP byte stream
 bounded-linger teardown).
 
 - **Host key**: host mints an ephemeral **ed25519** key; the token's `hostpub`
-  is `SSH_PUBLICKEY_HASH_SHA256` of that key (`sshd.c`, `sshc.c:make_host_fp`).
+  is `SSH_PUBLICKEY_HASH_SHA256` of that key (`sshd.c:sshd_hostkey_new`,
+`sshc.c:pin_hostkey`).
 - **Pinning** (`sshc.c:pin_hostkey`): the client compares the server key's
   SHA-256 to `hostpub`; mismatch is a hard failure. No TOFU.
 - **Auth** (`sshd.c:do_auth`, `sshc.c`): password auth only; the password is
@@ -923,7 +924,7 @@ the largest message, and the reframer rejects anything claiming more.
   outage on KCP retransmission; each attempt runs `RESUME_ATTEMPT_MS 10000`
   before regathering. Only when that keeps failing does the interactive client
   tear down and rejoin as a fresh identity (tmux redraws), after
-  `SSHC_REJOIN_GRACE_S 45`: the worker was reaped, the host is gone, or the
+  `SSHC_REJOIN_GRACE_S 75`: the worker was reaped, the host is gone, or the
   network refuses every punch.
 - **Signalling is rebuilt on a move**. A fresh `sig` binds a new DHT socket on
   the new network, where the old one stays stuck on the interface that vanished;

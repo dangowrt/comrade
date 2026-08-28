@@ -112,6 +112,25 @@ The token is a capability to join one session, and the session is SSH.
   nothing to the pre-auth surface; a host can decline them all with
   `--no-forwarding`.
 
+One invitation can be handed to several people, and a read-only link is
+the one you hand to a room, so what one holder can do to another matters
+as much as what an outsider can do:
+
+- **A holder cannot read another's claim.** The rendezvous mailbox is
+  readable by everyone holding the invitation, so a claim -- which names
+  the addresses a peer can be reached at -- is sealed to the host, whose
+  key nobody else has. A read-only link given to twenty people does not
+  publish each attendee's address to the other nineteen.
+- **A holder cannot reach another's session.** Once two ends are talking
+  they agree a key of their own inside the SSH session and everything on
+  the direct link is keyed to that pair, so the invitation buys the right
+  to start a session and nothing over one already running.
+- **A holder can still take a turn.** Joining is a queue, and occupancy
+  cannot be hidden from the people entitled to queue: a holder can claim
+  repeatedly and delay others. It needs a valid invitation, it delays
+  rather than discloses, and it shows up as a rendezvous that will not
+  settle.
+
 > Treat the session token like a credential: anyone who has it can use it
 > to attempt to join the session.
 
@@ -291,6 +310,22 @@ native ConPTY build from winget:
     winget install arndawg.tmux-windows
 
 ## Limitations and plans
+
+Standing:
+
+- **Everything is UDP, and there is no relay.** comrade needs a path that
+  carries UDP between the two ends. A network permitting outbound UDP
+  nowhere -- some hotel, campus and corporate networks -- stops it, and no
+  amount of obfuscation changes that. Having no relay is deliberate: there
+  is nothing to run, fund or trust, and nothing that sees the timing and
+  volume of every session. A TCP fallback straight to a reachable host
+  would cover the common half of the problem without a third party, and is
+  the shape any future answer would take; see SECURITY-ARCHITECTURE.md.
+- **An invitation is shared by everyone holding it.** One token is one
+  rendezvous, which is what lets a link be handed to whoever you like and
+  simply work. A holder can therefore take a turn in the queue and delay
+  others, though not read what they exchange. The trade is described in
+  SECURITY-ARCHITECTURE.md.
 
 Planned:
 
@@ -484,7 +519,7 @@ it.
 |---------|---------|------------|---------|
 | libssh | SSH server and client | extra/libssh | libssh (packages feed) |
 | libjuice | ICE/STUN hole punching | extra/libjuice | libjuice (packages feed, master only) |
-| a crypto library | ed25519, ChaCha20-Poly1305, BLAKE2b | whichever libssh uses | whichever libssh uses (see below) |
+| a crypto library | ed25519, X25519, ChaCha20-Poly1305, BLAKE2b | whichever libssh uses | whichever libssh uses (see below) |
 | kcp | reliable stream over UDP | `packaging/arch/kcp` (in-tree PKGBUILD) | libkcp (packages feed, master only) |
 | jech/dht | mainline DHT (Kademlia, BEP 32) | extra/dht | libdht (packages feed) |
 
@@ -520,15 +555,26 @@ fallback for mbedTLS-based systems.
 | libssh built against | comrade uses | why |
 |----------------------|--------------|-----|
 | OpenSSL | OpenSSL libcrypto | already linked |
-| libgcrypt | libgcrypt | already linked |
+| libgcrypt | libgcrypt, 1.10 or newer | already linked |
 | mbedTLS | monocypher (~70 KB) | mbedTLS has no BLAKE2b and no Ed25519 |
 
 Configure reads that from the libssh binary itself and prints what it
-resolved and why; `-DCOMRADE_CRYPTO=<backend>` overrides it.
+resolved and why; `-DCOMRADE_CRYPTO=<backend>` overrides it. The libgcrypt
+floor is `gcry_ecc_mul_point`, which arrived in 1.10 and is what the
+X25519 half is written against; configure checks for it rather than
+letting the compiler find out.
 
 ## Documentation
 
-- **PROTOCOL.md** -- the wire protocol and rendezvous design.
+- **PROTOCOL.md** -- the wire protocol and rendezvous design, precise
+  enough to implement against. Nothing on the wire is stable across
+  0.1.x, and it says which parts moved last.
+- **SECURITY-ARCHITECTURE.md** -- what two adversarial reviews of the
+  transport found, what was done about it, and what is left: the parts
+  that are properties of the design rather than bugs in it, each with the
+  option that would close it and what that would cost.
+- **INTEGRATION.md** -- the machine-readable interface for embedding
+  comrade in something else.
 
 ## Licence
 
