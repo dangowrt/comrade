@@ -242,6 +242,13 @@ struct cap_data {
 	unsigned int inheritable;
 };
 
+/* Discard a best-effort call's result where a fortified libc would otherwise
+ * warn that it must be used; a (void) cast does not satisfy that attribute. */
+static void ignore_result(long r)
+{
+	(void)r;
+}
+
 /* Refuse core dumps and same-uid ptrace attach. */
 static int no_dumpable(void)
 {
@@ -651,7 +658,7 @@ static void stage_ro(const char *root, const char *path)
 			mkdir_p(dst);
 			*slash = '/';
 		}
-		symlink(target, dst);
+		ignore_result(symlink(target, dst));
 		return;
 	}
 	bind_at(root, path, path, 1, 1);
@@ -718,7 +725,7 @@ static void stage_etc(const char *root)
 		mkdir_p(etc);
 	if ((size_t)snprintf(dst, sizeof(dst), "%s/etc/resolv.conf", root) <
 	    sizeof(dst))
-		symlink(target, dst);
+		ignore_result(symlink(target, dst));
 }
 
 /* Bind a single host device node into the new root's /dev, left writable --
@@ -819,12 +826,12 @@ static int fs_confine_ns(const struct sandbox_cfg *cfg)
 	if (chdir(root) != 0 || syscall(SYS_pivot_root, ".", ".") != 0) {
 		dbg_logf("sandbox: pivot_root failed (%d); filesystem left open",
 			 errno);
-		(void)chdir("/");	/* best effort */
+		ignore_result(chdir("/"));	/* best effort */
 		umount2(root, MNT_DETACH);
 		return 0;
 	}
 	umount2(".", MNT_DETACH);
-	(void)chdir("/");		/* best effort */
+	ignore_result(chdir("/"));		/* best effort */
 	return SANDBOX_L_USERNS | SANDBOX_L_MOUNTNS;
 }
 

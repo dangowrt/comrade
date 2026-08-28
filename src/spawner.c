@@ -411,8 +411,9 @@ static void sp_reap(struct sp_state *s)
 		if (k->exit_wfd >= 0) {
 			unsigned char b = (unsigned char)
 				(WIFEXITED(st) ? WEXITSTATUS(st) : 0);
+			ssize_t n = write(k->exit_wfd, &b, 1);
 
-			(void)write(k->exit_wfd, &b, 1);	/* reader may be gone */
+			(void)n;		/* the reader may already be gone */
 			close(k->exit_wfd);
 		}
 		k->used = 0;
@@ -508,7 +509,9 @@ static void sp_handle(struct sp_state *s, const struct sp_req *req)
 	}
 	case SP_SPAWN: {
 		struct sp_child *k = sp_slot(s);
-		int io[2], npty = 0, ep[2];
+		int io[2] = { -1, -1 };
+		int npty = 0;
+		int ep[2];
 		pid_t pid;
 
 		if (!k) {
