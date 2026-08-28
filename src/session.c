@@ -874,8 +874,13 @@ static int conn_rtt_ms(struct conn *c, int *out)
 	pthread_mutex_lock(&c->hb_lock);
 	*out = c->hb_rtt;
 	pthread_mutex_unlock(&c->hb_lock);
+	/* The stream is the worker thread's to destroy, and it clears the
+	 * pointer under this lock before doing so; every other thread reads it
+	 * the same way or reads freed memory. */
+	pthread_mutex_lock(&c->stream_lock);
 	if (!*out && c->stream)
 		*out = stream_rtt(c->stream);
+	pthread_mutex_unlock(&c->stream_lock);
 	return *out > 0;
 }
 
@@ -4643,7 +4648,8 @@ static void report_peer_links(struct sess *s, struct worker *ws)
 			continue;
 		st = conn_link_state(s, c);
 		rtt = 0;
-		conn_rtt_ms(c, &rtt);
+		if (!conn_rtt_ms(c, &rtt))
+			rtt = -1;	/* nothing measured; 0 is under a ms */
 		if (c->link_told_any && c->link_told == st &&
 		    c->rtt_told == rtt)
 			continue;

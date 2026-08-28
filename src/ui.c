@@ -59,8 +59,7 @@ struct peerrow {
 	int id;
 	int state;			/* SESSION_PEER_* -- how far it got */
 	int link;			/* enum conn_state -- how it is now */
-	int rtt_ms;
-	int rtt_known;			/* 0ms is then under a millisecond */
+	int rtt_ms;			/* -1 unmeasured, 0 under a millisecond */
 	int read_only;
 	char addr[80];
 };
@@ -650,7 +649,7 @@ static void draw(struct ui *u)
 			char rtt[24], buf[16];
 
 			rtt[0] = '\0';
-			if (p->link == CONN_LIVE && p->rtt_known)
+			if (p->link == CONN_LIVE && p->rtt_ms >= 0)
 				snprintf(rtt, sizeof(rtt), "  %s",
 					 rtt_text(p->rtt_ms, buf, sizeof(buf)));
 			line("  " BGR "#%d" RST " %s  " CYN "%s" RST DIM "%s" RST
@@ -891,12 +890,10 @@ static void um_peer_link(struct ui *u, int id, int state, int rtt_ms)
 	for (i = 0; i < u->npeer; i++) {
 		if (u->peer[i].id != id)
 			continue;
-		if (u->peer[i].link == state && u->peer[i].rtt_ms == rtt_ms &&
-		    u->peer[i].rtt_known)
+		if (u->peer[i].link == state && u->peer[i].rtt_ms == rtt_ms)
 			return;
 		u->peer[i].link = state;
 		u->peer[i].rtt_ms = rtt_ms;
-		u->peer[i].rtt_known = 1;
 		if (u->anim)
 			u->dirty = 1;
 		else

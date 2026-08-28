@@ -124,6 +124,17 @@ static void own_endpoint_check(void)
 				      sizeof(sa4)));
 	assert(!cand_ep_is_local(ep.addr, local, 2));
 
+	/* Loopback is ours whether or not the snapshot lists it -- it never
+	 * does -- so a peer offering it is offering us ourselves. */
+	assert(inet_pton(AF_INET, "127.0.0.1", &sa4.sin_addr) == 1);
+	assert(!path_ep_from_sockaddr(&ep, (struct sockaddr *)&sa4,
+				      sizeof(sa4)));
+	assert(cand_ep_is_local(ep.addr, local, 2));
+	assert(cand_ep_is_local(ep.addr, NULL, 0));
+	memset(&ep, 0, sizeof(ep));
+	assert(inet_pton(AF_INET6, "::1", ep.addr) == 1);
+	assert(cand_ep_is_local(ep.addr, NULL, 0));
+
 	/* The v6 half, and a machine that knows of no address of its own. */
 	memset(&ep, 0, sizeof(ep));
 	assert(inet_pton(AF_INET6, "2a01:db8::1", ep.addr) == 1);

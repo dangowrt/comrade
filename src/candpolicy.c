@@ -229,6 +229,9 @@ int cand_ep_is_local(const uint8_t addr[16], const struct netmon_addr *local,
 	static const uint8_t v4_prefix[12] = {
 		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff
 	};
+	static const uint8_t v6_loop[16] = {
+		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1
+	};
 	const uint8_t *a = addr;
 	int alen = 16;
 	size_t i;
@@ -237,6 +240,13 @@ int cand_ep_is_local(const uint8_t addr[16], const struct netmon_addr *local,
 		a = addr + 12;
 		alen = 4;
 	}
+	/*
+	 * Loopback is ours by definition and is not in the interface snapshot,
+	 * which leaves it out as naming this machine to nobody else. A peer
+	 * offering it is offering us ourselves.
+	 */
+	if (alen == 4 ? a[0] == 127 : !memcmp(a, v6_loop, 16))
+		return 1;
 	for (i = 0; i < nlocal; i++)
 		if (local[i].addrlen == alen &&
 		    !memcmp(local[i].addr, a, (size_t)alen))
