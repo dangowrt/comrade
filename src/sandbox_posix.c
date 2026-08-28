@@ -1,12 +1,18 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 /* Copyright (C) 2026 Daniel Golle <daniel@makrotopia.org> */
 
+/* unshare(), the CLONE_NEW* flags and the mount constants are GNU extensions. */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include "sandbox.h"
 
 #ifndef _WIN32
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -79,8 +85,14 @@ static int apply_macos(const struct sandbox_cfg *cfg)
 #elif defined(__linux__)
 
 #include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <sched.h>
+#include <sys/mount.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/syscall.h>
 
 #include <linux/filter.h>
@@ -329,15 +341,278 @@ static int seccomp_apply(int role)
 /*
  * Confine the visible filesystem to what the role needs -- writable only its
  * own data (and, for the service, the host state dir), read-only the resolver
- * config and shared objects the C library and TLS stack keep reading. Filled
- * in a later commit with a mount-namespace confinement (the primitive that
- * works on OpenWrt, where Landlock does not exist) and a Landlock ruleset as
- * the desktop path. Returns 0 for now so the rest of the sandbox is exercised.
+ * config and the shared objects the C library and TLS stack keep reading -- by
+ * building a fresh root in a private mount namespace and pivoting into it. This
+ * is the primitive that works on OpenWrt, where Landlock does not exist: an
+ * unprivileged user namespace grants the mount privilege, and nothing here
+ * needs a helper binary or a pre-staged root. Every step is best-effort; the
+ * one operation that could strand the program in a broken world -- pivot_root
+ * -- runs last, only after the whole tree is built, and a failure before it
+ * detaches the half-built tree and leaves the process in its normal view.
+ *
+ * The Landlock ruleset (the desktop filesystem path, for kernels that refuse an
+ * unprivileged user namespace) is a later addition; where the namespace is
+ * unavailable this returns 0 and the rest of the sandbox still applies.
  */
+
+/* Write a value to a one-shot /proc file (the id maps, setgroups). */
+static int write_once(const char *path, const char *val)
+{
+	int fd = open(path, O_WRONLY);
+	ssize_t n;
+	size_t len = strlen(val);
+
+	if (fd < 0)
+		return -1;
+	n = write(fd, val, len);
+	close(fd);
+	return (n == (ssize_t)len) ? 0 : -1;
+}
+
+/*
+ * Map this process's own uid and gid to themselves in the new user namespace,
+ * so files it owns stay writable. setgroups must be denied before the gid map
+ * when unprivileged. Best-effort: an unmapped namespace still confines, it just
+ * sees its own files as nobody.
+ */
+static void map_ids(uid_t uid, gid_t gid)
+{
+	char buf[64];
+
+	write_once("/proc/self/setgroups", "deny");
+	snprintf(buf, sizeof(buf), "%lu %lu 1", (unsigned long)gid,
+		 (unsigned long)gid);
+	write_once("/proc/self/gid_map", buf);
+	snprintf(buf, sizeof(buf), "%lu %lu 1", (unsigned long)uid,
+		 (unsigned long)uid);
+	write_once("/proc/self/uid_map", buf);
+}
+
+/* Create path and every missing parent, like mkdir -p, mode 0755. */
+static void mkdir_p(const char *path)
+{
+	char buf[PATH_MAX];
+	size_t i, n;
+
+	n = strlen(path);
+	if (n == 0 || n >= sizeof(buf))
+		return;
+	memcpy(buf, path, n + 1);
+	for (i = 1; i < n; i++) {
+		if (buf[i] != '/')
+			continue;
+		buf[i] = '\0';
+		mkdir(buf, 0755);
+		buf[i] = '/';
+	}
+	mkdir(buf, 0755);
+}
+
+#ifndef MOUNT_ATTR_RDONLY
+#define MOUNT_ATTR_RDONLY 0x00000001
+#endif
+#ifndef MOUNT_ATTR_NOSUID
+#define MOUNT_ATTR_NOSUID 0x00000002
+#endif
+#ifndef AT_RECURSIVE
+#define AT_RECURSIVE 0x8000
+#endif
+
+/* The mount_attr the kernel expects; declared here so no UAPI header is
+ * assumed. Only the first two fields are set. */
+struct sb_mount_attr {
+	uint64_t attr_set;
+	uint64_t attr_clr;
+	uint64_t propagation;
+	uint64_t userns_fd;
+};
+
+/*
+ * Turn a mount (and, where the kernel supports it, its whole subtree) read-only
+ * and nosuid. mount_setattr with AT_RECURSIVE does the whole tree and preserves
+ * the flags a user namespace forbids changing; the older bind-remount reaches
+ * only the top mount but is enough on the flat binds used here. Best-effort.
+ */
+static void remount_ro(const char *path)
+{
+#ifdef SYS_mount_setattr
+	struct sb_mount_attr a;
+
+	memset(&a, 0, sizeof(a));
+	a.attr_set = MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID;
+	if (syscall(SYS_mount_setattr, -1, path, AT_RECURSIVE, &a,
+		    sizeof(a)) == 0)
+		return;
+#endif
+	/* The remount only takes read-only in a second call, and must not try to
+	 * relax a flag the namespace locked; adding rdonly/nosuid/nodev never is
+	 * relaxing, and no atime flag is touched. */
+	mount(NULL, path, NULL,
+	      MS_REMOUNT | MS_BIND | MS_RDONLY | MS_NOSUID | MS_NODEV, NULL);
+}
+
+/* Bind src onto <root><at>, creating the mount point. recursive carries
+ * submounts; ro turns the result read-only. Returns 0 on the bind succeeding. */
+static int bind_at(const char *root, const char *src, const char *at,
+		   int recursive, int ro)
+{
+	char dst[PATH_MAX];
+	unsigned long fl = MS_BIND | (recursive ? (unsigned long)MS_REC : 0UL);
+
+	if ((size_t)snprintf(dst, sizeof(dst), "%s%s", root, at) >= sizeof(dst))
+		return -1;
+	mkdir_p(dst);
+	if (mount(src, dst, NULL, fl, NULL) != 0)
+		return -1;
+	if (ro)
+		remount_ro(dst);
+	return 0;
+}
+
+/*
+ * Stage one top-level system directory into the new root: recreate it as a
+ * symlink if that is what the host has (so /bin -> usr/bin layouts survive),
+ * otherwise bind it read-only. Absent directories are skipped.
+ */
+static void stage_sysdir(const char *root, const char *name)
+{
+	struct stat st;
+	char dst[PATH_MAX];
+	char target[PATH_MAX];
+	ssize_t n;
+
+	if (lstat(name, &st) != 0)
+		return;
+	if (S_ISLNK(st.st_mode)) {
+		n = readlink(name, target, sizeof(target) - 1);
+		if (n <= 0)
+			return;
+		target[n] = '\0';
+		if ((size_t)snprintf(dst, sizeof(dst), "%s%s", root, name) >=
+		    sizeof(dst))
+			return;
+		symlink(target, dst);
+		return;
+	}
+	bind_at(root, name, name, 1, 1);
+}
+
+/* Bind a single host device node (character device) into the new root's /dev,
+ * left writable -- /dev/null is written and /dev/urandom is read, and some TLS
+ * backends on musl read /dev/urandom throughout the run. */
+static void bind_dev(const char *root, const char *node)
+{
+	char dst[PATH_MAX];
+	int fd;
+
+	if ((size_t)snprintf(dst, sizeof(dst), "%s%s", root, node) >=
+	    sizeof(dst))
+		return;
+	fd = open(dst, O_WRONLY | O_CREAT | O_EXCL, 0600);
+	if (fd >= 0)
+		close(fd);
+	mount(node, dst, NULL, MS_BIND, NULL);
+}
+
 static int fs_confine(const struct sandbox_cfg *cfg)
 {
-	(void)cfg;
-	return 0;
+	static const char *sysdirs[] = {
+		"/usr", "/etc", "/bin", "/sbin", "/lib", "/lib64",
+		"/lib32", "/opt", "/run", "/var", "/nix", "/gnu"
+	};
+	char root[PATH_MAX];
+	char resolv[PATH_MAX];
+	const char *dbg;
+	uid_t uid;
+	gid_t gid;
+	size_t i;
+
+	if (!cfg->data_dir || !cfg->data_dir[0])
+		return 0;		/* no writable home to build around */
+
+	uid = getuid();
+	gid = getgid();
+
+	if (unshare(CLONE_NEWUSER | CLONE_NEWNS) != 0) {
+		dbg_logf("sandbox: no user namespace (%d); filesystem left open",
+			 errno);
+		return 0;
+	}
+	map_ids(uid, gid);
+
+	/* Keep every mount from here private to this process. */
+	if (mount(NULL, "/", NULL, MS_REC | MS_SLAVE, NULL) != 0) {
+		dbg_logf("sandbox: could not privatise mounts (%d)", errno);
+		return 0;
+	}
+
+	/* The new root is a small tmpfs under the data dir, not /tmp, which on
+	 * OpenWrt holds the resolver config we still need to bind from. */
+	if ((size_t)snprintf(root, sizeof(root), "%s/.ns", cfg->data_dir) >=
+	    sizeof(root))
+		return 0;
+	mkdir(root, 0700);
+	if (mount("tmpfs", root, "tmpfs", MS_NOSUID | MS_NODEV,
+		  "mode=0755,size=1M") != 0) {
+		dbg_logf("sandbox: could not mount the confined root (%d)",
+			 errno);
+		return 0;
+	}
+
+	for (i = 0; i < sizeof(sysdirs) / sizeof(sysdirs[0]); i++)
+		stage_sysdir(root, sysdirs[i]);
+
+	/* If resolv.conf resolves outside /etc (systemd-resolved, or OpenWrt's
+	 * /tmp), bind that directory read-only so the C library can keep reading
+	 * it -- and never the file itself, whose inode a rename would leave
+	 * stale. */
+	if (realpath("/etc/resolv.conf", resolv) &&
+	    strncmp(resolv, "/etc/", 5) != 0) {
+		char *slash = strrchr(resolv, '/');
+
+		if (slash && slash != resolv) {
+			*slash = '\0';
+			bind_at(root, resolv, resolv, 1, 1);
+		}
+	}
+
+	bind_dev(root, "/dev/null");
+	bind_dev(root, "/dev/urandom");
+
+	/* Writable: the data dir (bound non-recursively so the tmpfs staged on
+	 * its own .ns does not nest into the bind), the host state dir for a
+	 * service, and the debug log's directory when one is set. */
+	bind_at(root, cfg->data_dir, cfg->data_dir, 0, 0);
+	if (cfg->state_dir && cfg->state_dir[0])
+		bind_at(root, cfg->state_dir, cfg->state_dir, 0, 0);
+	dbg = getenv("COMRADE_DEBUG");
+	if (dbg && dbg[0] == '/') {
+		char dir[PATH_MAX];
+		char *slash;
+
+		if ((size_t)snprintf(dir, sizeof(dir), "%s", dbg) < sizeof(dir)) {
+			slash = strrchr(dir, '/');
+			if (slash && slash != dir) {
+				*slash = '\0';
+				bind_at(root, dir, dir, 0, 0);
+			}
+		}
+	}
+
+	/* Pivot into the new root and drop the old one. From here the process
+	 * cannot see anything outside what was bound above. */
+	if (chdir(root) != 0 ||
+	    syscall(SYS_pivot_root, ".", ".") != 0) {
+		dbg_logf("sandbox: pivot_root failed (%d); filesystem left open",
+			 errno);
+		(void)chdir("/");	/* best effort */
+		umount2(root, MNT_DETACH);
+		return 0;
+	}
+	umount2(".", MNT_DETACH);
+	(void)chdir("/");		/* best effort */
+
+	return SANDBOX_L_USERNS | SANDBOX_L_MOUNTNS;
 }
 
 static int apply_linux(const struct sandbox_cfg *cfg)
@@ -345,15 +620,17 @@ static int apply_linux(const struct sandbox_cfg *cfg)
 	int layers = 0;
 
 	/*
-	 * Order: the cheap prctls first; then filesystem confinement and the
-	 * seccomp filter, both of which require no_new_privs to already be set
-	 * when unprivileged. seccomp is installed last so nothing this function
-	 * itself does is filtered. The foreground keeps exec and a full
-	 * filesystem (it runs tmux), so it takes neither the FS confinement nor
-	 * the exec-denying filter -- only the no-network one.
+	 * Order matters. The filesystem confinement enters a user namespace and
+	 * mounts a new root, which needs the capabilities that namespace grants
+	 * and a still-dumpable /proc/self to write its id maps -- so it runs
+	 * before the capability drop and before dumpability is turned off. The
+	 * capability drop, no_new_privs and the seccomp filter follow, seccomp
+	 * last so nothing this function does is itself filtered (and so the
+	 * filter can forbid further mounts). The foreground keeps exec and a
+	 * full filesystem because it runs tmux, so it takes neither the
+	 * confinement nor the exec-denying filter -- only the no-network one.
 	 */
 	layers |= limit_core();
-	layers |= no_dumpable();
 	if (cfg->role == SANDBOX_CLIENT) {
 		/* The client holds only its standard descriptors here; shut the
 		 * door on any other inherited fd. The host children keep their
@@ -363,10 +640,11 @@ static int apply_linux(const struct sandbox_cfg *cfg)
 #endif
 	}
 	layers |= mdwe();
-	layers |= drop_caps();
-	layers |= no_new_privs();
 	if (cfg->role != SANDBOX_FOREGROUND)
 		layers |= fs_confine(cfg);
+	layers |= no_dumpable();
+	layers |= drop_caps();
+	layers |= no_new_privs();
 	layers |= seccomp_apply(cfg->role);
 	return layers;
 }
