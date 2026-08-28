@@ -478,6 +478,25 @@ void path_table_clear(struct path_table *t)
 	path_table_init(t);
 }
 
+void path_table_drop_agent(struct path_table *t, struct nat_agent *agent)
+{
+	int i;
+
+	if (!agent)		/* a lanlink path has none: it would take those */
+		return;
+	for (i = 0; i < PATH_TABLE_MAX; i++) {
+		if (!t->p[i].used || t->p[i].agent != agent)
+			continue;
+		memset(&t->p[i], 0, sizeof(t->p[i]));
+		if (t->sel == i)
+			t->sel = -1;
+		if (t->cand == i) {
+			t->cand = -1;
+			t->hold = 0;
+		}
+	}
+}
+
 void path_table_drop_kind(struct path_table *t, enum path_kind kind)
 {
 	int i;

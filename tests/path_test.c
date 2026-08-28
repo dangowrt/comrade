@@ -984,6 +984,46 @@ static void offer_check(void)
 	assert(path_table_offer(&t, PATH_ROUTED, &sa, now) == NULL);
 }
 
+/*
+ * Two agents at once. A connection holds the agent it is punching and the one
+ * it set aside, and libjuice reports no source with a datagram, so the agent
+ * that received one is the only thing that says which path it arrived on:
+ * asking for either must never answer with the other's, and letting one go
+ * must leave the other standing. The lanlink paths name no agent at all and
+ * belong to neither.
+ */
+static void agent_paths_check(void)
+{
+	static int one, two;		/* two distinct addresses, never read */
+	struct nat_agent *a = (struct nat_agent *)&one;
+	struct nat_agent *b = (struct nat_agent *)&two;
+	struct path_table t;
+	struct path *pa, *pb;
+
+	path_table_init(&t);
+	add(&t, "2001:db8::1", 5000, 0);
+	pa = path_table_add(&t, PATH_ICE, NULL, a, 0);
+	pb = path_table_add(&t, PATH_ICE, NULL, b, 0);
+	assert(pa && pb && pa != pb);
+	assert(path_table_count(&t) == 3);
+
+	assert(path_table_find_agent(&t, a) == pa);
+	assert(path_table_find_agent(&t, b) == pb);
+
+	/* Naming no agent must not name every lanlink path. */
+	assert(path_table_find_agent(&t, NULL) == NULL);
+	path_table_drop_agent(&t, NULL);
+	assert(path_table_count(&t) == 3);
+
+	path_table_drop_agent(&t, a);
+	assert(path_table_count(&t) == 2);
+	assert(path_table_find_agent(&t, a) == NULL);
+	assert(path_table_find_agent(&t, b) == pb);
+
+	path_table_drop_agent(&t, b);
+	assert(path_table_count(&t) == 1);
+}
+
 int main(void)
 {
 	endpoint_check();
@@ -1001,5 +1041,6 @@ int main(void)
 	usable_check();
 	adopt_check();
 	offer_check();
+	agent_paths_check();
 	return 0;
 }

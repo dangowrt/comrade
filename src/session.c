@@ -223,6 +223,17 @@ struct sess;			/* forward: a conn carries a back-pointer to it */
  * of these at once over the shared tmux; today there is
  * one, embedded in the session. Callbacks reach the session through `sess`.
  */
+/*
+ * What a transport callback is told it belongs to. A connection can hold two
+ * agents at once -- the one a resume is punching and the one it set aside --
+ * and libjuice reports no source address with a datagram, so without this each
+ * one's traffic would be credited to whichever agent is current.
+ */
+struct ice_ctx {
+	struct conn *c;
+	struct nat_agent *agent;
+};
+
 struct conn {
 	struct sess *sess;		/* the session this connection belongs to */
 
@@ -239,6 +250,16 @@ struct conn {
 					 * one can take this punch's place */
 
 	struct nat_agent *nat;
+	struct ice_ctx *nat_ctx;
+	/*
+	 * The agent a resume set aside rather than destroyed, and the deadline
+	 * it is held to. Its path stays in the table and is probed like any
+	 * other, so the ranking decides whether it still carries; nothing
+	 * promotes it, because a path already names the agent it sends through.
+	 */
+	struct nat_agent *parked;
+	struct ice_ctx *parked_ctx;
+	uint64_t parked_until_ms;
 	struct stream *stream;
 	pthread_mutex_t stream_lock;	/* guards c->stream: a transport receive
 					 * thread (libjuice) or the host's main
@@ -293,6 +314,7 @@ struct conn {
 	int rs_state;
 	uint64_t rs_deadline;
 	struct nat_agent *volatile resume_agent;
+	struct ice_ctx *volatile resume_agent_ctx;
 	volatile int resume_pending;
 	uint64_t resume_last_ms;	/* host: when a resume punch last began,
 					 * so a redelivered claim in the window
@@ -748,6 +770,61 @@ static void conn_drop_ice_path(struct conn *c)
 	pthread_mutex_unlock(&c->path_lock);
 }
 
+/* Let one agent go, with the path that borrowed it and the context its
+ * callbacks were handed. The table is unlocked before the agent call. */
+static void conn_free_agent(struct conn *c, struct nat_agent *agent,
+			    struct ice_ctx *ctx)
+{
+	if (agent) {
+		pthread_mutex_lock(&c->path_lock);
+		path_table_drop_agent(&c->paths, agent);
+		pthread_mutex_unlock(&c->path_lock);
+		nat_destroy(agent);
+	}
+	free(ctx);
+}
+
+static void conn_reap_parked(struct conn *c)
+{
+	conn_free_agent(c, c->parked, c->parked_ctx);
+	c->parked = NULL;
+	c->parked_ctx = NULL;
+	c->parked_until_ms = 0;
+}
+
+/* Is the session being carried on the agent that was set aside? */
+static int conn_carrying_parked(struct conn *c)
+{
+	int sel, yes = 0;
+
+	pthread_mutex_lock(&c->path_lock);
+	sel = c->paths.sel;
+	if (sel >= 0 && c->paths.p[sel].used && c->parked &&
+	    c->paths.p[sel].agent == c->parked)
+		yes = 1;
+	pthread_mutex_unlock(&c->path_lock);
+	return yes;
+}
+
+/*
+ * A resume replaces the agent, and the one being replaced is not known to be
+ * dead: it stopped answering, which is also what a drop that ends in a moment
+ * looks like. Set it aside with its path rather than destroy it, so the
+ * ranking can find it alive and keep carrying on it -- a punch costs a round
+ * trip to rebuild and its bindings may still be good. One is held at a time,
+ * for as long as a claim gets.
+ */
+static void conn_park_ice(struct conn *c, uint64_t now)
+{
+	if (c->parked)
+		conn_reap_parked(c);
+	c->parked = c->nat;
+	c->parked_ctx = c->nat_ctx;
+	c->parked_until_ms = now + RESUME_ATTEMPT_MS;
+	c->nat = NULL;
+	c->nat_ctx = NULL;
+}
+
 /* How many lanlink paths this connection holds; routable_only leaves out the
  * link-local endpoints a lanlink send cannot reliably reach. */
 static int conn_lan_paths(struct conn *c, int routable_only)
@@ -842,10 +919,29 @@ static void path_desc(const struct path *p, char *out, size_t n)
  * Returns 0 when a path was chosen. A change of path is logged with both ends'
  * numbers, the one triage surface when a switch looks wrong.
  */
+/*
+ * Can this path's transport carry a datagram right now? A lanlink path always
+ * can; an ICE path only while the agent that owns it holds a pair. Both agents
+ * are asked before the table is locked, since an agent call may not be made
+ * under it.
+ */
+static int path_usable_now(const struct conn *c, const struct path *p,
+			   int nat_ok, int parked_ok)
+{
+	if (p->kind != PATH_ICE)
+		return 1;
+	if (p->agent && p->agent == c->nat)
+		return nat_ok;
+	if (p->agent && p->agent == c->parked)
+		return parked_ok;
+	return 0;
+}
+
 static int conn_pick(struct conn *c, struct path_pick *out)
 {
 	char from[PATH_LABEL_MAX + 64], to[PATH_LABEL_MAX + 64];
 	int ice_ok = c->nat && nat_connected(c->nat);
+	int parked_ok = c->parked && nat_connected(c->parked);
 
 	/*
 	 * Published for the threads that may not touch the agent: it belongs to
@@ -854,7 +950,7 @@ static int conn_pick(struct conn *c, struct path_pick *out)
 	 * only ever be a turn out of date, which is what a status line is
 	 * anyway.
 	 */
-	c->ice_up = ice_ok;
+	c->ice_up = ice_ok || parked_ok;
 	int i, prev, sel;
 
 	memset(out, 0, sizeof(*out));
@@ -863,7 +959,8 @@ static int conn_pick(struct conn *c, struct path_pick *out)
 	to[0] = '\0';
 	pthread_mutex_lock(&c->path_lock);
 	for (i = 0; i < PATH_TABLE_MAX; i++)
-		c->paths.p[i].usable = c->paths.p[i].kind != PATH_ICE || ice_ok;
+		c->paths.p[i].usable = path_usable_now(c, &c->paths.p[i],
+						       ice_ok, parked_ok);
 	prev = c->paths.sel;
 	sel = path_select(&c->paths, now_ms());
 	if (sel >= 0) {
@@ -1517,7 +1614,7 @@ static void canon_v6(const char *in, const char *src6, char *out, size_t cap)
 
 static void on_local_sdp(void *arg, const char *sdp)
 {
-	struct sess *s = ((struct conn *)arg)->sess;
+	struct sess *s = ((struct ice_ctx *)arg)->c->sess;
 
 	canon_v6(sdp, netstate_src_text(&s->ns, 6), s->local_sdp,
 		 sizeof(s->local_sdp));
@@ -1771,7 +1868,7 @@ static int stun_probe6_kick(struct sess *s)
  * observer report, which not every caller wires up. */
 static void on_ice_candidate(void *arg, const char *cand)
 {
-	struct sess *s = ((struct conn *)arg)->sess;
+	struct sess *s = ((struct ice_ctx *)arg)->c->sess;
 	size_t used, room, n = strlen(cand);
 	const char *p = strstr(cand, "candidate:");
 	char addr[64], typ[16];
@@ -1964,10 +2061,11 @@ static size_t conn_probe_seal(struct conn *c, struct path_probe *pr,
  * Called with path_lock held.
  */
 static struct path *conn_recv_path(struct conn *c, enum path_kind kind,
-				   const struct path_ep *src)
+				   const struct path_ep *src,
+				   struct nat_agent *agent)
 {
 	if (kind == PATH_ICE)
-		return path_table_find_agent(&c->paths, c->nat);
+		return path_table_find_agent(&c->paths, agent);
 	return path_table_find_ep(&c->paths, src);
 }
 
@@ -2068,6 +2166,7 @@ static void conn_tell_fresh(struct conn *c, const struct sockaddr_in6 *lan_to)
 }
 
 static void probe_apply(struct conn *c, const struct path_probe *pr,
+			struct nat_agent *agent,
 			enum path_kind kind, const struct sockaddr_in6 *src)
 {
 	struct sess *s = c->sess;
@@ -2097,7 +2196,7 @@ static void probe_apply(struct conn *c, const struct path_probe *pr,
 				 "-- our own, reflected");
 			return;
 		}
-		p = conn_recv_path(c, kind, &from);
+		p = conn_recv_path(c, kind, &from, agent);
 		if (!p && src && kind != PATH_ICE &&
 		    !sess_ep_is_self(c->sess, &from)) {
 			/*
@@ -2132,8 +2231,8 @@ static void probe_apply(struct conn *c, const struct path_probe *pr,
 		if (!o)
 			return;
 		if (kind == PATH_ICE) {
-			if (c->nat)
-				nat_send(c->nat, out, o);
+			if (agent)
+				nat_send(agent, out, o);
 		} else if (src && s->lan) {
 			lanlink_send(s->lan, src, out, o);
 		}
@@ -2143,7 +2242,8 @@ static void probe_apply(struct conn *c, const struct path_probe *pr,
 		int had, held;
 
 		pthread_mutex_lock(&c->path_lock);
-		held = kind == PATH_ICE || conn_recv_path(c, kind, &from) != NULL;
+		held = kind == PATH_ICE ||
+		       conn_recv_path(c, kind, &from, agent) != NULL;
 		pthread_mutex_unlock(&c->path_lock);
 		/*
 		 * Only from where this session is actually being carried. The
@@ -2252,7 +2352,8 @@ static int conn_probe_fresh(struct conn *c, const struct path_probe *pr)
 /* Unseal a probe and act on it, if it names the claimant this connection
  * serves. Anything else is dropped in silence. */
 static void probe_recv(struct conn *c, const uint8_t *data, size_t len,
-		       enum path_kind kind, const struct sockaddr_in6 *src)
+		       enum path_kind kind, const struct sockaddr_in6 *src,
+		       struct nat_agent *agent)
 {
 	struct path_probe pr;
 
@@ -2263,7 +2364,7 @@ static void probe_recv(struct conn *c, const uint8_t *data, size_t len,
 	if (!conn_probe_fresh(c, &pr))
 		return;
 	conn_heard(c, now_ms());
-	probe_apply(c, &pr, kind, src);
+	probe_apply(c, &pr, agent, kind, src);
 }
 
 /*
@@ -2383,7 +2484,7 @@ static void probe_adopt(struct sess *s, const uint8_t *data, size_t len,
 		    !strcmp(s->conns[i]->claim_ufrag, pr.ufrag)) {
 			if (!conn_probe_fresh(s->conns[i], &pr))
 				return;
-			probe_apply(s->conns[i], &pr, PATH_SEGMENT, src);
+			probe_apply(s->conns[i], &pr, NULL, PATH_SEGMENT, src);
 			return;
 		}
 }
@@ -2395,7 +2496,8 @@ static void probe_adopt(struct sess *s, const uint8_t *data, size_t len,
  * so selection is never a negotiation. */
 static void deliver_stream_from(struct conn *c, const uint8_t *data, size_t len,
 				enum path_kind kind,
-				const struct sockaddr_in6 *src)
+				const struct sockaddr_in6 *src,
+				struct nat_agent *agent)
 {
 	uint64_t now = now_ms();
 	int took = 0;
@@ -2403,7 +2505,7 @@ static void deliver_stream_from(struct conn *c, const uint8_t *data, size_t len,
 	if (c->bh_mute)		/* a staged total outage swallows receives */
 		return;
 	if (path_probe_is(c->sess->keys.probe_magic, data, len)) {
-		probe_recv(c, data, len, kind, src);
+		probe_recv(c, data, len, kind, src, agent);
 		return;
 	}
 	pthread_mutex_lock(&c->stream_lock);
@@ -2414,10 +2516,6 @@ static void deliver_stream_from(struct conn *c, const uint8_t *data, size_t len,
 		conn_heard(c, now);
 }
 
-static void deliver_stream(struct conn *c, const uint8_t *data, size_t len)
-{
-	deliver_stream_from(c, data, len, PATH_ICE, NULL);
-}
 
 /*
  * The remote endpoint of this connection's ICE path, when its agent has
@@ -2425,14 +2523,13 @@ static void deliver_stream(struct conn *c, const uint8_t *data, size_t len)
  * formats the pair under its own lock, so it is asked at the probe cadence
  * rather than on every pass of a loop that turns a hundred times a second.
  */
-static int conn_ice_ep(struct conn *c, uint64_t now, struct path_ep *ep)
+static int conn_ice_ep(struct nat_agent *agent, struct path_ep *ep)
 {
 	char loc[192], rem[192];
 
-	if (!c->nat || !nat_connected(c->nat) || now < c->next_ice_ep_ms)
+	if (!agent || !nat_connected(agent))
 		return -1;
-	c->next_ice_ep_ms = now + PATH_KEEP_MS;
-	if (nat_selected(c->nat, loc, sizeof(loc), rem, sizeof(rem)))
+	if (nat_selected(agent, loc, sizeof(loc), rem, sizeof(rem)))
 		return -1;
 	return cand_ep(rem, ep);
 }
@@ -2452,26 +2549,35 @@ static void path_tick(struct conn *c, uint64_t now)
 	struct sockaddr_in6 to[PATH_TABLE_MAX];
 	struct path_probe pr[PATH_TABLE_MAX];
 	uint64_t nonce[PATH_TABLE_MAX];
-	struct path_ep ice;
+	struct path_ep ice, pice;
+	struct nat_agent *agent[PATH_TABLE_MAX];
 	uint8_t out[PROBE_MAX];
 	int kind[PATH_TABLE_MAX], drop[PATH_TABLE_MAX], due[PATH_TABLE_MAX];
-	int i, n = 0, m = 0, have_ice, ice_ok;
+	int i, n = 0, m = 0, have_ice = 0, have_pice = 0, ice_ok, parked_ok;
 	size_t len;
 
 	if (!c->claim_ufrag[0])
 		return;
-	have_ice = !conn_ice_ep(c, now, &ice);
+	/* Each agent names its own nominated pair, on the one cadence. */
+	if (now >= c->next_ice_ep_ms) {
+		c->next_ice_ep_ms = now + PATH_KEEP_MS;
+		have_ice = !conn_ice_ep(c->nat, &ice);
+		have_pice = !conn_ice_ep(c->parked, &pice);
+	}
 	ice_ok = c->nat && nat_connected(c->nat);
+	parked_ok = c->parked && nat_connected(c->parked);
 	pthread_mutex_lock(&c->path_lock);
 	for (i = 0; i < PATH_TABLE_MAX; i++) {
 		struct path *p = &c->paths.p[i];
 
 		if (!p->used)
 			continue;
-		p->usable = p->kind != PATH_ICE || ice_ok;
+		p->usable = path_usable_now(c, p, ice_ok, parked_ok);
 		path_probe_expire(p, now);
-		if (p->kind == PATH_ICE && have_ice)
+		if (p->kind == PATH_ICE && have_ice && p->agent == c->nat)
 			path_set_peer_ep(p, &ice, s->keys.sig_key);
+		if (p->kind == PATH_ICE && have_pice && p->agent == c->parked)
+			path_set_peer_ep(p, &pice, s->keys.sig_key);
 		if (p->usable && path_probe_due(p, now))
 			due[n++] = i;
 	}
@@ -2492,6 +2598,7 @@ static void path_tick(struct conn *c, uint64_t now)
 		path_fill_tail(p, &pr[m]);
 		path_probe_sent(p, nonce[i], now);
 		kind[m] = (int)p->kind;
+		agent[m] = p->agent;
 		drop[m] = path_blackholed(c, kind[m], &p->remote);
 		to[m] = p->remote;
 		m++;
@@ -2503,10 +2610,12 @@ static void path_tick(struct conn *c, uint64_t now)
 		len = conn_probe_seal(c, &pr[i], out);
 		if (!len)
 			return;
-		if (kind[i] == PATH_ICE)
-			nat_send(c->nat, out, len);
-		else if (s->lan)
+		if (kind[i] == PATH_ICE) {
+			if (agent[i])
+				nat_send(agent[i], out, len);
+		} else if (s->lan) {
 			lanlink_send(s->lan, &to[i], out, len);
+		}
 	}
 }
 
@@ -2606,7 +2715,9 @@ static void claim_watch(struct conn *c)
 
 static void on_transport_recv(void *arg, const uint8_t *data, size_t len)
 {
-	deliver_stream((struct conn *)arg, data, len);
+	struct ice_ctx *x = arg;
+
+	deliver_stream_from(x->c, data, len, PATH_ICE, NULL, x->agent);
 }
 
 /* Single-connection lanlink receive (client, or a single-connection host): its
@@ -2632,7 +2743,7 @@ static void client_lan_recv(void *arg, const struct sockaddr *src,
 	 */
 	if (!path_probe_is(c->sess->keys.probe_magic, data, len) && !conn_holds_ep(c, &ep, 1))
 		return;
-	deliver_stream_from(c, data, len, PATH_SEGMENT, &mapped);
+	deliver_stream_from(c, data, len, PATH_SEGMENT, &mapped, NULL);
 }
 
 /*
@@ -2862,7 +2973,7 @@ static void host_lan_recv(void *arg, const struct sockaddr *src, socklen_t srcle
 	if (!probe_gate(s, c, &ep, data, len))
 		return;
 	if (c)
-		deliver_stream_from(c, data, len, PATH_SEGMENT, &mapped);
+		deliver_stream_from(c, data, len, PATH_SEGMENT, &mapped, NULL);
 	else if (path_probe_is(s->keys.probe_magic, data, len))
 		probe_adopt(s, data, len, &mapped);
 }
@@ -3040,6 +3151,7 @@ static int nat_setup(struct conn *c)
 	struct sess *s = c->sess;
 	static char bind_addr[64];
 	struct nat_config cfg;
+	struct ice_ctx *ctx;
 
 	memset(&cfg, 0, sizeof(cfg));
 	cfg.stun_host = s->cfg->stun_host;
@@ -3071,7 +3183,11 @@ static int nat_setup(struct conn *c)
 	cfg.on_local_sdp = on_local_sdp;
 	cfg.on_recv = on_transport_recv;
 	cfg.on_candidate = on_ice_candidate;
-	cfg.arg = c;
+	ctx = calloc(1, sizeof(*ctx));
+	if (!ctx)
+		return -1;
+	ctx->c = c;
+	cfg.arg = ctx;
 
 	s->remote_set = 0;
 	/* Stamp before the gather thread can report from it. One agent gathers
@@ -3079,7 +3195,14 @@ static int nat_setup(struct conn *c)
 	s->gather_epoch[0] = netstate_epoch(&s->ns, 4);
 	s->gather_epoch[1] = netstate_epoch(&s->ns, 6);
 	c->nat = nat_create(&cfg);
-	if (!c->nat || nat_gather(c->nat))
+	ctx->agent = c->nat;
+	c->nat_ctx = ctx;
+	if (!c->nat) {
+		c->nat_ctx = NULL;
+		free(ctx);
+		return -1;
+	}
+	if (nat_gather(c->nat))
 		return -1;
 	s->stun_since_ms = now_ms();
 	conn_add_ice_path(c);
@@ -3698,17 +3821,36 @@ static void resume_tick(struct conn *c)
 			sig_withdraw(s->sig);
 			dbg_logf("resume: link back");
 		}
+		/*
+		 * It came back on the agent set aside, so that is the one
+		 * carrying: it takes the current role and the punch being
+		 * built in its place is let go.
+		 */
+		if (conn_carrying_parked(c)) {
+			struct nat_agent *spare = c->nat;
+			struct ice_ctx *spare_ctx = c->nat_ctx;
+
+			c->nat = c->parked;
+			c->nat_ctx = c->parked_ctx;
+			c->parked = NULL;
+			c->parked_ctx = NULL;
+			c->parked_until_ms = 0;
+			conn_free_agent(c, spare, spare_ctx);
+			dbg_logf("resume: carried by the agent set aside");
+		} else if (c->parked && now >= c->parked_until_ms) {
+			conn_reap_parked(c);
+			dbg_logf("resume: the agent set aside answered "
+				 "nothing");
+		}
 		return;
 	}
+	if (c->parked && now >= c->parked_until_ms && !conn_carrying_parked(c))
+		conn_reap_parked(c);
 	switch (c->rs_state) {
 	case 0:
 		if (net_changed(s) && sig_rebuild(s, "on the new network"))
 			return;
-		conn_drop_ice_path(c);
-		if (c->nat) {
-			nat_destroy(c->nat);
-			c->nat = NULL;
-		}
+		conn_park_ice(c, now);
 		conn_fresh_pwd(c);
 		s->have_local_sdp = 0;
 		s->have_peer_sdp = 0;
@@ -3883,13 +4025,15 @@ static int conn_run(struct conn *c, int drive_sig)
 		 * makes it the sending agent too. */
 		if (c->resume_agent) {
 			struct nat_agent *old = c->nat;
+			struct ice_ctx *old_ctx = c->nat_ctx;
 
 			conn_drop_ice_path(c);
 			c->nat = c->resume_agent;
+			c->nat_ctx = c->resume_agent_ctx;
 			c->resume_agent = NULL;
+			c->resume_agent_ctx = NULL;
 			conn_add_ice_path(c);
-			if (old)
-				nat_destroy(old);
+			conn_free_agent(c, old, old_ctx);
 			c->bh_mute = 0;
 			/* The resumed link earns a full liveness window; without
 			 * this it is judged by silence that predates it. */
@@ -4124,9 +4268,9 @@ static int client_regather(struct sess *s)
 					 * verdict; neither has actually moved */
 	s->established_fired = 0;
 	conn_drop_ice_path(&s->c);
-	if (s->c.nat)
-		nat_destroy(s->c.nat);
+	conn_free_agent(&s->c, s->c.nat, s->c.nat_ctx);
 	s->c.nat = NULL;
+	s->c.nat_ctx = NULL;
 	conn_gen_ice(&s->c);
 	s->have_local_sdp = 0;
 	s->have_peer_sdp = 0;
@@ -4867,9 +5011,9 @@ static void conn_free(struct conn *c)
 	if (!c)
 		return;
 	conn_unregister(c->sess, c);
+	conn_reap_parked(c);
 	conn_drop_ice_path(c);
-	if (c->nat)
-		nat_destroy(c->nat);
+	conn_free_agent(c, c->nat, c->nat_ctx);
 	pthread_mutex_destroy(&c->hb_lock);
 	pthread_mutex_destroy(&c->peer_in_lock);
 	pthread_mutex_destroy(&c->status_lock);
@@ -5204,9 +5348,13 @@ static void punch_scan(struct sess *s, struct worker *ws, struct conn **punching
 
 				dbg_logf("host: punch connected -> resume "
 					 "worker");
-				nat_rebind(c->nat, t);
+				if (c->nat_ctx)
+					c->nat_ctx->c = t;
+				nat_rebind(c->nat, c->nat_ctx);
 				t->resume_agent = c->nat;
+				t->resume_agent_ctx = c->nat_ctx;
 				c->nat = NULL;
+				c->nat_ctx = NULL;
 				t->resume_pending = 0;
 				punching[i] = NULL;
 				punch_resume[i] = NULL;
@@ -6177,8 +6325,9 @@ int session_run(const struct session_cfg *cfg)
 			}
 			if (s.c.nat) {
 				conn_drop_ice_path(&s.c);
-				nat_destroy(s.c.nat);
+				conn_free_agent(&s.c, s.c.nat, s.c.nat_ctx);
 				s.c.nat = NULL;
+				s.c.nat_ctx = NULL;
 			}
 			conn_gen_ice(&s.c);
 			pthread_mutex_lock(&s.c.path_lock);
@@ -6392,8 +6541,9 @@ int session_run(const struct session_cfg *cfg)
 			    now_ms() - s.ice_attempt_start > ICE_ATTEMPT_MS) {
 				s.ice_attempt++;
 				conn_drop_ice_path(&s.c);
-				nat_destroy(s.c.nat);
+				conn_free_agent(&s.c, s.c.nat, s.c.nat_ctx);
 				s.c.nat = NULL;
+				s.c.nat_ctx = NULL;
 				if (nat_setup(&s.c))
 					st = ST_FAIL;
 				else
@@ -6487,9 +6637,9 @@ int session_run(const struct session_cfg *cfg)
 done:
 	if (s.c.stream)
 		stream_destroy(s.c.stream);
+	conn_reap_parked(&s.c);
 	conn_drop_ice_path(&s.c);
-	if (s.c.nat)
-		nat_destroy(s.c.nat);
+	conn_free_agent(&s.c, s.c.nat, s.c.nat_ctx);
 	if (s.lan)
 		lanlink_destroy(s.lan);
 	sig_destroy(s.sig);

@@ -319,6 +319,10 @@ struct path *path_table_sel(struct path_table *t);
 
 void path_table_clear(struct path_table *t);
 void path_table_drop_kind(struct path_table *t, enum path_kind kind);
+/* The path a single agent owns. A connection can hold two agents at once, so
+ * dropping by kind would take the one still carrying along with the one being
+ * let go. */
+void path_table_drop_agent(struct path_table *t, struct nat_agent *agent);
 /* Drop every measurement and every proof, keeping the endpoints: what a probe
  * proved was proved for one claimant identity, and a re-claim mints a new
  * one. */
