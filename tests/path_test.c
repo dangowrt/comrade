@@ -277,10 +277,16 @@ static void table_check(void)
 		add(&t, "2001:db8::1", (uint16_t)(5000 + i), 100 + i);
 	assert(path_table_count(&t) == PATH_TABLE_MAX);
 
-	/* Full: the oldest DEAD goes first, and never the path in use. */
+	/* Full: the oldest DEAD goes first, and never the path in use. The
+	 * siblings are untried rather than failed, so they are stamped as
+	 * created just now -- an entry that has been probed for a whole dead
+	 * window without ever answering is dead in its own right, which the
+	 * case below covers. */
 	round_trip(p, 200, 1);
 	assert(path_select(&t, 200) == 0);
 	q = &t.p[2];
+	for (i = 1; i < PATH_TABLE_MAX; i++)
+		t.p[i].trying_since_ms = 200 + PATH_DEAD_MS;
 	q->qualified = 1;
 	q->last_pong_ms = 0;
 	assert(path_warmth_of(q, 200 + PATH_DEAD_MS + 1) == PATH_DEAD);
@@ -288,6 +294,22 @@ static void table_check(void)
 	assert(p == q);
 	assert(path_table_count(&t) == PATH_TABLE_MAX);
 	assert(t.sel == 0);
+
+	/*
+	 * An entry that has never answered holds its slot no longer than one
+	 * that fell silent. Until it read DEAD it was probed every round and
+	 * never reclaimed, so a table full of addresses that answer nothing --
+	 * a stranger's offer, a peer's stale candidate -- could never admit
+	 * the next endpoint worth trying.
+	 */
+	path_table_init(&t);
+	p = add(&t, "2001:db8::5", 5555, 1000);
+	assert(path_warmth_of(p, 1000 + PATH_DEAD_MS) == PATH_UNQUALIFIED);
+	assert(path_warmth_of(p, 1000 + PATH_DEAD_MS + 1) == PATH_DEAD);
+	/* And the offer path, which takes a free or dead slot only, can have
+	 * it back. */
+	assert(path_table_offer(&t, PATH_SEGMENT, &t.p[0].remote,
+				1000 + PATH_DEAD_MS + 1) != NULL);
 
 	path_table_drop_kind(&t, PATH_SEGMENT);
 	assert(path_table_count(&t) == 0);
@@ -304,9 +326,14 @@ static void warmth_check(void)
 	path_table_init(&t);
 	p = add(&t, "2001:db8::1", 5000, 0);
 
-	/* Never answered stays UNQUALIFIED however long it is left. */
+	/* Never answered reads UNQUALIFIED while it might still answer, and
+	 * DEAD once it has been given as long as a silent path gets: an
+	 * address that answers nothing has been shown not to work as surely
+	 * as one that stopped. */
 	assert(path_warmth_of(p, 0) == PATH_UNQUALIFIED);
-	assert(path_warmth_of(p, 1000000) == PATH_UNQUALIFIED);
+	assert(path_warmth_of(p, PATH_DEAD_MS) == PATH_UNQUALIFIED);
+	assert(path_warmth_of(p, PATH_DEAD_MS + 1) == PATH_DEAD);
+	assert(path_warmth_of(p, 1000000) == PATH_DEAD);
 	assert(!path_table_any_qualified(&t));
 
 	round_trip(p, 0, 4);
@@ -324,7 +351,7 @@ static void warmth_check(void)
 
 	/* A re-claim mints a new identity, so every proof taken under the old
 	 * one goes; the endpoints stay. */
-	path_table_reset_stats(&t);
+	path_table_reset_stats(&t, 20003);
 	assert(path_table_count(&t) == 1);
 	assert(!path_table_any_qualified(&t));
 	assert(path_warmth_of(p, 20003) == PATH_UNQUALIFIED);
@@ -760,9 +787,13 @@ static void hysteresis_check(void)
 	warm(&t.p[0], now);
 	bucketed(&t.p[0], 1);
 	assert(path_select(&t, now) == 0);
-	add(&t, "2001:db8::2", 5000, now);
 	now += PATH_DEAD_MS + 1;
+	/* Offered once the incumbent is dead, so it is genuinely untried
+	 * rather than one that has been asked all this time without ever
+	 * answering -- which is dead in its own right. */
+	add(&t, "2001:db8::2", 5000, now);
 	assert(path_warmth_of(&t.p[0], now) == PATH_DEAD);
+	assert(path_warmth_of(&t.p[1], now) == PATH_UNQUALIFIED);
 	assert(path_select(&t, now) == 1);
 }
 

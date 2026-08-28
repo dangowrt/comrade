@@ -2918,7 +2918,7 @@ static void conn_gen_ice(struct conn *c)
 	/* What a probe proved was proved for one claimant identity, so a fresh
 	 * one voids every measurement; the endpoints themselves stand. */
 	pthread_mutex_lock(&c->path_lock);
-	path_table_reset_stats(&c->paths);
+	path_table_reset_stats(&c->paths, now_ms());
 	pthread_mutex_unlock(&c->path_lock);
 	c->claim_held_seen = 0;
 	c->claim_lost = 0;

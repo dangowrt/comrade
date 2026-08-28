@@ -412,6 +412,7 @@ struct path *path_table_add(struct path_table *t, enum path_kind kind,
 	if (remote)
 		p->remote = *remote;
 	p->created_ms = now;
+	p->trying_since_ms = now;
 	if (!path_ep_any(&ep))
 		path_ep_str(&ep, p->label, sizeof(p->label));
 	return p;
@@ -474,7 +475,7 @@ void path_table_drop_kind(struct path_table *t, enum path_kind kind)
 	}
 }
 
-void path_table_reset_stats(struct path_table *t)
+void path_table_reset_stats(struct path_table *t, uint64_t now)
 {
 	int i;
 
@@ -494,6 +495,11 @@ void path_table_reset_stats(struct path_table *t)
 		p->last_pong_ms = 0;
 		p->next_probe_ms = 0;
 		p->qualified = 0;
+		/* On trial again from here: the endpoints are kept across a
+		 * re-claim precisely so they can be tried under the new
+		 * identity, and a path is only called dead for failing to
+		 * answer while it was being asked. */
+		p->trying_since_ms = now;
 	}
 	t->cand = -1;
 	t->hold = 0;
@@ -514,8 +520,21 @@ enum path_warmth path_warmth_of(const struct path *p, uint64_t now)
 {
 	uint64_t silent;
 
-	if (!p->qualified)
+	if (!p->qualified) {
+		/*
+		 * Untried, or tried and never once answered? The second is a
+		 * path shown not to work as surely as one that fell silent,
+		 * and until it was called that it held its slot for the life
+		 * of the connection: probed every round, never reclaimed, and
+		 * in the way of the next endpoint worth trying. An address
+		 * that answers nothing is what a stranger's offer looks like,
+		 * and what a peer's stale candidate looks like too.
+		 */
+		if (now > p->trying_since_ms &&
+		    now - p->trying_since_ms > PATH_DEAD_MS)
+			return PATH_DEAD;
 		return PATH_UNQUALIFIED;
+	}
 	silent = now > p->last_pong_ms ? now - p->last_pong_ms : 0;
 	if (silent > PATH_DEAD_MS)
 		return PATH_DEAD;

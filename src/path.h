@@ -242,6 +242,7 @@ struct path {
 	int loss_n;
 	uint64_t last_pong_ms;
 	uint64_t created_ms;
+	uint64_t trying_since_ms;	/* creation, or the last reset of proof */
 	uint64_t next_probe_ms;
 	int qualified;
 
@@ -300,7 +301,7 @@ void path_table_drop_kind(struct path_table *t, enum path_kind kind);
 /* Drop every measurement and every proof, keeping the endpoints: what a probe
  * proved was proved for one claimant identity, and a re-claim mints a new
  * one. */
-void path_table_reset_stats(struct path_table *t);
+void path_table_reset_stats(struct path_table *t, uint64_t now);
 int path_table_any_qualified(const struct path_table *t);
 
 /* Our own reflexive endpoint on this path, learnt from a PONG echo. Completes
