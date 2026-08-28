@@ -748,6 +748,21 @@ static void svc_confine(struct svc *v)
 	sandbox_apply(&sb);
 }
 
+/*
+ * Confine the operator's foreground: it drives a local tmux (so it keeps exec
+ * and its terminal) and reads the service's state files, but never opens a
+ * network socket, so its profile forbids exactly that. No filesystem
+ * confinement -- it runs tmux, which needs a full view.
+ */
+static void foreground_confine(void)
+{
+	struct sandbox_cfg sb;
+
+	memset(&sb, 0, sizeof(sb));
+	sb.role = SANDBOX_FOREGROUND;
+	sandbox_apply(&sb);
+}
+
 /* The serving core: sessions over the shared tmux, again after each client,
  * until the tmux server is gone. The observer in v->obs is already bound. */
 static void svc_serve(struct svc *v, void *hostkey, int no_mcast, int no_dht)
@@ -973,6 +988,7 @@ static int start_new(int ui_mode, int no_mcast, int no_dht, int no_fwd)
 	}
 	close(pfd[1]);
 	sshd_hostkey_free(hostkey);		/* the service has its own copy */
+	foreground_confine();			/* no network from here on */
 
 	/* The view renders the service's progress and blocks until the operator
 	 * enters (1, playing the zap), aborts (-1), or the service exits (0). A
