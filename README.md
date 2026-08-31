@@ -68,6 +68,19 @@ The read-write token joins read-write; the read-only token joins the
 same session view-only, unable to type into it. Which one you were handed
 decides it; there is no extra flag.
 
+Joining is the other way round from hosting: detaching there behaves
+like detaching from a local tmux -- you drop back to your own shell, the
+shared session carries on without you, and comrade prints the command to
+rejoin. If the host's session has ended instead, comrade says so and
+offers no way back. A guest who was in it is told over its own
+connection; anyone presenting the token afterwards is told by the note
+the host leaves on the DHT rendezvous, so a spent token fails in a few
+seconds rather than hanging on a host that will never answer. On an
+isolated LAN there is nowhere to leave that note -- discovery there only
+exists while somebody is talking -- so a token whose host has gone
+simply finds nobody, exactly as one whose host has not started yet
+does.
+
 `-v` swaps the dashboard for plain log lines on either side.
 `--no-multicast` skips link-local discovery to force the DHT/STUN path,
 and `--no-dht` declines the DHT so peers meet over link-local discovery

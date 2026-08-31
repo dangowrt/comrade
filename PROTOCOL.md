@@ -916,8 +916,9 @@ bounded-linger teardown).
 
 ### comrade-ctl in-band control channel (`src/ctlproto.c`)
 
-A second SSH channel carries heartbeat + roam re-signal. Framing (no magic, no
-per-message checksum; the SSH channel provides integrity):
+A second SSH channel carries heartbeat, roam re-signal and the end of the
+session. Framing (no magic, no per-message checksum; the SSH channel provides
+integrity):
 
 ```
   frame = type(1) | len(1) | payload(len)
@@ -931,6 +932,20 @@ and so the same codec, one local endpoint at the sender's lanlink port for the
 peer to probe and hold as a path (§9), re-sent every `CAND_TELL_MS 5000` so an
 interface brought up mid-session is advertised within one period; `CTLM_REACH 4`
 and `CTLM_RDVASK 5` (§11).
+
+`CTLM_BYE 8`, no payload: **the shared session behind this connection has
+ended**. The host sends it the moment its end-of-session monitor fires
+(`session.c:conn_run`, per connection), which is while the control channel is
+still up: sshd sees the same signal and keeps pumping for `SSHD_END_DRAIN_MS`
+before it closes the shell channel, a window measured in time precisely so that
+this message has one to be written and bridged in. It matters because the two ways a guest's session can finish look identical from
+the channel closing: the guest detached, and there is a session to rejoin; or
+the shared session ended, and there is not. This is the one statement about the
+end that cannot be forged, since it arrives inside the authenticated SSH
+session, and it beats the mailbox tombstone (§4.1) by the time a DHT store
+takes. A guest that hears it leaves with `SESSION_ENDED` rather than
+re-claiming; a peer on a build that does not know the type ignores the frame and
+falls back to the tombstone.
 
 `CTLM_KEY 6` payload `half(32)` = `CTL_KEY_PLEN`, and `CTLM_KEYOK 7` with no
 payload, carry the per-connection key exchange (§2). Each end sends its half as

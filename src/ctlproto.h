@@ -37,6 +37,14 @@
  * is needed to derive.
  */
 #define CTLM_KEYOK 7
+/*
+ * payload: none. "The shared session behind this connection has ended." Sent
+ * by a host as its tmux goes, so the guest can tell being left from being
+ * dropped: one has something to rejoin and the other does not. A peer that
+ * does not know this type ignores the frame and falls back to the mailbox
+ * tombstone, which says the same thing more slowly.
+ */
+#define CTLM_BYE 8
 #define CTL_HDR 2
 #define CTL_TS_LEN 8
 #define CTL_RDV_PLEN 19

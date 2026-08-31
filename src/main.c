@@ -130,6 +130,26 @@ static int session_connect(const char *arg, int ui_mode, int no_mcast,
 	}
 	rc = session_run(&cfg);
 	ui_destroy(u);
+	/*
+	 * The invitation names a session that is over: the rendezvous carries
+	 * the host's tombstone rather than an offer. An error, because the only
+	 * other thing to do with a token whose session has ended is to keep
+	 * punching at a host that will never answer, for as long as the
+	 * operator is willing to watch it.
+	 */
+	if (rc == SESSION_GONE) {
+		fprintf(stderr, "comrade: that session has ended -- the token "
+			"is spent\n");
+		return 1;
+	}
+	/*
+	 * It ended under us, which is not a failure and not something to offer
+	 * a way back into: the host's last shell exited, or its operator left.
+	 */
+	if (rc == SESSION_ENDED) {
+		fprintf(stderr, "comrade: the shared session has ended.\n");
+		return 0;
+	}
 	if (rc) {
 		fprintf(stderr, "comrade: could not connect to the session\n");
 		return 1;

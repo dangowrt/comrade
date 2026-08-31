@@ -13,6 +13,7 @@
 #include "base64.h"
 #include "cpty.h"
 #include "dbg.h"
+#include "oscompat.h"
 #include "sshfwd.h"
 
 /*
@@ -372,6 +373,10 @@ static void drain_messages(struct pump_ctx *c)
 	}
 }
 
+/* How long the pump keeps running once the session is over, before it closes
+ * the channel toward the client: see the comment on pump(). */
+#define SSHD_END_DRAIN_MS 400
+
 /* End-of-session fd became readable (a liveness monitor exited with the shared
  * session). Flag it; the pump breaks on the flag and closes toward the client. */
 static int on_end_fd(socket_t fd, int revents, void *userdata)
@@ -391,10 +396,24 @@ static int on_end_fd(socket_t fd, int revents, void *userdata)
  * on any of: the connectors erroring, the child exiting (watched directly;
  * WNOWAIT leaves it for the caller to reap), or the optional end-of-session fd
  * signalling (event-driven, so the client is released the moment the session
- * ends, not after a poll interval). A few extra polls flush the command's final
- * output first; then we return and the caller closes the channel to the client.
- */
-/*
+ * ends, not after a poll interval).
+ *
+ * Then it drains before returning and letting the caller close the channel,
+ * for a length that depends on which end it was.
+ *
+ * The command exiting is a guest leaving, and nothing is owed to a client
+ * already on its way out: a few more turns flush its last output.
+ *
+ * The end-of-session fd is the other case, and there it waits
+ * SSHD_END_DRAIN_MS by the clock rather than by turns of the loop, because
+ * there is something to wait FOR: the session layer's notice to the client
+ * that the shared session has ended (CTLM_BYE), which it writes to the control
+ * socket on seeing the same signal we do. Turns would not do it -- the end fd
+ * stays readable once it has fired, so dopoll returns at once and three of them
+ * pass in microseconds, closing the channel before the notice could be written,
+ * let alone bridged. So the fd comes out of the event as soon as it has been
+ * read, and the loop goes back to blocking for the length of the wait.
+ *
  * Serve one authenticated session: the control channel, port forwarding, and
  * a shell if the client asks for one. Returns the child's exit status, or 0
  * where there was no child to have one.
@@ -409,6 +428,7 @@ static int pump(ssh_session s, ssh_channel chan, const struct sshd_opts *o,
 {
 	sock_t end_fd = o->end_fd;
 	struct pump_ctx c;
+	uint64_t end_ms = 0;
 	int ending = 0, drain = 0, exit_code = 0;
 
 	memset(&c, 0, sizeof(c));
@@ -447,11 +467,21 @@ static int pump(ssh_session s, ssh_channel chan, const struct sshd_opts *o,
 			break;
 		drain_messages(&c);
 		sshfwd_tick(c.fwd);
-		if (!ending && c.end_hit)
+		if (c.end_hit && !end_ms) {
 			ending = 1;
+			end_ms = os_mono_ms();
+			/* Out of the event: it stays readable, and leaving it
+			 * in turns the wait below into a spin. */
+			if (sock_isset(end_fd)) {
+				ssh_event_remove_fd(c.event, end_fd);
+				end_fd = INVALID_SOCK;
+			}
+		}
 		if (!ending && c.child && cpty_exited(c.child))
 			ending = 1;
-		if (ending && ++drain >= 3)
+		if (ending && (end_ms ?
+			       os_mono_ms() - end_ms >= SSHD_END_DRAIN_MS :
+			       ++drain >= 3))
 			break;
 	}
 

@@ -307,6 +307,14 @@ struct session_cfg {
 					 * what it must notice */
 };
 
+/*
+ * How a client's session finished, beyond success and failure. The shared
+ * session living on the host is what a token is a way back to, so whether it
+ * is still there decides what the caller may offer the operator next.
+ */
+#define SESSION_ENDED 2			/* we were in it and the host ended it */
+#define SESSION_GONE 3			/* the invitation names one already over */
+
 /* Run the session to completion; returns 0 on success, non-zero on failure. */
 int session_run(const struct session_cfg *cfg);
 

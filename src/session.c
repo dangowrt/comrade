@@ -387,6 +387,14 @@ struct conn {
 	sock_t ctl_fd;			/* our end of the comrade-ctl socketpair */
 	struct ctl_reframer ctl_rf;	/* reassembles ctl messages across reads */
 	int ssh_cli_rc;
+	/*
+	 * The end of the shared session, said on the control channel. A host
+	 * sends it once its tmux is gone; a client that has heard it knows the
+	 * connection ended because there is nothing left to be connected to,
+	 * which is the difference between offering a rejoin and refusing one.
+	 */
+	int bye_sent;			/* host: told this client */
+	int peer_ended;			/* client: was told */
 
 	/* Liveness heartbeat: a tiny ping/pong over the comrade-ctl channel, so a
 	 * dead link is noticed even when nobody is typing. Riding the reliable
@@ -519,6 +527,20 @@ struct sess {
 	int escalated;			/* observer: client warned of DHT warm */
 	int peer_state;			/* observer: highest SESSION_PEER_* sent */
 	int established_fired;		/* observer: established sent once */
+	int was_live;			/* a path carried this session at some
+					 * point; unlike established_fired it
+					 * survives a re-gather, because what it
+					 * answers is whether this client was
+					 * ever in the shared session -- which
+					 * decides whether an ended session is
+					 * news or a spent invitation */
+	int peer_ended;			/* client: the host said the shared
+					 * session is over (control channel), or
+					 * the mailbox carries its tombstone */
+	int session_over;		/* host: the shared tmux is gone, so this
+					 * invitation leads nowhere from now on */
+	uint64_t tomb_deadline;		/* host: how long the end of the session
+					 * is published for before we go */
 	volatile int have_priv4;	/* a private/CGNAT v4 host candidate (needs
 					 * STUN); set from the gather thread */
 	volatile int have_srflx4;	/* STUN gave us a public v4 (reflexive) */
@@ -2122,6 +2144,18 @@ static void ctl_dispatch(void *arg, int type, const uint8_t *pl, size_t plen)
 
 		if (ctl_rdv_decode(pl, plen, &sa, &sl))
 			conn_offer_path(c, (struct sockaddr *)&sa, sl);
+	} else if (type == CTLM_BYE) {
+		/*
+		 * The host's shared session has ended. It arrives inside the
+		 * SSH session, so it is the one statement about the end that
+		 * cannot be forged, and it beats the mailbox tombstone by the
+		 * time a store takes. Recorded on the session as well as the
+		 * connection: what it changes is whether this client rejoins,
+		 * and that decision outlives this connection.
+		 */
+		dbg_logf("ctl: the host says the shared session has ended");
+		c->peer_ended = 1;
+		c->sess->peer_ended = 1;
 	}
 }
 
@@ -3437,6 +3471,8 @@ static int nat_setup(struct conn *c)
 	return 0;
 }
 
+static void session_entomb_start(struct sess *s);
+
 static void pump_once(struct sess *s, int timeout_cap_ms)
 {
 	struct pollfd fds[6];
@@ -4369,6 +4405,44 @@ static int conn_run(struct conn *c, int drive_sig)
 			ctl_send(c, CTLM_PING, ts, sizeof(ts));
 			next_hb = now_ms() + HB_INTERVAL_MS;
 		}
+		/*
+		 * The shared session ended under us. sshd is closing the shell
+		 * channel on the same signal, and a channel closing on its own
+		 * looks exactly like the guest detaching, so say which it was
+		 * while the control channel is still up. Polled here rather
+		 * than added to the set above: the fd is only ever readable at
+		 * EOF and nothing consumes it, so every worker sees it.
+		 */
+		if (s->cfg->is_host && !c->bye_sent &&
+		    sock_isset(s->cfg->ssh_end_fd)) {
+			struct pollfd ef;
+
+			ef.fd = s->cfg->ssh_end_fd;
+			ef.events = POLLIN;
+			ef.revents = 0;
+			if (sock_poll(&ef, 1, 0) > 0 &&
+			    (ef.revents & (POLLIN | POLLHUP | POLLERR))) {
+				dbg_logf("ctl: telling the client the shared "
+					 "session has ended");
+				ctl_send(c, CTLM_BYE, NULL, 0);
+				c->bye_sent = 1;
+				/*
+				 * On the single-connection path this loop owns
+				 * the signalling, so the end starts being
+				 * published here rather than after the
+				 * teardown -- which is a client's departure,
+				 * and can take seconds the operator would
+				 * otherwise wait through twice. A worker
+				 * leaves it alone: there, sig belongs to the
+				 * turnstile thread, which does the same at its
+				 * own exit.
+				 */
+				if (drive_sig) {
+					s->session_over = 1;
+					session_entomb_start(s);
+				}
+			}
+		}
 		if (drive_sig) {
 			/*
 			 * This loop owns the model here, so what the peer has
@@ -4589,6 +4663,67 @@ static int deadline_passed(uint64_t deadline, uint64_t now)
 static int deadline_room(uint64_t deadline, uint64_t now, uint64_t need)
 {
 	return !deadline || now + need < deadline;
+}
+
+/*
+ * Longest the operator's shell is held while the end of the session is
+ * published. The usual cost is a round trip to the rendezvous node the token
+ * already names, so this is the ceiling on a bad network, not the price of a
+ * quit. Waiting at all is the point: a comrade that returned the prompt and
+ * finished the publish behind the operator's back would be the background
+ * process this whole path exists to avoid.
+ */
+#define SESSION_TOMB_MS 4000
+
+/*
+ * And the longest a worker is given to wind down while that goes on. Sized
+ * above LINGER_HOST_MS, which is what a worker spends flushing its own
+ * end-of-session signal at a client that has stopped acknowledging: the two
+ * are meant to run together, so the wait is the longer of them rather than one
+ * after the other -- and past this the worker is simply joined, since a
+ * departed guest is not something to hold a shell open for.
+ */
+#define SESSION_WIND_MS (LINGER_HOST_MS + 1000)
+
+/*
+ * The shared session is over: leave that where the invitation points.
+ *
+ * Everything a client holds says where to meet a host that is still there, and
+ * nothing in it can say the opposite -- so a token outliving its session sends
+ * every holder into a wait with no end. The tombstone is the missing answer,
+ * and it has to be placed from here, while this session's rendezvous node is
+ * still warm and pinned: a process that has already torn its signalling down
+ * would have to converge on the DHT from cold to say a single word.
+ *
+ * The DHT is the only place there is to leave it, so a link-local session has
+ * nothing to do here and returns at once -- see sig_end.
+ *
+ * Started as early as the end is known and finished last, because the operator
+ * is waiting on it: the deadline runs from the start, so whatever winding down
+ * happens in between -- workers lingering to land their end-of-session signal
+ * on clients that are slow to ack -- is time the store has been using rather
+ * than time added to it.
+ */
+static void session_entomb_start(struct sess *s)
+{
+	if (!s->sig || s->tomb_deadline)
+		return;
+	s->tomb_deadline = now_ms() + SESSION_TOMB_MS;
+	sig_end(s->sig);
+}
+
+static void session_entomb(struct sess *s)
+{
+	if (!s->sig)
+		return;
+	session_entomb_start(s);
+	while (!deadline_passed(s->tomb_deadline, now_ms())) {
+		pump_once(s, 100);
+		if (sig_end_placed(s->sig))
+			break;
+	}
+	dbg_logf("session: tombstone %s", sig_end_placed(s->sig) ?
+		 "placed (or nowhere to place it)" : "not placed in time");
 }
 
 /* The single-connection path (client, or a host serving one connection): run
@@ -5906,6 +6041,7 @@ static int host_turnstile(struct sess *s)
 	enum { TS_GATHER, TS_WAIT_CLAIM } ts = TS_GATHER;
 	uint64_t deadline = now_ms() + (uint64_t)cfg->connect_timeout_s * 1000;
 	uint64_t last_active = now_ms();
+	uint64_t wind;
 	char filtered[NAT_SDP_MAX];
 	sock_t end_fd = cfg->ssh_end_fd;
 	int served = 0, dash_seq = 0, i, j;
@@ -6446,8 +6582,13 @@ static int host_turnstile(struct sess *s)
 			ef.events = POLLIN;
 			ef.revents = 0;
 			if (sock_poll(&ef, 1, 0) > 0 &&
-			    (ef.revents & (POLLIN | POLLHUP | POLLERR)))
+			    (ef.revents & (POLLIN | POLLHUP | POLLERR))) {
+				/* Not this attempt running out: the shared
+				 * session is gone, and the invitation to it
+				 * has to stop saying otherwise. */
+				s->session_over = 1;
 				break;
+			}
 		} else if (now_ms() >= deadline) {
 			break;
 		} else if (active || ts != TS_GATHER) {
@@ -6459,13 +6600,27 @@ static int host_turnstile(struct sess *s)
 
 	s->offer_conn = NULL;
 	conn_free(listen);
+	/*
+	 * Say the session is over before winding the workers down, and keep
+	 * driving the model while they go. A worker lingers to land its
+	 * end-of-session signal on a client that may be slow to ack, and a join
+	 * that stopped pumping for that long would put the whole store behind
+	 * it -- with the operator's shell waiting on the sum of the two rather
+	 * than on the longer of them.
+	 */
+	if (s->session_over)
+		session_entomb_start(s);
+	wind = now_ms() + SESSION_WIND_MS;
 	for (i = 0; i < HOST_MAX_WORKERS; i++) {
 		if (punching[i])
 			conn_free(punching[i]);
-		if (ws[i].used) {
-			pthread_join(ws[i].th, NULL);
-			conn_free(ws[i].c);
-		}
+		if (!ws[i].used)
+			continue;
+		while (s->session_over && !ws[i].done &&
+		       !deadline_passed(wind, now_ms()))
+			pump_once(s, 50);
+		pthread_join(ws[i].th, NULL);
+		conn_free(ws[i].c);
 	}
 	return 0;
 }
@@ -6510,6 +6665,7 @@ int session_run(const struct session_cfg *cfg)
 	struct sess s;
 	enum state st = ST_WAIT_DHT;
 	uint64_t deadline;
+	int ended = 0;			/* SESSION_ENDED / SESSION_GONE */
 	int rc;
 
 	memset(&s, 0, sizeof(s));
@@ -6584,10 +6740,12 @@ int session_run(const struct session_cfg *cfg)
 	 */
 	if (host_is_multiuser(cfg)) {
 		rc = host_turnstile(&s);
+		if (s.session_over)
+			session_entomb(&s);
 		goto done;
 	}
 
-	while (st != ST_DONE && st != ST_FAIL &&
+	while (st != ST_DONE && st != ST_FAIL && !ended &&
 	       !(cfg->test_stop && *cfg->test_stop) &&
 	       !deadline_passed(deadline, now_ms())) {
 		char filtered[NAT_SDP_MAX];
@@ -6598,6 +6756,35 @@ int session_run(const struct session_cfg *cfg)
 		maybe_announce_rendezvous(&s);
 		report_mailbox(&s);
 		token_pump(&s);
+		/*
+		 * A host with one connection has no turnstile to notice the end
+		 * in, so it is noticed here: the shared session is gone, and
+		 * what is left to do is say so and stop offering it.
+		 */
+		if (cfg->is_host && sock_isset(cfg->ssh_end_fd) &&
+		    !s.session_over) {
+			struct pollfd ef;
+
+			ef.fd = cfg->ssh_end_fd;
+			ef.events = POLLIN;
+			ef.revents = 0;
+			if (sock_poll(&ef, 1, 0) > 0 &&
+			    (ef.revents & (POLLIN | POLLHUP | POLLERR))) {
+				s.session_over = 1;
+				break;
+			}
+		}
+		/*
+		 * The mailbox says the session behind this invitation is over.
+		 * A client that has been in it is being told the shared session
+		 * ended; one that never got in is being told its invitation is
+		 * spent. Either way there is nothing left to wait for, which is
+		 * the whole reason the tombstone exists.
+		 */
+		if (!cfg->is_host && sig_peer_ended(s.sig)) {
+			ended = s.was_live ? SESSION_ENDED : SESSION_GONE;
+			break;
+		}
 		/*
 		 * Roamed before the link came up: rebuild the signalling on the
 		 * interfaces that exist now, re-gather there and flush the
@@ -6845,9 +7032,21 @@ int session_run(const struct session_cfg *cfg)
 				if (o && o->established)
 					o->established(o->arg);
 				s.established_fired = 1;
+				s.was_live = 1;
 			}
 			r = run_ssh(&s);
 			dbg_logf("session: run_ssh rc=%d", r);
+			/*
+			 * The host said the shared session ended (CTLM_BYE).
+			 * Whatever the connection did afterwards, there is
+			 * nothing on the other end to rejoin, so this is where
+			 * the client stops rather than re-claiming.
+			 */
+			if (!cfg->is_host && s.peer_ended) {
+				ended = SESSION_ENDED;
+				st = ST_DONE;
+				break;
+			}
 			/* The host's connection just ended (the client left or was
 			 * reaped); drop its dashboard row so the next serve does not
 			 * stack a stale peer over the real one. */
@@ -6921,7 +7120,9 @@ int session_run(const struct session_cfg *cfg)
 		}
 	}
 
-	rc = (st == ST_DONE) ? 0 : 1;
+	if (s.session_over)
+		session_entomb(&s);
+	rc = ended ? ended : ((st == ST_DONE) ? 0 : 1);
 done:
 	if (s.c.stream)
 		stream_destroy(s.c.stream);
