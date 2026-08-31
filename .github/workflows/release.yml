@@ -78,7 +78,7 @@ jobs:
     timeout-minutes: 60
     strategy:
       fail-fast: false
-      max-parallel: 1
+      max-parallel: 6
       matrix:
         suite: [stable, testing]
     steps:
@@ -128,7 +128,7 @@ jobs:
       fail-fast: false
       # Fourteen suite/arch jobs share one egress IP; cap the burst so the
       # checkout download does not trip the anonymous per-IP limit.
-      max-parallel: 4
+      max-parallel: 6
       matrix:
         suite:
           - { name: stable  }   # trixie
@@ -439,7 +439,7 @@ jobs:
       fail-fast: false
       # Both arch jobs share one egress IP; cap the burst so the action and
       # dependency downloads do not trip the anonymous per-IP limit.
-      max-parallel: 1
+      max-parallel: 6
       matrix:
         include:
           - { triple: x86_64-w64-mingw32,  arch: x64 }
