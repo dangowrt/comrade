@@ -115,7 +115,14 @@ constant that would identify comrade to anyone without the token:
   probe_magic  = tags[0..4]  as big-endian uint32
   conv         = tags[4..8]  as big-endian uint32
   if probe_magic == conv: conv ^= 0x5f5f5f5f
+
+  pb(2)        = BLAKE2b_keyed(key=R, len=2, msg="comrade1 mcast port") # 19 bytes, no NUL
+  mcast_port   = 32768 + ((pb[0]<<8 | pb[1]) & 0x3fff)                  # 32768..49151
 ```
+
+`mcast_port` is the link-local group's port (§6), above the registered range
+and clear of the ephemeral one most systems draw from, so it neither squats on
+a service nor collides with what else the machine binds.
 
 `probe_magic` opens a probe (§9) and `conv` is the KCP conversation id, and the
 demux that tells one from the other is a single compare of the first four
@@ -367,8 +374,12 @@ For isolated LANs, the same sealed candpack is announced over link-local
 multicast, plus a direct UDP transport port.
 
 Multicast (`sig_mcast.c`):
-- Groups: v6 `MCAST_V6 = ff02::da7a`, v4 `MCAST_V4 = 224.0.0.224`,
-  port `MCAST_PORT = 47654`.
+- Groups: v6 `MCAST_V6 = ff02::da7a`, v4 `MCAST_V4 = 224.0.0.224`. The **port
+  is this session's**, derived from the invitation (§2), not a constant: on a
+  fixed port every comrade session sharing a segment lands in one conversation,
+  hearing every other's announcements, opening none of them and paying for all
+  of them. `MCAST_PORT = 47654` remains only as the fallback for a caller with
+  no session to derive from (the `mcast-probe` interface check).
 - Packet: `MCAST_MAGIC "pMc1"` (4 bytes) `|| salt_len(1) || salt || payload`.
 - **Salt = the sender's own role slot character**: `"o"` (host) or `"a"`
   (client); a receiver listens for the *peer's* slot char (`sig.c` `peer_slot`,

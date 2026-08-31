@@ -136,8 +136,10 @@ int keys_derive(struct session_keys *keys, const uint8_t rdv[TOKEN_RDV_LEN])
 	static const char sig_info[] = "comrade1 sig key";
 	static const char seed_info[] = "comrade1 bep44 seed";
 	static const char wire_info[] = "comrade1 wire tags";
+	static const char port_info[] = "comrade1 mcast port";
 	uint8_t seed[32];
 	uint8_t tags[8];
+	uint8_t pb[2];
 	int i;
 
 	cc_blake2b_keyed(keys->sig_key, sizeof(keys->sig_key),
@@ -147,6 +149,14 @@ int keys_derive(struct session_keys *keys, const uint8_t rdv[TOKEN_RDV_LEN])
 			 (const uint8_t *)seed_info, sizeof(seed_info) - 1);
 	cc_blake2b_keyed(tags, sizeof(tags), rdv, TOKEN_RDV_LEN,
 			 (const uint8_t *)wire_info, sizeof(wire_info) - 1);
+	cc_blake2b_keyed(pb, sizeof(pb), rdv, TOKEN_RDV_LEN,
+			 (const uint8_t *)port_info, sizeof(port_info) - 1);
+	/*
+	 * Above the registered range and clear of the ephemeral one most
+	 * systems draw from, so a derived port neither squats on a service nor
+	 * collides with whatever else the machine is binding.
+	 */
+	keys->mcast_port = (uint16_t)(32768 + ((pb[0] << 8 | pb[1]) & 0x3fff));
 	keys->probe_magic = 0;
 	keys->conv = 0;
 	for (i = 0; i < 4; i++) {

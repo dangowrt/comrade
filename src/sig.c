@@ -223,7 +223,7 @@ struct sig *sig_create(const uint8_t rdv[TOKEN_RDV_LEN], unsigned flags,
 	 * retried from sig_dispatch too.
 	 */
 	if (flags & SIG_MCAST)
-		s->mc = sig_mcast_open();
+		s->mc = sig_mcast_open(s->keys.mcast_port);
 	if ((s->flags & SIG_DHT) && !s->mc)
 		engage_dht(s);
 	if (!(s->flags & (SIG_DHT | SIG_MCAST))) {
@@ -1194,7 +1194,7 @@ void sig_dispatch(struct sig *s, const struct pollfd *fds, int nfds)
 	uint64_t now = now_ms();
 
 	if ((s->flags & SIG_MCAST) && !s->mc && now >= s->next_mcast_open_ms) {
-		s->mc = sig_mcast_open();
+		s->mc = sig_mcast_open(s->keys.mcast_port);
 		s->next_mcast_open_ms = now + SIG_MCAST_OPEN_MS;
 	}
 	if (s->mc) {

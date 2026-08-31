@@ -29,7 +29,9 @@ typedef void sig_mcast_recv_cb(void *arg, const char *salt,
 			       const uint8_t *data, size_t len,
 			       const struct sockaddr *src, socklen_t srclen);
 
-struct sig_mcast *sig_mcast_open(void);
+/* `port` is this session's, derived from the invitation (keys.h): sessions that
+ * share a segment do not share a conversation. */
+struct sig_mcast *sig_mcast_open(uint16_t port);
 void sig_mcast_close(struct sig_mcast *m);
 
 /* Copy up to max serviced interfaces into out; returns how many. */

@@ -29,6 +29,15 @@ struct session_keys {
 	 */
 	uint32_t probe_magic;
 	uint32_t conv;
+	/*
+	 * The port this session's link-local announcements meet on. A fixed one
+	 * puts every comrade session on a segment into the same conversation:
+	 * each hears every other's announcements, opens none of them, and pays
+	 * for all of them -- and a busy segment is exactly where a lab runs
+	 * several at once. Derived, so two sessions share a port only by the
+	 * same accident that would have them share a key.
+	 */
+	uint16_t mcast_port;
 };
 
 #define KEYS_HALF_LEN 32

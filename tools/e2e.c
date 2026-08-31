@@ -132,7 +132,9 @@ int main(int argc, char **argv)
 	/* Deterministic skip signal for the LAN harnesses: 0 if a usable
 	 * multicast interface exists, 77 (ctest SKIP) if not. */
 	if (argc >= 2 && !strcmp(argv[1], "mcast-probe")) {
-		struct sig_mcast *m = sig_mcast_open();
+		/* Only asking whether a usable interface exists, so the
+		 * fallback port serves: no session, nothing to derive from. */
+		struct sig_mcast *m = sig_mcast_open(0);
 		struct pollfd fds[8];
 		int got = 0, t, nf;
 

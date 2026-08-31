@@ -27,6 +27,8 @@
 #include <net/if.h>
 #endif
 
+/* Kept only as the fallback for a caller that has no session to derive one
+ * from; every real session passes its own (keys.h). */
 #define MCAST_PORT 47654
 #define MCAST_V4 "224.0.0.224"
 #define MCAST_V6 "ff02::da7a"
@@ -48,6 +50,7 @@ struct sig_mcast {
 	uint8_t ifhas4[MCAST_MAX_IF];	/* interface carries a v4 address */
 	uint8_t ifhas6[MCAST_MAX_IF];	/* interface carries a v6 address */
 	int nif;
+	uint16_t port;			/* this session's, see sig_mcast.h */
 };
 
 #ifdef _WIN32
@@ -191,7 +194,7 @@ static sock_t open4(struct sig_mcast *m)
 	memset(&a, 0, sizeof(a));
 	a.sin_family = AF_INET;
 	a.sin_addr.s_addr = htonl(INADDR_ANY);
-	a.sin_port = htons(MCAST_PORT);
+	a.sin_port = htons(m->port);
 	if (bind(s, (struct sockaddr *)&a, sizeof(a))) {
 		sock_close(s);
 		return INVALID_SOCK;
@@ -246,7 +249,7 @@ static sock_t open6(struct sig_mcast *m)
 	memset(&a, 0, sizeof(a));
 	a.sin6_family = AF_INET6;
 	a.sin6_addr = in6addr_any;
-	a.sin6_port = htons(MCAST_PORT);
+	a.sin6_port = htons(m->port);
 	if (bind(s, (struct sockaddr *)&a, sizeof(a))) {
 		sock_close(s);
 		return INVALID_SOCK;
@@ -276,7 +279,7 @@ static sock_t open6(struct sig_mcast *m)
 	return s;
 }
 
-struct sig_mcast *sig_mcast_open(void)
+struct sig_mcast *sig_mcast_open(uint16_t port)
 {
 	struct sig_mcast *m = calloc(1, sizeof(*m));
 
@@ -288,6 +291,7 @@ struct sig_mcast *sig_mcast_open(void)
 	}
 	m->s4 = INVALID_SOCK;
 	m->s6 = INVALID_SOCK;
+	m->port = port ? port : MCAST_PORT;
 	collect_ifaces(m);
 	if (!m->nif) {
 		free(m);
@@ -365,7 +369,7 @@ int sig_mcast_send(struct sig_mcast *m, const char *salt,
 				   sizeof(m->ifaddr4[i]));
 			memset(&d, 0, sizeof(d));
 			d.sin_family = AF_INET;
-			d.sin_port = htons(MCAST_PORT);
+			d.sin_port = htons(m->port);
 			inet_pton(AF_INET, MCAST_V4, &d.sin_addr);
 			if (sendto(m->s4, (const char *)buf, (int)n, 0,
 				   (struct sockaddr *)&d, sizeof(d)) > 0)
@@ -379,7 +383,7 @@ int sig_mcast_send(struct sig_mcast *m, const char *salt,
 				   (const char *)&idx, sizeof(idx));
 			memset(&d, 0, sizeof(d));
 			d.sin6_family = AF_INET6;
-			d.sin6_port = htons(MCAST_PORT);
+			d.sin6_port = htons(m->port);
 			d.sin6_scope_id = idx;
 			inet_pton(AF_INET6, MCAST_V6, &d.sin6_addr);
 			if (sendto(m->s6, (const char *)buf, (int)n, 0,
