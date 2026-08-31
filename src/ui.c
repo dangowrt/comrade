@@ -677,13 +677,18 @@ static void draw(struct ui *u)
 		line("");
 		if (notice_live(u))
 			line(BGR "[ %s ]" RST, u->notice);
+		/*
+		 * ESC is named for what it costs: the session lives only while
+		 * this dashboard or the shared tmux is on screen, so leaving
+		 * here ends it, and that is not something to discover by trying.
+		 */
 		else if (u->have_token)
-			line(DIM "[ " BYE "ENTER" DIM " / " BYE "SPACE" DIM
-			     " to enter the shared session / " BYE "Q" DIM
-			     " invite QR / " BYE "C" DIM " copy token ]" RST);
+			line(DIM "[ " BYE "ENTER" DIM " enter / " BYE "Q" DIM
+			     " invite QR / " BYE "C" DIM " copy token / "
+			     BYE "ESC" DIM " end the session ]" RST);
 		else
-			line(DIM "[ " BYE "ENTER" DIM " / " BYE "SPACE" DIM
-			     " to enter the shared session ]" RST);
+			line(DIM "[ " BYE "ENTER" DIM " enter the shared "
+			     "session / " BYE "ESC" DIM " end it ]" RST);
 	} else {
 		const char *pa = u->npeer && u->peer[0].addr[0] &&
 				 u->peer[0].addr[0] != '-' ? u->peer[0].addr : NULL;

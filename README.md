@@ -54,11 +54,19 @@ Host a session:
 
 A dashboard shows the session tokens -- a read-write one and a read-only
 twin -- to hand to your peers over any channel you trust, and the peers
-as they arrive. ENTER drops you into the shared tmux session; ESC before
-entering aborts it. `comrade` again re-attaches to your running session,
-and `comrade show` prints them. The session ends when the last shell in
-it exits, on whichever side; a client detaching or dropping never ends
-it.
+as they arrive. ENTER drops you into the shared tmux session, and
+detaching that tmux brings the dashboard back, so you can step in and
+out for as long as the session lasts. `comrade show` prints the tokens
+of a running session from another terminal.
+
+ESC leaves the dashboard, and leaving the dashboard ends the session.
+comrade never keeps hosting in the background: when the shell you
+started it from gets its prompt back, there is nothing left running and
+no way back into that session -- so a machine is never quietly still
+being shared. That holds however you leave, including closing the
+terminal or killing comrade outright, and `comrade stop` ends a session
+from elsewhere. The session also ends when the last shell in it exits,
+on whichever side; a client detaching or dropping never ends it.
 
 Join one from anywhere, in the same tmux session:
 
@@ -87,9 +95,9 @@ and `--no-dht` declines the DHT so peers meet over link-local discovery
 alone. Both work on either side, and each is that operator's own choice:
 a token never switches a transport off for the other end. Giving both at
 once is refused, since it would leave nothing to meet on. They are
-properties of the session being started, so `comrade` re-attaching to a
-session you already have keeps whatever that service was started with,
-and says which of them it is ignoring.
+properties of the session being started, and a session lasts exactly as
+long as the terminal that started it, so there is never a running one to
+give them to a second time.
 
 A host on an isolated LAN reaches no DHT, so its mailbox is published
 nowhere and its token carries no rendezvous node. Joining such a host
@@ -184,10 +192,13 @@ handful of protocol and platform improvements.
   transport; the Windows multicast and lanlink path is built and
   CI-smoke-tested, with end-to-end runtime validation pending.
 - **The end-user CLI.** `comrade` hosts a private per-session tmux
-  server, a detached connection service that keeps serving while the
-  operator is away, and a dashboard showing the tokens and the live peer
-  list. `comrade <token>` joins interactively; `comrade show` prints a
-  running session's tokens. Both ends paint a live status row: connection
+  server, a connection service that keeps serving while the operator is
+  inside the shared terminal, and a dashboard showing the tokens and the
+  live peer list. The session lives exactly as long as the operator has
+  it on screen, and ends -- leaving a tombstone for anyone still holding
+  the token -- the moment they leave. `comrade <token>` joins
+  interactively; `comrade show` prints a running session's tokens and
+  `comrade stop` ends one. Both ends paint a live status row: connection
   health, RTT, the in-use path, and the rendezvous state.
 - **Multi-user.** One host serves up to `HOST_MAX_WORKERS` (16)
   concurrent clients on the single shared tmux session. DHT/ICE joins

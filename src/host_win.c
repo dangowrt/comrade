@@ -11,6 +11,7 @@
 #ifdef _WIN32
 
 #include <libssh/libssh.h>
+#include <pthread.h>
 
 #include "conn.h"
 #include "cpty.h"
@@ -53,9 +54,15 @@
  *
  * The other consequence of having no fork is that the service must not be a
  * child that dies with its console. DETACHED_PROCESS gives it no console at
- * all, which is what keeps the session alive after the operator detaches --
+ * all, which is what lets it keep serving while the operator is inside tmux --
  * and is why cpty_win.c has to be explicit about std handles (see the comment
  * there; a console-less parent is exactly the case that breaks silently).
+ *
+ * Having no console does not mean having no operator. The lifecycle is the
+ * POSIX host's, for the reasons set out there: a live session is always on
+ * screen, as the shared tmux or as the dashboard, in the terminal it was
+ * started in. The socketpair the state came down is what says the operator is
+ * still there, and the service ends the session when it closes.
  */
 
 #define ID_LEN 12			/* hex chars of the per-session id */
@@ -71,6 +78,8 @@ struct svc {
 	int no_fwd;
 	int no_mcast;
 	int no_dht;
+	sock_t ctrl;			/* the operator's channel; its closing is
+					 * the operator leaving (hangup_watch) */
 	struct session_obs obs;		/* view-event emitter to the foreground */
 };
 
@@ -163,6 +172,62 @@ static sock_t spawn_end_monitor(const char *sock)
 	if (!h)
 		return INVALID_SOCK;
 	return win_proc_exit_sock(h);
+}
+
+/*
+ * End the session, from inside the service: the tmux server is what a session
+ * IS, so taking it is what ends one, and the end monitor turns that into
+ * everything else -- the serve loop stopping, connected clients being released,
+ * the tombstone going out.
+ */
+static void svc_end(struct svc *v)
+{
+	char *k[] = { NULL, "-S", NULL, "kill-server", NULL };
+
+	k[0] = (char *)tmux_path();
+	k[2] = v->sock;
+	if (k[0])
+		win_run(k);
+}
+
+/*
+ * The operator has gone.
+ *
+ * The socketpair the session came down is open for exactly as long as there is
+ * an operator in front of it: the foreground holds its end while it draws the
+ * dashboard and while it runs tmux, and nothing else does. Its closing is a
+ * hangup, and the answer to a hangup is to end the session rather than to go
+ * on serving a terminal nobody is watching.
+ *
+ * The backstop rather than the usual path: an operator leaving the dashboard
+ * ends the session itself and waits for the tombstone. What arrives here is
+ * what leaves a foreground no chance to -- the console closing, the process
+ * being killed. A peer that has gone shows up on WSAPoll as a readable socket
+ * that reads zero, so it is read rather than merely polled.
+ */
+static void *hangup_watch(void *arg)
+{
+	struct svc *v = arg;
+	char b[64];
+
+	for (;;) {
+		struct pollfd p;
+
+		p.fd = v->ctrl;
+		p.events = POLLIN;
+		p.revents = 0;
+		if (sock_poll(&p, 1, 500) <= 0)
+			continue;
+		if (p.revents & (POLLHUP | POLLERR | POLLNVAL))
+			break;
+		if ((p.revents & POLLIN) &&
+		    sock_read(v->ctrl, b, sizeof(b)) <= 0 &&
+		    !sock_err_would_block(sock_errno()))
+			break;
+	}
+	dbg_logf("host: the operator's terminal is gone -- ending the session");
+	svc_end(v);
+	return NULL;
 }
 
 /* The command the service serves, and the one the operator attaches with. */
@@ -477,6 +542,7 @@ static void run_service(struct svc *v, void *hostkey, sock_t wfd)
 	char cmd_ro[600];
 	struct session_cfg cfg;
 	struct sandbox_cfg sb;
+	pthread_t hw;
 	sock_t end_fd;
 
 	attach_cmd(cmd, sizeof(cmd), v->sock);
@@ -491,6 +557,9 @@ static void run_service(struct svc *v, void *hostkey, sock_t wfd)
 	sandbox_apply(&sb);
 
 	ui_emitter(&v->obs, wfd);	/* progress -> the foreground view */
+	v->ctrl = wfd;
+	if (!pthread_create(&hw, NULL, hangup_watch, v))
+		pthread_detach(hw);
 
 	memset(&cfg, 0, sizeof(cfg));
 	cfg.is_host = 1;
@@ -702,20 +771,40 @@ int host_win_service(const char *handle_arg)
 	return 0;
 }
 
-/* Abort path: stop the detached service and drop its tmux session and state. */
+/*
+ * Longest the operator's shell waits for the service to finish ending the
+ * session: publishing the tombstone (session.c: SESSION_TOMB_MS) and releasing
+ * whoever was connected, which run together rather than one after the other.
+ * The ceiling sits above what those two can cost between them, so terminating
+ * the service is a backstop against a wedge rather than something a slow
+ * network reaches.
+ */
+#define TEARDOWN_WAIT_MS 10000
+
+/*
+ * The operator is leaving, so the session ends: take the tmux server, which is
+ * what the service watches, and wait for it to go.
+ *
+ * Waiting is the point. The service has something to say on the way out -- a
+ * tombstone on the rendezvous, so nobody holding the invitation waits on a
+ * session that is over -- and returning the prompt before it has said it would
+ * leave the unnoticed background comrade this lifecycle exists to prevent. It
+ * is terminated only if it overruns, since a service killed mid-publish leaves
+ * the invitation pointing at silence.
+ */
 static void teardown(HANDLE svc, const char *sock, const char *tokfile)
 {
 	char *k[] = { NULL, "-S", NULL, "kill-server", NULL };
 
-	if (svc) {
-		TerminateProcess(svc, 0);
-		WaitForSingleObject(svc, 3000);
-		CloseHandle(svc);
-	}
 	k[0] = (char *)tmux_path();
 	k[2] = (char *)sock;
 	if (k[0])
 		win_run(k);
+	if (svc) {
+		if (WaitForSingleObject(svc, TEARDOWN_WAIT_MS) != WAIT_OBJECT_0)
+			TerminateProcess(svc, 0);
+		CloseHandle(svc);
+	}
 	DeleteFileA(tokfile);
 	DeleteFileA(sock);
 }
@@ -738,7 +827,7 @@ static const char *self_path(void)
  * filesystem. Everything that talks to that server still works, because the
  * path is only a name -- but comrade finds its own sessions by listing
  * <state_dir>\*.sock, so with no entry `comrade show` reports no session and a
- * second `comrade` starts a second session instead of re-attaching.
+ * second `comrade` starts one beside it instead of saying where it is.
  *
  * So create the entry if tmux did not. It must happen *after* tmux has bound,
  * never before: MSYS2's tmux really does bind an AF_UNIX socket there and a
@@ -793,7 +882,7 @@ static int start_new(int ui_mode, int no_mcast, int no_dht, int no_fwd)
 	struct ui *ui;
 	HANDLE proc;
 	sock_t sv[2];
-	int enter, rc = 0;
+	int enter, entered = 0, rc = 0;
 
 	if (!tmux_path() && !tmux_offer_install()) {
 		tmux_missing_help();
@@ -865,57 +954,61 @@ static int start_new(int ui_mode, int no_mcast, int no_dht, int no_fwd)
 	}
 	sshd_hostkey_free(hostkey);		/* the service has its own copy */
 
-	/* The view renders the service's progress and blocks until the operator
-	 * enters (1, playing the zap), aborts (-1), or the service exits (0). A
-	 * detach (attach() returns 2, session still alive) loops back to the
-	 * dashboard instead of leaving it. */
+	/*
+	 * The view renders the service's progress and blocks until the operator
+	 * enters (1, playing the zap), leaves (-1), or the service exits because
+	 * the session ended (0). Detaching tmux (attach() returns 2, the session
+	 * still alive) comes back to the dashboard rather than to the shell:
+	 * between the two there is always one of them on screen, and leaving is
+	 * a thing the operator does deliberately, from here.
+	 */
 	ui = ui_create(UI_ROLE_HOST, ui_mode);
 	for (;;) {
 		enter = ui ? ui_host_wait(ui, sv[0]) : 0;
 		if (enter != 1)
 			break;
+		entered = 1;
 		rc = attach(id);
 		if (rc != 2)
 			break;
 	}
 	ui_destroy(ui);
-	sock_close(sv[0]);
 
-	if (enter == 1) {
-		CloseHandle(proc);
-		return rc;
-	}
-	if (enter < 0) {			/* operator aborted */
+	if (enter < 0) {		/* the operator left: end it, and wait */
+		fprintf(stderr, "comrade: ending the session ...\n");
 		teardown(proc, v.sock, v.tokfile);
-		fprintf(stderr, "comrade: aborted.\n");
+		sock_close(sv[0]);
+		fprintf(stderr, "comrade: session ended.\n");
 		return 0;
 	}
+	sock_close(sv[0]);		/* and with it the service, if it is left */
 	CloseHandle(proc);
-	fprintf(stderr, "comrade: session ended before you entered "
-		"(token: `comrade show`)\n");
-	return 1;
+	if (enter == 1)
+		return rc;
+	fprintf(stderr, entered ?
+		"comrade: the shared session ended.\n" :
+		"comrade: session ended before you entered it.\n");
+	return entered ? 0 : 1;
 }
 
 int host_run(int ui_mode, int no_mcast, int no_dht, int no_fwd)
 {
 	char id[ID_LEN + 1];
-	int rc;
 
 	sweep_stale();
+	/*
+	 * A live session is one somebody is sitting in front of, in the
+	 * terminal it was started in -- the service ends with that foreground,
+	 * so a session with nobody in front of it is a moment old at most. This
+	 * is therefore not a session to adopt, and adopting it would be a way
+	 * to resume one that was walked away from, which is the thing the
+	 * lifecycle rules out. Say where it is instead.
+	 */
 	if (find_live(id)) {
-		fprintf(stderr, "comrade: re-attaching to your running session"
-			" (its token: `comrade show`)\n");
-		if (no_mcast || no_dht || no_fwd)
-			fprintf(stderr, "comrade: ignoring%s%s%s -- the "
-				"running service keeps what it was started "
-				"with\n",
-				no_mcast ? " --no-multicast" : "",
-				no_dht ? " --no-dht" : "",
-				no_fwd ? " --no-forwarding" : "");
-		do {
-			rc = attach(id);
-		} while (rc == 2);
-		return rc;
+		fprintf(stderr, "comrade: a session is already running in "
+			"another terminal (its token: `comrade show`)\n"
+			"comrade: end it there, or with `comrade stop`\n");
+		return 1;
 	}
 	return start_new(ui_mode, no_mcast, no_dht, no_fwd);
 }
@@ -970,11 +1063,52 @@ int host_headless(const char *id, int no_mcast, int no_dht, int no_fwd,
 	return 1;
 }
 
-int host_stop(const char *id)
+/*
+ * End a session from outside it, the way the operator's own quit does: take
+ * the tmux server and let the service wind down behind it. Named or, with no
+ * --id, the single live one. Idempotent: nothing running is a session already
+ * stopped, not an error.
+ *
+ * The service is not signalled, because there is no handle to it here -- an
+ * interactive session records none. Killing its tmux is enough: that is the
+ * one signal it watches, and it publishes its tombstone and exits on it. What
+ * this waits for is the token file going, which is the last thing the service
+ * does.
+ */
+int host_stop(const char *id_opt)
 {
-	(void)id;
-	fprintf(stderr, "comrade: stop is not supported on Windows yet\n");
-	return 1;
+	char id[ID_LEN + 1], sock[512], tokfile[512];
+	int i;
+
+	sweep_stale();
+	if (id_opt) {
+		if (strlen(id_opt) != ID_LEN)
+			return 0;
+		snprintf(id, sizeof(id), "%s", id_opt);
+	} else if (!find_live(id)) {
+		return 0;		/* nothing running: stop is idempotent */
+	}
+	sock_path(sock, sizeof(sock), id);
+	tok_path(tokfile, sizeof(tokfile), id);
+	if (!tmux_alive(sock)) {
+		sweep_stale();
+		return 0;
+	}
+	{
+		char *k[] = { NULL, "-S", NULL, "kill-server", NULL };
+
+		k[0] = (char *)tmux_path();
+		k[2] = sock;
+		if (k[0])
+			win_run(k);
+	}
+	for (i = 0; i < TEARDOWN_WAIT_MS / 50; i++) {
+		if (GetFileAttributesA(tokfile) == INVALID_FILE_ATTRIBUTES)
+			break;
+		os_msleep(50);
+	}
+	sweep_stale();			/* collect whatever the exit left */
+	return 0;
 }
 
 int host_capture(const char *id, int ansi)

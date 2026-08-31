@@ -1150,9 +1150,9 @@ CLI surface:
 `--no-dht` names the mechanism it declines rather than the medium it assumes. A
 future non-IP transport (BLE, LoRaWAN, AX.25) would make a `--lan-only` spelling
 meaningless, while "no DHT" still says exactly what it does. These options
-configure the session being started: `comrade` re-attaching to a session that is
-already running keeps whatever its service was given, and names on stderr which
-of them it is ignoring.
+configure the session being started, and a session lasts exactly as long as the
+terminal that started it, so a second `comrade` never inherits them: it is told
+where the running session is rather than adopting it.
 
 MVC seam (`src/session.h:session_obs`): the controller emits semantic events
 (`net`, `link`, `rendezvous`, `rdv_stage`, `token`, `peer`, `reset`, `escalate`,
@@ -1162,11 +1162,31 @@ draws one row per client.
 
 - **Host dashboard** (`ui.c`): the token to share, and the live peer list
   (per-connection rows keyed by connection id, each with its proven path). A
-  detached connection **service** keeps serving while the operator is away
-  (`host.c`: `run_service` re-serves until the tmux session dies); the operator
-  attaches/detaches without ending the session.
+  connection **service** runs beside it, detached from the terminal so it keeps
+  serving while the operator is inside the shared tmux (`host.c`: `run_service`
+  re-serves until the tmux session dies).
 - **Status row** (`statusbar.c`): connection health (green live / amber if smoothed
   RTT over `RTT_WARN_MS 250` / down), RTT, the path in use and its warm
   alternatives (§9), and the rendezvous state; address scope shown as LAN / CGNAT / GLOBAL (`session.c:addr_scope`).
-- The session ends when the last shell in the tmux exits on either side; a
-  client detaching or dropping never ends it.
+- **Session lifecycle** -- a live session is always on screen, as the shared
+  tmux or as the dashboard, in the terminal it was started in. Detaching tmux
+  comes back to the dashboard; leaving the dashboard (ESC) ends the session, and
+  the shell is not given its prompt back until the service has finished doing so
+  (`host.c:teardown`, bounded by `TEARDOWN_WAIT_MS`). Nothing survives the
+  operator: the service holds the far end of the event pipe and ends the session
+  when it closes -- or when the foreground it was forked from is gone, watched
+  alongside it since how a broken pipe reports itself differs between kernels
+  (`host.c:hangup_watch`). That covers a hangup, a closed window, or a kill -- and a later `comrade` starts a new session rather than
+  adopting one, since there is no session left to come back to. A tmux server
+  left standing by a service that was killed outright is collected by the next
+  `comrade` (`find_live`, against the service's own pidfile).
+- The session also ends when the last shell in the tmux exits on either side; a
+  client detaching or dropping never ends it. A guest detaching drops back to
+  its own shell with the token to rejoin, exactly like detaching from a local
+  tmux; a guest whose session **ended** is told so instead (`CTLM_BYE`, §10),
+  and anyone presenting the token afterwards is told the same by the tombstone
+  (§4.1) rather than left punching.
+- `comrade --headless` is the exception to all of that, deliberately: it is a
+  supervisor's service with a pidfile (INTEGRATION.md), owned by whatever
+  started it, and an interactive `comrade` never touches one. It still leaves a
+  tombstone when it ends.

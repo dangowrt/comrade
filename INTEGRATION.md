@@ -37,9 +37,16 @@ Supervisors poll that file; no exec is needed on the poll path.
 
 `--id NAME` (a-z A-Z 0-9 `-` `_`, at most 32 chars) makes every path
 deterministic. A named session that is already running is refused
-(exit 2). Sessions with a pidfile (every headless session) are never
-adopted by an interactive `comrade`, so a supervisor's session and an
-operator's shell session cannot collide; both appear in `show`.
+(exit 2).
+
+Headless is the one host that is meant to outlive the process that
+started it, and it is the exception to comrade's own lifecycle rule: an
+interactive `comrade` ends its session the moment the operator leaves
+the terminal, so nothing is ever hosting in the background unnoticed.
+A headless session is a supervisor's, and is owned by whatever started
+it -- it runs until `stop`, `--expire`, or its grant is spent. The two
+never collide: a headless session is the one with a pidfile, an
+interactive `comrade` never touches one, and both appear in `show`.
 
 `--expire SECONDS` ends the session after that long, whatever happens:
 a root-shell grant handed out by QR code should be temporary by
@@ -75,14 +82,17 @@ only written once startup has succeeded, an error document with no
 
     comrade stop [--id NAME]
 
-Ends a session, completely: the tmux server is killed first, which
-closes every attached client's channel through the end monitor, then
-the service gets SIGTERM and `stop` waits (up to ~3 s) for it to exit
-before returning -- when it returns, access has ended and the state
-file is gone. A client still holding the token has nothing left to
-join: the mailbox offer it might read has no live host behind it.
-Idempotent: exit 0 when nothing was running. Without `--id` it acts on
-the single live session and refuses (exit 1) when there are several.
+Ends any session, interactive or headless, completely: the tmux server
+is killed first, which closes every attached client's channel through
+the end monitor, and `stop` then waits for the service to finish going
+-- a headless one on SIGTERM (~3 s), an interactive one on its own,
+watched by its token file disappearing (~6 s). When `stop` returns,
+access has ended and the state file is gone. A client still holding the
+token is told so rather than left waiting: the service replaces the
+mailbox offer with a tombstone on its way out (PROTOCOL.md §4.1), so a
+join attempt fails with an error in a few seconds. Idempotent: exit 0
+when nothing was running. Without `--id` it acts on the single live
+session and refuses (exit 1) when there are several.
 
     comrade capture [--id NAME] [--ansi]
 
@@ -130,6 +140,14 @@ For `--id NAME` the paths are exactly:
     $DIR/NAME.sock      the shared tmux server's socket
     $DIR/NAME.tok       both tokens, read-write then read-only, one per line
     $DIR/NAME.status    connection status for comrade's own status row
+
+An interactive session has no `.json` and no `.pid` -- it belongs to an
+operator, not a supervisor -- and carries `NAME.svc` instead, naming its
+connection service while that runs. The two files answer different
+questions and are not interchangeable: `.pid` says a session is a
+supervisor's, `.svc` says the service behind a shared tmux is still
+alive, which is what tells a session somebody is hosting from a tmux
+server left standing by a service that was killed outright.
 
 ## The session document (schema 1)
 
