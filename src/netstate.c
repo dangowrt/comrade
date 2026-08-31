@@ -501,6 +501,23 @@ void netstate_on_dht_concluded(struct netstate *ns, int family, int concluded)
 	facts_moved(ns, i);
 }
 
+/* A candidate that did not earn its place: nobody has been shown it, so it
+ * simply goes, and forgetting it is what lets another node be captured. */
+static void cand_drop(struct netstate *ns, int i)
+{
+	struct netstate_fam *f = &ns->f[i];
+
+	memset(f->anchor, 0, sizeof(f->anchor));
+	f->anchor_len = 0;
+	f->anchor_candidate = 0;
+	f->anchor_confirmed = 0;
+	f->anchor_acks = 0;
+	f->anchor_first_ms = 0;
+	f->anchor_quiet = 0;
+	raise_act(ns, i, NSA_EMIT_RDV | NSA_RDV_DROP);
+	facts_moved(ns, i);
+}
+
 void netstate_tick(struct netstate *ns, uint64_t now)
 {
 	int i;
@@ -524,34 +541,24 @@ void netstate_tick(struct netstate *ns, uint64_t now)
 			f->probe_next_ms = now + probe_gap(f);
 		}
 		/* Only on a network this family has proven: elsewhere the
-		 * silence is as likely ours. Searching does not unseat the
-		 * node -- it is what lets a different one answer at all. */
+		 * silence is as likely ours. See NETSTATE_ANCHOR_QUIET for
+		 * the candidate/qualified split. */
 		if (f->anchor_len && now >= f->anchor_next_ms) {
 			f->anchor_next_ms = now + NETSTATE_RDV_MS;
 			if (f->conn == NET_CONN_UP &&
-			    ++f->anchor_quiet >= NETSTATE_ANCHOR_QUIET)
-				raise_act(ns, i, NSA_RDV_RELOCATE);
+			    ++f->anchor_quiet >= NETSTATE_ANCHOR_QUIET) {
+				if (f->anchor_candidate)
+					cand_drop(ns, i);
+				else
+					raise_act(ns, i, NSA_RDV_RELOCATE);
+			}
 		}
 		anchor_confirm(ns, i, now);
-		/*
-		 * A candidate that did not qualify in the time it was given.
-		 * Nobody has been shown it, so it simply goes, and the search
-		 * that finds the next one starts again -- which is the only
-		 * way another node can ever answer, the direct get asking only
-		 * the nodes already held.
-		 */
+		/* The trial ceiling, for a candidate answering too rarely to
+		 * ever qualify. */
 		if (f->anchor_len && f->anchor_candidate &&
-		    now - f->anchor_set_ms >= NETSTATE_ANCHOR_TRY_MS) {
-			memset(f->anchor, 0, sizeof(f->anchor));
-			f->anchor_len = 0;
-			f->anchor_candidate = 0;
-			f->anchor_confirmed = 0;
-			f->anchor_acks = 0;
-			f->anchor_first_ms = 0;
-			f->anchor_quiet = 0;
-			raise_act(ns, i, NSA_EMIT_RDV | NSA_RDV_RELOCATE);
-			facts_moved(ns, i);
-		}
+		    now - f->anchor_set_ms >= NETSTATE_ANCHOR_TRY_MS)
+			cand_drop(ns, i);
 	}
 }
 

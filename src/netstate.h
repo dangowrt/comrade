@@ -136,14 +136,12 @@ enum {					/* how a local address was learnt */
 
 /*
  * Rounds a held node may leave unanswered, on a network this family has
- * proven, before an alternative is searched for alongside it.
- *
- * Silence alone says nothing -- it is equally the network. But the direct get
- * only ever asks the nodes already held, so if nothing is searched for, no
- * other node can answer, and the one piece of evidence that could replace a
- * dead node can never arrive. Searching is free and reversible: the held node
- * stays pinned, served and named by the token throughout, and only a different
- * node actually answering replaces it.
+ * proven, before anything is done about it. A qualified anchor (or one the
+ * peer named) gets an alternative searched for alongside it: the direct get
+ * only asks the nodes already held, so unless something goes looking, the
+ * different answer that could replace a dead node can never arrive; the held
+ * node stays pinned, served and named by the token throughout. A candidate,
+ * shown to nobody, is simply dropped rather than waited out.
  */
 #define NETSTATE_ANCHOR_QUIET 5
 
@@ -178,6 +176,9 @@ enum {					/* how a local address was learnt */
 #define NSA_RDV_PIN	   (1u << 5)	/* pin the anchor now held */
 #define NSA_RDV_RELOCATE   (1u << 6)	/* quiet: look for one alongside it */
 #define NSA_EMIT_TOKEN	   (1u << 7)	/* host only: the advert changed */
+#define NSA_RDV_DROP	   (1u << 8)	/* a candidate failed its trial: forget
+					 * it in sig, so the family locates
+					 * afresh instead of settling */
 
 /*
  * A node on trial to become this family's rendezvous.

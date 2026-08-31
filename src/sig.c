@@ -485,6 +485,31 @@ void sig_search_again(struct sig *s, int family)
 		s->relocate4 = 1;
 }
 
+void sig_forget(struct sig *s, int family)
+{
+	struct sockaddr_storage *r = family == 6 ? &s->rnode6 : &s->rnode4;
+	socklen_t *rl = family == 6 ? &s->rnode6_len : &s->rnode4_len;
+
+	if (!*rl)
+		return;
+	if (s->dht_engaged)
+		bep44_pin_del(s->engine, (const struct sockaddr *)r, *rl);
+	memset(r, 0, sizeof(*r));
+	*rl = 0;
+	if (family == 6) {
+		s->relocate6 = 0;
+		s->acked6 = 0;
+		s->anchor_seen6 = 0;
+		s->ack_new6 = 0;
+	} else {
+		s->relocate4 = 0;
+		s->acked4 = 0;
+		s->anchor_seen4 = 0;
+		s->ack_new4 = 0;
+	}
+	s->next_put_ms = 0;
+}
+
 int sig_locating(struct sig *s, int family)
 {
 	socklen_t rl = family == 6 ? s->rnode6_len : s->rnode4_len;

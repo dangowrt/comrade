@@ -23,7 +23,9 @@ typedef void bep44_put_cb(void *arg, int stored, const struct sockaddr *node,
 /*
  * On a get, node/node_len identify the DHT node that first served the winning
  * value: proven to hold it and fastest to answer, so the right rendezvous
- * hint to embed in a token. NULL when no value was found.
+ * hint to embed in a token. Invoked once per address family that served it,
+ * since a single winner would starve the slower family's node of the answers
+ * that prove it. NULL when no value was found.
  */
 typedef void bep44_get_cb(void *arg, const uint8_t *v, size_t v_len, int64_t seq,
 			  const struct sockaddr *node, socklen_t node_len);
@@ -43,6 +45,9 @@ int bep44_seed_add(struct bep44_engine *e, const uint8_t id[20],
  */
 int bep44_pin_add(struct bep44_engine *e, const uint8_t id[20],
 		  const struct sockaddr *sa, socklen_t salen);
+/* Unpin a node given up on, freeing its never-aged slot for a replacement. */
+void bep44_pin_del(struct bep44_engine *e, const struct sockaddr *sa,
+		   socklen_t salen);
 int bep44_input(struct bep44_engine *e, const uint8_t *buf, size_t len,
 		const struct sockaddr *from, socklen_t fromlen);
 int bep44_periodic(struct bep44_engine *e, int *timeout_ms);

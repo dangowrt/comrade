@@ -205,6 +205,12 @@ int sig_take_anchor_seen(struct sig *s, int family);
  * serve the one we hold; sig_reinforce with a new one ends the search. */
 void sig_search_again(struct sig *s, int family);
 
+/* Host: give up on `family`'s captured node entirely -- unpin it and return
+ * the family to locating, so the next validating get can capture a fresh one.
+ * For a node no token has ever named; one that qualified is only ever
+ * replaced, never dropped (sig_search_again). */
+void sig_forget(struct sig *s, int family);
+
 /*
  * Client: establish a rendezvous on `family` for a peer that cannot reach it.
  *

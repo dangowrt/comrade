@@ -513,17 +513,43 @@ static void a_candidate_that_never_qualifies_is_dropped(void)
 	netstate_tick(&ns, t);
 	a = drain(&ns);
 	assert(!netstate_anchor(&ns, 6, NULL, NULL, NULL));
-	/* And the search that could turn up another one is asked for: the
+	/* And it is forgotten outright, so the family locates afresh: the
 	 * direct get only ever asks the nodes already held. */
-	assert(a.f[1] & NSA_RDV_RELOCATE);
+	assert(a.f[1] & NSA_RDV_DROP);
 	assert(a.f[1] & NSA_EMIT_RDV);
 	/* The other family is untouched by any of it. */
-	assert(!(a.f[0] & NSA_RDV_RELOCATE));
+	assert(!(a.f[0] & NSA_RDV_DROP));
 
 	/* And the next node to answer takes the empty place. */
 	fill(node, 16, 90);
 	netstate_on_dht_ack(&ns, 6, netstate_epoch(&ns, 6), node, 16, t);
 	assert(netstate_anchor(&ns, 6, NULL, NULL, NULL));
+}
+
+/* A candidate that answers once and falls silent does not get to use up its
+ * whole trial window: nobody has been shown it, so a few unanswered rounds on
+ * a proven network are enough to move on. */
+static void a_silent_candidate_is_dropped_quickly(void)
+{
+	struct netstate ns;
+	struct netstate_actions a;
+	uint8_t node[16];
+	uint64_t began;
+
+	start(&ns, 1);
+	give_src(&ns, 6, 20);
+	fill(node, 16, 70);
+
+	netstate_on_dht_ack(&ns, 6, netstate_epoch(&ns, 6), node, 16, t);
+	drain(&ns);
+	assert(netstate_conn(&ns, 6) == NET_CONN_UP);
+	began = t;
+
+	quiet_rounds(&ns, NETSTATE_ANCHOR_QUIET);
+	a = drain(&ns);
+	assert(!netstate_anchor(&ns, 6, NULL, NULL, NULL));
+	assert(a.f[1] & NSA_RDV_DROP);
+	assert(t - began < NETSTATE_ANCHOR_TRY_MS);
 }
 
 /* Once it has qualified it may be in somebody's token, so the deadline stops
@@ -1216,6 +1242,7 @@ int main(void)
 	quiet_searches_without_giving_up();
 	quiet_says_nothing_until_the_family_is_up();
 	a_candidate_that_never_qualifies_is_dropped();
+	a_silent_candidate_is_dropped_quickly();
 	a_qualified_node_outlives_the_deadline();
 	an_offered_node_is_not_on_trial();
 	a_move_gives_a_candidate_a_fresh_run();

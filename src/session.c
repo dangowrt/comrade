@@ -4770,6 +4770,10 @@ static void net_apply(struct sess *s, const struct netstate_actions *a)
 			if (s->sig)
 				sig_search_again(s->sig, family);
 		}
+		if (act & NSA_RDV_DROP) {
+			if (s->sig)
+				sig_forget(s->sig, family);
+		}
 		if (act & NSA_EMIT_RDV)
 			report_rendezvous(s);
 		/* NSA_EMIT_TOKEN is advisory: token_pump recomputes on its own

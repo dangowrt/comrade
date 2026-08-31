@@ -214,8 +214,9 @@ struct b44_op {
 	uint16_t best_len;
 	int64_t best_seq;
 	uint8_t have_best;
-	struct sockaddr_storage best_node;	/* who first served the value */
-	socklen_t best_node_len;
+	struct sockaddr_storage best_node[2];	/* who first served the value,
+						 * per family: [0] v4, [1] v6 */
+	socklen_t best_node_len[2];
 	struct b44_node nodes[B44_NODES_MAX];
 	uint8_t nnodes;
 	struct b44_req reqs[B44_REQS_MAX];
@@ -878,16 +879,20 @@ static void op_finish(struct b44_op *op)
 	 * storing the value: known here, at store time, from the store itself,
 	 * so the host never needs a separate (cold) get to discover it.
 	 */
-	if (op->is_put && !op->best_node_len) {
+	if (op->is_put && !op->best_node_len[0] && !op->best_node_len[1]) {
 		int k;
 
 		for (k = 0; k < op->nnodes; k++) {
+			int v6;
+
 			if (op->nodes[k].state != B44_NODE_STORED ||
 			    !node_addr_usable((struct sockaddr *)&op->nodes[k].ss,
 					      op->nodes[k].sslen))
 				continue;
-			memcpy(&op->best_node, &op->nodes[k].ss, op->nodes[k].sslen);
-			op->best_node_len = op->nodes[k].sslen;
+			v6 = op->nodes[k].ss.ss_family == AF_INET6;
+			memcpy(&op->best_node[v6], &op->nodes[k].ss,
+			       op->nodes[k].sslen);
+			op->best_node_len[v6] = op->nodes[k].sslen;
 			break;
 		}
 	}
@@ -895,20 +900,40 @@ static void op_finish(struct b44_op *op)
 	uint16_t best_len = op->best_len;
 	int64_t best_seq = op->best_seq;
 	uint8_t have_best = op->have_best;
-	struct sockaddr_storage best_node = op->best_node;
-	socklen_t best_node_len = op->best_node_len;
+	struct sockaddr_storage best_node[2];
+	socklen_t best_node_len[2];
+	int fam;
 
+	memcpy(best_node, op->best_node, sizeof(best_node));
+	memcpy(best_node_len, op->best_node_len, sizeof(best_node_len));
 	memcpy(best, op->best, best_len);
 	op_retain_nodes(e, op);
 	op_free(e, op);
-	if (put_cb)
-		put_cb(arg, stored,
-		       best_node_len ? (struct sockaddr *)&best_node : NULL,
-		       best_node_len);
-	else if (get_cb)
-		get_cb(arg, have_best ? best : NULL, best_len, best_seq,
-		       best_node_len ? (struct sockaddr *)&best_node : NULL,
-		       best_node_len);
+	if (put_cb) {
+		struct sockaddr *n = NULL;
+		socklen_t nl = 0;
+
+		for (fam = 0; fam < 2 && !nl; fam++)
+			if (best_node_len[fam]) {
+				n = (struct sockaddr *)&best_node[fam];
+				nl = best_node_len[fam];
+			}
+		put_cb(arg, stored, n, nl);
+	} else if (get_cb) {
+		int served = 0;
+
+		for (fam = 0; fam < 2; fam++)
+			if (best_node_len[fam]) {
+				served = 1;
+				get_cb(arg, have_best ? best : NULL, best_len,
+				       best_seq,
+				       (struct sockaddr *)&best_node[fam],
+				       best_node_len[fam]);
+			}
+		if (!served)
+			get_cb(arg, have_best ? best : NULL, best_len,
+			       best_seq, NULL, 0);
+	}
 }
 
 static int store_start(struct b44_op *op)
@@ -1050,14 +1075,21 @@ static int node_addr_usable(const struct sockaddr *sa, socklen_t len)
 	return 0;
 }
 
+/* Note a server of the winning value in its family's slot, first one wins:
+ * a single shared slot would go to the quicker family on every round. */
 static void record_best_node(struct b44_op *op, const struct sockaddr *sa,
 			     socklen_t salen)
 {
-	if (op->best_node_len || !sa || (size_t)salen > sizeof(op->best_node) ||
-	    !node_addr_usable(sa, salen))
+	int fam;
+
+	if (!sa || !node_addr_usable(sa, salen))
 		return;
-	memcpy(&op->best_node, sa, salen);
-	op->best_node_len = salen;
+	fam = sa->sa_family == AF_INET6 ? 1 : 0;
+	if (op->best_node_len[fam] ||
+	    (size_t)salen > sizeof(op->best_node[fam]))
+		return;
+	memcpy(&op->best_node[fam], sa, salen);
+	op->best_node_len[fam] = salen;
 }
 
 static void value_check(struct b44_op *op, const struct sockaddr *from,
@@ -1089,7 +1121,8 @@ static void value_check(struct b44_op *op, const struct sockaddr *from,
 		op->best_len = (uint16_t)v_len;
 		op->best_seq = -1;
 		op->have_best = 1;
-		op->best_node_len = 0;
+		op->best_node_len[0] = 0;
+		op->best_node_len[1] = 0;
 		record_best_node(op, from, fromlen);
 		return;
 	}
@@ -1121,7 +1154,8 @@ static void value_check(struct b44_op *op, const struct sockaddr *from,
 	op->best_len = (uint16_t)v_len;
 	op->best_seq = seq;
 	op->have_best = 1;
-	op->best_node_len = 0;
+	op->best_node_len[0] = 0;
+	op->best_node_len[1] = 0;
 	record_best_node(op, from, fromlen);
 }
 
@@ -2378,6 +2412,23 @@ int bep44_pin_add(struct bep44_engine *e, const uint8_t id[20],
 	p->sslen = salen;
 	p->in_use = 1;
 	return 0;
+}
+
+void bep44_pin_del(struct bep44_engine *e, const struct sockaddr *sa,
+		   socklen_t salen)
+{
+	int i;
+
+	for (i = 0; i < e->npinned; i++) {
+		struct b44_seed *p = &e->pinned[i];
+
+		if (p->sslen != salen || memcmp(&p->ss, sa, salen))
+			continue;
+		memmove(&e->pinned[i], &e->pinned[i + 1],
+			(size_t)(e->npinned - i - 1) * sizeof(e->pinned[0]));
+		e->npinned--;
+		return;
+	}
 }
 
 int bep44_put(struct bep44_engine *e, const uint8_t sk[64], const uint8_t pk[32],
