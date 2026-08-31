@@ -264,16 +264,18 @@ cleanly on an older build instead of being misparsed as this one.
 
 ## 4. Rendezvous mailbox (`src/mailbox.c`, `src/sig.c`)
 
-One shared mailbox, two slots. The container is a **bencoded dict** with keys in
+One shared mailbox. The container is a **bencoded dict** with keys in
 sorted order (`mailbox.c:mailbox_build`):
 
 ```
-  d [ 1:a <sealed answer> ] [ 1:o <sealed offer> ] e
+  d [ 1:a <sealed answer> ] [ 1:o <sealed offer> ] [ 1:x <sealed tombstone> ] e
 ```
 
-- `o` (offer) is written by the **host**, `a` (answer) by the **client**.
-- Each slot value is a **sealed blob** (§1) under `sig_key`, but the two slots
-  do not carry the same thing:
+- `o` (offer) is written by the **host**, `a` (answer) by the **client**, `x`
+  (tombstone, §4.1) by the host as it goes. `o` and `x` never stand together,
+  so the item carries at most two sealed slots at a time.
+- Each slot value is a **sealed blob** (§1) under `sig_key`, but the offer and
+  the answer do not carry the same thing:
 
 ```
   offer  = seal(sig_key,  claim_pk(32) || candpack )

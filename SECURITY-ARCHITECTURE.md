@@ -37,9 +37,9 @@ whatever the invitation says. The switch is clocked by the peer rather than a
 timer, because the halves travel over the stream the key protects.
 
 **Closed for the mailbox too.** The rendezvous still runs under the
-invitation's key, and both slots are still sealed with it, so a token holder
+invitation's key, and its slots are still sealed with it, so a token holder
 can still tell a claim is present and can still take the turnstile. What it can
-no longer do is read one. The mailbox has two slots and they were not alike:
+no longer do is read one. The two slots a peer writes were not alike:
 
 - The *offer* slot is the host's own description. Every invited guest needs it
   to reach the host, view-only ones included, so reading it is not a leak -- it

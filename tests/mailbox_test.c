@@ -3,10 +3,11 @@
 
 /*
  * Unit tests for the rendezvous mailbox: the
- * two-slot container build/parse/merge, the turnstile claim decision (the
+ * container build/parse/merge, the turnstile claim decision (the
  * answer slot as a mutex), the host rotate that releases the answer slot
- * until it is observed gone, and the CAS/seq contract modelled with an
- * in-test store so that two
+ * until it is observed gone, the tombstone that says the session is over --
+ * including a live host erasing a forged one -- and the CAS/seq contract
+ * modelled with an in-test store so that two
  * claimants against one empty slot resolve to exactly one winner. The slot
  * payloads are arbitrary byte blobs -- the container layer never inspects the
  * sealed contents -- so no crypto or DHT is involved.
@@ -594,6 +595,129 @@ int main(void)
 		assert(!mailbox_client_should_claim(&c));
 	}
 
-	printf("mailbox: all container, turnstile, CAS and relay cases pass\n");
+	/* ---- 6. The tombstone: the session is over ---- */
+	{
+		static const uint8_t TOMB[] = { 0x7B, 0x7B };
+		struct mailbox h, c;
+		const uint8_t *slot;
+		uint8_t ended[BEP44_MAX_VALUE], claimed[BEP44_MAX_VALUE];
+		uint8_t live[BEP44_MAX_VALUE];
+		size_t endlen, livelen, outlen;
+
+		/* A host that is serving: an offer, and a claim in the mutex. */
+		mailbox_init(&h, 1);
+		mailbox_set_mine(&h, OFFER_E, sizeof(OFFER_E));
+		mailbox_parse(&h, offv, offlen);
+		mailbox_init(&c, 0);
+		mailbox_set_mine(&c, ANS1, sizeof(ANS1));
+		assert(!mailbox_merge(&c, offv, offlen, claimed, &outlen,
+				      sizeof(claimed)));
+		mailbox_parse(&h, claimed, outlen);
+		assert(mailbox_peer_slot(&h, &slot) == sizeof(ANS1));
+		assert(!mailbox_tombstoned(&h));
+
+		/* Ending replaces the lot: no offer to answer, no claim to
+		 * serve, one tombstone where the invitation points. */
+		mailbox_entomb(&h, TOMB, sizeof(TOMB));
+		endlen = mailbox_build(&h, ended, sizeof(ended));
+		assert(endlen == 6 + sizeof(TOMB) + 1);
+		assert(!memcmp(ended, "d1:x2:", 6));
+		assert(!memcmp(ended + 6, TOMB, sizeof(TOMB)));
+		assert(ended[endlen - 1] == 'e');
+
+		/* And it is placed until it is the only thing there: a claim
+		 * landing over it is another round, not the end of it. */
+		mailbox_parse(&h, ended, endlen);
+		assert(!h.need_write);
+		mailbox_parse(&h, claimed, outlen);
+		assert(h.need_write);
+
+		/* A client reads it. The container layer only reports it; when
+		 * it is believed is sig's judgement, not the container's. */
+		mailbox_init(&c, 0);
+		mailbox_parse(&c, ended, endlen);
+		assert(mailbox_tombstoned(&c));
+		assert(!mailbox_peer_slot(&c, &slot));
+
+		/* A client does not claim an ended mailbox: there is nobody
+		 * left to answer it, and every claim the host loses the CAS to
+		 * is another round before the end is where the next joiner
+		 * looks. Should it write for another reason, the tombstone goes
+		 * through rather than being erased. */
+		mailbox_set_mine(&c, ANS2, sizeof(ANS2));
+		assert(!mailbox_client_should_claim(&c));
+		assert(!mailbox_merge(&c, ended, endlen, claimed, &outlen,
+				      sizeof(claimed)));
+		mailbox_init(&h, 0);
+		mailbox_parse(&h, claimed, outlen);
+		assert(mailbox_tombstoned(&h));
+
+		/* A live host does the opposite with a tombstone somebody else
+		 * wrote: everyone holding the invitation can write this
+		 * container, so the one end that knows takes the slot back. */
+		mailbox_init(&h, 1);
+		mailbox_set_mine(&h, OFFER_E, sizeof(OFFER_E));
+		mailbox_parse(&h, ended, endlen);
+		assert(mailbox_tombstoned(&h) && h.need_write);
+		livelen = mailbox_build(&h, live, sizeof(live));
+		mailbox_init(&c, 0);
+		mailbox_parse(&c, live, livelen);
+		assert(!mailbox_tombstoned(&c));
+		assert(mailbox_peer_slot(&c, &slot) == sizeof(OFFER_E));
+
+		/*
+		 * And a tombstone standing beside an offer stalls nobody: that
+		 * is a live host about to erase it, so a claimant carries on
+		 * claiming rather than handing every holder of the invitation a
+		 * way to freeze the turnstile. No writer here builds that
+		 * pairing, so the container is assembled by hand -- which is
+		 * what a holder writing a forged tombstone would do.
+		 */
+		{
+			uint8_t both[64];
+			size_t bl = 0;
+
+			memcpy(both, "d1:o", 4); bl = 4;
+			bl += (size_t)sprintf((char *)both + bl, "%u:",
+					      (unsigned)sizeof(OFFER_E));
+			memcpy(both + bl, OFFER_E, sizeof(OFFER_E));
+			bl += sizeof(OFFER_E);
+			memcpy(both + bl, "1:x", 3); bl += 3;
+			bl += (size_t)sprintf((char *)both + bl, "%u:",
+					      (unsigned)sizeof(TOMB));
+			memcpy(both + bl, TOMB, sizeof(TOMB));
+			bl += sizeof(TOMB);
+			both[bl++] = 'e';
+
+			mailbox_init(&c, 0);
+			mailbox_set_mine(&c, ANS1, sizeof(ANS1));
+			mailbox_parse(&c, both, bl);
+			assert(mailbox_tombstoned(&c));
+			assert(mailbox_peer_slot(&c, &slot) == sizeof(OFFER_E));
+			assert(mailbox_client_should_claim(&c));
+
+			/* The claim it then writes drops the contradicted
+			 * tombstone, so the container never carries three
+			 * sealed slots at once. */
+			assert(!mailbox_merge(&c, both, bl, claimed, &outlen,
+					      sizeof(claimed)));
+			mailbox_init(&h, 0);
+			mailbox_parse(&h, claimed, outlen);
+			assert(!mailbox_tombstoned(&h));
+			assert(mailbox_peer_slot(&h, &slot) == sizeof(OFFER_E));
+		}
+
+		/* Relaying on somebody else's behalf preserves a tombstone the
+		 * same way, so a client rendezvousing for a host it cannot see
+		 * does not quietly revive a session that has ended. */
+		mailbox_init(&c, 0);
+		mailbox_parse(&c, ended, endlen);
+		assert(!mailbox_relay(&c, ended, endlen, claimed, &outlen,
+				      sizeof(claimed)));
+		assert(outlen == endlen && !memcmp(claimed, ended, endlen));
+	}
+
+	printf("mailbox: all container, turnstile, tombstone, CAS and relay "
+	       "cases pass\n");
 	return 0;
 }

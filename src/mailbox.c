@@ -34,6 +34,22 @@ void mailbox_arm_release(struct mailbox *m)
 	m->released_len = m->slot_a_len;
 }
 
+void mailbox_entomb(struct mailbox *m, const uint8_t *data, size_t len)
+{
+	if (!m->is_host || len > sizeof(m->tomb) || !len)
+		return;
+	memcpy(m->tomb, data, len);
+	m->tomb_len = len;
+	m->ending = 1;
+	m->released_len = 0;		/* nothing left to release a turnstile for */
+	m->need_write = 1;
+}
+
+int mailbox_tombstoned(const struct mailbox *m)
+{
+	return m->have_cur && m->slot_x_len != 0;
+}
+
 void mailbox_note_own_answer(struct mailbox *m, int own)
 {
 	m->slot_a_own = own;
@@ -66,6 +82,7 @@ static void parse_slots(struct mailbox *m, const uint8_t *v, size_t v_len)
 {
 	m->slot_o_len = slot_extract(v, v_len, "o", m->slot_o, sizeof(m->slot_o));
 	m->slot_a_len = slot_extract(v, v_len, "a", m->slot_a, sizeof(m->slot_a));
+	m->slot_x_len = slot_extract(v, v_len, "x", m->slot_x, sizeof(m->slot_x));
 	m->slot_a_own = 0;
 	if (m->released_len && (m->slot_a_len != m->released_len ||
 				memcmp(m->slot_a, m->released, m->released_len)))
@@ -78,7 +95,22 @@ static void recompute_need_write(struct mailbox *m)
 	const uint8_t *cur = m->is_host ? m->slot_o : m->slot_a;
 	size_t cur_len = m->is_host ? m->slot_o_len : m->slot_a_len;
 
-	if (!m->have_mine)
+	if (m->ending)
+		/* Placed once the container is the tombstone and nothing but,
+		 * so a write that lost a race -- or a holder writing a claim
+		 * over it -- is followed by another. */
+		m->need_write = (m->slot_x_len != m->tomb_len ||
+				 memcmp(m->slot_x, m->tomb, m->tomb_len) ||
+				 m->slot_o_len || m->slot_a_len) ? 1 : 0;
+	else if (m->is_host && m->slot_x_len)
+		/*
+		 * A tombstone under a host that is still serving. Nobody who
+		 * can write this container has anything true to say about
+		 * whether the session behind it is over, so the one end that
+		 * does takes the slot back on its next write.
+		 */
+		m->need_write = 1;
+	else if (!m->have_mine)
 		m->need_write = 0;
 	else if (m->is_host && releasing(m))
 		/*
@@ -101,11 +133,12 @@ void mailbox_parse(struct mailbox *m, const uint8_t *v, size_t v_len)
 	recompute_need_write(m);
 }
 
-/* The container itself: the answer slot then the offer slot, each omitted when
- * empty. Both writers go through here, so there is one definition of what the
- * value on the wire looks like. */
+/* The container itself: the answer slot, the offer slot and the tombstone in
+ * bencode's key order, each omitted when empty. Every writer goes through
+ * here, so there is one definition of what the value on the wire looks like. */
 static size_t build_slots(const uint8_t *pa, size_t la, const uint8_t *po,
-			  size_t lo, uint8_t *out, size_t outlen)
+			  size_t lo, const uint8_t *px, size_t lx,
+			  uint8_t *out, size_t outlen)
 {
 	struct benc_buf b;
 
@@ -119,14 +152,24 @@ static size_t build_slots(const uint8_t *pa, size_t la, const uint8_t *po,
 		benc_key_add(&b, "o");
 		benc_str_add(&b, po, lo);
 	}
+	if (lx) {
+		benc_key_add(&b, "x");
+		benc_str_add(&b, px, lx);
+	}
 	benc_raw_add(&b, "e", 1);
 	return b.err ? 0 : b.len;
 }
 
 size_t mailbox_build(struct mailbox *m, uint8_t *out, size_t outlen)
 {
-	const uint8_t *pa = NULL, *po = NULL;
-	size_t la = 0, lo = 0;
+	const uint8_t *pa = NULL, *po = NULL, *px = NULL;
+	size_t la = 0, lo = 0, lx = 0;
+
+	if (m->ending)
+		/* An offer beside it would say the session is both live and
+		 * over, and a claim would be one nobody is left to serve. */
+		return build_slots(NULL, 0, NULL, 0, m->tomb, m->tomb_len,
+				   out, outlen);
 
 	if (m->is_host) {
 		po = m->mine;
@@ -135,14 +178,29 @@ size_t mailbox_build(struct mailbox *m, uint8_t *out, size_t outlen)
 		la = m->slot_a_len;
 		if (releasing(m))
 			la = 0;			/* release the answer slot */
+		/* A live host's write is what erases a tombstone it reads: lx
+		 * stays 0 whatever the container carried. */
 	} else {
 		pa = m->mine;
 		la = m->mine_len;
 		po = m->slot_o;
 		lo = m->slot_o_len;
+		/*
+		 * A client passes a tombstone through: it is not the client's to
+		 * judge, and dropping it while claiming would erase the one
+		 * thing telling the next joiner not to wait. Not beside an
+		 * offer, though -- that pairing says the session is both live
+		 * and over, the host is about to erase it anyway, and carrying
+		 * all three slots is what would take the container past what one
+		 * mutable item holds.
+		 */
+		if (!lo) {
+			px = m->slot_x;
+			lx = m->slot_x_len;
+		}
 	}
 
-	return build_slots(pa, la, po, lo, out, outlen);
+	return build_slots(pa, la, po, lo, px, lx, out, outlen);
 }
 
 int mailbox_merge(struct mailbox *m, const uint8_t *cur, size_t cur_len,
@@ -162,24 +220,29 @@ int mailbox_merge(struct mailbox *m, const uint8_t *cur, size_t cur_len,
 int mailbox_relay(const struct mailbox *m, const uint8_t *cur, size_t cur_len,
 		  uint8_t *out, size_t *out_len, size_t max)
 {
-	uint8_t a[MAILBOX_SLOT_MAX], o[MAILBOX_SLOT_MAX];
-	size_t la = 0, lo = 0, n;
+	uint8_t a[MAILBOX_SLOT_MAX], o[MAILBOX_SLOT_MAX], x[MAILBOX_SLOT_MAX];
+	size_t la = 0, lo = 0, lx = 0, n;
 
 	if (cur && cur_len) {
 		la = slot_extract(cur, cur_len, "a", a, sizeof(a));
 		lo = slot_extract(cur, cur_len, "o", o, sizeof(o));
+		lx = slot_extract(cur, cur_len, "x", x, sizeof(x));
 	}
-	if (!la && !lo) {
+	if (!la && !lo && !lx) {
 		if (!m->have_cur)
 			return -1;
 		memcpy(a, m->slot_a, m->slot_a_len);
 		la = m->slot_a_len;
 		memcpy(o, m->slot_o, m->slot_o_len);
 		lo = m->slot_o_len;
+		memcpy(x, m->slot_x, m->slot_x_len);
+		lx = m->slot_x_len;
 	}
-	if (!la && !lo)			/* nothing worth placing anywhere */
+	if (!la && !lo && !lx)		/* nothing worth placing anywhere */
 		return -1;
-	n = build_slots(a, la, o, lo, out, max);
+	if (lo)
+		lx = 0;			/* see mailbox_build: never both */
+	n = build_slots(a, la, o, lo, x, lx, out, max);
 	if (!n)
 		return -1;
 	*out_len = n;
@@ -202,6 +265,18 @@ enum mailbox_claim mailbox_claim_status(const struct mailbox *m)
 
 int mailbox_client_should_claim(const struct mailbox *m)
 {
+	/*
+	 * A container that carries a tombstone and no offer has no host left to
+	 * answer, so a claim written into it is a write nobody will read -- and
+	 * it costs more than nothing: the host is entombing the same item, and
+	 * every claim it loses the compare-and-swap to is another round before
+	 * the end of the session is where the next joiner will look. A
+	 * tombstone standing beside an offer is not this: that is a live host
+	 * about to erase it, and stopping there would let any holder of the
+	 * invitation stall every claimant by writing one.
+	 */
+	if (m->slot_x_len && !m->slot_o_len)
+		return 0;
 	return !m->is_host && m->have_mine && m->need_write && m->have_cur &&
 	       (m->slot_a_len == 0 || m->slot_a_own);
 }
