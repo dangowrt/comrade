@@ -585,7 +585,8 @@ target_include_directories(comrade_qr PUBLIC src)
 set_source_files_properties(src/qrcodegen.c PROPERTIES COMPILE_OPTIONS -w)
 
 add_library(comrade_ui STATIC src/ui.c)
-target_include_directories(comrade_ui PUBLIC src)
+target_include_directories(comrade_ui PUBLIC src
+	PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")	# version.h, for the header line
 target_link_libraries(comrade_ui PUBLIC comrade_token comrade_qr comrade_compat)
 
 # The host, in two files: the POSIX one and the Windows one. Each is guarded

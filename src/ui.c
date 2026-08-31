@@ -25,6 +25,7 @@
 #include "token.h"
 #include "tty.h"
 #include "ui.h"
+#include "version.h"		/* generated: COMRADE_GIT_HASH/DATE/RELEASE */
 #include "wsock.h"
 
 #include <signal.h>
@@ -518,6 +519,22 @@ static void draw_mailbox(struct ui *u, int f)
 	line("");
 }
 
+/* The version as --version prints it, sans the program name. */
+static const char *version_text(void)
+{
+	static char v[80];
+
+	if (!v[0]) {
+		if (COMRADE_RELEASE[0])
+			snprintf(v, sizeof(v), "%s (%s, %s)", COMRADE_RELEASE,
+				 COMRADE_GIT_HASH, COMRADE_GIT_DATE);
+		else
+			snprintf(v, sizeof(v), "%s (%s)", COMRADE_GIT_HASH,
+				 COMRADE_GIT_DATE);
+	}
+	return v;
+}
+
 /*
  * A peer's link, coloured by what is actually known about it. Grey is not a
  * lesser green: it says nothing has been heard on this network, which is where
@@ -556,8 +573,7 @@ static void draw(struct ui *u)
 	fputs("\033[H", stdout);
 
 	if (u->role == UI_ROLE_HOST)
-		line(BGR "comrade" RST DIM
-		     "  shared terminals over a punched p2p link" RST);
+		line(BGR "comrade" RST DIM "  %s" RST, version_text());
 	else {
 		char sh[64];
 
@@ -567,7 +583,8 @@ static void draw(struct ui *u)
 				 u->token, u->token + strlen(u->token) - 3);
 		else
 			snprintf(sh, sizeof(sh), "%.40s", u->token);
-		line(BGR "comrade" RST DIM "  joining  " RST CYN "%s" RST, sh);
+		line(BGR "comrade" RST DIM "  %s  joining  " RST CYN "%s" RST,
+		     version_text(), sh);
 	}
 	line("");
 
