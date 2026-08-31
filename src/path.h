@@ -266,6 +266,7 @@ struct path {
 	uint64_t trying_since_ms;	/* creation, or the last reset of proof */
 	uint64_t next_probe_ms;
 	int qualified;
+	int warmth_noted;		/* last warmth the view was told of */
 
 	char label[PATH_LABEL_MAX];	/* the remote endpoint, printable */
 };
@@ -375,7 +376,11 @@ int path_loss_ppt(const struct path *p);
  *
  *   cost(P)   = max(srtt_local, srtt_peer)
  *               + PATH_LOSS_PENALTY_MS * max(loss_local, loss_peer) / 1000
- *   bucket(P) = ceil(cost(P) / PATH_COST_QUANTUM_MS)
+ *   bucket(P) = floor(cost(P) / PATH_COST_QUANTUM_MS)
+ *
+ * floor, so costs within one quantum of each other share a bucket. Rounding up
+ * put 0ms and 1ms a whole bucket apart -- the switch margin -- at exactly the
+ * boundary where a LAN's measurement noise lives, so equal paths drifted.
  */
 int path_cost_of(int srtt_a, int loss_a, int srtt_b, int loss_b);
 int path_cost(const struct path *p);

@@ -2751,8 +2751,10 @@ static void path_tick(struct conn *c, uint64_t now)
 	struct path_ep ice, pice;
 	struct nat_agent *agent[PATH_TABLE_MAX];
 	uint8_t out[PROBE_MAX];
+	char wdesc[PATH_TABLE_MAX][PATH_LABEL_MAX + 64];
+	enum path_warmth wto[PATH_TABLE_MAX];
 	int kind[PATH_TABLE_MAX], drop[PATH_TABLE_MAX], due[PATH_TABLE_MAX];
-	int i, n = 0, m = 0, have_ice = 0, have_pice = 0, ice_ok, parked_ok;
+	int i, n = 0, m = 0, nw = 0, have_ice = 0, have_pice = 0, ice_ok, parked_ok;
 	size_t len;
 
 	if (!c->claim_ufrag[0])
@@ -2773,6 +2775,18 @@ static void path_tick(struct conn *c, uint64_t now)
 			continue;
 		p->usable = path_usable_now(c, p, ice_ok, parked_ok);
 		path_probe_expire(p, now);
+		/* A qualified path's warmth changing is the silence verdict the
+		 * selection acts on, so it is logged like the loss one. */
+		if (p->qualified) {
+			enum path_warmth w = path_warmth_of(p, now);
+
+			if (w != (enum path_warmth)p->warmth_noted) {
+				p->warmth_noted = (int)w;
+				wto[nw] = w;
+				path_desc(p, wdesc[nw], sizeof(wdesc[nw]));
+				nw++;
+			}
+		}
 		if (p->kind == PATH_ICE && have_ice && p->agent == c->nat)
 			path_set_peer_ep(p, &ice, s->keys.sig_key);
 		if (p->kind == PATH_ICE && have_pice && p->agent == c->parked)
@@ -2781,6 +2795,10 @@ static void path_tick(struct conn *c, uint64_t now)
 			due[n++] = i;
 	}
 	pthread_mutex_unlock(&c->path_lock);
+	for (i = 0; i < nw; i++)
+		dbg_logf("path %s: %s",
+			 wto[i] == PATH_WARM ? "warm again" :
+			 wto[i] == PATH_COLD ? "cold" : "dead", wdesc[i]);
 	if (!n)
 		return;
 	if (random_bytes(nonce, n * sizeof(nonce[0])))

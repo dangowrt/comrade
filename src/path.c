@@ -534,6 +534,7 @@ void path_table_reset_stats(struct path_table *t, uint64_t now)
 		p->last_pong_ms = 0;
 		p->next_probe_ms = 0;
 		p->qualified = 0;
+		p->warmth_noted = (int)PATH_WARM;
 		/* On trial again from here: the endpoints are kept across a
 		 * re-claim precisely so they can be tried under the new
 		 * identity, and a path is only called dead for failing to
@@ -693,7 +694,7 @@ int path_cost(const struct path *p)
 
 int path_bucket_of(int cost)
 {
-	return (cost + PATH_COST_QUANTUM_MS - 1) / PATH_COST_QUANTUM_MS;
+	return cost / PATH_COST_QUANTUM_MS;
 }
 
 int path_bucket(const struct path *p)
@@ -731,8 +732,15 @@ int path_best(const struct path_table *t, uint64_t now)
 
 int path_select(struct path_table *t, uint64_t now)
 {
-	int best = path_best(t, now);
+	int best, i;
 
+	/* Score what is already decided before ranking on it: a probe past its
+	 * deadline is a loss whether or not the caller's tick got there first,
+	 * and a demotion must not outrun the verdict that explains it. */
+	for (i = 0; i < PATH_TABLE_MAX; i++)
+		if (t->p[i].used)
+			path_probe_expire(&t->p[i], now);
+	best = path_best(t, now);
 	if (best < 0) {
 		t->sel = -1;
 		t->cand = -1;

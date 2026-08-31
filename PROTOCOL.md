@@ -689,8 +689,13 @@ same number from the same data:
 ```
   cost(P)   = max(srtt_local, srtt_peer)
               + PATH_LOSS_PENALTY_MS * max(loss_local, loss_peer) / 1000
-  bucket(P) = ceil(cost(P) / PATH_COST_QUANTUM_MS)
+  bucket(P) = floor(cost(P) / PATH_COST_QUANTUM_MS)
 ```
+
+`floor`, so costs within one quantum of each other share a bucket. Rounding up
+would put 0ms and 1ms a whole bucket -- the switch margin -- apart, at exactly
+the boundary where a LAN's measurement noise lives, and equal paths would
+drift.
 
 A path whose local transport cannot carry a datagram at that moment -- an `ICE`
 path whose agent has nominated no pair -- is not a candidate at all rather than

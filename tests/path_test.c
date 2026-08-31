@@ -237,7 +237,8 @@ static void id_check(void)
 }
 
 /* Both ends compute the same cost from the same pair of views, and the bucket
- * quantises at PATH_COST_QUANTUM_MS. */
+ * quantises at PATH_COST_QUANTUM_MS: costs within one quantum share a bucket,
+ * so sub-quantum jitter can never open the switch margin. */
 static void cost_check(void)
 {
 	assert(path_cost_of(30, 0, 12, 0) == path_cost_of(12, 0, 30, 0));
@@ -247,9 +248,10 @@ static void cost_check(void)
 	assert(path_cost_of(10, 500, 10, 0) == 10 + PATH_LOSS_PENALTY_MS / 2);
 
 	assert(path_bucket_of(0) == 0);
-	assert(path_bucket_of(1) == 1);
+	assert(path_bucket_of(1) == 0);
+	assert(path_bucket_of(PATH_COST_QUANTUM_MS - 1) == 0);
 	assert(path_bucket_of(PATH_COST_QUANTUM_MS) == 1);
-	assert(path_bucket_of(PATH_COST_QUANTUM_MS + 1) == 2);
+	assert(path_bucket_of(PATH_COST_QUANTUM_MS + 1) == 1);
 	assert(path_bucket_of(2 * PATH_COST_QUANTUM_MS) == 2);
 }
 
@@ -824,6 +826,70 @@ static void hysteresis_check(void)
 }
 
 /*
+ * A millisecond is measurement noise on a LAN, not a margin: two paths whose
+ * costs sit within one quantum of each other share a bucket, so the incumbent
+ * is never drifted away from for jitter. Rounding the cost up put 0ms and 1ms
+ * a whole bucket apart, and the session wandered between equal paths.
+ */
+static void jitter_within_a_bucket_does_not_drift(void)
+{
+	struct path_table t;
+	uint64_t now = 0;
+	int sel, other, i;
+
+	path_table_init(&t);
+	add(&t, "2001:db8::1", 5000, 0);
+	add(&t, "2001:db8::2", 5000, 0);
+	warm(&t.p[0], 0);
+	warm(&t.p[1], 0);
+	bucketed(&t.p[0], 0);
+	bucketed(&t.p[1], 0);
+	sel = path_select(&t, 0);
+	assert(sel >= 0);
+	other = !sel;
+
+	bucketed(&t.p[sel], 1);
+	bucketed(&t.p[other], 0);
+	for (i = 0; i < 6; i++) {
+		now += PATH_KEEP_MS;
+		warm(&t.p[0], now);
+		warm(&t.p[1], now);
+		assert(path_select(&t, now) == sel);
+	}
+}
+
+/*
+ * A demotion must not outrun the verdict that explains it: selection scores any
+ * probe past its loss deadline before ranking, so the switch away from a path
+ * that fell silent carries the loss that killed it even when the caller's own
+ * tick has not run since the deadline passed (a stalled loop waking up).
+ */
+static void demotion_scores_the_overdue_probe(void)
+{
+	struct path_table t;
+	uint64_t now = 100000;
+	int sel, other;
+
+	path_table_init(&t);
+	add(&t, "2001:db8::1", 5000, 0);
+	add(&t, "2001:db8::2", 5000, 0);
+	warm(&t.p[0], now);
+	warm(&t.p[1], now);
+	bucketed(&t.p[0], 0);
+	bucketed(&t.p[1], 0);
+	sel = path_select(&t, now);
+	assert(sel >= 0);
+	other = !sel;
+
+	path_probe_sent(&t.p[sel], 0xfeedULL, now);
+	now += PATH_WARM_MS + 1;
+	warm(&t.p[other], now);
+	assert(path_warmth_of(&t.p[sel], now) == PATH_COLD);
+	assert(path_select(&t, now) == other);
+	assert(path_loss_ppt(&t.p[sel]) > 0);
+}
+
+/*
  * A path whose local transport cannot carry a datagram at this moment is no
  * candidate at all rather than a poor one, and an incumbent that becomes one is
  * left at once: hysteresis gates a contest between paths, never a transport
@@ -1038,6 +1104,8 @@ int main(void)
 	tail_check();
 	order_check();
 	hysteresis_check();
+	jitter_within_a_bucket_does_not_drift();
+	demotion_scores_the_overdue_probe();
 	usable_check();
 	adopt_check();
 	offer_check();

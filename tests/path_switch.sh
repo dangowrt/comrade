@@ -13,8 +13,9 @@
 # What is asserted:
 #   1. The client leaves the blackholed path for another one it already held
 #      warm, so the switch is a reordering rather than a rediscovery -- and the
-#      path it left was scoring probe loss by then, so the move was caused by
-#      the path dying and is not the ordinary drift a multi-homed pair does.
+#      path it left carried a death verdict by then (probe loss at either end,
+#      or the silence demotion out of WARM), so the move was caused by the path
+#      dying and is not the ordinary drift a multi-homed pair does.
 #   2. The session survives it. The heartbeat rides the SSH channel end to end
 #      and knows nothing about paths, so a link it never reports lost (or
 #      reports lost and then back) is proof the KCP stream, the SSH session and
@@ -129,9 +130,24 @@ if [ -z "$sw" ]; then
 	echo "FAIL: the client stayed on the path it can no longer send on"
 	grep -E 'path (blackholed|: carrying)' "$tmp/client.log"; rc=1
 elif [ "$own" -eq 0 ] && [ "$peer" -eq 0 ]; then
-	echo "FAIL: the client left $bh with neither end scoring a loss on" \
-	     "it, so it drifted rather than switched"
-	grep -E 'path (blackholed|: carrying)' "$tmp/client.log"; rc=1
+	# A loss stamp can legitimately be missing when the whole loss window
+	# passed inside one stall of the loop (a frozen CI runner): the probes
+	# that would have scored it were never sent. The silence verdict for
+	# the same endpoint -- "path cold"/"path dead", logged when a qualified
+	# path leaves WARM -- is death evidence just the same; only a switch
+	# with neither verdict is drift.
+	if ! awk -v bh="$bh" '
+		/path blackholed:/ { seen = 1; next }
+		seen && (index($0, "path cold: " bh " ") ||
+			 index($0, "path dead: " bh " ")) { ok = 1 }
+		END { exit !ok }
+	' "$tmp/client.log" 2>/dev/null; then
+		echo "FAIL: the client left $bh with neither end scoring a" \
+		     "loss on it nor a silence verdict, so it drifted rather" \
+		     "than switched"
+		grep -E 'path (blackholed|: carrying| cold:| dead:)' \
+			"$tmp/client.log"; rc=1
+	fi
 fi
 # The heartbeat may or may not notice a switch, depending on where in its
 # 700ms round the path died -- a blip inside the rejoin grace is the outage the
