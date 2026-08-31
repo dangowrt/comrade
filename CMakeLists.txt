@@ -1154,6 +1154,7 @@ if(COMRADE_BUILD_TOOLS)
 			roam_lan_e2e roam_fam_e2e roam_client_e2e
 			path_switch_e2e resume_e2e
 			hostroam_e2e rdvsync_e2e
+			forward_e2e rejoin_e2e rejoin_lan_e2e
 			PROPERTIES RESOURCE_LOCK comrade_net)
 	endif()
 endif()
