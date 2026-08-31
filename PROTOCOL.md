@@ -315,6 +315,58 @@ longer read.
 The host can release the answer slot on offer rotation
 (`mailbox.c`: `clear_peer` drops `a` once, `mailbox_arm_release`).
 
+### 4.1 Tombstone: the session has ended
+
+An invitation says where to meet a host that is still there and, on its own,
+can say nothing else -- so a token outliving its session sends every holder
+into a wait with no end. The `x` slot is the missing answer.
+
+```
+  tombstone = seal(sig_key, version(1) = 1)
+```
+
+- The **host** writes it as the session ends (`sig_end`, from
+  `session.c:session_entomb_start`), replacing the container: no offer to answer and
+  no claim to serve, since a session cannot be both live and over. It is sealed
+  like every other slot -- not because that makes it unforgeable among the
+  holders of the invitation, but because a passer-by should learn no more from
+  the end of a session than from the rest of it.
+- It is published from **inside the session**, while the rendezvous node is
+  still warm and pinned; a process that had already torn its signalling down
+  would have to converge on the DHT from cold to say one word. Both routes are
+  used and **both are waited for** (`sig_end_placed`): the direct store reaches
+  the node a token names, and the convergent store reaches whoever is closest to
+  the key -- which is where a token naming no node leads a client, and where
+  this host's own last offer is sitting. Leaving before the second lands leaves
+  that offer standing, and a client that finds it punches at nothing. They go
+  out **one at a time**: both are read-modify-writes of the same mutable item,
+  so two in flight read the same sequence, write the same next one, and every
+  node refuses the second on the compare-and-swap it has just lost -- which
+  reads back as one route having reached nothing at all.
+- A **live host erases** any `x` it reads (`recompute_need_write`), which is
+  what makes the slot self-healing. Every holder of the invitation can write
+  this container, so a forged tombstone must not outlive the next write of the
+  host it lies about -- roughly a second, while one is serving.
+- A **client** therefore does not act on first sight. `sig_peer_ended` believes
+  the slot once it has stood `SIG_TOMB_SETTLE_MS` (4 s) with no offer seen
+  since, timed from when it was **first** seen rather than most recently, so
+  the clock runs out rather than restarting on every read. A read with no
+  tombstone puts the clock back. The cost of forging one is therefore a joiner's
+  pause, not the session.
+- It is a **DHT-only** thing, because only the DHT holds anything once the host
+  is gone. Link-local discovery is a conversation and not a store: a message
+  left there reaches whoever happens to be listening at that instant, which is
+  the peers already connected -- and those are told inside their own session,
+  where the statement cannot be forged. On an isolated LAN a session that has
+  ended is a segment where nobody is offering, which is also what a session that
+  never started looks like, and there is nothing truthful to say about the
+  difference. So a LAN-only host stops announcing and says nothing more, and
+  `sig_end_placed` has nothing to wait for.
+
+The tombstone is the slower of the two ways a client learns this, and the only
+one that reaches a client that was never connected. A client that **is**
+connected is told over the control channel first (`CTLM_BYE`, §10).
+
 ---
 
 ## 5. DHT rendezvous / BEP44 (`src/bep44.c`, `src/dhtnode.c`, `src/sig.c`)

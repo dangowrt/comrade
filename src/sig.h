@@ -20,8 +20,11 @@
  * single shared key is the only way one rendezvous node can serve BOTH
  * directions. Each peer writes its own slot with compare-and-swap so neither
  * clobbers the other; a stale write loses the CAS and is retried after the
- * next read. On a LAN, multicast carries the two slots directly instead, with
- * no shared item.
+ * next read. On a LAN, multicast carries the slots directly instead, with no
+ * shared item -- and so with nothing that outlives the host, which is why the
+ * tombstone below is a DHT-only thing. A third slot holds it once the session
+ * is over, and never stands beside an offer, so the item still carries at most
+ * two sealed slots at a time.
  */
 
 #define SIG_MAX_VALUE 440		/* plaintext per slot; two sealed slots
@@ -100,6 +103,49 @@ int sig_rotate(struct sig *s, const uint8_t *offer, size_t len);
  * simply stops turning. Idempotent, and a no-op on an empty slot.
  */
 void sig_release(struct sig *s);
+
+/*
+ * Host: the session behind this invitation is over. Replaces the offer in the
+ * DHT mailbox with a tombstone, so a client that comes to join is told the
+ * session has ended instead of waiting on an offer nobody will write again.
+ * One way; a signaller does not go back to serving.
+ *
+ * Only the DHT carries this, because only the DHT holds anything once we are
+ * gone. Link-local discovery is a conversation, not a store: a message left
+ * there reaches whoever happens to be listening at that moment, which is the
+ * peers already connected -- and those are told over the control channel
+ * inside their own session, where the statement cannot be forged. On an
+ * isolated LAN a session that has ended is simply a segment where nobody is
+ * offering, which is also what a session that never started looks like, and
+ * there is nothing truthful to say about the difference.
+ *
+ * sig_end_placed says the tombstone has reached somewhere a joiner will look,
+ * which is what a host is waiting for before it exits. With no DHT there is
+ * nothing to place and nothing to wait for.
+ */
+void sig_end(struct sig *s);
+int sig_end_placed(struct sig *s);
+
+/*
+ * Client: the DHT mailbox says the session has ended.
+ *
+ * Not the first sight of a tombstone: every holder of the invitation can write
+ * the container, so the slot is only believed once it has stood for a few
+ * rounds with no offer beside it. A host that is merely being lied about
+ * writes its offer again within a second or so, which resets the judgement --
+ * and is why a forged tombstone costs a joiner a pause rather than the
+ * session.
+ */
+int sig_peer_ended(struct sig *s);
+
+/*
+ * That judgement on its own: a tombstone first seen at `tomb_ms` (0 = none
+ * seen), against an offer last seen at `offer_ms` (0 = none), as of `now`.
+ * Exported so the rule that ends a client's wait can be exercised without a
+ * DHT, since being wrong either way is expensive: too eager refuses a live
+ * session, too slow leaves the wait it exists to end.
+ */
+int sig_tomb_settled(uint64_t tomb_ms, uint64_t offer_ms, uint64_t now);
 
 /*
  * Deliver the peer's slot again even if it has not changed. A peer slot is

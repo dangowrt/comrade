@@ -29,6 +29,19 @@
 #define SIG_DHT_RESTORE_MS 8000		/* re-store backoff while a store's
 					 * k-close nodes are being validated */
 #define SIG_MCAST_ANN_MS 1000
+#define SIG_DHT_TOMB_MS 300		/* the tombstone's own store cadence: the
+					 * session is over and the operator's
+					 * shell is waiting on it, so it is
+					 * retried faster than a live mailbox */
+/*
+ * How long a tombstone must stand unanswered before a client believes it.
+ *
+ * Every holder of the invitation can write the container, so the slot alone is
+ * not proof: a live host takes it back on its next write, roughly once a
+ * second while it is serving. Waiting a few of those rounds is what separates
+ * a session that ended from one somebody is lying about.
+ */
+#define SIG_TOMB_SETTLE_MS 4000
 #define SIG_MCAST_OPEN_MS 1000		/* retry the link-local half this often
 					 * while no interface can carry it */
 #define SIG_DHT_GRACE_MS 2000
@@ -80,6 +93,28 @@ struct sig {
 	uint8_t mcast_mine[SIG_MCAST_SEALED_MAX];	/* our announcement, sealed (mcast) */
 	size_t mcast_mine_len;
 	int64_t cur_seq;
+
+	/*
+	 * The end of the session, as the mailbox carries it. The host places a
+	 * tombstone where the invitation points so a client joining a session
+	 * that is over is told so instead of waiting for an offer nobody will
+	 * write again; the client weighs what it reads against when it last saw
+	 * an offer, since the slot is writable by everyone the invitation was
+	 * handed to.
+	 */
+	int ending;			/* host: the tombstone is what we publish */
+	/*
+	 * Where it has found a home, counted apart because the two stores reach
+	 * different readers and a client is only told by the one it uses: the
+	 * direct store lands on the node a token names, the convergent one on
+	 * whoever is closest to the key -- which is both where a token naming
+	 * no node leads, and where this host's own offer was left.
+	 */
+	int end_placed_direct;
+	int end_placed_wide;
+	uint64_t tomb_seen_ms;		/* when a tombstone was first seen with
+					 * nothing since to contradict it, 0 none */
+	uint64_t offer_seen_ms;		/* and when the host's offer last was */
 
 	sig_recv_cb *cb;
 	void *arg;
@@ -370,6 +405,78 @@ void sig_release(struct sig *s)
 void sig_redeliver(struct sig *s)
 {
 	s->have_last = 0;
+}
+
+/*
+ * The tombstone's payload: a version byte, so what a later comrade puts in one
+ * can grow without an older one reading the addition as a different slot. It is
+ * sealed like every other slot, which keeps it to the holders of the invitation
+ * -- not because that makes it unforgeable among them (nothing here could), but
+ * because a passer-by should learn no more from the end of a session than from
+ * the rest of it.
+ */
+#define SIG_TOMB_VERSION 1
+
+void sig_end(struct sig *s)
+{
+	uint8_t plain = SIG_TOMB_VERSION;
+	uint8_t sealed[SIG_SEALED_MAX];
+	int n;
+
+	if (!s->is_host || s->ending)
+		return;
+	n = msg_seal(sealed, sizeof(sealed), s->keys.sig_key, &plain, 1);
+	if (n < 0)
+		return;
+	mailbox_entomb(&s->mb, sealed, (size_t)n);
+	s->ending = 1;
+	s->next_put_ms = 0;		/* place it now, not on the next round */
+	dbg_logf("sig: publishing the tombstone");
+}
+
+int sig_end_placed(struct sig *s)
+{
+	int placed = 1;
+
+	if (!s->ending)
+		return 0;
+	/*
+	 * Only a DHT that is actually up is waited on. One that was never there
+	 * -- an isolated LAN, or a network that has just gone -- has no store to
+	 * make, and holding the operator's shell for one that was never going to
+	 * happen would tax every quit for a case that cannot succeed.
+	 *
+	 * The convergent store is always waited on, even where a rendezvous node
+	 * is held and answered first. The k-closest nodes are where a token
+	 * naming no node leads a client, and they are also holding this host's
+	 * last offer: leaving early means leaving that offer standing, and a
+	 * client that finds it punches at a host that is no longer there for as
+	 * long as it is willing to.
+	 */
+	if ((s->flags & SIG_DHT) && s->dht_engaged && dhtnode_ready(s->node)) {
+		placed = s->end_placed_wide;
+		if ((s->rnode4_len || s->rnode6_len) && !s->end_placed_direct)
+			placed = 0;
+	}
+	return placed;
+}
+
+int sig_tomb_settled(uint64_t tomb_ms, uint64_t offer_ms, uint64_t now)
+{
+	if (!tomb_ms)
+		return 0;
+	/* An offer since the tombstone is a host still serving, whatever the
+	 * slot says -- so the clock only runs while nothing has answered. */
+	if (offer_ms >= tomb_ms)
+		return 0;
+	return now - tomb_ms >= SIG_TOMB_SETTLE_MS;
+}
+
+int sig_peer_ended(struct sig *s)
+{
+	if (s->is_host)
+		return 0;
+	return sig_tomb_settled(s->tomb_seen_ms, s->offer_seen_ms, now_ms());
 }
 
 void sig_set_direct_port(struct sig *s, uint16_t port)
@@ -819,6 +926,25 @@ static void on_dht_get(void *arg, const uint8_t *v, size_t v_len, int64_t seq,
 		}
 	}
 
+	/*
+	 * What the container says about the session being over, recorded rather
+	 * than acted on: whether a tombstone is believed depends on how long it
+	 * has stood with nothing contradicting it, which is sig_peer_ended's
+	 * judgement.
+	 *
+	 * When it was FIRST seen, not most recently: the settle window measures
+	 * how long it has stood, and stamping every read would restart the clock
+	 * once a second and never let it run out. A read without one puts the
+	 * clock back, so a tombstone a live host has since erased is forgotten
+	 * rather than held against it.
+	 */
+	if (!s->mb.slot_x_len)
+		s->tomb_seen_ms = 0;
+	else if (!s->tomb_seen_ms)
+		s->tomb_seen_ms = s->last_get_ms;
+	if (!s->is_host && s->mb.slot_o_len)
+		s->offer_seen_ms = s->last_get_ms;
+
 	peer_len = mailbox_peer_slot(&s->mb, &peer);
 	if (peer_len)
 		deliver_peer(s, peer, peer_len);
@@ -1019,6 +1145,35 @@ static void on_host_put(void *arg, int stored, const struct sockaddr *node,
 	}
 }
 
+/* A tombstone store came back. One node that took it is enough for that route:
+ * what matters is that this way in now leads somewhere that answers, not how
+ * many copies of the answer there are. */
+static void on_tomb_direct(void *arg, int stored, const struct sockaddr *node,
+			   socklen_t node_len)
+{
+	struct sig *s = arg;
+
+	(void)node;
+	(void)node_len;
+	dbg_logf("sig: tombstone stored on the rendezvous node -> %d node(s)",
+		 stored);
+	if (stored > 0)
+		s->end_placed_direct = 1;
+}
+
+static void on_tomb_wide(void *arg, int stored, const struct sockaddr *node,
+			 socklen_t node_len)
+{
+	struct sig *s = arg;
+
+	(void)node;
+	(void)node_len;
+	dbg_logf("sig: tombstone stored where the key belongs -> %d node(s)",
+		 stored);
+	if (stored > 0)
+		s->end_placed_wide = 1;
+}
+
 /* A store has gone out. Counted where it is issued rather than where it is
  * acknowledged, because only the convergent one reports back at all -- and a
  * store nobody answered is exactly what the operator needs to see. Whether it
@@ -1097,6 +1252,39 @@ static void dht_pump(struct sig *s, uint64_t now)
 	}
 	if (now < s->next_put_ms)
 		return;
+	if (s->ending) {
+		/*
+		 * Both routes have to carry it, because they reach different
+		 * readers: the direct store lands on the node the token names,
+		 * which is where a client holding that invitation looks first,
+		 * and the convergent one lands on whoever is closest to the key
+		 * now, which is where a client with an older token ends up and
+		 * where this host's own last offer is sitting. A tombstone only
+		 * one of them can see leaves the other waiting.
+		 *
+		 * One at a time, though. Both are read-modify-writes of the same
+		 * mutable item, so two in flight read the same sequence and
+		 * write the same next one, and every node refuses the second for
+		 * the compare-and-swap it now loses. Run together they place the
+		 * tombstone exactly once and report the other route as having
+		 * reached nothing -- which is true, and is why the session then
+		 * waits out its whole grace for a store that will never be
+		 * acknowledged.
+		 */
+		if (!s->end_placed_direct && (s->rnode4_len || s->rnode6_len)) {
+			sig_note_put(s);
+			bep44_update_direct(s->engine, s->keys.bep44_sk,
+					    s->keys.bep44_pk, SIG_SALT,
+					    sig_merge, s, on_tomb_direct, s);
+		} else if (!s->end_placed_wide) {
+			sig_note_put(s);
+			bep44_update(s->engine, s->keys.bep44_sk,
+				     s->keys.bep44_pk, SIG_SALT, sig_merge, s,
+				     on_tomb_wide, s);
+		}
+		s->next_put_ms = now + SIG_DHT_TOMB_MS;
+		return;
+	}
 	if (s->is_host) {
 		/*
 		 * A reachable family with no anchor yet is still being located:
@@ -1206,6 +1394,10 @@ static void mcast_pump(struct sig *s, uint64_t now)
 	 * processed the announcement yet). Keep announcing; a host deduplicates a
 	 * claimant it has already admitted.
 	 */
+	/* Nothing is announced once the session is over: what a peer needs to
+	 * hear on a segment is that the offer has stopped. */
+	if (s->ending)
+		return;
 	if (!s->mcast_mine_len || now < s->next_mcast_ms)
 		return;
 	ms[0] = my_slot(s);

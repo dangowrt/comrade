@@ -774,7 +774,8 @@ if(BUILD_TESTING)
 	add_test(NAME hostreap_test COMMAND hostreap_test)
 
 	# When the signaller is given up on: the node's own view of its table,
-	# and the backstop for a table that looks fine and answers nothing.
+	# the backstop for a table that looks fine and answers nothing, and
+	# when a tombstone has stood long enough to end a client's wait.
 	add_executable(sigquiet_test tests/sigquiet_test.c)
 	target_link_libraries(sigquiet_test comrade_sig)
 	add_test(NAME sigquiet_test COMMAND sigquiet_test)
