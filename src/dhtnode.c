@@ -22,7 +22,7 @@
 #include "oscompat.h"
 
 #define DHTNODE_SEED_INTERVAL_MS 1000
-#define DHTNODE_BOOTSTRAP_INTERVAL_MS 10000
+#define DHTNODE_RESOLVE_POLL_MS 200		/* while the resolver thread runs */
 #define DHTNODE_WARMCHECK_MS 2000		/* poll for the one warm-up cache write */
 #define DHTNODE_DHT_PORT 0
 
@@ -123,8 +123,9 @@ struct dhtnode {
 	uint64_t next_dht_ms;
 	uint64_t next_seed_ms;
 	uint64_t next_bootstrap_ms;
+	uint64_t bootstrap_backoff_ms;	/* 0 until the first round has gone out */
 	uint64_t next_cache_ms;		/* next warm-up cache-write check */
-	int bootstrap_done;
+	int no_bootstrap;		/* rendezvous-only: never ping the routers */
 	pthread_t resolver;
 	int resolver_on;
 	struct resolver *boot;
@@ -264,22 +265,24 @@ static void *resolver_fn(void *arg)
 
 /*
  * Main thread: once the resolver has produced addresses, ping the routers and
- * seed the bep44 engine from them (so its lookups have responsive entry points
- * at once), then mark bootstrap done. Runs on the DHT thread, as jech/dht
- * requires. No-op until the resolver is finished.
+ * seed the bep44 engine from them, so its lookups have responsive entry points
+ * at once. Runs on the DHT thread, as jech/dht requires. Returns whether a
+ * round actually went out: until the resolver thread has finished there is
+ * nothing to ping, and a round that never happened must not be counted as one
+ * that was ignored.
  */
-static void bootstrap_ping(struct dhtnode *n)
+static int bootstrap_ping(struct dhtnode *n)
 {
 	struct sockaddr_storage addr[16];
 	socklen_t len[16];
 	int cnt, i;
 
 	if (!n->boot)
-		return;
+		return 0;
 	pthread_mutex_lock(&n->boot->lock);
 	if (!n->boot->ready) {
 		pthread_mutex_unlock(&n->boot->lock);
-		return;
+		return 0;
 	}
 	cnt = n->boot->n;
 	memcpy(addr, n->boot->addr, sizeof(addr));
@@ -296,7 +299,17 @@ static void bootstrap_ping(struct dhtnode *n)
 		bep44_bootstrap_add(n->engine, (struct sockaddr *)&addr[i],
 				    len[i]);
 	}
-	n->bootstrap_done = 1;
+	return 1;
+}
+
+/* Good nodes this family holds now. Asked per family and never summed: a table
+ * that never filled is invisible in a total the other family is carrying. */
+static int family_good(int family)
+{
+	int good = 0, dubious = 0;
+
+	dht_nodes(family, &good, &dubious, NULL, NULL);
+	return good;
 }
 
 static void dht_event(void *closure, int event, const unsigned char *info_hash,
@@ -523,7 +536,7 @@ static struct dhtnode *dhtnode_create_impl(int do_bootstrap)
 	} else {
 		/* Rendezvous-only: no public routers, the caller injects the
 		 * one node it was handed via dhtnode_seed(). */
-		n->bootstrap_done = 1;
+		n->no_bootstrap = 1;
 	}
 	n->next_seed_ms = 0;
 	return n;
@@ -606,6 +619,22 @@ uint16_t dhtnode_port(struct dhtnode *n, int family)
 	return ntohs(((struct sockaddr_in *)&ss)->sin_port);
 }
 
+int dhtnode_bootstrap_wanted(int have4, int good4, int have6, int good6)
+{
+	if (have4 && good4 < DHTNODE_BOOTSTRAP_MIN_GOOD)
+		return 1;
+	if (have6 && good6 < DHTNODE_BOOTSTRAP_MIN_GOOD)
+		return 1;
+	return 0;
+}
+
+uint64_t dhtnode_bootstrap_backoff(uint64_t prev_ms)
+{
+	uint64_t next = prev_ms ? prev_ms * 2 : DHTNODE_BOOTSTRAP_FIRST_MS;
+
+	return next > DHTNODE_BOOTSTRAP_MAX_MS ? DHTNODE_BOOTSTRAP_MAX_MS : next;
+}
+
 int dhtnode_ready(struct dhtnode *n)
 {
 	int good = 0, dubious = 0;
@@ -643,7 +672,9 @@ static void packet_route(struct dhtnode *n, uint8_t *buf, size_t len,
 static void netchange(struct dhtnode *n)
 {
 	n->netgen++;
-	n->bootstrap_done = 0;
+	/* The routers are worth asking again at the opening cadence: a move is
+	 * the one moment a set that answered nothing before plausibly will. */
+	n->bootstrap_backoff_ms = 0;
 	n->next_bootstrap_ms = 0;
 	n->next_seed_ms = 0;
 	n->next_dht_ms = 0;
@@ -669,9 +700,27 @@ static void housekeep(struct dhtnode *n)
 		seed_from_dht(n);
 		n->next_seed_ms = now + DHTNODE_SEED_INTERVAL_MS;
 	}
-	if (!n->bootstrap_done)
-		bootstrap_ping(n);	/* no-op until the resolver thread is ready,
-					 * then pings the routers once and is done */
+	if (!n->no_bootstrap && now >= n->next_bootstrap_ms) {
+		if (!dhtnode_bootstrap_wanted(sock_valid(n->s4),
+					      family_good(AF_INET),
+					      sock_valid(n->s6),
+					      family_good(AF_INET6))) {
+			/* Every family this node speaks has enough. Look again
+			 * on the opening cadence rather than never: a table
+			 * that empties under us is the same problem arriving
+			 * later, and asking costs no packets. */
+			n->bootstrap_backoff_ms = 0;
+			n->next_bootstrap_ms = now + DHTNODE_BOOTSTRAP_FIRST_MS;
+		} else if (bootstrap_ping(n)) {
+			n->bootstrap_backoff_ms =
+				dhtnode_bootstrap_backoff(n->bootstrap_backoff_ms);
+			n->next_bootstrap_ms = now + n->bootstrap_backoff_ms;
+		} else {
+			/* The resolver has not finished. That is not a round
+			 * that went unanswered, so it must not spend one. */
+			n->next_bootstrap_ms = now + DHTNODE_RESOLVE_POLL_MS;
+		}
+	}
 	/*
 	 * One warm-up write, and only if we started with no cache: keep probing
 	 * until the table is warm enough that a save actually lands (the writers

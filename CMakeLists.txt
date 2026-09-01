@@ -868,6 +868,10 @@ if(BUILD_TESTING)
 	target_link_libraries(keys_test comrade_crypto comrade_token)
 	add_test(NAME keys_test COMMAND keys_test)
 
+	add_executable(dhtnode_boot_test tests/dhtnode_boot_test.c src/dhtnode.c)
+	target_link_libraries(dhtnode_boot_test comrade_dht comrade_bep44)
+	add_test(NAME dhtnode_boot_test COMMAND dhtnode_boot_test)
+
 	add_executable(connkey_test tests/connkey_test.c)
 	target_link_libraries(connkey_test comrade_crypto comrade_token)
 	add_test(NAME connkey_test COMMAND connkey_test)
@@ -1212,6 +1216,7 @@ if(BUILD_TESTING)
 		termfilter_test
 		ctlproto_test netmon_test
 		candpolicy_test candpack_test mailbox_test roauth_test keys_test
+		dhtnode_boot_test
 		connkey_test dataauth_test box_test
 		stunprobe_test path_test bep44_test
 		bep44_pin_test bep44_store_test bep44_rl_test
