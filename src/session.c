@@ -18,6 +18,7 @@
 #include "lanlink.h"
 #include "nat.h"
 #include "netmon.h"
+#include "netroute.h"
 #include "netstate.h"
 #include "claimlog.h"
 #include "replay.h"
@@ -3305,67 +3306,9 @@ static int on_stream_output(void *arg, const uint8_t *data, size_t len)
  * raw/rawlen optionally receive the address, so a caller compares addresses
  * rather than the two spellings of one.
  */
-static int source_addr_raw(int family, char *out, size_t outlen, uint8_t *raw,
-			   int *rawlen)
-{
-	static const char *probe6 = "2001:db8::1";
-	static const char *probe4 = "192.0.2.1";
-	struct sockaddr_storage ss;
-	socklen_t slen = sizeof(ss);
-	sock_t fd;
-	int rc = -1;
-
-	if (wsock_init())
-		return -1;
-	fd = socket(family, SOCK_DGRAM, 0);
-	if (!sock_valid(fd))
-		return -1;
-	memset(&ss, 0, sizeof(ss));
-	if (family == AF_INET6) {
-		struct sockaddr_in6 *a = (struct sockaddr_in6 *)&ss;
-
-		a->sin6_family = AF_INET6;
-		a->sin6_port = htons(9);
-		if (inet_pton(AF_INET6, probe6, &a->sin6_addr) != 1 ||
-		    connect(fd, (struct sockaddr *)a, sizeof(*a)))
-			goto out;
-	} else {
-		struct sockaddr_in *a = (struct sockaddr_in *)&ss;
-
-		a->sin_family = AF_INET;
-		a->sin_port = htons(9);
-		if (inet_pton(AF_INET, probe4, &a->sin_addr) != 1 ||
-		    connect(fd, (struct sockaddr *)a, sizeof(*a)))
-			goto out;
-	}
-	memset(&ss, 0, sizeof(ss));
-	if (getsockname(fd, (struct sockaddr *)&ss, &slen))
-		goto out;
-	if (family == AF_INET6) {
-		struct in6_addr *a6 = &((struct sockaddr_in6 *)&ss)->sin6_addr;
-
-		rc = inet_ntop(AF_INET6, a6, out, outlen) ? 0 : -1;
-		if (!rc && raw && rawlen) {
-			memcpy(raw, a6, 16);
-			*rawlen = 16;
-		}
-	} else {
-		struct in_addr *a4 = &((struct sockaddr_in *)&ss)->sin_addr;
-
-		rc = inet_ntop(AF_INET, a4, out, outlen) ? 0 : -1;
-		if (!rc && raw && rawlen) {
-			memcpy(raw, a4, 4);
-			*rawlen = 4;
-		}
-	}
-out:
-	sock_close(fd);
-	return rc;
-}
-
 static int source_addr(int family, char *out, size_t outlen)
 {
-	return source_addr_raw(family, out, outlen, NULL, NULL);
+	return net_source_addr(family, out, outlen, NULL, NULL);
 }
 
 /* Fill a connection's ICE identity: a fresh ufrag/pwd and a random bind port.
@@ -4822,7 +4765,7 @@ static void net_sample_src(struct sess *s, int family, uint32_t epoch)
 	char text[64];
 	int len = 0;
 
-	if (source_addr_raw(af, text, sizeof(text), raw, &len))
+	if (net_source_addr(af, text, sizeof(text), raw, &len))
 		len = 0;
 	netstate_on_src(&s->ns, family, epoch, len ? raw : NULL, len,
 			len ? text : NULL, now_ms());

@@ -369,6 +369,13 @@ target_link_libraries(comrade_dataauth comrade_crypto)
 # Per-family reachability: what this host knows about its own network, and what
 # stops being true when it moves. Deliberately links nothing -- no sockets, no
 # threads, no clock -- so it can be driven entirely from synthetic events.
+# The routing table asked without sending: a connected UDP socket and
+# getsockname. Shared, because two modules now decide whether to speak a
+# family and neither should have its own copy of the question.
+add_library(comrade_netroute STATIC src/netroute.c)
+target_include_directories(comrade_netroute PUBLIC src)
+target_link_libraries(comrade_netroute PUBLIC comrade_compat)
+
 add_library(comrade_netstate STATIC src/netstate.c)
 target_include_directories(comrade_netstate PUBLIC src)
 
@@ -507,6 +514,7 @@ if(COMRADE_DHT_DIR AND EXISTS "${COMRADE_DHT_DIR}/dht.c")
 	set(COMRADE_DHT_HOW "dht.c compiled in from ${COMRADE_DHT_DIR}")
 	add_library(comrade_dht STATIC ${COMRADE_DHT_DIR}/dht.c src/dhtnode.c)
 	target_include_directories(comrade_dht PUBLIC src ${COMRADE_DHT_DIR})
+	target_link_libraries(comrade_dht PUBLIC comrade_netroute)
 	set_source_files_properties(${COMRADE_DHT_DIR}/dht.c PROPERTIES
 		COMPILE_OPTIONS "-w")
 else()
@@ -515,7 +523,8 @@ else()
 	# undefined, so any target that links the library also pulls those in.
 	add_library(comrade_dht STATIC src/dhtnode.c)
 	target_include_directories(comrade_dht PUBLIC src ${COMRADE_DHT_INCLUDE_DIR})
-	target_link_libraries(comrade_dht PUBLIC ${COMRADE_DHT_LIBRARY})
+	target_link_libraries(comrade_dht PUBLIC ${COMRADE_DHT_LIBRARY}
+		comrade_netroute)
 endif()
 target_compile_definitions(comrade_dht PRIVATE _GNU_SOURCE)
 target_link_libraries(comrade_dht PUBLIC comrade_bep44 comrade_crypto
@@ -606,8 +615,8 @@ target_link_libraries(comrade_session PUBLIC
 	comrade_sig comrade_nat comrade_lanlink comrade_stream comrade_ssh
 	comrade_bridge comrade_token comrade_crypto comrade_stunlist
 	comrade_stunprobe comrade_conn comrade_path comrade_ctlproto comrade_dbg
-	comrade_netstate comrade_nsfacts comrade_hostreap comrade_claimlog
-	comrade_hbeat comrade_replay comrade_dataauth)
+	comrade_netstate comrade_netroute comrade_nsfacts comrade_hostreap
+	comrade_claimlog comrade_hbeat comrade_replay comrade_dataauth)
 
 # The view: the only module that draws to the terminal (MVC).
 # Token QR codes for the dashboard. qrcodegen.c is vendored from Project
