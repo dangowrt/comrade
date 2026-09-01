@@ -111,22 +111,56 @@ The two wire tags come from the same secret, so no datagram opens with a
 constant that would identify comrade to anyone without the token:
 
 ```
-  tags(8)      = BLAKE2b_keyed(key=R, len=8, msg="comrade1 wire tags")  # 18 bytes, no NUL
-  probe_magic  = tags[0..4]  as big-endian uint32
-  conv         = tags[4..8]  as big-endian uint32
-  if probe_magic == conv: conv ^= 0x5f5f5f5f
+  draw(n):
+    m           = "comrade1 wire tags"                    # 18 bytes, no NUL
+    if n > 0: m = m || byte(n)
+    tags(32)    = BLAKE2b_keyed(key=R, len=32, msg=m)
+    probe_magic = tags[0..4]  as big-endian uint32
+    conv        = tags[4..8]  as big-endian uint32
 
-  pb(2)        = BLAKE2b_keyed(key=R, len=2, msg="comrade1 mcast port") # 19 bytes, no NUL
-  mcast_port   = 32768 + ((pb[0]<<8 | pb[1]) & 0x3fff)                  # 32768..49151
+  n = 0, 1, 2, ... until every one of these holds:
+    probe_magic != conv
+    bswap32(probe_magic) not in 1..4
+    conv                 not in 1..4
+
+  pb(32)       = BLAKE2b_keyed(key=R, len=32, msg="comrade1 mcast port") # 19 bytes, no NUL
+  mcast_port   = 32768 + ((pb[0]<<8 | pb[1]) & 0x3fff)                   # 32768..49151
 ```
+
+Both are the first bytes of a 32-byte digest and not a digest of their own
+length. BLAKE2b folds the digest length into its parameter block (RFC 7693),
+so a short digest is a different hash rather than a prefix of a longer one,
+and not every library can be asked for one: taking a prefix of the size they
+all have is what makes these the same number on every backend, which is the
+whole point of deriving them from a shared secret. §9 states the same rule for
+a path's id.
+
+Three properties, and a draw that fails any of them is rejected in favour of
+the next rather than nudged into shape, since a nudge has to be re-examined
+for what it broke. A draw fails about once in 2^30, so the first is
+effectively always the one taken. A conforming implementation must still
+iterate, because the invitations where it matters are exactly the ones where
+guessing is wrong.
+
+`probe_magic` opens a probe (§9) and `conv` is the KCP conversation id, and
+the demux that tells one from the other is a single compare of the first four
+bytes -- so they are forced apart rather than left to chance. The 1..4
+exclusion is the same rule against a third reader: a WireGuard datagram opens
+with a little-endian `uint32` message type of 1 to 4, and wherever comrade and
+WireGuard share a port those four bytes are the whole of the demux between
+them. The two tags are tested differently because they reach the wire
+differently -- a probe writes `probe_magic` big-endian (§9) while KCP writes
+`conv` little-endian -- so the same four bytes are a different number in each,
+and only one of them is byte-swapped before the test.
+
+Implementations bounding the loop should note that eight consecutive failures
+is 2^-240; comrade takes `probe_magic = (probe_magic & 0x7fffffff) | 0x80` and
+`conv = conv | 0x80000000` at that point, which satisfies all three by
+construction and is unreachable in practice.
 
 `mcast_port` is the link-local group's port (§6), above the registered range
 and clear of the ephemeral one most systems draw from, so it neither squats on
 a service nor collides with what else the machine binds.
-
-`probe_magic` opens a probe (§9) and `conv` is the KCP conversation id, and the
-demux that tells one from the other is a single compare of the first four
-bytes -- so they are forced apart rather than left to chance.
 
 `sig_key` seals every mailbox/multicast payload (§4, §6). `bep44_pk/sk` are the
 BEP44 mutable-item identity (§5). Both peers derive the **same** keys from the
@@ -158,9 +192,12 @@ The **read-only auth secret** is a one-way derivation of the read-write one
   A_ro(16) = BLAKE2b_keyed(key=A_rw, len=32, msg="comrade1 ro token")[0:16]
 ```
 
-the 32-byte keyed digest truncated to `TOKEN_AUTH_LEN = 16` (gcrypt offers
-BLAKE2b only at whole standard digest sizes, so the 16-byte secret is a prefix of
-the 32-byte hash, not a 16-byte-digest request). A host holding `A_rw` can mint
+the 32-byte keyed digest truncated to `TOKEN_AUTH_LEN = 16`, so the 16-byte
+secret is a prefix of the 32-byte hash rather than a 16-byte-digest request.
+BLAKE2b folds the digest length into its parameter block (RFC 7693), which
+makes a short digest its own hash and not the front of a longer one, and not
+every library offers the short ones: asking for the natural size and
+truncating is what keeps a derivation available on any backend. A host holding `A_rw` can mint
 and accept `A_ro`; a read-only guest cannot walk `A_ro` back to `A_rw`. The
 read-only token carries `A_ro` in its `auth` slot with `TOKEN_FLAG_RO` set (§3),
 and SSH auth maps it to a view-only attach (§10).
@@ -173,7 +210,7 @@ Fixed **90-byte** payload (`TOKEN_RAW_LEN`), packed in order:
 
 | field | bytes | meaning |
 |-------|-------|---------|
-| version | 1 | `TOKEN_VERSION = 1` |
+| version | 1 | `TOKEN_VERSION = 2` |
 | flags | 1 | see below |
 | rdv `R` | 16 | rendezvous secret (KDF input, §2) |
 | auth `A` | 16 | session auth secret (SSH password, §10) |
@@ -258,7 +295,13 @@ String form: **base58** of the 94-byte wire (`src/base58.c`, Bitcoin alphabet
 characters. Decode requires exactly 130 chars, base58 back to 94 bytes, a CRC
 match, and `version == TOKEN_VERSION` (`token.c:token_decode`). A decoder
 **must** make that last check, so that a future revision of the format fails
-cleanly on an older build instead of being misparsed as this one.
+cleanly on an older build instead of being misparsed as this one, and must
+report it apart from the rest: every other reason a decode fails is a typo,
+while this one is an intact string whose other end derives different keys
+from it. Version 1 differs from this one only below the token, in how §2
+draws the wire tags and the multicast port, so without that check the two
+meet in the same mailbox, exchange offers, and then never complete a punch --
+which is the failure this is worth a version number to avoid.
 
 ---
 
@@ -702,8 +745,10 @@ echo, so both hold the same unordered pair:
 
 `min`/`max` are plain byte comparisons, so the value is order-free and no role
 appears in it. Keyed BLAKE2b is the primitive from §1; nothing new is
-introduced. Take the natural 32-byte digest and truncate -- do **not** ask for an
-8-byte digest, which the libgcrypt backend cannot produce.
+introduced. Take the natural 32-byte digest and truncate rather than asking
+for an 8-byte one, for the reason in §2: a short BLAKE2b is a distinct hash,
+and not every backend can produce one. Every keyed derivation in comrade asks
+for 32 bytes and slices, for that reason and no other.
 
 #### Qualification, warmth and measurement
 

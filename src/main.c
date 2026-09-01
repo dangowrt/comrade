@@ -85,7 +85,13 @@ static int session_connect(const char *arg, int ui_mode, int no_mcast,
 	int rc;
 
 	memset(&cfg, 0, sizeof(cfg));
-	if (token_decode(&cfg.tok, arg)) {
+	rc = token_decode(&cfg.tok, arg);
+	if (rc == TOKEN_ERR_VERSION) {
+		fprintf(stderr, "comrade: that token was made by a different "
+			"version of comrade\n");
+		return 1;
+	}
+	if (rc) {
 		fprintf(stderr, "comrade: invalid token\n");
 		return 1;
 	}

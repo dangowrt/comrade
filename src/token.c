@@ -113,7 +113,7 @@ int token_decode(struct token *tok, const char *src)
 	if (sum != want)
 		return -1;
 	if (wire[0] != TOKEN_VERSION)
-		return -1;
+		return TOKEN_ERR_VERSION;
 
 	payload_unpack(tok, wire);
 	return 0;

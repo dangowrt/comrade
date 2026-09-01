@@ -131,6 +131,30 @@ int random_bytes(void *buf, size_t len)
 #endif
 }
 
+/*
+ * A WireGuard datagram opens with a little-endian u32 message type, 1 to 4,
+ * and nothing comrade puts on the wire may wear one. Where the two share a
+ * port -- a unet peer's helper socket, or a classifier sitting in front of a
+ * kernel WireGuard listener -- those four bytes are the whole of the demux, so
+ * a tag that collides is either a comrade datagram the kernel takes for a
+ * handshake or a WireGuard datagram a comrade parser reaches into.
+ *
+ * The two tags reach the wire in opposite orders, so the same four bytes are a
+ * different number in each: a probe writes probe_magic big-endian
+ * (path.c:path_put32) while kcp writes conv little-endian. Hence the swap on
+ * one and not the other.
+ */
+static int wg_msg_type(uint32_t first_four_le)
+{
+	return first_four_le >= 1 && first_four_le <= 4;
+}
+
+static uint32_t bswap32(uint32_t v)
+{
+	return (v >> 24) | ((v >> 8) & 0xff00U) |
+	       ((v << 8) & 0xff0000U) | (v << 24);
+}
+
 int keys_derive(struct session_keys *keys, const uint8_t rdv[TOKEN_RDV_LEN])
 {
 	static const char sig_info[] = "comrade1 sig key";
@@ -138,38 +162,73 @@ int keys_derive(struct session_keys *keys, const uint8_t rdv[TOKEN_RDV_LEN])
 	static const char wire_info[] = "comrade1 wire tags";
 	static const char port_info[] = "comrade1 mcast port";
 	uint8_t seed[32];
-	uint8_t tags[8];
-	uint8_t pb[2];
-	int i;
+	uint8_t tags[32];
+	uint8_t pb[32];
+	int i, n;
 
 	cc_blake2b_keyed(keys->sig_key, sizeof(keys->sig_key),
 			 rdv, TOKEN_RDV_LEN,
 			 (const uint8_t *)sig_info, sizeof(sig_info) - 1);
 	cc_blake2b_keyed(seed, sizeof(seed), rdv, TOKEN_RDV_LEN,
 			 (const uint8_t *)seed_info, sizeof(seed_info) - 1);
-	cc_blake2b_keyed(tags, sizeof(tags), rdv, TOKEN_RDV_LEN,
-			 (const uint8_t *)wire_info, sizeof(wire_info) - 1);
 	cc_blake2b_keyed(pb, sizeof(pb), rdv, TOKEN_RDV_LEN,
 			 (const uint8_t *)port_info, sizeof(port_info) - 1);
 	/*
 	 * Above the registered range and clear of the ephemeral one most
 	 * systems draw from, so a derived port neither squats on a service nor
 	 * collides with whatever else the machine is binding.
+	 *
+	 * Two bytes of a 32-byte digest rather than a two-byte digest, and the
+	 * same for the tags below. BLAKE2b folds the digest length into its
+	 * parameter block (RFC 7693), so a short digest is its own hash and not
+	 * the front of a longer one, and a library offering only the standard
+	 * sizes cannot produce one at all. Asking for the size every backend has
+	 * and taking a prefix is what makes the derivation the same number
+	 * everywhere, which is the whole of what deriving from a shared secret
+	 * is for.
 	 */
 	keys->mcast_port = (uint16_t)(32768 + ((pb[0] << 8 | pb[1]) & 0x3fff));
-	keys->probe_magic = 0;
-	keys->conv = 0;
-	for (i = 0; i < 4; i++) {
-		keys->probe_magic = (keys->probe_magic << 8) | tags[i];
-		keys->conv = (keys->conv << 8) | tags[4 + i];
-	}
 	/*
-	 * The demux tells a probe from stream data by this one compare, so the
-	 * two must differ; derived values agree only by chance, and chance is
-	 * not a thing to leave in a parser.
+	 * Three things have to hold of the pair: the two must differ, since the
+	 * demux tells a probe from stream data by that one compare, and neither
+	 * may be a WireGuard message type. Draw until they do, rather than nudge
+	 * a bad value and then re-examine what the nudge broke. A draw fails
+	 * about once in 2^30, so the first is effectively always the one taken.
 	 */
-	if (keys->probe_magic == keys->conv)
-		keys->conv ^= 0x5f5f5f5fU;
+	for (n = 0; ; n++) {
+		uint8_t wbuf[sizeof(wire_info)];
+		size_t wlen = sizeof(wire_info) - 1;
+
+		memcpy(wbuf, wire_info, wlen);
+		if (n)
+			wbuf[wlen++] = (uint8_t)n;
+		cc_blake2b_keyed(tags, sizeof(tags), rdv, TOKEN_RDV_LEN, wbuf,
+				 wlen);	/* of which the first eight */
+		keys->probe_magic = 0;
+		keys->conv = 0;
+		for (i = 0; i < 4; i++) {
+			keys->probe_magic = (keys->probe_magic << 8) | tags[i];
+			keys->conv = (keys->conv << 8) | tags[4 + i];
+		}
+		if (keys->probe_magic != keys->conv &&
+		    !wg_msg_type(bswap32(keys->probe_magic)) &&
+		    !wg_msg_type(keys->conv))
+			break;
+		/*
+		 * Eight consecutive failures is 2^-240 and so is not a case to
+		 * have a policy about, but a loop in a key schedule should not be
+		 * the thing that has to terminate for the program to. Forcing the
+		 * top bit apart makes the two differ, a set low byte keeps the
+		 * big-endian one clear of N,0,0,0, and a top bit keeps the
+		 * little-endian one above 4.
+		 */
+		if (n == 8) {
+			keys->probe_magic =
+				(keys->probe_magic & 0x7fffffffU) | 0x80U;
+			keys->conv |= 0x80000000U;
+			break;
+		}
+	}
 	return cc_ed25519_key_pair(keys->bep44_sk, keys->bep44_pk, seed);
 }
 

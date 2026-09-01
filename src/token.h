@@ -7,7 +7,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define TOKEN_VERSION		1
+#define TOKEN_VERSION		2
 
 #define TOKEN_RDV_LEN		16
 #define TOKEN_AUTH_LEN		16
@@ -86,6 +86,15 @@ struct token {
 };
 
 int token_encode(const struct token *tok, char *dest, size_t dest_len);
+/*
+ * Returns 0, or TOKEN_ERR_VERSION for a well-formed token of a version this
+ * build does not speak, or -1 for anything else. The version is worth telling
+ * apart because everything else a decode rejects is a typo, and this one is
+ * not: the string is intact and the other end simply derives different keys
+ * from it, which without a word here shows up much later as a punch that
+ * never completes.
+ */
+#define TOKEN_ERR_VERSION (-2)
 int token_decode(struct token *tok, const char *src);
 
 /*
