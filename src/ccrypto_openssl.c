@@ -75,11 +75,12 @@ void cc_blake2b_keyed(uint8_t *out, size_t out_len,
 	EVP_MAC_CTX *ctx = NULL;
 	OSSL_PARAM params[2];
 	size_t n = 0;
+	int ok = 0;
 
 	memset(out, 0, out_len);
 	mac = EVP_MAC_fetch(NULL, "BLAKE2BMAC", NULL);
 	if (!mac)
-		return;
+		cc_fatal("keyed BLAKE2b");
 	ctx = EVP_MAC_CTX_new(mac);
 	if (!ctx)
 		goto out;
@@ -89,10 +90,12 @@ void cc_blake2b_keyed(uint8_t *out, size_t out_len,
 		goto out;
 	if (EVP_MAC_update(ctx, msg, msg_len) != 1)
 		goto out;
-	EVP_MAC_final(ctx, out, &n, out_len);
+	ok = EVP_MAC_final(ctx, out, &n, out_len) == 1 && n == out_len;
 out:
 	EVP_MAC_CTX_free(ctx);
 	EVP_MAC_free(mac);
+	if (!ok)
+		cc_fatal("keyed BLAKE2b");
 }
 
 /* RFC 7748 says a shared secret of all zeros means the peer sent a low-order

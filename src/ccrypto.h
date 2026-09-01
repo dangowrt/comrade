@@ -29,11 +29,30 @@ int cc_blake2b_init(struct cc_blake2b *ctx, size_t hash_size);
 void cc_blake2b_update(struct cc_blake2b *ctx, const void *msg, size_t len);
 void cc_blake2b_final(struct cc_blake2b *ctx, uint8_t *out);
 
-/* Keyed BLAKE2b (RFC 7693 keyed mode, digest length in the parameter
- * block): the KDF under K_sig and the BEP 44 seed. Interop-critical. */
+/*
+ * Keyed BLAKE2b (RFC 7693 keyed mode, digest length in the parameter
+ * block): the KDF under K_sig and the BEP 44 seed. Interop-critical.
+ *
+ * Fills out, or does not return. Every key comrade holds comes from here --
+ * the sealing key, the BEP 44 seed, the wire tags, the per-connection key,
+ * the read-only secret, a path's id -- so a backend that cannot compute this
+ * has no degraded mode to fall back to: an output left as zeros would be a
+ * key every build without the primitive agreed on, and a mailbox target every
+ * such session shared. There is nothing data-dependent about the failure
+ * either, since it means the primitive is absent from this binary's backend
+ * rather than that this call was wrong, so it is the same on every call and
+ * belongs to the build. Configure proves the primitive is there (see the
+ * backend probe in CMakeLists.txt); this is what happens if it lied.
+ */
 void cc_blake2b_keyed(uint8_t *out, size_t out_len,
 		      const uint8_t *key, size_t key_len,
 		      const uint8_t *msg, size_t msg_len);
+
+/*
+ * The backend cannot do something comrade's wire format requires. Names the
+ * primitive on stderr and ends the process; never returns.
+ */
+void cc_fatal(const char *what);
 
 /* RFC 8032 Ed25519. sk is seed || public key (64 bytes); seed is wiped.
  * check returns 0 for a good signature, non-zero otherwise. */

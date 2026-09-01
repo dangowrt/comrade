@@ -98,7 +98,7 @@ endif()
 # in a second one. Override with -DCOMRADE_CRYPTO=<backend>.
 #
 set(COMRADE_CRYPTO "auto" CACHE STRING
-	"Crypto backend: auto (follow libssh), openssl, gcrypt or monocypher")
+	"Crypto backend: auto (follow libssh, probed), openssl, gcrypt or monocypher")
 
 # Which crypto library is this libssh linked against? libssh exposes that
 # neither in its headers nor in its pkg-config file, so read the DT_NEEDED
@@ -168,6 +168,39 @@ if(COMRADE_CRYPTO_RESOLVED STREQUAL "monocypher")
 	endif()
 elseif(COMRADE_CRYPTO_RESOLVED STREQUAL "openssl")
 	find_package(OpenSSL QUIET)
+	# Which primitives an OpenSSL carries is a build-time choice of whoever
+	# built it, not something its version says: OpenWrt's is compiled without
+	# BLAKE2, and a distribution may drop others. So compile and link against
+	# this one rather than believing libssh's DT_NEEDED entry, and take the
+	# self-contained backend instead when it comes up short. EVP_blake2b512
+	# stands in for the BLAKE2BMAC the key schedule needs, which is fetched by
+	# name at run time and so cannot be linked against: no-blake2 removes the
+	# digest and the MAC together, which is what makes the one a sound proxy for
+	# the other -- and the alternative to catching it here is a binary that runs
+	# and derives from a hash that failed.
+	if(TARGET OpenSSL::Crypto)
+		include(CheckCSourceCompiles)
+		set(CMAKE_REQUIRED_LIBRARIES OpenSSL::Crypto)
+		check_c_source_compiles("
+#include <openssl/evp.h>
+int main(void) {
+	return !EVP_blake2b512() + !EVP_chacha20() + !EVP_chacha20_poly1305();
+}" COMRADE_OPENSSL_HAS_PRIMITIVES)
+		unset(CMAKE_REQUIRED_LIBRARIES)
+		if(NOT COMRADE_OPENSSL_HAS_PRIMITIVES)
+			message(STATUS "OpenSSL here has no BLAKE2b/ChaCha20; using monocypher")
+			set(COMRADE_CRYPTO_RESOLVED "monocypher")
+			set(COMRADE_CRYPTO_WHY "OpenSSL lacks the primitives comrade needs")
+			pkg_check_modules(MONOCYPHER IMPORTED_TARGET monocypher)
+			if(NOT MONOCYPHER_FOUND)
+				find_path(MONOCYPHER_INCLUDE_DIR monocypher.h)
+				find_library(MONOCYPHER_LIBRARY monocypher)
+				if(MONOCYPHER_INCLUDE_DIR AND MONOCYPHER_LIBRARY)
+					set(MONOCYPHER_FOUND 1)
+				endif()
+			endif()
+		endif()
+	endif()
 elseif(COMRADE_CRYPTO_RESOLVED STREQUAL "gcrypt")
 	# 1.10 is the floor: gcry_ecc_mul_point, which the X25519 half of the
 	# backend is written against, arrived there. Without the version the
@@ -415,7 +448,7 @@ add_library(comrade_stunlist STATIC src/stunlist.c)
 target_include_directories(comrade_stunlist PUBLIC src PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 target_link_libraries(comrade_stunlist PUBLIC comrade_appdir)
 
-set(COMRADE_CRYPTO_SRC src/sha1.c src/bencode.c src/keys.c src/netmon.c src/candpolicy.c src/candpack.c)
+set(COMRADE_CRYPTO_SRC src/ccrypto.c src/sha1.c src/bencode.c src/keys.c src/netmon.c src/candpolicy.c src/candpack.c)
 if(COMRADE_CRYPTO_RESOLVED STREQUAL "monocypher")
 	add_library(comrade_crypto STATIC ${COMRADE_CRYPTO_SRC} src/ccrypto_monocypher.c)
 	target_include_directories(comrade_crypto PUBLIC src)

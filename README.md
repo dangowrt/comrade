@@ -593,15 +593,20 @@ fallback for mbedTLS-based systems.
 
 | libssh built against | comrade uses | why |
 |----------------------|--------------|-----|
-| OpenSSL | OpenSSL libcrypto | already linked |
+| OpenSSL with BLAKE2b and ChaCha20 | OpenSSL libcrypto | already linked |
+| OpenSSL without them | monocypher (~70 KB) | OpenWrt, among others, builds OpenSSL with no BLAKE2 |
 | libgcrypt | libgcrypt, 1.10 or newer | already linked |
 | mbedTLS | monocypher (~70 KB) | mbedTLS has no BLAKE2b and no Ed25519 |
 
 Configure reads that from the libssh binary itself and prints what it
-resolved and why; `-DCOMRADE_CRYPTO=<backend>` overrides it. The libgcrypt
-floor is `gcry_ecc_mul_point`, which arrived in 1.10 and is what the
-X25519 half is written against; configure checks for it rather than
-letting the compiler find out.
+resolved and why; `-DCOMRADE_CRYPTO=<backend>` overrides it.
+
+Which library libssh links is a hint about what is already on the box, not
+a promise that it can do the work, so configure compiles and links the
+primitives against the candidate before accepting it and takes monocypher
+when they are missing. The libgcrypt floor is `gcry_ecc_mul_point`, which
+arrived in 1.10 and is what the X25519 half is written against; configure
+checks for it rather than letting the compiler find out.
 
 ## Documentation
 

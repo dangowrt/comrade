@@ -157,17 +157,20 @@ void cc_blake2b_keyed(uint8_t *out, size_t out_len,
 	cc_init();
 	memset(out, 0, out_len);
 	if (!algo || gcry_md_open(&h, algo, 0))
-		return;
+		cc_fatal("keyed BLAKE2b");
 	/* RFC 7693 keyed mode, the digest length folded into the parameter
 	 * block -- the same construction crypto_blake2b_keyed produces. */
 	if (gcry_md_setkey(h, key, key_len)) {
 		gcry_md_close(h);
-		return;
+		cc_fatal("keyed BLAKE2b");
 	}
 	gcry_md_write(h, msg, msg_len);
 	d = gcry_md_read(h, algo);
-	if (d)
-		memcpy(out, d, out_len);
+	if (!d) {
+		gcry_md_close(h);
+		cc_fatal("keyed BLAKE2b");
+	}
+	memcpy(out, d, out_len);
 	gcry_md_close(h);
 }
 
