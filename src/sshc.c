@@ -320,18 +320,31 @@ static int run_test(ssh_session s, ssh_channel chan, const struct sshc_opts *o)
 	}
 out:
 	sshfwd_destroy(fwd);
+	/*
+	 * FREED, NOT MERELY REMOVED, AND BEFORE ANYTHING THAT PUMPS THE
+	 * SESSION.
+	 *
+	 * ssh_event_remove_connector releases the connector's poll handles but
+	 * leaves it attached to the channel as a callback. ssh_channel_send_eof
+	 * below flushes, and a flush runs the packet loop: an inbound
+	 * CHANNEL_DATA arriving in that window is dispatched to the connector,
+	 * which resets its poll events and dereferences the handle that removal
+	 * just took away. It crashes in libssh, inside a call comrade made
+	 * deliberately, and only when a packet happens to land in that window
+	 * -- which is why it looked like a flaky test rather than a bug.
+	 */
 	if (c_ctl_in) {
 		ssh_event_remove_connector(event, c_ctl_in);
 		ssh_event_remove_connector(event, c_ctl_out);
+		ssh_connector_free(c_ctl_in);
+		ssh_connector_free(c_ctl_out);
+		c_ctl_in = NULL;
+		c_ctl_out = NULL;
 	}
 	if (ctl && ssh_channel_is_open(ctl)) {
 		ssh_channel_send_eof(ctl);
 		ssh_channel_close(ctl);
 	}
-	if (c_ctl_in)
-		ssh_connector_free(c_ctl_in);
-	if (c_ctl_out)
-		ssh_connector_free(c_ctl_out);
 	if (ctl)
 		ssh_channel_free(ctl);
 	if (event)
@@ -388,18 +401,19 @@ static int run_forward(ssh_session s, ssh_channel chan,
 	}
 
 	sshfwd_destroy(fwd);
+	/* Freed before the flush below; see the note in run_test. */
 	if (c_ctl_in) {
 		ssh_event_remove_connector(event, c_ctl_in);
 		ssh_event_remove_connector(event, c_ctl_out);
+		ssh_connector_free(c_ctl_in);
+		ssh_connector_free(c_ctl_out);
+		c_ctl_in = NULL;
+		c_ctl_out = NULL;
 	}
 	if (ctl && ssh_channel_is_open(ctl)) {
 		ssh_channel_send_eof(ctl);
 		ssh_channel_close(ctl);
 	}
-	if (c_ctl_in)
-		ssh_connector_free(c_ctl_in);
-	if (c_ctl_out)
-		ssh_connector_free(c_ctl_out);
 	if (ctl)
 		ssh_channel_free(ctl);
 	if (event) {
@@ -539,11 +553,20 @@ static int run_interactive(ssh_session s, ssh_channel chan,
 	sshfwd_destroy(fwd);
 	fwd = NULL;
 	ssh_event_remove_fd(event, s_in);
+	/* Freed before the flush below; see the note in run_test. */
 	ssh_event_remove_connector(event, c_out);
 	ssh_event_remove_connector(event, c_err);
+	ssh_connector_free(c_out);
+	ssh_connector_free(c_err);
+	c_out = NULL;
+	c_err = NULL;
 	if (c_ctl_in) {
 		ssh_event_remove_connector(event, c_ctl_in);
 		ssh_event_remove_connector(event, c_ctl_out);
+		ssh_connector_free(c_ctl_in);
+		ssh_connector_free(c_ctl_out);
+		c_ctl_in = NULL;
+		c_ctl_out = NULL;
 	}
 	if (ctl && ssh_channel_is_open(ctl)) {
 		ssh_channel_send_eof(ctl);
