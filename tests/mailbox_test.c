@@ -329,6 +329,71 @@ static void a_lagging_copy_is_merged_over_not_from(void)
 	assert(probe.slot_a_len == sizeof(CLAIM_OLD));
 }
 
+/*
+ * AN OLDER COPY IS STILL READ FROM, AND STILL NEVER WRITTEN FROM.
+ *
+ * A store carries one compare-and-swap for every node it addresses, so a node
+ * whose copy has fallen below that sequence refuses it and is never caught up.
+ * A claim written to such a node is written nowhere else, and refusing to read
+ * it is how two ends whose sequences have diverged never hear each other.
+ *
+ * Reading it is not taking it: its slots must not become the basis of the next
+ * store, or a superseded claim goes back over the current one and the ends
+ * take turns putting each other's slot back for the rest of the session.
+ */
+static void an_older_copy_is_read_but_not_written_from(void)
+{
+	static const uint8_t OFFER[] = { 0x01, 0x01, 0x01 };
+	static const uint8_t CLAIM_OLD[] = { 0xA0, 0xA0 };
+	static const uint8_t CLAIM_NEW[] = { 0xB0, 0xB0 };
+	uint8_t behind[256], now[256], out[256], slot[MAILBOX_SLOT_MAX];
+	size_t blen, nlen, olen, slen;
+	struct mailbox h, c, probe;
+
+	/* What the node that fell behind still serves, and what the rest hold. */
+	mailbox_init(&h, 1);
+	mailbox_set_mine(&h, OFFER, sizeof(OFFER));
+	blen = mailbox_build(&h, behind, sizeof(behind));
+	mailbox_init(&c, 0);
+	mailbox_set_mine(&c, CLAIM_OLD, sizeof(CLAIM_OLD));
+	assert(!mailbox_merge(&c, behind, blen, -1, behind, &blen,
+			      sizeof(behind)));
+	nlen = mailbox_build(&h, now, sizeof(now));
+	mailbox_init(&c, 0);
+	mailbox_set_mine(&c, CLAIM_NEW, sizeof(CLAIM_NEW));
+	assert(!mailbox_merge(&c, now, nlen, -1, now, &nlen, sizeof(now)));
+
+	mailbox_note_seq(&h, 9);
+	mailbox_parse(&h, now, nlen);
+
+	/* The claim on the copy left behind is still legible to a host. */
+	slen = mailbox_peer_slot_in(&h, behind, blen, slot, sizeof(slot));
+	assert(slen == sizeof(CLAIM_OLD));
+	assert(!memcmp(slot, CLAIM_OLD, slen));
+
+	/* And a store merged against that copy still carries the current one. */
+	assert(!mailbox_merge(&h, behind, blen, 4, out, &olen, sizeof(out)));
+	mailbox_init(&probe, 1);
+	mailbox_parse(&probe, out, olen);
+	assert(probe.slot_a_len == sizeof(CLAIM_NEW));
+	assert(!memcmp(probe.slot_a, CLAIM_NEW, sizeof(CLAIM_NEW)));
+
+	/*
+	 * AND THE HIGH-WATER MARK IS NOT FOREVER. A store that finds nothing
+	 * where it asked says the item is gone, so what we were holding
+	 * describes a container that no longer exists -- which is how an item
+	 * that ages out everywhere is noticed, rather than waited out on a
+	 * clock.
+	 */
+	assert(h.seq_high == 9);
+	assert(!mailbox_merge(&h, NULL, 0, -1, out, &olen, sizeof(out)));
+	assert(h.seq_high == 0);
+	assert(!mailbox_merge(&h, behind, blen, 4, out, &olen, sizeof(out)));
+	mailbox_init(&probe, 1);
+	mailbox_parse(&probe, out, olen);
+	assert(probe.slot_a_len == sizeof(CLAIM_OLD));	/* believed again */
+}
+
 int main(void)
 {
 	static const uint8_t OFFER_E[] = { 0xEE, 0x01, 0x02 };
@@ -972,6 +1037,7 @@ int main(void)
 	a_claim_that_does_not_open_is_never_written_back();
 	a_released_claim_may_be_claimed_again();
 	a_lagging_copy_is_merged_over_not_from();
+	an_older_copy_is_read_but_not_written_from();
 
 	printf("mailbox: all container, turnstile, tombstone, CAS and relay "
 	       "cases pass\n");

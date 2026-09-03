@@ -79,7 +79,6 @@
  * looks past the handful it pinned.
  */
 /* Reads older than the one we hold, before we believe the item restarted. */
-#define SIG_SEQ_REGRESS_MAX 3
 
 #define SIG_DHT_WIDE_GET_MS 4000	/* while the peer's slot is still unseen */
 #define SIG_DHT_WIDE_IDLE_MS 20000	/* once it has been, as a safety net */
@@ -113,7 +112,6 @@ struct sig {
 	struct mailbox mb;		/* the two-slot rendezvous container */
 	uint8_t mcast_mine[SIG_MCAST_SEALED_MAX];	/* our announcement, sealed (mcast) */
 	size_t mcast_mine_len;
-	int64_t cur_seq;
 
 	/*
 	 * The end of the session, as the mailbox carries it. The host places a
@@ -194,7 +192,6 @@ struct sig {
 	int relay4, relay6;		/* client: asked to establish a
 					 * rendezvous the peer cannot reach */
 	int up4, up6;			/* proven connectivity, see sig_set_family_up */
-	int seq_regress;		/* consecutive reads older than what we hold */
 	int gets_ok;			/* validated reads of the container */
 	int puts_ok;			/* stores that found a home */
 	uint64_t last_get_ms;		/* when either last happened, 0 = never */
@@ -1003,40 +1000,51 @@ static void on_dht_get(void *arg, const uint8_t *v, size_t v_len, int64_t seq,
 		       const struct sockaddr *node, socklen_t node_len)
 {
 	struct sig *s = arg;
+	uint8_t stale_slot[MAILBOX_SLOT_MAX];
 	const uint8_t *peer;
 	size_t peer_len;
+	int fresh;
 
 	if (!v)
 		return;
 	/* Evidence of what the store holds even where the copy itself is not
 	 * taken: a write is judged against the highest sequence, not the last
 	 * one believed. */
-	mailbox_note_seq(&s->mb, seq);
 	/*
 	 * Two reads are in flight at once -- the direct one and the convergent
-	 * one -- and they answer from different nodes, so an older container can
-	 * land after a newer one. Taking it would put a superseded claim back in
-	 * front of the turnstile and walk cur_seq backwards, which the next
-	 * compare-and-swap then loses on.
+	 * one -- and they answer from different nodes, so an older container
+	 * lands after a newer one as a matter of course. Copies also fall
+	 * behind and stay there: a store carries one compare-and-swap for every
+	 * node it addresses, so a node below that sequence refuses it and is
+	 * never caught up.
 	 *
-	 * A lower seq that keeps coming back is not a straggler though: if the
-	 * item aged out everywhere our own next store begins again at one. So
-	 * hold out for a few, then believe it.
+	 * BOTH OF WHICH MAKE AN OLDER COPY WORTH READING AND NEVER WORTH
+	 * WRITING FROM. Worth reading, because a claim written to a node that
+	 * has fallen behind is written nowhere else, and refusing it is how two
+	 * ends whose sequences have diverged never hear each other at all.
+	 * Never worth writing from, because taking its slots as the basis of
+	 * our next store re-asserts a superseded offer or claim over the
+	 * current one -- and the other end, reading that, puts its own back.
+	 * The two then take turns for the rest of the session, with the
+	 * sequence climbing a step for every turn and neither end able to see
+	 * why the mailbox will not settle.
 	 */
-	if (s->cur_seq && seq < s->cur_seq &&
-	    ++s->seq_regress < SIG_SEQ_REGRESS_MAX)
-		return;
-	s->seq_regress = 0;
+	fresh = !s->mb.seq_high || seq < 0 || seq >= s->mb.seq_high;
+	mailbox_note_seq(&s->mb, seq);
 	s->gets_ok++;
 	s->last_get_ms = now_ms();
-	mailbox_parse(&s->mb, v, v_len);
-	s->cur_seq = seq;
+	if (fresh)
+		mailbox_parse(&s->mb, v, v_len);
+	else
+		dbg_logf("sig: older container read but not written from "
+			 "(seq %lld, holding %lld)", (long long)seq,
+			 (long long)s->mb.seq_high);
 
 	/* A client recognises its own claimant's claim in the answer slot --
 	 * typically a superseded attempt the host never released -- so the
 	 * turnstile rule lets it overwrite that one rather than wedge itself
 	 * out behind it. */
-	if (!s->mb.is_host && s->mb.slot_a_len && s->my_ufrag[0]) {
+	if (fresh && !s->mb.is_host && s->mb.slot_a_len && s->my_ufrag[0]) {
 		uint8_t plain[SIG_MAX_VALUE];
 		char uf[64];
 		int n = msg_open(plain, sizeof(plain), s->keys.sig_key,
@@ -1074,14 +1082,22 @@ static void on_dht_get(void *arg, const uint8_t *v, size_t v_len, int64_t seq,
 	 * clock back, so a tombstone a live host has since erased is forgotten
 	 * rather than held against it.
 	 */
-	if (!s->mb.slot_x_len)
-		s->tomb_seen_ms = 0;
-	else if (!s->tomb_seen_ms)
-		s->tomb_seen_ms = s->last_get_ms;
-	if (!s->is_host && s->mb.slot_o_len)
-		s->offer_seen_ms = s->last_get_ms;
+	if (fresh) {
+		if (!s->mb.slot_x_len)
+			s->tomb_seen_ms = 0;
+		else if (!s->tomb_seen_ms)
+			s->tomb_seen_ms = s->last_get_ms;
+		if (!s->is_host && s->mb.slot_o_len)
+			s->offer_seen_ms = s->last_get_ms;
+	}
 
-	peer_len = mailbox_peer_slot(&s->mb, &peer);
+	if (fresh) {
+		peer_len = mailbox_peer_slot(&s->mb, &peer);
+	} else {
+		peer_len = mailbox_peer_slot_in(&s->mb, v, v_len, stale_slot,
+						sizeof(stale_slot));
+		peer = stale_slot;
+	}
 	if (peer_len)
 		deliver_peer(s, peer, peer_len);
 

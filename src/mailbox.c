@@ -254,7 +254,16 @@ int mailbox_merge(struct mailbox *m, const uint8_t *cur, size_t cur_len,
 {
 	size_t n;
 
-	if (stale(m, cur, seq))
+	if (!cur)
+		/*
+		 * Nothing stored where we asked, so the sequence we are holding
+		 * describes a container that is not there any more and whatever
+		 * we write starts a new run. Noticing it here is what keeps a
+		 * clock out of this: an item that ages out everywhere is found
+		 * by our own next write rather than waited out.
+		 */
+		m->seq_high = 0;
+	else if (stale(m, cur, seq))
 		cur = NULL;		/* merged over, not from */
 	if (cur)
 		parse_slots(m, cur, cur_len);
@@ -329,6 +338,14 @@ int mailbox_client_should_claim(const struct mailbox *m)
 		return 0;
 	return !m->is_host && m->have_mine && m->need_write && m->have_cur &&
 	       (m->slot_a_len == 0 || m->slot_a_own);
+}
+
+size_t mailbox_peer_slot_in(const struct mailbox *m, const uint8_t *v,
+			    size_t v_len, uint8_t *out, size_t max)
+{
+	if (!v || !v_len || max < MAILBOX_SLOT_MAX)
+		return 0;
+	return slot_extract(v, v_len, m->is_host ? "a" : "o", out, max);
 }
 
 size_t mailbox_peer_slot(const struct mailbox *m, const uint8_t **out)

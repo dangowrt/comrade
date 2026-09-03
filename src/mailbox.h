@@ -222,4 +222,20 @@ int mailbox_client_should_claim(const struct mailbox *m);
  */
 size_t mailbox_peer_slot(const struct mailbox *m, const uint8_t **out);
 
+/*
+ * The same, out of a container the mailbox has NOT taken as its own -- one
+ * older than the newest seen -- copied into `out`. Returns its length, 0 if
+ * absent or it does not fit.
+ *
+ * A copy that has fallen behind is still serving somebody, and its answer slot
+ * may hold a claim written to that node and nowhere else: the ends whose
+ * sequences have diverged reach each other through exactly this. So an older
+ * container is still READ from. What it must never become is the basis of a
+ * write -- see mailbox_merge -- because re-asserting a superseded offer or
+ * claim makes the two ends take turns putting each other's slot back, with the
+ * sequence climbing for as long as the session lasts.
+ */
+size_t mailbox_peer_slot_in(const struct mailbox *m, const uint8_t *v,
+			    size_t v_len, uint8_t *out, size_t max);
+
 #endif
