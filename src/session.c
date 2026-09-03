@@ -3095,15 +3095,6 @@ static int lan_conn_active(struct sess *s, const struct sockaddr_in6 *peer)
 
 /* The ICE ufrag of an answer (its client's single-use identity), into out
  * (>= 40 bytes). candpack round-trips it, so it is stable across the mailbox. */
-static void sdp_ufrag(const char *sdp, char *out)
-{
-	const char *p = strstr(sdp, "ice-ufrag:");
-
-	out[0] = '\0';
-	if (p)
-		sscanf(p, "ice-ufrag:%39s", out);
-}
-
 /*
  * The password of the claim, which is what separates a claimant trying again
  * from the DHT handing us its previous try a second time. The ufrag is the
@@ -3183,7 +3174,7 @@ static void on_direct_claim(void *arg, const struct sockaddr *src, socklen_t src
 		return;
 	memcpy(claim_sdp, sdp, sdp_len);
 	claim_sdp[sdp_len] = '\0';
-	sdp_ufrag(claim_sdp, ufrag);
+	cand_sdp_ufrag(claim_sdp, ufrag, sizeof(ufrag));
 	if (lanlink_map_peer(src, srclen, &mapped))
 		return;
 	if (ufrag_admitted(s, ufrag) ||
@@ -3194,7 +3185,7 @@ static void on_direct_claim(void *arg, const struct sockaddr *src, socklen_t src
 	if (lan_ufrag_claimed(s, ufrag))
 		return;
 	if (s->have_peer_sdp) {
-		sdp_ufrag(s->peer_sdp, queued);
+		cand_sdp_ufrag(s->peer_sdp, queued, sizeof(queued));
 		if (!strcmp(ufrag, queued))
 			s->have_peer_sdp = 0;
 	}
@@ -3262,7 +3253,7 @@ static void on_peer_offer(void *arg, const uint8_t *data, size_t len)
 		len = sizeof(incoming) - 1;
 	memcpy(incoming, data, len);
 	incoming[len] = '\0';
-	sdp_ufrag(incoming, ufrag);
+	cand_sdp_ufrag(incoming, ufrag, sizeof(ufrag));
 	snprintf(s->cur_offer_ufrag, sizeof(s->cur_offer_ufrag), "%s", ufrag);
 	if (c->remote_ufrag[0] && strcmp(ufrag, c->remote_ufrag)) {
 		dbg_logf("session: ignore rotated offer while punching");
@@ -4108,7 +4099,7 @@ static void resume_tick(struct conn *c)
 			sdp_filter_peer(s->peer_sdp, s->cfg->family, filtered,
 					sizeof(filtered));
 			if (!nat_set_remote_description(c->nat, filtered)) {
-				sdp_ufrag(s->peer_sdp, ufrag);
+				cand_sdp_ufrag(s->peer_sdp, ufrag, sizeof(ufrag));
 				snprintf(c->remote_ufrag,
 					 sizeof(c->remote_ufrag), "%s", ufrag);
 				s->remote_set = 1;
@@ -6331,7 +6322,7 @@ static int host_turnstile(struct sess *s)
 				 * consistent DHT re-serving a stale value, ignored as
 				 * before (either would be punched again: double-serve).
 				 */
-				sdp_ufrag(s->peer_sdp, cu);
+				cand_sdp_ufrag(s->peer_sdp, cu, sizeof(cu));
 				sdp_pwd(s->peer_sdp, cp);
 				if (cu[0]) {
 					struct conn *w = worker_by_ufrag(ws, cu);
@@ -6868,7 +6859,7 @@ int session_run(const struct session_cfg *cfg)
 					st = ST_FAIL;
 					break;
 				}
-				sdp_ufrag(s.peer_sdp, ufrag);
+				cand_sdp_ufrag(s.peer_sdp, ufrag, sizeof(ufrag));
 				snprintf(s.c.remote_ufrag, sizeof(s.c.remote_ufrag),
 					 "%s", ufrag);
 				/* The claimant a single-connection host serves is

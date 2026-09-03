@@ -287,3 +287,22 @@ int cand_sdp_reaches_off_segment(const char *sdp)
 	}
 	return 0;
 }
+
+void cand_sdp_ufrag(const char *sdp, char *out, size_t max)
+{
+	const char *p;
+	size_t i = 0;
+
+	if (!out || !max)
+		return;
+	out[0] = '\0';
+	if (!sdp)
+		return;
+	p = strstr(sdp, "a=ice-ufrag:");
+	if (!p)
+		return;
+	p += 12;
+	while (*p && *p != '\r' && *p != '\n' && *p != ' ' && i + 1 < max)
+		out[i++] = *p++;
+	out[i] = '\0';
+}

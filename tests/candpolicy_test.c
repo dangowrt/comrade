@@ -275,8 +275,55 @@ static void off_segment_check(void)
 	assert(cand_sdp_reaches_off_segment("v=0\r\na=ice-ufrag:abcd\r\n") == 0);
 }
 
+/*
+ * The ufrag comes out of the SDP ATTRIBUTE and nowhere else.
+ *
+ * Two copies of this used to exist and disagreed exactly here: one matched the
+ * bare token anywhere in the text, which also matches it inside a candidate
+ * line or a comment and would read a neighbouring value as an identity. The
+ * bound matters for the same reason a truncated description does: it arrives
+ * over a mailbox anyone may write to.
+ */
+static void ufrag_check(void)
+{
+	char out[40];
+
+	cand_sdp_ufrag("v=0\r\na=ice-ufrag:abc123\r\na=ice-pwd:zz\r\n", out,
+		       sizeof(out));
+	assert(!strcmp(out, "abc123"));
+
+	/* Stopped at end of line, not run on into the next attribute. */
+	cand_sdp_ufrag("a=ice-ufrag:one\na=ice-pwd:two\n", out, sizeof(out));
+	assert(!strcmp(out, "one"));
+
+	/* The bare token is not the attribute. */
+	cand_sdp_ufrag("a=candidate:0 1 UDP 1 1.2.3.4 1 typ host ice-ufrag:no\n",
+		       out, sizeof(out));
+	assert(out[0] == '\0');
+
+	/* Absent, empty and NULL all read as absent rather than as a value. */
+	cand_sdp_ufrag("v=0\r\n", out, sizeof(out));
+	assert(out[0] == '\0');
+	cand_sdp_ufrag("", out, sizeof(out));
+	assert(out[0] == '\0');
+	cand_sdp_ufrag(NULL, out, sizeof(out));
+	assert(out[0] == '\0');
+
+	/* Bounded: a ufrag longer than the caller's buffer is truncated into
+	 * it and still terminated, never written past. */
+	{
+		char small[8];
+
+		cand_sdp_ufrag("a=ice-ufrag:0123456789abcdef\n", small,
+			       sizeof(small));
+		assert(strlen(small) == sizeof(small) - 1);
+		assert(!strncmp(small, "0123456", 7));
+	}
+}
+
 int main(void)
 {
+	ufrag_check();
 	off_segment_check();
 	default_policy_check();
 	opt_in_check();

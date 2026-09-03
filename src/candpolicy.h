@@ -73,4 +73,17 @@ void cand_sdp_fan_v4(char *sdp, size_t cap, const uint8_t (*pool)[4],
  */
 int cand_sdp_reaches_off_segment(const char *sdp);
 
+/*
+ * The ICE ufrag out of a description, or an empty string.
+ *
+ * Matches the SDP ATTRIBUTE, "a=ice-ufrag:", and not the bare token anywhere
+ * in the text. A loose reader also accepts the token out of a candidate line
+ * or a comment, and descriptions arrive over a mailbox anyone holding the
+ * rendezvous may write to -- so one that merely MENTIONS the token elsewhere
+ * yields whatever follows it as an identity. Bounded by `max` and stopped at
+ * end of line, so a description that arrived truncated cannot walk past its
+ * own buffer.
+ */
+void cand_sdp_ufrag(const char *sdp, char *out, size_t max);
+
 #endif
