@@ -157,9 +157,11 @@ int main(void)
 
 	free(sent);
 	free(recvd);
-	stream_destroy(a.stream);
-	stream_destroy(b.stream);
+	/* The agents first: each one's poll thread delivers into a stream, so
+	 * both have to be stopped before either stream is freed. */
 	nat_destroy(a.nat);
 	nat_destroy(b.nat);
+	stream_destroy(a.stream);
+	stream_destroy(b.stream);
 	return 0;
 }

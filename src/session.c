@@ -4267,8 +4267,11 @@ static int conn_run(struct conn *c, int drive_sig)
 		sock_close(cp[0]);
 		sock_close(cp[1]);
 		c->ctl_fd = INVALID_SOCK;
-		stream_destroy(c->stream);
+		pthread_mutex_lock(&c->stream_lock);
+		st = c->stream;
 		c->stream = NULL;
+		pthread_mutex_unlock(&c->stream_lock);
+		stream_destroy(st);
 		return -1;
 	}
 	br = sshbridge_create(sp[0], c->stream,
@@ -6800,6 +6803,7 @@ int session_run(const struct session_cfg *cfg)
 {
 	struct sess s;
 	enum state st = ST_WAIT_DHT;
+	struct stream *st_done;
 	uint64_t deadline;
 	int ended = 0;			/* SESSION_ENDED / SESSION_GONE */
 	int rc;
@@ -7261,8 +7265,16 @@ int session_run(const struct session_cfg *cfg)
 		session_entomb(&s);
 	rc = ended ? ended : ((st == ST_DONE) ? 0 : 1);
 done:
-	if (s.c.stream)
-		stream_destroy(s.c.stream);
+	/* Cleared under the lock before it is freed, as run_ssh does: the ICE
+	 * agent's poll thread lives until conn_free_agent below, and it reaches
+	 * the stream through this field. After this, deliver_stream_from sees
+	 * NULL and no-ops. */
+	pthread_mutex_lock(&s.c.stream_lock);
+	st_done = s.c.stream;
+	s.c.stream = NULL;
+	pthread_mutex_unlock(&s.c.stream_lock);
+	if (st_done)
+		stream_destroy(st_done);
 	conn_reap_parked(&s.c);
 	conn_drop_ice_path(&s.c);
 	conn_free_agent(&s.c, s.c.nat, s.c.nat_ctx);
