@@ -337,12 +337,14 @@ static int screen_recover_x(gcry_mpi_t x, gcry_mpi_t y, int sign)
 	gcry_mpi_mulm(chk, x, x, scr_p);
 	if (gcry_mpi_cmp(chk, xx) != 0) {
 		gcry_mpi_t e2 = gcry_mpi_new(0), i2 = gcry_mpi_new(0);
+		gcry_mpi_t two = gcry_mpi_set_ui(NULL, 2);
 
 		gcry_mpi_sub_ui(e2, scr_p, 1);
 		gcry_mpi_rshift(e2, e2, 2);
-		gcry_mpi_powm(i2, gcry_mpi_set_ui(NULL, 2), e2, scr_p);
+		gcry_mpi_powm(i2, two, e2, scr_p);
 		gcry_mpi_mulm(x, x, i2, scr_p);			/* x *= sqrt(-1) */
 		gcry_mpi_mulm(chk, x, x, scr_p);
+		gcry_mpi_release(two);
 		gcry_mpi_release(e2);
 		gcry_mpi_release(i2);
 		if (gcry_mpi_cmp(chk, xx) != 0)
