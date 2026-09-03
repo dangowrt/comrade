@@ -549,9 +549,10 @@ static void run_service(struct svc *v, void *hostkey, sock_t wfd)
 	attach_cmd_ro(cmd_ro, sizeof(cmd_ro), v->sock);
 	end_fd = spawn_end_monitor(v->sock);
 
-	/* Harden this network-facing service before it opens a socket. Windows
-	 * cannot deny it CreateProcess (it still launches tmux), so this is the
-	 * mitigation policies rather than the client's child-process ban. */
+	/* Harden this network-facing service before it opens a socket. It still
+	 * launches tmux and every guest's shell, so it can take neither the
+	 * child-process ban nor a job object whose limits those would inherit:
+	 * what is left is the token's privileges and the mitigation policies. */
 	memset(&sb, 0, sizeof(sb));
 	sb.role = SANDBOX_SERVICE;
 	sandbox_apply(&sb);
@@ -878,6 +879,7 @@ static int start_new(int ui_mode, int no_mcast, int no_dht, int no_fwd)
 	struct svc v;
 	char id[ID_LEN + 1], hnum[32];
 	char *argv[4];
+	struct sandbox_cfg sb;
 	void *hostkey;
 	struct ui *ui;
 	HANDLE proc;
@@ -943,6 +945,18 @@ static int start_new(int ui_mode, int no_mcast, int no_dht, int no_fwd)
 		return 1;
 	}
 	sock_close(sv[1]);			/* the service owns its copy */
+
+	/*
+	 * Both the things this foreground had to launch are launched: the tmux
+	 * server, and the service that outlives this terminal. Neither inherits
+	 * what follows, so confine what is left. It keeps exec -- attach() still
+	 * runs the tmux client -- and there is no Windows counterpart to the
+	 * POSIX foreground's refusal of INET sockets, so this is the token's
+	 * privileges and the mitigation policies and no more.
+	 */
+	memset(&sb, 0, sizeof(sb));
+	sb.role = SANDBOX_FOREGROUND;
+	sandbox_apply(&sb);
 
 	if (send_state(sv[0], &v, hostkey)) {
 		fprintf(stderr, "comrade: could not hand the session to the "

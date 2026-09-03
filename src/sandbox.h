@@ -46,6 +46,34 @@
  *                      so its profile forbids INET/INET6 sockets and leaves
  *                      exec alone.
  *
+ * What a platform can actually take away differs, and Windows differs most: it
+ * cannot narrow a running process's view of the filesystem at all, and nothing
+ * there refuses a system call by name. What it can do is drop the privileges
+ * held in its token (all of them but SeChangeNotifyPrivilege, whose absence
+ * turns every path lookup into a walk that checks each component), turn on the
+ * runtime process-mitigation policies, put itself in a one-process job object,
+ * and lower its own integrity level. The client takes all four. A service that
+ * still runs tmux itself -- which on Windows is every service, since
+ * sandbox_needs_spawner() is 0 there -- and the operator's foreground take the
+ * first two only: a job object's limits apply to every process in the job and
+ * children inherit membership, so the rest would land on tmux and on every
+ * guest's shell. The child-process ban goes with them too, since it also blocks
+ * CreatePseudoConsole. The client takes it, because it spawns nothing and
+ * renders into the console it was started in rather than making one, and so
+ * does a forwarding-only host, which serves no shell at all.
+ *
+ * Low integrity is a write-and-reach boundary, not a read boundary. It stops a
+ * compromised client writing anywhere the mandatory policy does not label low,
+ * and stops it opening a process, thread or window at any higher level; it
+ * reads the user's files exactly as it did before. It is one-shot -- a token's
+ * level goes down and never up, and lowering it costs the right to lower it
+ * again -- so it is the last thing applied, and it is skipped where the data
+ * directory will not take a low label, or where COMRADE_DEBUG asks for a log
+ * the temporary directory would then refuse to hold. The Windows foreground
+ * has no equivalent of the POSIX foreground's refusal of INET sockets: denying
+ * a running process the network there needs an administrator's firewall rule,
+ * which self-sandboxing does not reach for.
+ *
  * Applied at a single-threaded moment on each path (the client just before it
  * runs a session, the host children right after they fork and before the first
  * socket), so the per-thread Linux primitives -- capset, seccomp, namespace
@@ -75,13 +103,20 @@
 #define SANDBOX_L_SECCOMP	0x0008	/* a syscall/operation filter is active:
 					 * a Linux seccomp filter, or a macOS
 					 * Seatbelt profile */
-#define SANDBOX_L_CAPS		0x0010	/* capabilities + bounding set dropped */
+#define SANDBOX_L_CAPS		0x0010	/* privileges dropped: the Linux
+					 * capability and bounding sets, or the
+					 * Windows token's privileges */
 #define SANDBOX_L_NONEWPRIVS	0x0020	/* PR_SET_NO_NEW_PRIVS / equivalent */
 #define SANDBOX_L_MDWE		0x0040	/* memory write-xor-execute enforced */
 #define SANDBOX_L_RLIMIT	0x0080	/* resource limits (fork/core) clamped */
 #define SANDBOX_L_NODUMP	0x0100	/* core dumps / ptrace-attach refused */
-#define SANDBOX_L_JOB		0x0200	/* Windows job object (child ban) */
+#define SANDBOX_L_JOB		0x0200	/* Windows job object: one process, and
+					 * no desktop, clipboard or foreign
+					 * window handle */
 #define SANDBOX_L_MITIGATION	0x0400	/* Windows process mitigation policies */
+#define SANDBOX_L_INTEGRITY	0x0800	/* Windows: the token dropped to a lower
+					 * integrity level. A write-and-reach
+					 * boundary only -- see above */
 
 /*
  * A layer that engaged is reported, not only logged: a headless session names

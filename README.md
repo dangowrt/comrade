@@ -178,7 +178,7 @@ supervisor's log answers, not one that needs a debug build.
 |---------|----------------|--------------|---------------------|
 | Linux   | drop capabilities, `no_new_privs`, W^X, a seccomp filter denying `execve`, and a mount-namespace (or Landlock) filesystem confinement | the same, with tmux launched through a small unsandboxed broker | a seccomp filter denying the network |
 | macOS   | a Seatbelt `deny default` profile, `fork` blocked, `ptrace` refused | the same, through the broker | a Seatbelt profile denying the network |
-| Windows | a one-process job object (no child processes) plus process-mitigation policies | the mitigation policies (it launches tmux directly) | the mitigation policies |
+| Windows | every token privilege removed, low integrity with the data directory labelled to accept it, the child-process ban, a one-process job object with no desktop or window access, and the process-mitigation policies | the privileges and the mitigation policies (it launches tmux directly, so the job and the child ban would land on every guest's shell) | the same as the service |
 
 ## what works
 
