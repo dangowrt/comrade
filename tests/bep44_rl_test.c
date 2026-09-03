@@ -217,11 +217,73 @@ static void admission(void)
 	assert(slot >= 0 && E->store[slot] == NULL);	/* the furthest was evicted */
 }
 
+/*
+ * THE OTHER HALF OF THE LIMIT: WHAT WE SEND.
+ *
+ * Everything above is this node refusing to be flooded. The rendezvous nodes
+ * are the other side of it -- a handful of foreign nodes that every operation
+ * this engine runs asks, direct and convergent alike, with a read and a store
+ * able to fall due in the same round. The node that decides we are flooding it
+ * is then the one node whose answer the session cannot do without.
+ *
+ * Only the nodes we hold are budgeted, those being the only ones our own
+ * traffic can pile up on.
+ */
+static void our_own_queries_to_one_node_are_budgeted(void)
+{
+	struct sockaddr_in a;
+	uint64_t t = 100000;
+	int i;
+
+	memset(&a, 0, sizeof(a));
+	a.sin_family = AF_INET;
+	a.sin_port = htons(6881);
+	a.sin_addr.s_addr = htonl(0x0a000001);
+
+	/* Met once in the middle of a lookup and not held: not budgeted. */
+	for (i = 0; i < 20; i++)
+		assert(node_budget_ok(E, (struct sockaddr *)&a, sizeof(a), t));
+
+	assert(!bep44_pin_add(E, NULL, (struct sockaddr *)&a, sizeof(a)));
+
+	/* A ROUND'S BURST GOES OUT AT ONCE. Spacing these would buy nothing --
+	 * the average over the window is what a node watches -- and would cost
+	 * the latency of every rendezvous. */
+	for (i = 0; i <= B44_NODE_BURST; i++)
+		assert(node_budget_ok(E, (struct sockaddr *)&a, sizeof(a), t));
+	assert(!node_budget_ok(E, (struct sockaddr *)&a, sizeof(a), t));
+
+	/* And it drains at the sustained rate, so the next one waits for it. */
+	assert(!node_budget_ok(E, (struct sockaddr *)&a, sizeof(a),
+			       t + B44_NODE_COST_MS - 1));
+	assert(node_budget_ok(E, (struct sockaddr *)&a, sizeof(a),
+			      t + B44_NODE_COST_MS));
+
+	/* Left alone, the bucket empties rather than banking credit: a quiet
+	 * minute does not buy a flood. */
+	t += 60000;
+	for (i = 0; i <= B44_NODE_BURST; i++)
+		assert(node_budget_ok(E, (struct sockaddr *)&a, sizeof(a), t));
+	assert(!node_budget_ok(E, (struct sockaddr *)&a, sizeof(a), t));
+
+	/*
+	 * The whole point, stated as the node would measure it: over any ten
+	 * seconds, burst and sustained together stay under what this engine
+	 * itself would ban a source for.
+	 */
+	assert(B44_NODE_BURST + 10000 / B44_NODE_COST_MS <
+	       B44_BAN_RATE * 10);
+	/* Without squeezing the read-and-store pair a round already needs. */
+	assert(B44_NODE_COST_MS <= 500);
+}
+
+
 int main(void)
 {
 	void (*tests[])(void) = {
 		ban_at_limit, window_resets, escalate_v6, lone_pair_no_wide,
 		escalate_v4, fail_closed, admission,
+		our_own_queries_to_one_node_are_budgeted,
 	};
 	size_t i;
 

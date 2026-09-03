@@ -110,6 +110,30 @@ _Static_assert(BEP44_MAX_SALT <= UINT8_MAX, "salt_len is stored in a uint8_t");
 #define B44_BAN_MAX 128				/* blocklist / tracker entries */
 #define B44_BAN_WINDOW_MS 10000			/* the counting window (libtorrent's 10s) */
 #define B44_BAN_RATE 5				/* messages/sec over the window before a ban */
+/*
+ * OUR OWN QUERY BUDGET TO ONE NODE.
+ *
+ * The rendezvous nodes are asked by every operation this engine runs, the
+ * direct ones and the convergent ones alike, and a read and a store can fall
+ * due in the same round. Without a budget the handful of nodes a session
+ * actually depends on take the whole of its traffic -- and a node that decides
+ * we are flooding it stops answering, which is the one node whose answer the
+ * session cannot do without.
+ *
+ * A LEAKY BUCKET, BECAUSE THAT IS THE SHAPE OF WHAT IT GUARDS AGAINST. A node
+ * counts messages over a window and bans on the average; a minimum gap between
+ * queries is a different shape and the wrong one. A rendezvous round genuinely
+ * wants three or four packets away quickly, and spacing those buys nothing --
+ * the average over the window is what is being watched, and a short burst
+ * hardly moves it -- while costing the whole of that latency, on the one node
+ * a session with a single rendezvous cannot route around.
+ *
+ * So: a burst goes out at once, and the sustained rate settles at half the
+ * rate this engine itself serves a source before banning it, which mirrors
+ * libtorrent's dos_blocker and is the strictest behaviour we know of.
+ */
+#define B44_NODE_BURST 4		/* queries a round may need back to back */
+#define B44_NODE_COST_MS (2 * 1000 / B44_BAN_RATE)
 #define B44_BAN_TIME_MS (5 * 60 * 1000)		/* ban duration (libtorrent's 5 min) */
 #define B44_FAILCLOSED_MS 30000			/* block-all window when the table saturates */
 #define B44_COMPACT_CACHE_MAX 4			/* cache entries taken from one reply */
@@ -196,6 +220,7 @@ struct b44_op {
 	uint8_t is_put;
 	uint8_t is_immutable;		/* item named by sha1(v), no key or seq */
 	uint8_t is_update;		/* get, then merge, then put on same nodes */
+	int store_deferred;		/* a store the node budget held back */
 	uint8_t direct;			/* rendezvous mode: talk only to the seeded
 					 * and pinned nodes, never converge toward
 					 * the target (no find_node expansion) */
@@ -233,6 +258,8 @@ struct b44_seed {
 	socklen_t sslen;
 	uint8_t in_use;
 	uint8_t has_id;
+	uint64_t tat_ms;		/* leaky bucket: when the queries asked of
+					 * it so far will have drained away */
 };
 
 struct bep44_engine {
@@ -806,6 +833,44 @@ static void retain_add(struct bep44_engine *e, const uint8_t id[20],
  * subscription makes) starts already converged instead of cold. They carry
  * ids, so they rank by true distance and actually accelerate the next lookup.
  */
+/* The bucket for a node we hold, or NULL if we hold no such node. */
+static uint64_t *seed_bucket(struct bep44_engine *e, const struct sockaddr *sa,
+			     socklen_t len)
+{
+	int i;
+
+	for (i = 0; i < e->npinned; i++)
+		if (e->pinned[i].sslen == len &&
+		    !memcmp(&e->pinned[i].ss, sa, (size_t)len))
+			return &e->pinned[i].tat_ms;
+	for (i = 0; i < B44_RETAINED_MAX; i++)
+		if (e->retained[i].in_use && e->retained[i].sslen == len &&
+		    !memcmp(&e->retained[i].ss, sa, (size_t)len))
+			return &e->retained[i].tat_ms;
+	return NULL;
+}
+
+/*
+ * Whether this node may be asked now, stamping it where it may. Only the nodes
+ * we hold are budgeted: they are the few that every operation asks, so they are
+ * the only ones our own traffic can pile up on. A node met once in the middle
+ * of a lookup is not worth the bookkeeping.
+ */
+static int node_budget_ok(struct bep44_engine *e, const struct sockaddr *sa,
+			  socklen_t len, uint64_t now)
+{
+	uint64_t *tat = seed_bucket(e, sa, len);
+
+	if (!tat)
+		return 1;
+	if (*tat < now)
+		*tat = now;		/* drained while we were not asking */
+	if (*tat - now > (uint64_t)B44_NODE_BURST * B44_NODE_COST_MS)
+		return 0;
+	*tat += B44_NODE_COST_MS;
+	return 1;
+}
+
 static void op_retain_nodes(struct bep44_engine *e, struct b44_op *op)
 {
 	int k, kept4 = 0, kept6 = 0;
@@ -938,11 +1003,13 @@ static void op_finish(struct b44_op *op)
 
 static int store_start(struct b44_op *op)
 {
+	uint64_t now = now_ms();
 	int i, sent = 0, s4 = 0, s6 = 0;
 
 	/* Store on the closest token-bearing nodes of EACH family, so the value
 	 * lands on the v6 k-closest too and a v6-only client can read it. */
 	op->phase = B44_PHASE_STORE;
+	op->store_deferred = 0;
 	for (i = 0; i < op->nnodes; i++) {
 		int v6;
 
@@ -952,6 +1019,12 @@ static int store_start(struct b44_op *op)
 		v6 = op->nodes[i].ss.ss_family == AF_INET6;
 		if ((v6 ? s6 : s4) >= B44_K)
 			continue;
+		if (!node_budget_ok(op->e,
+				    (struct sockaddr *)&op->nodes[i].ss,
+				    op->nodes[i].sslen, now)) {
+			op->store_deferred = 1;
+			continue;
+		}
 		if (put_send(op, i))
 			break;
 		if (v6)
@@ -989,7 +1062,7 @@ static void update_store(struct b44_op *op)
 static void op_step(struct b44_op *op)
 {
 	uint64_t now = now_ms();
-	int i, inflight = 0, if4 = 0, if6 = 0;
+	int i, inflight = 0, if4 = 0, if6 = 0, deferred = 0, answered = 0;
 
 	if (now - op->start_ms > B44_OP_TIMEOUT_MS) {
 		op_finish(op);
@@ -1025,11 +1098,20 @@ static void op_step(struct b44_op *op)
 		for (i = 0; i < op->nnodes; i++) {
 			int v6;
 
+			if (op->nodes[i].state == B44_NODE_REPLIED ||
+			    op->nodes[i].state == B44_NODE_STORED)
+				answered++;
 			if (op->nodes[i].state != B44_NODE_FRESH)
 				continue;
 			v6 = op->nodes[i].ss.ss_family == AF_INET6;
 			if ((v6 ? if6 : if4) >= (v6 ? B44_ALPHA_V6 : B44_ALPHA_V4))
 				continue;
+			if (!node_budget_ok(op->e,
+					    (struct sockaddr *)&op->nodes[i].ss,
+					    op->nodes[i].sslen, now)) {
+				deferred++;
+				continue;
+			}
 			if (get_send(op, i))
 				break;
 			inflight++;
@@ -1038,7 +1120,16 @@ static void op_step(struct b44_op *op)
 			else
 				if4++;
 		}
-		if (inflight)
+		/*
+		 * A node held off by the budget has not failed, so the lookup
+		 * is not over -- but it waits for one only while nothing else
+		 * has answered. Where something has, the budget is doing what
+		 * it is for: spreading this operation over the other nodes we
+		 * hold instead of queueing behind the busiest one. Waiting on
+		 * it then would make holding more nodes slower than holding
+		 * one, which is the opposite of the point.
+		 */
+		if (inflight || (deferred && !answered))
 			return;
 		if (op->is_update) {
 			update_store(op);
@@ -1053,8 +1144,16 @@ static void op_step(struct b44_op *op)
 		return;
 	}
 
-	if (!inflight)
-		op_finish(op);
+	if (inflight)
+		return;
+	if (op->phase == B44_PHASE_STORE && op->store_deferred) {
+		/* Stores the budget held back, which have to go out before
+		 * this is a store that reached whom it was meant to. */
+		if (!store_start(op) && !op->store_deferred)
+			op_finish(op);
+		return;
+	}
+	op_finish(op);
 }
 
 /* A node address worth handing on as a rendezvous hint: real family, and
