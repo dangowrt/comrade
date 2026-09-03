@@ -880,6 +880,13 @@ static void svc_confine(struct svc *v)
 	sb.no_exec = (v->sp != NULL) || v->forward_only;
 	/* Forwarding-only serves no shell (see sshd.c), so it reaches no pty. */
 	sb.no_pty = v->forward_only;
+	/*
+	 * A host is told which port to listen on when a client asks it to,
+	 * which is long after this, so it cannot be given a list the way a
+	 * client can -- it is all TCP or none. Declining to forward is what
+	 * makes it none, and then the service keeps only the UDP it runs on.
+	 */
+	sb.tcp_any = !v->no_fwd;
 	sandbox_apply(&sb);
 }
 

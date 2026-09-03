@@ -106,7 +106,9 @@ static int session_connect(const char *arg, int ui_mode, int no_mcast,
 	struct sandbox_cfg sb;
 	struct rejoin rj;
 	struct ui *u;
-	int rc;
+	uint16_t tcp_bind[FWD_SPECS_MAX], tcp_connect[FWD_SPECS_MAX];
+	int ntcp_bind = 0, ntcp_connect = 0;
+	int rc, i;
 
 	memset(&cfg, 0, sizeof(cfg));
 	rc = token_decode(&cfg.tok, arg);
@@ -148,9 +150,24 @@ static int session_connect(const char *arg, int ui_mode, int no_mcast,
 	 * is called first so the data directory exists (and is the one path the
 	 * filesystem confinement will keep writable).
 	 */
+	/*
+	 * The only TCP a client ever does is its own forwarding: a -L is a port
+	 * it listens on, a -R is a port it connects out to once the host hands
+	 * it a channel. Everything else it speaks is UDP. So the ports are known
+	 * here, and a client asked for no forwards is a client that needs no TCP.
+	 */
+	for (i = 0; i < nfwd_l && i < FWD_SPECS_MAX; i++)
+		tcp_bind[ntcp_bind++] = fwd_l[i].bind_port;
+	for (i = 0; i < nfwd_r && i < FWD_SPECS_MAX; i++)
+		tcp_connect[ntcp_connect++] = fwd_r[i].port;
+
 	memset(&sb, 0, sizeof(sb));
 	sb.role = SANDBOX_CLIENT;
 	sb.data_dir = appdir_data();
+	sb.tcp_bind = tcp_bind;
+	sb.n_tcp_bind = ntcp_bind;
+	sb.tcp_connect = tcp_connect;
+	sb.n_tcp_connect = ntcp_connect;
 	sandbox_apply(&sb);
 
 	u = ui_create(UI_ROLE_CLIENT, ui_mode);	/* the view drives the dashboard */

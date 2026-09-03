@@ -1133,8 +1133,24 @@ static int fs_confine_ns(const struct sandbox_cfg *cfg)
 #define SB_FS_TRUNCATE		(1ULL << 14)
 #define SB_FS_IOCTL_DEV		(1ULL << 15)
 
+/*
+ * The kernel takes the size of this and refuses a field it does not know only
+ * when that field is set, so one struct serves every ABI: the network member
+ * stays zero below version 4 and the call is accepted exactly as before.
+ */
 struct sb_ruleset_attr {
 	uint64_t handled_access_fs;
+	uint64_t handled_access_net;
+};
+
+#define SB_LANDLOCK_RULE_NET_PORT 2
+
+#define SB_NET_BIND_TCP		(1ULL << 0)
+#define SB_NET_CONNECT_TCP	(1ULL << 1)
+
+struct sb_net_port {
+	uint64_t allowed_access;
+	uint64_t port;
 };
 
 struct sb_path_beneath {
@@ -1149,6 +1165,20 @@ struct sb_path_beneath {
 
 /* Grant `access` beneath `path`; a path that is not present is skipped, and a
  * file keeps only the file-applicable rights so the rule is not rejected. */
+/* One TCP port the process may bind or connect to. */
+static void ll_allow_port(int rs, uint16_t port, uint64_t access)
+{
+	struct sb_net_port np;
+
+	memset(&np, 0, sizeof(np));
+	np.allowed_access = access;
+	np.port = port;
+	if (syscall(__NR_landlock_add_rule, rs, SB_LANDLOCK_RULE_NET_PORT,
+		    &np, 0U) != 0)
+		dbg_logf("sandbox: landlock rule for tcp/%u failed (%d)",
+			 (unsigned)port, errno);
+}
+
 static void ll_allow(int rs, const char *path, uint64_t access)
 {
 	struct sb_path_beneath pb;
@@ -1183,7 +1213,7 @@ static int fs_confine_landlock(const struct sandbox_cfg *cfg)
 	char dir[PATH_MAX];
 	const char *dbg;
 	char *slash;
-	uint64_t handled, ro, rwx, rw;
+	uint64_t handled, ro, rwx, rw, net;
 	long abi;
 	int rs;
 	int have_resolv;
@@ -1216,11 +1246,41 @@ static int fs_confine_landlock(const struct sandbox_cfg *cfg)
 	if (abi >= 5)
 		handled |= SB_FS_IOCTL_DEV;
 
+	/*
+	 * Network rules arrive at version 4, and only a role that knows its
+	 * ports can use them. Handling the access with no rule for a port is
+	 * what refuses it, so a role with no forwarding gets no TCP at all --
+	 * which is every ordinary client, comrade's own transport being UDP
+	 * from the DHT through to the session.
+	 */
+	net = 0;
+	if (abi >= 4 && !cfg->tcp_any)
+		net = SB_NET_BIND_TCP | SB_NET_CONNECT_TCP;
+
 	memset(&attr, 0, sizeof(attr));
 	attr.handled_access_fs = handled;
+	attr.handled_access_net = net;
 	rs = (int)syscall(__NR_landlock_create_ruleset, &attr, sizeof(attr), 0U);
 	if (rs < 0)
 		return 0;
+
+	if (net) {
+		int i;
+
+		for (i = 0; i < cfg->n_tcp_bind; i++)
+			ll_allow_port(rs, cfg->tcp_bind[i], SB_NET_BIND_TCP);
+		for (i = 0; i < cfg->n_tcp_connect; i++)
+			ll_allow_port(rs, cfg->tcp_connect[i],
+				      SB_NET_CONNECT_TCP);
+		/*
+		 * The resolver falls back to TCP for an answer that will not
+		 * fit in a datagram, and comrade resolves names for as long as
+		 * a session lasts rather than once at the start, so refusing
+		 * this would break name resolution only occasionally and only
+		 * for the unlucky.
+		 */
+		ll_allow_port(rs, 53, SB_NET_CONNECT_TCP);
+	}
 
 	ro = (SB_FS_READ_FILE | SB_FS_READ_DIR) & handled;
 	rwx = (SB_FS_READ_FILE | SB_FS_READ_DIR | SB_FS_EXECUTE) & handled;

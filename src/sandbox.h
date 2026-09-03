@@ -4,6 +4,8 @@
 #ifndef COMRADE_SANDBOX_H
 #define COMRADE_SANDBOX_H
 
+#include <stdint.h>		/* the port lists in struct sandbox_cfg */
+
 /*
  * Self-sandboxing: comrade shrinks its own privileges to what the work in
  * front of it needs, using only what the running kernel already offers and
@@ -99,6 +101,24 @@ struct sandbox_cfg {
 	 * that serves shells reaches them through its broker.
 	 */
 	int no_pty;
+	/*
+	 * The TCP a role will actually use, so a kernel with Landlock's network
+	 * rules can refuse the rest. comrade's own transport is UDP throughout
+	 * -- the DHT, the multicast rendezvous, STUN, ICE and the KCP the
+	 * session rides on -- so the only TCP is port forwarding, and a process
+	 * doing none of it needs none at all.
+	 *
+	 * tcp_any means the role cannot know its ports in advance and the
+	 * restriction is skipped: a host learns which port to listen on when a
+	 * client asks it to, long after it is confined. A client does know, from
+	 * its own -L and -R arguments, so it gets the exact ports and nothing
+	 * else. With neither set, a role gets no TCP whatsoever.
+	 */
+	const uint16_t *tcp_bind;	/* ports it will listen on */
+	int n_tcp_bind;
+	const uint16_t *tcp_connect;	/* ports it will connect out to */
+	int n_tcp_connect;
+	int tcp_any;
 };
 
 /*
