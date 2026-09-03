@@ -73,6 +73,29 @@ static int print_version(void)
 
 #define FWD_SPECS_MAX 8
 
+/*
+ * The way back in, kept current while the session runs.
+ *
+ * A client joins on whatever token it was given, which may name no rendezvous
+ * at all, and is told where the host actually is once it gets there. Printing
+ * the original on the way out sends the next join round the whole convergent
+ * search again, for a node it already knows the address of.
+ */
+struct rejoin {
+	struct token tok;
+	char str[TOKEN_STR_LEN];
+};
+
+static void on_rejoin_state(void *arg, int family, int state,
+			    const uint8_t *addr, uint16_t port)
+{
+	struct rejoin *r = arg;
+
+	token_set_family(&r->tok, family, state, addr, port);
+	if (token_encode(&r->tok, r->str, sizeof(r->str)))
+		r->str[0] = '\0';	/* keep the one we came in on */
+}
+
 static int session_connect(const char *arg, int ui_mode, int no_mcast,
 			   int no_dht, const struct fwdspec *fwd_l, int nfwd_l,
 			   const struct fwdspec *fwd_r, int nfwd_r,
@@ -81,6 +104,7 @@ static int session_connect(const char *arg, int ui_mode, int no_mcast,
 	struct session_cfg cfg;
 	struct session_obs obs;
 	struct sandbox_cfg sb;
+	struct rejoin rj;
 	struct ui *u;
 	int rc;
 
@@ -134,6 +158,10 @@ static int session_connect(const char *arg, int ui_mode, int no_mcast,
 		ui_bind(u, &obs);
 		cfg.obs = &obs;
 	}
+	rj.tok = cfg.tok;
+	rj.str[0] = '\0';
+	cfg.on_token_state = on_rejoin_state;
+	cfg.arg = &rj;
 	rc = session_run(&cfg);
 	ui_destroy(u);
 	/*
@@ -168,7 +196,7 @@ static int session_connect(const char *arg, int ui_mode, int no_mcast,
 	 * just scrolled away with the session.
 	 */
 	fprintf(stderr, "comrade: left the shared session "
-		"(comrade %s   to rejoin)\n", arg);
+		"(comrade %s   to rejoin)\n", rj.str[0] ? rj.str : arg);
 	return 0;
 }
 

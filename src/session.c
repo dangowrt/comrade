@@ -530,7 +530,11 @@ struct sess {
 	uint64_t ice_attempt_start;
 	int ice_attempt;
 	int expect4, expect6;		/* host has DHT reach on this family */
-	int tok_state[2];		/* per family [0]=v4 [1]=v6, TOKEN_STATE_* */
+	int tok_state[2];
+	uint8_t tok_ep[2][TOKEN_EP6_LEN];	/* client: the node last told,
+						 * so an unchanged one is not
+						 * re-encoded every round */
+	uint16_t tok_port[2];		/* per family [0]=v4 [1]=v6, TOKEN_STATE_* */
 	int tok_told[2];		/* the state has been reported at least once */
 	int noconn_warned;		/* operator told no family can be advertised */
 	uint64_t next_tok_ms;		/* throttle the per-family advert decision */
@@ -5306,6 +5310,53 @@ static int advert_state(struct sess *s, int fam, enum tok_advert adv,
  * neither family has an address the operator is told, rather than the host
  * hanging silently.
  */
+/*
+ * A CLIENT'S WAY BACK IN, KEPT CURRENT.
+ *
+ * It joined on whatever token it was handed, which may have named no
+ * rendezvous at all -- that is what its own DHT warm-up is for -- and it has
+ * since been told where the host actually is, over the control channel.
+ * Handing the original back when it leaves sends it round the whole convergent
+ * search again next time, for a node it is already holding the address of.
+ *
+ * Only ever a rendezvous this end holds: a family with none keeps whatever the
+ * token it arrived on said, since nothing here knows better.
+ */
+static void client_token_pump(struct sess *s)
+{
+	static const int famv[2] = { 4, 6 };
+	int i;
+
+	if (s->cfg->is_host || !s->cfg->on_token_state)
+		return;
+	for (i = 0; i < 2; i++) {
+		uint8_t node[NETSTATE_SA_MAX], nlen = 0;
+		uint8_t a[TOKEN_EP6_LEN];
+		uint16_t port = 0;
+		const uint8_t *b;
+
+		if (!netstate_anchor(&s->ns, famv[i], node, &nlen, NULL) ||
+		    !nlen)
+			continue;
+		b = ep_bytes((struct sockaddr *)node, &port);
+		if (!b)
+			continue;
+		memset(a, 0, sizeof(a));
+		memcpy(a, b, famv[i] == 6 ? TOKEN_EP6_LEN : TOKEN_EP4_LEN);
+		if (s->tok_told[i] &&
+		    s->tok_state[i] == TOKEN_STATE_RENDEZVOUS &&
+		    !memcmp(s->tok_ep[i], a, sizeof(a)) &&
+		    s->tok_port[i] == port)
+			continue;
+		s->tok_state[i] = TOKEN_STATE_RENDEZVOUS;
+		s->tok_told[i] = 1;
+		memcpy(s->tok_ep[i], a, sizeof(a));
+		s->tok_port[i] = port;
+		s->cfg->on_token_state(s->cfg->arg, famv[i],
+				       TOKEN_STATE_RENDEZVOUS, a, port);
+	}
+}
+
 static void token_pump(struct sess *s)
 {
 	static const int famv[2] = { 4, 6 };
@@ -6096,6 +6147,7 @@ static int host_turnstile(struct sess *s)
 		maybe_announce_rendezvous(s);	/* report the rendezvous */
 		report_mailbox(s);
 		token_pump(s);			/* mint and advertise the token */
+		client_token_pump(s);		/* or keep the way back in */
 		rdv_publish(s);			/* where we rendezvous, for the
 						 * workers to announce */
 		reach_publish(s);		/* and what we can reach */
