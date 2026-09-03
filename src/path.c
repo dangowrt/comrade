@@ -19,6 +19,8 @@ int path_ep_is_v4(const struct path_ep *ep)
 
 int path_ep_is_unicast(const struct path_ep *ep)
 {
+	static const uint8_t zero[16] = { 0 };
+
 	if (path_ep_is_v4(ep)) {
 		const uint8_t *a = ep->addr + 12;
 
@@ -32,7 +34,14 @@ int path_ep_is_unicast(const struct path_ep *ep)
 	}
 	if (ep->addr[0] == 0xff)		/* ff00::/8 */
 		return 0;
-	return !path_ep_any(ep);
+	/*
+	 * The unspecified address in its own right, and not through
+	 * path_ep_any: that asks whether an endpoint is EMPTY, which needs the
+	 * port to be zero as well -- so "::" carrying a real port walked past
+	 * both tests and was entered as a path. It names no host, nothing
+	 * answers on it, and the table it occupies a slot in holds four.
+	 */
+	return memcmp(ep->addr, zero, sizeof(zero)) != 0;
 }
 
 int path_ep_any(const struct path_ep *ep)

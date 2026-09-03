@@ -1090,8 +1090,39 @@ static void agent_paths_check(void)
 	assert(path_table_count(&t) == 1);
 }
 
+/*
+ * THE UNSPECIFIED ADDRESS NAMES NO HOST, WHATEVER PORT IS ON IT.
+ *
+ * path_ep_any asks whether an endpoint is EMPTY, which requires the port to be
+ * zero as well -- so "::" carrying a real port walked past it and past the
+ * unicast test, and was entered as a path. Nothing answers there, and the
+ * table it takes a slot in holds four, so a peer that advertises it costs
+ * every other candidate its place.
+ */
+static void unspecified_is_not_unicast(void)
+{
+	struct path_ep ep;
+
+	memset(&ep, 0, sizeof(ep));
+	ep.port = 51820;
+	assert(!path_ep_any(&ep));	/* not empty: it has a port */
+	assert(!path_ep_is_unicast(&ep));
+
+	/* v4's own zero page was already refused, and stays so. */
+	ep.addr[10] = 0xff;
+	ep.addr[11] = 0xff;
+	assert(!path_ep_is_unicast(&ep));
+
+	/* And an ordinary address is unaffected. */
+	ep.addr[12] = 192;
+	ep.addr[13] = 168;
+	ep.addr[15] = 5;
+	assert(path_ep_is_unicast(&ep));
+}
+
 int main(void)
 {
+	unspecified_is_not_unicast();
 	endpoint_check();
 	probe_codec_check();
 	id_check();
