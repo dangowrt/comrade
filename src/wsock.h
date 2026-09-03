@@ -35,7 +35,23 @@
 
 #ifdef _WIN32
 
-/* Win10: WSAPoll and struct pollfd need >= 0x0600, inet_ntop/pton >= 0x0600. */
+/*
+ * Win10: WSAPoll and struct pollfd need >= 0x0600, inet_ntop/pton >= 0x0600,
+ * SetProcessMitigationPolicy >= 0x0602, CreatePseudoConsole 0x0A00.
+ *
+ * Defaulting the value is not enough, because something may already have set a
+ * lower one: mingw's own <_mingw.h> defines _WIN32_WINNT as 0x601, and any
+ * standard header at all drags that in -- <stdint.h> is enough. A version left
+ * at Windows 7 does not fail the build in any obvious way. It silently hides
+ * every declaration guarded above it, and the call then compiles as an implicit
+ * declaration or not at all, depending on the toolchain's own dialect defaults.
+ * So raise a lower value rather than accepting it. sdkddkver.h has not run yet
+ * at this point (it comes in with windows.h below), so NTDDI_VERSION is still
+ * derived from what is set here.
+ */
+#if defined(_WIN32_WINNT) && _WIN32_WINNT < 0x0A00
+#undef _WIN32_WINNT
+#endif
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0A00
 #endif
