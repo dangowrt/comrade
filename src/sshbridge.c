@@ -15,6 +15,8 @@ struct sshbridge {
 	int linger_set;
 	uint32_t linger_ms;	/* how long to flush after fd_eof (see header) */
 	uint32_t linger_at;	/* monotonic ms when fd_eof was first seen */
+	uint32_t linger_move;	/* and when the queue last got shorter */
+	int linger_q;		/* how long it was then */
 	size_t out_len;		/* bytes pulled from the stream, awaiting write */
 	size_t out_pos;
 	uint8_t out[BRIDGE_BUF];
@@ -118,6 +120,26 @@ static void pump_out(struct sshbridge *b)
 	}
 }
 
+/*
+ * How long to go on flushing with the queue not moving at all.
+ *
+ * The budget in linger_ms is for a peer that is THERE and slow -- a lossy link
+ * that needs the trailing close repeating. A peer that has gone acks nothing
+ * whatsoever, and spending the whole budget on it is dead time the other end
+ * sees as a guest that has left still sitting in its list.
+ *
+ * A few round trips tells the two apart, since a peer that is there acks
+ * something inside one. Where no round trip has been measured yet, a tenth of
+ * a second stands in for it; the budget is still the ceiling either way.
+ */
+static uint32_t stall_ms(const struct sshbridge *b)
+{
+	int rtt = stream_rtt(b->s);
+	uint32_t ms = (uint32_t)(rtt > 0 ? rtt : 100) * 4;
+
+	return ms > b->linger_ms ? b->linger_ms : ms;
+}
+
 int sshbridge_pump(struct sshbridge *b, short revents, uint32_t now_ms)
 {
 	/*
@@ -135,12 +157,21 @@ int sshbridge_pump(struct sshbridge *b, short revents, uint32_t now_ms)
 	if (b->dead)
 		return -1;
 	if (b->fd_eof) {
+		int q = stream_waitsnd(b->s);
+
 		if (!b->linger_set) {
 			b->linger_set = 1;
 			b->linger_at = now_ms;
+			b->linger_move = now_ms;
+			b->linger_q = q;
 		}
-		if (stream_waitsnd(b->s) == 0 ||
-		    (uint32_t)(now_ms - b->linger_at) >= b->linger_ms)
+		if (q < b->linger_q) {		/* acked: the peer is there */
+			b->linger_q = q;
+			b->linger_move = now_ms;
+		}
+		if (q == 0 ||
+		    (uint32_t)(now_ms - b->linger_at) >= b->linger_ms ||
+		    (uint32_t)(now_ms - b->linger_move) >= stall_ms(b))
 			return -1;
 	}
 	return 0;

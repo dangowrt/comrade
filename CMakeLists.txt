@@ -981,6 +981,11 @@ if(BUILD_TESTING)
 		target_link_libraries(sshkcp_test
 			comrade_ssh comrade_bridge comrade_stream comrade_token Threads::Threads)
 		add_test(NAME sshkcp_test COMMAND sshkcp_test)
+		add_executable(sshlinger_test tests/sshlinger_test.c)
+		target_link_libraries(sshlinger_test
+			comrade_bridge comrade_stream Threads::Threads)
+		add_test(NAME sshlinger_test COMMAND sshlinger_test)
+		set_tests_properties(sshlinger_test PROPERTIES TIMEOUT 30)
 		add_executable(sshctl_test tests/sshctl_test.c)
 		target_link_libraries(sshctl_test comrade_ssh comrade_bridge comrade_stream comrade_token Threads::Threads)
 		add_test(NAME sshctl_test COMMAND sshctl_test)

@@ -23,12 +23,17 @@ struct sshbridge;
 
 /*
  * linger_ms bounds how long, after our fd closes, we keep flushing the send
- * queue to deliver the trailing SSH close. It returns early once the peer acks,
- * so this only matters when the peer has stopped acking. The host wants it
- * generous, to land the close on the client over a lossy link; the client wants
- * it short, since its own closing bytes are non-critical (the session always
- * ends host-first) and a long wait for acks a departed host will never send
- * just stalls the client's exit.
+ * queue to deliver the trailing SSH close. The host wants it generous, to land
+ * the close on the client over a lossy link; the client wants it short, since
+ * its own closing bytes are non-critical (the session always ends host-first)
+ * and a long wait for acks a departed host will never send just stalls the
+ * client's exit.
+ *
+ * IT IS A CEILING FOR A PEER THAT IS SLOW, NOT A WAIT FOR ONE THAT HAS GONE.
+ * The flush also ends as soon as the queue stops moving at all: a peer that is
+ * there acks something within a round trip, and one that has left acks nothing
+ * ever, so spending the whole budget on it is dead time -- on a host, five
+ * seconds of showing a guest that has already gone.
  */
 struct sshbridge *sshbridge_create(sock_t fd, struct stream *s,
 				   uint32_t linger_ms);
