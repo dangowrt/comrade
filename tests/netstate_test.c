@@ -330,6 +330,21 @@ static void a_peers_vouch_qualifies_what_we_cannot_reach(void)
 	assert(netstate_anchor(&ns, 6, out, &olen, &confirmed));
 	assert(confirmed);
 
+	/*
+	 * AND IT STOPS STANDING IN ONCE WE CAN ASK FOR OURSELVES. Roaming onto
+	 * a network where the family is up puts the round trip back within
+	 * reach, so the node reads as being checked again rather than resting
+	 * on a proof made on a network we have left. The token slot keeps it
+	 * throughout: what the peer proved is that the node holds this key,
+	 * which is all the slot ever claimed.
+	 */
+	netstate_on_roundtrip(&ns, 6, netstate_epoch(&ns, 6));
+	assert(netstate_conn(&ns, 6) == NET_CONN_UP);
+	assert(netstate_anchor(&ns, 6, out, &olen, &confirmed));
+	assert(!confirmed);
+	netstate_facts(&ns, 6, &f);
+	assert(f.dht_acked);
+
 	/* A different node replacing it starts over: the vouch was for the
 	 * node that was vouched for, not for the slot. */
 	fill(node, 16, 70);

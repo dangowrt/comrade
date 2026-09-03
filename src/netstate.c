@@ -696,6 +696,26 @@ void netstate_reach(const struct netstate *ns, int family, int *conn,
 		*dht_acked = f->dht_acked;
 }
 
+/*
+ * Whether the anchor stands proven to a reader.
+ *
+ * A VOUCH IS A STAND-IN FOR A PROOF THIS END COULD NOT MAKE, so it holds only
+ * while that is still so. On a network where the family is up the round trip
+ * is available again and it is ours to make: the node goes back to being
+ * checked until it answers here, rather than resting for the rest of the
+ * session on a proof made elsewhere, on a network we have since left.
+ *
+ * The token slot is a separate question and keeps the node either way (see
+ * netstate_facts): what the peer proved is that the node holds this key, which
+ * is all the slot ever claimed, and re-checking it here is no reason to stop
+ * telling a client where to go.
+ */
+static int anchor_proven(const struct netstate_fam *f)
+{
+	return f->anchor_confirmed ||
+	       (f->anchor_vouched && f->conn != NET_CONN_UP);
+}
+
 int netstate_anchor(const struct netstate *ns, int family, uint8_t *out,
 		    uint8_t *out_len, int *confirmed)
 {
@@ -708,6 +728,6 @@ int netstate_anchor(const struct netstate *ns, int family, uint8_t *out,
 	if (out_len)
 		*out_len = f->anchor_len;
 	if (confirmed)
-		*confirmed = f->anchor_confirmed || f->anchor_vouched;
+		*confirmed = anchor_proven(f);
 	return 1;
 }

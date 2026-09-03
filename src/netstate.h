@@ -364,9 +364,15 @@ void netstate_on_rdv_offered(struct netstate *ns, int family,
  * rendezvous names a node willing to hold this mutable key, and never said
  * anything about who can reach it.
  *
- * A vouch survives a move of ours. What our own proof asserts is about this
- * network and is dropped with it; what the peer proved is about the node, and
- * changing networks here does not make it less true.
+ * A vouch survives a move of ours, for the purpose of the token slot: what our
+ * own proof asserts is about this network and is dropped with it, while what
+ * the peer proved is about the node, and changing networks here does not make
+ * it less true.
+ *
+ * It does NOT go on standing in for a proof we are able to make again. On a
+ * network where the family is up, the node reads as being checked until it has
+ * answered here -- a vouch covers the gap where this end has no way to ask,
+ * and closes when it has.
  */
 void netstate_on_rdv_vouched(struct netstate *ns, int family,
 			     const uint8_t *node, int len, uint64_t now);
