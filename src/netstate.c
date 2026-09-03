@@ -716,6 +716,19 @@ static int anchor_proven(const struct netstate_fam *f)
 	       (f->anchor_vouched && f->conn != NET_CONN_UP);
 }
 
+void netstate_anchor_state(const struct netstate *ns, int family, int *proven,
+			   int *vouched, int *blind)
+{
+	const struct netstate_fam *f = &ns->f[fam_idx(family)];
+
+	if (proven)
+		*proven = f->anchor_confirmed;
+	if (vouched)
+		*vouched = f->anchor_vouched;
+	if (blind)
+		*blind = !(f->conn & (NET_CONN_UP | NET_CONN_PENDING));
+}
+
 int netstate_anchor(const struct netstate *ns, int family, uint8_t *out,
 		    uint8_t *out_len, int *confirmed)
 {

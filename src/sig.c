@@ -83,6 +83,10 @@
 
 #define SIG_DHT_WIDE_GET_MS 4000	/* while the peer's slot is still unseen */
 #define SIG_DHT_WIDE_IDLE_MS 20000	/* once it has been, as a safety net */
+#define SIG_DHT_RELAY_MS 4000		/* operating a rendezvous the peer cannot
+					 * reach: often enough that a change to
+					 * its offer reaches the family within a
+					 * round of being made */
 #define SIG_DHT_WIDE_PUT_MS 45000	/* keep the value on whoever is closest
 					 * now, not only where it first landed */
 
@@ -1312,7 +1316,25 @@ static void sig_note_put(struct sig *s)
 /* Asked to establish a rendezvous for a family we have not captured one on
  * yet. A family we already hold needs no store: what we hold is what the peer
  * is told. */
+/*
+ * Rendezvousing on the peer's behalf, for as long as it keeps asking.
+ *
+ * NOT UNTIL A NODE IS FOUND. The peer cannot reach the family at all, so
+ * finding it a node and stopping there leaves it holding an address it can
+ * never store to, read from, or replace -- the rendezvous stops being served
+ * the moment we look away, and the peer has no way to notice. It has to go on
+ * being operated for it: the same store, direct store and direct get another
+ * end would run for itself. The ask lapses when the peer stops needing it,
+ * which is what ends this.
+ */
 static int relaying(const struct sig *s)
+{
+	return s->relay4 || s->relay6;
+}
+
+/* Still looking for the node, as opposed to operating one we have. Only the
+ * search is urgent: the peer is waiting on it and has nothing meanwhile. */
+static int relay_locating(const struct sig *s)
 {
 	return (s->relay4 && !s->rnode4_len) || (s->relay6 && !s->rnode6_len);
 }
@@ -1371,8 +1393,8 @@ static void dht_pump(struct sig *s, uint64_t now)
 		 * one in use.
 		 */
 		s->next_wide_get_ms = now +
-			((mailbox_peer_slot(&s->mb, &slot) && !relaying(s) &&
-			  !warming(s)) ?
+			((mailbox_peer_slot(&s->mb, &slot) &&
+			  !relay_locating(s) && !warming(s)) ?
 			 SIG_DHT_WIDE_IDLE_MS : SIG_DHT_WIDE_GET_MS);
 	}
 	if (now < s->next_put_ms)
@@ -1517,23 +1539,40 @@ static void dht_pump(struct sig *s, uint64_t now)
 	} else if (relaying(s) && !s->put_inflight) {
 		/*
 		 * Rendezvous on the peer's behalf: a host that cannot reach a
-		 * family has asked us to establish one there. The sequence is
-		 * the host's own -- the convergent store places the container
-		 * on the nodes the key belongs to, and the validating get that
-		 * follows picks whichever of them answers -- because a node
-		 * established any other way would carry a weaker promise while
-		 * being indistinguishable afterwards.
+		 * family has asked us to establish and then operate one there.
+		 * The sequence is the host's own -- the convergent store places
+		 * the container on the nodes the key belongs to, and the
+		 * validating get that follows picks whichever of them answers
+		 * -- because a node established any other way would carry a
+		 * weaker promise while being indistinguishable afterwards.
 		 *
 		 * What differs is only what is written: the container as it
 		 * stands, neither slot ours (mailbox_relay). Claiming the
 		 * answer slot here would take the turnstile and hold it for the
 		 * session, locking out every other client, for a store that was
 		 * never about claiming anything.
+		 *
+		 * Once there is a node, the same two routes the peer would run
+		 * for itself: the direct store keeps the container on that node
+		 * and carries the peer's newest offer to it, and the direct get
+		 * -- which every operation already makes to the nodes we hold
+		 * -- is what notices the node going quiet, so netstate can look
+		 * for a replacement and announce it. Which is the whole of the
+		 * migration: the peer follows what we tell it, having no way to
+		 * see the family for itself.
 		 */
 		sig_note_put(s);
-		bep44_update(s->engine, s->keys.bep44_sk, s->keys.bep44_pk,
-			     SIG_SALT, sig_relay_merge, s, NULL, NULL);
-		s->next_put_ms = now + SIG_DHT_PUT_MS;
+		if (relay_locating(s)) {
+			bep44_update(s->engine, s->keys.bep44_sk,
+				     s->keys.bep44_pk, SIG_SALT,
+				     sig_relay_merge, s, NULL, NULL);
+			s->next_put_ms = now + SIG_DHT_PUT_MS;
+		} else {
+			bep44_update_direct(s->engine, s->keys.bep44_sk,
+					    s->keys.bep44_pk, SIG_SALT,
+					    sig_relay_merge, s, NULL, NULL);
+			s->next_put_ms = now + SIG_DHT_RELAY_MS;
+		}
 	}
 }
 

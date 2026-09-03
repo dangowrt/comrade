@@ -48,6 +48,20 @@
 #define CTL_HDR 2
 #define CTL_TS_LEN 8
 #define CTL_RDV_PLEN 19
+
+/*
+ * What a sender can say about a rendezvous node it names, as a trailing byte
+ * on CTLM_RDV. A node is worth naming before it is proven: it is where the
+ * sender is meeting whatever it has managed to prove, and a peer that can
+ * reach the family may be able to prove it where the sender never can.
+ *
+ * The byte is optional, so a payload of CTL_RDV_PLEN is still a valid CTLM_RDV
+ * and reads as a node with nothing said about it.
+ */
+#define CTL_RDVST_PROVEN  0x01		/* it has answered the sender */
+#define CTL_RDVST_VOUCHED 0x02		/* another end proved it for the sender */
+#define CTL_RDVST_BLIND   0x04		/* the sender cannot reach this family */
+#define CTL_RDVST_PLEN (CTL_RDV_PLEN + 1)
 #define CTL_REACH_PLEN 4
 #define CTL_RDVASK_PLEN 1
 #define CTL_FRAME_MAX (CTL_HDR + CTL_KEY_PLEN)

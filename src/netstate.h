@@ -426,6 +426,19 @@ int netstate_rows(const struct netstate *ns, int family,
 void netstate_facts(const struct netstate *ns, int family,
 		    struct tokgen_facts *out);
 
+/*
+ * What is known about the anchor, for a sender describing it to a peer:
+ * whether it has answered here, whether another end proved it, and whether
+ * this end can reach the family at all. Any may be NULL.
+ *
+ * Reported separately rather than folded into one verdict, because a peer acts
+ * on them differently: proven says the node is good, vouched says somebody
+ * else found it so, and blind says the sender cannot check and may need the
+ * peer to do it.
+ */
+void netstate_anchor_state(const struct netstate *ns, int family, int *proven,
+			   int *vouched, int *blind);
+
 /* The anchor, and whether a round trip in this epoch confirmed it. */
 int netstate_anchor(const struct netstate *ns, int family, uint8_t *out,
 		    uint8_t *out_len, int *confirmed);

@@ -78,7 +78,8 @@ struct rdv_node {
 	struct sockaddr_storage sa;
 	socklen_t len;
 	int have;
-	int qualified;			/* proven here, so fit to hand over */
+	int qualified;			/* proven here, or proven for us */
+	int status;			/* CTL_RDVST_* as told to a peer */
 };
 
 /* [0] is IPv4, [1] is IPv6. */
@@ -2129,6 +2130,8 @@ static void ctl_dispatch(void *arg, int type, const uint8_t *pl, size_t plen)
 			c->rdv_in[i].sa = sa;
 			c->rdv_in[i].len = sl;
 			c->rdv_in[i].have = 1;
+			c->rdv_in[i].status = plen >= CTL_RDVST_PLEN ?
+					      pl[CTL_RDV_PLEN] : 0;
 			c->rdv_in_dirty = 1;
 			pthread_mutex_unlock(&c->peer_in_lock);
 		}
@@ -3602,24 +3605,30 @@ static void rdv_publish(struct sess *s)
 		return;
 	for (i = 0; i < 2; i++) {
 		uint8_t node[NETSTATE_SA_MAX], nlen = 0;
-		int confirmed = 0, same;
+		int confirmed = 0, same, proven = 0, vouched = 0, blind = 0;
+		int status;
 
 		if (!netstate_anchor(&s->ns, famv[i], node, &nlen, &confirmed) ||
 		    !nlen)
 			continue;
+		netstate_anchor_state(&s->ns, famv[i], &proven, &vouched,
+				      &blind);
+		status = (proven ? CTL_RDVST_PROVEN : 0) |
+			 (vouched ? CTL_RDVST_VOUCHED : 0) |
+			 (blind ? CTL_RDVST_BLIND : 0);
 		pthread_mutex_lock(&s->pub_lock);
 		same = s->rdv[i].have && s->rdv[i].len == nlen &&
 		       !memcmp(&s->rdv[i].sa, node, nlen);
-		if (!same || s->rdv[i].qualified != confirmed) {
+		if (!same || s->rdv[i].qualified != confirmed ||
+		    s->rdv[i].status != status) {
 			memset(&s->rdv[i].sa, 0, sizeof(s->rdv[i].sa));
 			memcpy(&s->rdv[i].sa, node, nlen);
 			s->rdv[i].len = nlen;
 			s->rdv[i].have = 1;
 			s->rdv[i].qualified = confirmed;
-			if (confirmed) {
-				s->rdv_gen++;
-				told = 1;
-			}
+			s->rdv[i].status = status;
+			s->rdv_gen++;
+			told = 1;
 		}
 		pthread_mutex_unlock(&s->pub_lock);
 	}
@@ -3631,10 +3640,10 @@ static void rdv_publish(struct sess *s)
 		 * waiting to be told about. */
 		b4[0] = b6[0] = '\0';
 		pthread_mutex_lock(&s->pub_lock);
-		if (s->rdv[0].have && s->rdv[0].qualified)
+		if (s->rdv[0].have)
 			fmt_sockaddr((struct sockaddr *)&s->rdv[0].sa,
 				     s->rdv[0].len, b4, sizeof(b4));
-		if (s->rdv[1].have && s->rdv[1].qualified)
+		if (s->rdv[1].have)
 			fmt_sockaddr((struct sockaddr *)&s->rdv[1].sa,
 				     s->rdv[1].len, b6, sizeof(b6));
 		pthread_mutex_unlock(&s->pub_lock);
@@ -3674,11 +3683,19 @@ static void rdv_tell(struct conn *c, uint64_t now)
 	c->rdv_told_gen = gen;
 	c->next_rdv_tell_ms = now + RDV_TELL_MS;
 	for (i = 0; i < 2; i++) {
-		uint8_t pl[CTL_RDV_PLEN];
+		uint8_t pl[CTL_RDVST_PLEN];
 
-		if (!pub[i].have || !pub[i].qualified)
+		/*
+		 * Unproven ones too. A node this end cannot prove is still
+		 * where it is meeting, and a peer that can reach the family
+		 * may be able to prove it -- which is the whole of how a host
+		 * with no route to a family keeps a rendezvous on it. The
+		 * status byte is what lets the peer tell the cases apart.
+		 */
+		if (!pub[i].have)
 			continue;
 		ctl_rdv_encode(pl, famv[i], (struct sockaddr *)&pub[i].sa);
+		pl[CTL_RDV_PLEN] = (uint8_t)pub[i].status;
 		ctl_send(c, CTLM_RDV, pl, sizeof(pl));
 	}
 }
@@ -3737,10 +3754,27 @@ static void rdv_adopt(struct sess *s, struct conn *c)
 				continue;
 			}
 		}
-		netstate_on_rdv_vouched(&s->ns, famv[i],
-					(const uint8_t *)&in[i].sa,
-					(int)in[i].len, now_ms());
-		dbg_logf("rdv: adopted the peer's v%d node %s", famv[i], b);
+		/*
+		 * Only a node the peer stands behind is a vouch. It now names
+		 * the ones it has not proven as well -- they are where it is
+		 * meeting, and this end may be able to prove what it cannot --
+		 * but taking its word for one it has not got would put a claim
+		 * behind the node that nobody has ever made.
+		 */
+		if (in[i].status & (CTL_RDVST_PROVEN | CTL_RDVST_VOUCHED))
+			netstate_on_rdv_vouched(&s->ns, famv[i],
+						(const uint8_t *)&in[i].sa,
+						(int)in[i].len, now_ms());
+		else
+			netstate_on_rdv_offered(&s->ns, famv[i],
+						(const uint8_t *)&in[i].sa,
+						(int)in[i].len, now_ms());
+		dbg_logf("rdv: adopted the peer's v%d node %s (%s%s%s)", famv[i],
+			 b, in[i].status & CTL_RDVST_PROVEN ? "proven" :
+			    in[i].status & CTL_RDVST_VOUCHED ? "vouched" :
+			    "unproven",
+			 in[i].status & CTL_RDVST_BLIND ? ", peer is blind" : "",
+			 "");
 	}
 }
 
@@ -3840,14 +3874,27 @@ static void reach_take(struct sess *s, struct conn *c)
  * Whether this end can settle `family`'s rendezvous by itself: it reaches the
  * DHT there, or it already holds a node. Either way there is nobody to ask.
  */
+/*
+ * Whether this end can look after `family`'s rendezvous itself.
+ *
+ * HOLDING A NODE IS NOT BEING ABLE TO OPERATE ONE. A node a client found for
+ * us, on a family we have no route to, is an address we can neither store to,
+ * read from, nor replace when it goes. Counting it as self-sufficiency stops
+ * the asking; the client's standing request then lapses, it stops relaying,
+ * and the rendezvous everybody has since been pointed at quietly stops being
+ * served -- with nobody in a position to notice, this end least of all.
+ *
+ * So reachability decides. With the family up the node is ours to keep, and
+ * with it down the request stands however many nodes we have been handed.
+ */
 static int rdv_self_sufficient(struct sess *s, int family)
 {
 	int conn = 0, acked = 0;
 
-	if (netstate_anchor(&s->ns, family, NULL, NULL, NULL))
-		return 1;
 	netstate_reach(&s->ns, family, &conn, &acked);
-	return conn == NET_CONN_UP && acked;
+	if (conn != NET_CONN_UP)
+		return 0;
+	return acked || netstate_anchor(&s->ns, family, NULL, NULL, NULL);
 }
 
 /*
