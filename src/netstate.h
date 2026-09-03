@@ -34,7 +34,10 @@ enum {					/* address scope for a local address */
 };
 enum {					/* how a local address was learnt */
 	NET_VIA_DIRECT,			/* locally gathered host candidate */
-	NET_VIA_STUN			/* server-reflexive, learnt via STUN */
+	NET_VIA_STUN,			/* server-reflexive, learnt via STUN */
+	NET_VIA_SHADOW			/* globally routable, but not what we
+					 * source from; named to a reader,
+					 * never gathered as one */
 };
 /* Bits, not an enum, so a later verdict (NAT type, filtering) can join UP. */
 #define NET_CONN_UP	  (1 << 0)	/* proven: something answered us here */
@@ -222,6 +225,9 @@ struct netstate_fam {
 	uint8_t src[16];
 	uint8_t src_len;		/* 0 = none held, else 4 or 16 */
 	char src_text[NETSTATE_ADDR_MAX];
+	int src_scope;			/* NET_SCOPE_* of src: our own address
+					 * being globally routable is what
+					 * tells a translation from a shadow */
 	uint32_t src_epoch;		/* src is offered only while this is
 					 * current, so a move cannot leave the
 					 * old address on the wire */
@@ -286,8 +292,31 @@ void netstate_on_netmon(struct netstate *ns, unsigned changed, int have4,
 
 /* len 0 means no route -- not a reason to forget the address we hold. */
 void netstate_on_src(struct netstate *ns, int family, uint32_t epoch,
-		     const uint8_t *addr, int len, const char *text,
+		     const uint8_t *addr, int len, int scope, const char *text,
 		     uint64_t now);
+
+/*
+ * The via a reader should be TOLD for a row, which is not always the one that
+ * was gathered.
+ *
+ * A multi-homed IPv6 host has several globally routable addresses, and ICE
+ * enumerates them all; each is reflexive to itself, since nothing translates
+ * IPv6. Reported as gathered they read as so many NATs, which is the one thing
+ * they are not. Two corrections, both about our own source address:
+ *
+ *   - the address we source from is never a translation of anything, however
+ *     it was learnt, because it is what the world already sees;
+ *   - another globally routable address, while the one we source from is
+ *     itself global, is a SHADOW: an interface address we do not send from.
+ *     A peer aiming at one reaches a socket that answers from the source
+ *     address instead, so its check never completes -- which is why the offer
+ *     leaves them out (canon_v6) and why naming them matters.
+ *
+ * Genuine NAT66 is what is left: a reflexive address that is global while ours
+ * is not, and that still reads GLOBAL (NAT).
+ */
+int netstate_row_via(const struct netstate *ns, int family,
+		     const struct netstate_row *r);
 
 void netstate_on_probe_started(struct netstate *ns, int family, uint32_t epoch,
 			       uint64_t now);

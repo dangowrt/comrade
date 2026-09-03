@@ -258,6 +258,9 @@ static void net_label(int scope, int via, const char **color, const char **text)
 	} else if (scope == NET_SCOPE_CGNAT) {
 		*color = YEL;
 		*text = "CGNAT";
+	} else if (via == NET_VIA_SHADOW) {
+		*color = DIM;
+		*text = "GLOBAL (shadow)";
 	} else if (via == NET_VIA_STUN) {
 		*color = BYE;
 		*text = "GLOBAL (NAT)";
@@ -782,6 +785,8 @@ static const char *scope_word(int scope, int via)
 		return "lan";
 	if (scope == NET_SCOPE_CGNAT)
 		return via == NET_VIA_STUN ? "cgnat-nat" : "cgnat";
+	if (via == NET_VIA_SHADOW)
+		return "global-shadow";
 	return via == NET_VIA_STUN ? "global-nat" : "global";
 }
 

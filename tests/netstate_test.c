@@ -75,7 +75,8 @@ static void give_src(struct netstate *ns, int fam, uint8_t seed)
 	int len = fam == 6 ? 16 : 4;
 
 	fill(a, len, seed);
-	netstate_on_src(ns, fam, netstate_epoch(ns, fam), a, len, "addr", t);
+	netstate_on_src(ns, fam, netstate_epoch(ns, fam), a, len,
+			NET_SCOPE_GLOBAL, "addr", t);
 }
 
 /* B14/R6: a v6 prefix arriving is not a v4 event. The whole v4 half of the
@@ -169,7 +170,8 @@ static void src_survives_the_roam_window(void)
 	assert(netstate_src_text(&ns, 6)[0] == '\0');
 
 	for (i = 0; i < 5; i++) {
-		netstate_on_src(&ns, 6, netstate_epoch(&ns, 6), NULL, 0, NULL, t);
+		netstate_on_src(&ns, 6, netstate_epoch(&ns, 6), NULL, 0, 0,
+				NULL, t);
 		assert(netstate_conn(&ns, 6) != NET_CONN_UP);
 		t += NETSTATE_SRC_FAST_MS;
 		netstate_tick(&ns, t);
@@ -177,7 +179,8 @@ static void src_survives_the_roam_window(void)
 	}
 
 	fill(a, 16, 20);
-	netstate_on_src(&ns, 6, netstate_epoch(&ns, 6), a, 16, "the-addr", t);
+	netstate_on_src(&ns, 6, netstate_epoch(&ns, 6), a, 16,
+			NET_SCOPE_GLOBAL, "the-addr", t);
 	assert(!strcmp(netstate_src_text(&ns, 6), "the-addr"));
 	assert(netstate_conn(&ns, 6) == NET_CONN_PENDING);
 
@@ -203,19 +206,82 @@ static void an_address_that_never_comes_stops_being_hurried(void)
 	assert(drain(&ns).f[1] & NSA_SAMPLE_SRC);
 
 	for (i = 0; i < NETSTATE_SRC_FAST_TRIES; i++) {
-		netstate_on_src(&ns, 6, netstate_epoch(&ns, 6), NULL, 0, NULL,
+		netstate_on_src(&ns, 6, netstate_epoch(&ns, 6), NULL, 0, 0, NULL,
 				t);
 		t += NETSTATE_SRC_FAST_MS;
 		netstate_tick(&ns, t);
 		drain(&ns);
 	}
-	netstate_on_src(&ns, 6, netstate_epoch(&ns, 6), NULL, 0, NULL, t);
+	netstate_on_src(&ns, 6, netstate_epoch(&ns, 6), NULL, 0, 0, NULL, t);
 	t += NETSTATE_SRC_FAST_MS;
 	netstate_tick(&ns, t);
 	assert(!(drain(&ns).f[1] & NSA_SAMPLE_SRC));
 	t += NETSTATE_SRC_SLOW_MS;
 	netstate_tick(&ns, t);
 	assert(drain(&ns).f[1] & NSA_SAMPLE_SRC);
+}
+
+/*
+ * A MULTI-HOMED IPv6 HOST IS NOT A ROW OF NATs.
+ *
+ * Nothing translates IPv6, so every global address ICE enumerates is
+ * reflexive to itself and arrives looking server-reflexive. Named as
+ * gathered, a host with a stable, a DHCPv6 and a privacy address reports
+ * three NATs and not one plain global -- which is the opposite of the truth.
+ *
+ * Our own source address is what separates them: it is the one the world
+ * already sees, the others are interface addresses we never send from, and
+ * genuine NAT66 is the case where ours is not globally routable at all.
+ */
+static void a_shadow_address_is_not_a_translation(void)
+{
+	struct netstate ns;
+	const struct netstate_row *rows;
+	uint8_t src[16], shadow[16], ula[16];
+	int n, i;
+
+	start(&ns, 1);
+	fill(src, 16, 20);
+	fill(shadow, 16, 60);
+	netstate_on_candidate(&ns, 6, netstate_epoch(&ns, 6), NET_SCOPE_GLOBAL,
+			      NET_VIA_STUN, src, 16, "src");
+	netstate_on_candidate(&ns, 6, netstate_epoch(&ns, 6), NET_SCOPE_GLOBAL,
+			      NET_VIA_STUN, shadow, 16, "shadow");
+	drain(&ns);
+
+	/* Nothing to judge them by yet, so they stand as gathered. */
+	n = netstate_rows(&ns, 6, &rows);
+	assert(n == 2);
+	for (i = 0; i < n; i++)
+		assert(netstate_row_via(&ns, 6, &rows[i]) == NET_VIA_STUN);
+
+	netstate_on_src(&ns, 6, netstate_epoch(&ns, 6), src, 16,
+			NET_SCOPE_GLOBAL, "src", t);
+	drain(&ns);
+	n = netstate_rows(&ns, 6, &rows);
+	assert(n == 2);
+	for (i = 0; i < n; i++) {
+		int via = netstate_row_via(&ns, 6, &rows[i]);
+
+		if (!memcmp(rows[i].addr, src, 16))
+			assert(via == NET_VIA_DIRECT);
+		else
+			assert(via == NET_VIA_SHADOW);
+	}
+
+	/*
+	 * NAT66 proper: ours is a ULA, so a global address really is something
+	 * translating us and goes on saying so.
+	 */
+	fill(ula, 16, 90);
+	ula[0] = 0xfd;
+	netstate_on_src(&ns, 6, netstate_epoch(&ns, 6), ula, 16, NET_SCOPE_LAN,
+			"ula", t);
+	drain(&ns);
+	n = netstate_rows(&ns, 6, &rows);
+	assert(n == 2);
+	for (i = 0; i < n; i++)
+		assert(netstate_row_via(&ns, 6, &rows[i]) == NET_VIA_STUN);
 }
 
 /* B6/B12, the visible half: the addresses arrive before the source does, so
@@ -244,7 +310,8 @@ static void late_src_retracts_the_wrong_row(void)
 		shown += rows[i].shown;
 	assert(shown == 2);		/* nothing held back without a source */
 
-	netstate_on_src(&ns, 6, netstate_epoch(&ns, 6), priv, 16, "priv", t);
+	netstate_on_src(&ns, 6, netstate_epoch(&ns, 6), priv, 16,
+			NET_SCOPE_GLOBAL, "priv", t);
 	a = drain(&ns);
 	assert(a.f[1] & NSA_EMIT_ROWS);
 	assert(!(a.f[0] & NSA_EMIT_ROWS));	/* v4 untouched */
@@ -264,7 +331,8 @@ static void src_is_never_stale_on_the_wire(void)
 
 	start(&ns, 1);
 	fill(a, 16, 20);
-	netstate_on_src(&ns, 6, netstate_epoch(&ns, 6), a, 16, "keep", t);
+	netstate_on_src(&ns, 6, netstate_epoch(&ns, 6), a, 16,
+			NET_SCOPE_GLOBAL, "keep", t);
 	assert(netstate_src(&ns, 6, out) == 16);
 
 	netstate_on_netmon(&ns, NETMON_CH_V6, 1, 1, t);
@@ -272,7 +340,8 @@ static void src_is_never_stale_on_the_wire(void)
 	assert(netstate_src_text(&ns, 6)[0] == '\0');
 
 	/* the same address, still assigned after the move, is offered again */
-	netstate_on_src(&ns, 6, netstate_epoch(&ns, 6), a, 16, "keep", t);
+	netstate_on_src(&ns, 6, netstate_epoch(&ns, 6), a, 16,
+			NET_SCOPE_GLOBAL, "keep", t);
 	assert(netstate_src(&ns, 6, out) == 16);
 	assert(!strcmp(netstate_src_text(&ns, 6), "keep"));
 }
@@ -787,9 +856,9 @@ static void latest_change_wins(void)
 	assert(a.f[0] & NSA_KICK_PROBE);
 
 	fill(addr, 4, 10);
-	netstate_on_src(&ns, 4, first, addr, 4, "old", t);
+	netstate_on_src(&ns, 4, first, addr, 4, NET_SCOPE_GLOBAL, "old", t);
 	assert(netstate_src_text(&ns, 4)[0] == '\0');
-	netstate_on_src(&ns, 4, second, addr, 4, "new", t);
+	netstate_on_src(&ns, 4, second, addr, 4, NET_SCOPE_GLOBAL, "new", t);
 	assert(!strcmp(netstate_src_text(&ns, 4), "new"));
 }
 
@@ -1087,7 +1156,8 @@ static void epoch_gate_exhaustive(void)
 				case 2:
 					netstate_on_src(&ns, fam, e, a,
 							fam == 6 ? 16 : 4,
-							"z", t + 1);
+							NET_SCOPE_GLOBAL, "z",
+							t + 1);
 					break;
 				case 3:
 					netstate_on_probe_done(&ns, fam, e,
@@ -1170,12 +1240,12 @@ static void laws_hold_under_churn(void)
 		}
 		case 1:
 			netstate_on_src(&ns, fam, e, a, fam == 6 ? 16 : 4,
-					"s", t);
+					NET_SCOPE_GLOBAL, "s", t);
 			if (e == sh_epoch[k])
 				sh_routed[k] = 1;
 			break;
 		case 2:
-			netstate_on_src(&ns, fam, e, NULL, 0, NULL, t);
+			netstate_on_src(&ns, fam, e, NULL, 0, 0, NULL, t);
 			if (e == sh_epoch[k])
 				sh_routed[k] = 0;
 			break;
@@ -1234,6 +1304,7 @@ int main(void)
 	src_survives_the_roam_window();
 	an_address_that_never_comes_stops_being_hurried();
 	late_src_retracts_the_wrong_row();
+	a_shadow_address_is_not_a_translation();
 	src_is_never_stale_on_the_wire();
 	an_answer_confirms_without_a_tick();
 	an_answer_alone_confirms_nothing();

@@ -4775,7 +4775,8 @@ static void net_sample_src(struct sess *s, int family, uint32_t epoch)
 	if (net_source_addr(af, text, sizeof(text), raw, &len))
 		len = 0;
 	netstate_on_src(&s->ns, family, epoch, len ? raw : NULL, len,
-			len ? text : NULL, now_ms());
+			len ? addr_scope(text) : 0, len ? text : NULL,
+			now_ms());
 }
 
 /* A validated get proves the family, and says whether the rendezvous we hold
@@ -4848,7 +4849,9 @@ static void net_apply(struct sess *s, const struct netstate_actions *a)
 			for (k = 0; k < n; k++)
 				if (rows[k].shown)
 					o->net(o->arg, family, rows[k].scope,
-					       rows[k].via, rows[k].text);
+					       netstate_row_via(&s->ns, family,
+								&rows[k]),
+					       rows[k].text);
 		}
 		if (act & NSA_EMIT_CONN) {
 			int conn = netstate_conn(&s->ns, family);

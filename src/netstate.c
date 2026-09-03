@@ -155,8 +155,27 @@ void netstate_on_netmon(struct netstate *ns, unsigned changed, int have4,
 	ns->primed = 1;
 }
 
+int netstate_row_via(const struct netstate *ns, int family,
+		     const struct netstate_row *r)
+{
+	const struct netstate_fam *f = &ns->f[fam_idx(family)];
+	int have_src = f->src_epoch == f->epoch && f->src_len;
+
+	if (!r)
+		return NET_VIA_DIRECT;
+	if (!have_src || r->scope != NET_SCOPE_GLOBAL)
+		return r->via;
+	/* Ours: nothing translated it, however it was learnt. */
+	if (r->addr_len == f->src_len &&
+	    !memcmp(r->addr, f->src, r->addr_len))
+		return NET_VIA_DIRECT;
+	if (f->src_scope == NET_SCOPE_GLOBAL)
+		return NET_VIA_SHADOW;
+	return r->via;			/* ours is not global: a real NAT */
+}
+
 void netstate_on_src(struct netstate *ns, int family, uint32_t epoch,
-		     const uint8_t *addr, int len, const char *text,
+		     const uint8_t *addr, int len, int scope, const char *text,
 		     uint64_t now)
 {
 	int i = fam_idx(family);
@@ -189,6 +208,7 @@ void netstate_on_src(struct netstate *ns, int family, uint32_t epoch,
 		memset(f->src, 0, sizeof(f->src));
 		memcpy(f->src, addr, (size_t)len);
 		f->src_len = (uint8_t)len;
+		f->src_scope = scope;
 		f->src_epoch = f->epoch;
 		f->src_text[0] = '\0';
 		if (text) {
