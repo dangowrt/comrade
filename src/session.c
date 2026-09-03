@@ -1766,8 +1766,17 @@ static void ns_drain(struct sess *s)
  * thread and the probe thread alike. */
 static void pool_note(struct sess *s, const uint8_t b[4])
 {
+	static const uint8_t zero[4] = { 0 };
 	int i;
 
+	/*
+	 * Not the unspecified address. A gathering agent emits it as a
+	 * placeholder, and it is not anywhere a carrier maps this machine to
+	 * -- so fanning the offer across it spends the peer's checks on a
+	 * destination that cannot answer, and does it for every peer.
+	 */
+	if (!memcmp(b, zero, sizeof(zero)))
+		return;
 	pthread_mutex_lock(&s->trickle_lock);
 	for (i = 0; i < s->npool4; i++)
 		if (!memcmp(s->pool4[i], b, 4))
