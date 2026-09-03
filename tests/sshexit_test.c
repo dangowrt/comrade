@@ -57,7 +57,20 @@ struct cli_arg {
 	uint8_t auth[TOKEN_AUTH_LEN];
 	int rc;
 	volatile int done;
+	/* `done` crosses the thread that sets it and the loop that
+	 * waits on it, so it is not a plain int. */
+	pthread_mutex_t lock;
 };
+
+static int cli_done(struct cli_arg *c)
+{
+	int v;
+
+	pthread_mutex_lock(&c->lock);
+	v = c->done;
+	pthread_mutex_unlock(&c->lock);
+	return v;
+}
 
 static void *cli_thread(void *p)
 {
@@ -76,7 +89,9 @@ static void *cli_thread(void *p)
 	co.recv_cap = sizeof(got);
 	co.recv_len = &gl;
 	c->rc = sshc_connect_fd(c->fd, &co);
+	pthread_mutex_lock(&c->lock);
 	c->done = 1;
+	pthread_mutex_unlock(&c->lock);
 	return NULL;
 }
 
@@ -113,6 +128,7 @@ static int one_round(void *hostkey, const uint8_t fp[32],
 	memcpy(ca.fp, fp, 32);
 	memcpy(ca.auth, auth, sizeof(ca.auth));
 
+	assert(pthread_mutex_init(&ca.lock, NULL) == 0);
 	assert(pthread_create(&sth, NULL, srv_thread, &sa) == 0);
 	assert(pthread_create(&cth, NULL, cli_thread, &ca) == 0);
 
@@ -121,9 +137,9 @@ static int one_round(void *hostkey, const uint8_t fp[32],
 		close(ep[1]);		/* EOF on the server's end_fd => end */
 	}
 
-	for (i = 0; i < 50 && !ca.done; i++)
+	for (i = 0; i < 50 && !cli_done(&ca); i++)
 		usleep(100000);
-	if (!ca.done)
+	if (!cli_done(&ca))
 		return -1;		/* hung: let the ctest timeout catch it too */
 
 	pthread_join(cth, NULL);

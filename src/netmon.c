@@ -167,7 +167,11 @@ void netmon_fingerprint(uint8_t fp4[32], uint8_t fp6[32], uint8_t fpif[32],
 	struct cc_blake2b c4, c6, cif;
 	size_t i;
 
-	qsort(addrs, n, sizeof(*addrs), addr_cmp);
+	/* Nothing to order, and qsort declares its array non-null: a snapshot
+	 * that found no addresses passes NULL with a count of zero, which is
+	 * undefined however harmlessly it behaves in practice. */
+	if (addrs && n > 1)
+		qsort(addrs, n, sizeof(*addrs), addr_cmp);
 	if (cc_blake2b_init(&c4, 32) || cc_blake2b_init(&c6, 32) ||
 	    cc_blake2b_init(&cif, 32)) {
 		memset(fp4, 0, 32);

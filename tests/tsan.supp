@@ -1,0 +1,24 @@
+# ThreadSanitizer suppressions for the test suite.
+#
+# Run with:
+#   TSAN_OPTIONS=suppressions=tests/tsan.supp ctest
+#
+# Anything listed here has to come with the argument for why it is not a bug.
+# A suppression that hides a real finding is worse than no sanitiser at all.
+
+# stream_input: lock-order inversion between two streams' locks.
+#
+# The KCP tests cross-connect two streams in-process -- whatever one emits is
+# fed straight into the other's input -- so A's lock is held while B's is taken
+# and vice versa, which is a cycle in the lock order graph.
+#
+# It is not a deadlock, on two independent counts. Both orderings are taken by
+# the SAME thread (the test's main loop drives both bridges; the reports name
+# `main` on both sides), and a lock order cycle needs two threads to close.
+# And it cannot arise away from the harness at all: the only production output
+# callback is on_stream_output -> transport_send, which ends in nat_send or
+# lanlink_send -- a socket write, never another stream's input.
+#
+# If a production output callback ever grows a path back into stream_input,
+# this suppression must go and the cycle must be broken for real.
+deadlock:stream_input

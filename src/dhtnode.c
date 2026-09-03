@@ -66,8 +66,21 @@ static struct {
 } bootstrap_env[BOOTSTRAP_MAX];
 static int bootstrap_env_n;		/* 0 = use the routers above */
 
-/* Parsed once, before the resolver thread that reads it is started. */
-static void bootstrap_env_load(void)
+/*
+ * PARSED ONCE FOR THE PROCESS, not once per node.
+ *
+ * Every node creation used to re-run this, starting by setting the count back
+ * to zero -- while the resolver thread of a node created earlier was still
+ * reading it. A rebuild makes a node beside a live one and every move makes a
+ * rebuild, so this was not a corner: a resolver reading the count in that
+ * window sees none configured and goes to the public routers instead of the
+ * bootstrap it was given, which on a private swarm is the wrong network
+ * entirely.
+ *
+ * The environment cannot change under a running process, so there is nothing
+ * to re-read. Parsing once removes the write rather than guarding it.
+ */
+static void bootstrap_env_parse(void)
 {
 	const char *e = getenv("COMRADE_DHT_BOOTSTRAP");
 	const char *p;
@@ -94,6 +107,13 @@ static void bootstrap_env_load(void)
 			break;
 		p = comma + 1;
 	}
+}
+
+static pthread_once_t bootstrap_env_once = PTHREAD_ONCE_INIT;
+
+static void bootstrap_env_load(void)
+{
+	pthread_once(&bootstrap_env_once, bootstrap_env_parse);
 }
 
 /*

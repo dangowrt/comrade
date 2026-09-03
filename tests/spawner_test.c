@@ -39,7 +39,19 @@
 #define ITERS 12
 
 static struct spawner *g_sp;
-static volatile int g_stop_alive;
+/* Set by main, read by the spam thread: not a plain int across that. */
+static int g_stop_alive;
+static pthread_mutex_t g_alive_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int stop_alive(void)
+{
+	int v;
+
+	pthread_mutex_lock(&g_alive_lock);
+	v = g_stop_alive;
+	pthread_mutex_unlock(&g_alive_lock);
+	return v;
+}
 
 /* One worker: spawn a pipe-backed attach, close it, and read its exit byte,
  * ITERS times. Returns a two-int array {spawns_ok, exits_ok}. */
@@ -84,7 +96,7 @@ static void *hammer(void *arg)
 static void *alive_spam(void *arg)
 {
 	(void)arg;
-	while (!g_stop_alive) {
+	while (!stop_alive()) {
 		if (spawner_alive(g_sp) == SPAWNER_GONE)
 			break;
 		usleep(5 * 1000);	/* interleave, do not fork tmux flat out */
@@ -159,7 +171,9 @@ int main(void)
 		return 77;
 	}
 
+	pthread_mutex_lock(&g_alive_lock);
 	g_stop_alive = 0;
+	pthread_mutex_unlock(&g_alive_lock);
 	assert(pthread_create(&spam, NULL, alive_spam, NULL) == 0);
 	for (i = 0; i < THREADS; i++)
 		assert(pthread_create(&th[i], NULL, hammer, NULL) == 0);
@@ -172,7 +186,9 @@ int main(void)
 		total_exit += ((int *)r)[1];
 		free(r);
 	}
+	pthread_mutex_lock(&g_alive_lock);
 	g_stop_alive = 1;
+	pthread_mutex_unlock(&g_alive_lock);
 	pthread_join(spam, NULL);
 
 	/* Every spawn across every thread succeeded and delivered its own exit

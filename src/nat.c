@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 /* Copyright (C) 2026 Daniel Golle <daniel@makrotopia.org> */
 
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -15,21 +16,38 @@ struct nat_agent {
 	nat_cb_recv *on_recv;
 	nat_cb_candidate *on_candidate;
 	void *arg;
+	/*
+	 * libjuice runs its own poll thread and delivers every state change on
+	 * it, while the caller asks about the state from its own. Sharing plain
+	 * ints across that is a data race however small they look: nothing
+	 * stops the compiler holding a read in a register for the whole of a
+	 * wait loop, and nothing orders these writes against what the caller
+	 * goes on to do on the strength of them. ThreadSanitizer names both.
+	 */
+	pthread_mutex_t lock;
 	int connected;
 	int failed;
 	int gathered;
-	int remote_set;
+	int remote_set;		/* the caller's thread alone */
 };
 
 static void on_state_changed(juice_agent_t *agent, juice_state_t state, void *user)
 {
 	struct nat_agent *a = user;
+	int connected, failed;
 
 	(void)agent;
-	a->connected = state == JUICE_STATE_CONNECTED || state == JUICE_STATE_COMPLETED;
-	a->failed = state == JUICE_STATE_FAILED;
+	connected = state == JUICE_STATE_CONNECTED ||
+		    state == JUICE_STATE_COMPLETED;
+	failed = state == JUICE_STATE_FAILED;
+	pthread_mutex_lock(&a->lock);
+	a->connected = connected;
+	a->failed = failed;
+	pthread_mutex_unlock(&a->lock);
+	/* Announced outside the lock: it is the caller's code, and it may ask
+	 * this agent about itself while it runs. */
 	if (a->on_state)
-		a->on_state(a->arg, a->connected, a->failed);
+		a->on_state(a->arg, connected, failed);
 }
 
 static void on_candidate(juice_agent_t *agent, const char *sdp, void *user)
@@ -47,7 +65,9 @@ static void on_gathering_done(juice_agent_t *agent, void *user)
 	char sdp[NAT_SDP_MAX];
 
 	(void)agent;
+	pthread_mutex_lock(&a->lock);
 	a->gathered = 1;
+	pthread_mutex_unlock(&a->lock);
 	if (a->on_local_sdp &&
 	    juice_get_local_description(a->agent, sdp, sizeof(sdp)) >= 0)
 		a->on_local_sdp(a->arg, sdp);
@@ -69,6 +89,10 @@ struct nat_agent *nat_create(const struct nat_config *cfg)
 
 	if (!a)
 		return NULL;
+	if (pthread_mutex_init(&a->lock, NULL)) {
+		free(a);
+		return NULL;
+	}
 	a->on_local_sdp = cfg->on_local_sdp;
 	a->on_state = cfg->on_state;
 	a->on_recv = cfg->on_recv;
@@ -92,6 +116,7 @@ struct nat_agent *nat_create(const struct nat_config *cfg)
 
 	a->agent = juice_create(&jc);
 	if (!a->agent) {
+		pthread_mutex_destroy(&a->lock);
 		free(a);
 		return NULL;
 	}
@@ -117,8 +142,11 @@ void nat_destroy(struct nat_agent *a)
 {
 	if (!a)
 		return;
+	/* The poll thread goes with the agent, so nothing can be inside the
+	 * callbacks once this returns and the lock has no last user. */
 	if (a->agent)
 		juice_destroy(a->agent);
+	pthread_mutex_destroy(&a->lock);
 	free(a);
 }
 
@@ -178,12 +206,22 @@ int nat_send(struct nat_agent *a, const uint8_t *data, size_t len)
 
 int nat_connected(struct nat_agent *a)
 {
-	return a->connected;
+	int v;
+
+	pthread_mutex_lock(&a->lock);
+	v = a->connected;
+	pthread_mutex_unlock(&a->lock);
+	return v;
 }
 
 int nat_failed(struct nat_agent *a)
 {
-	return a->failed;
+	int v;
+
+	pthread_mutex_lock(&a->lock);
+	v = a->failed;
+	pthread_mutex_unlock(&a->lock);
+	return v;
 }
 
 int nat_selected(struct nat_agent *a, char *local, size_t local_len,
