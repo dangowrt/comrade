@@ -42,18 +42,95 @@ jobs:
           - name: linux (openssl backend)
             os: ${{ vars.RUNNER_LINUX && fromJSON(vars.RUNNER_LINUX) || 'ubuntu-latest' }}
             crypto: auto
+            sanitize: none
           - name: linux (gcrypt backend)
             os: ${{ vars.RUNNER_LINUX && fromJSON(vars.RUNNER_LINUX) || 'ubuntu-latest' }}
             crypto: gcrypt
+            sanitize: none
           - name: linux (monocypher backend)
             os: ${{ vars.RUNNER_LINUX && fromJSON(vars.RUNNER_LINUX) || 'ubuntu-latest' }}
             crypto: monocypher
+            sanitize: none
           # macos-latest is Apple Silicon (arm64); a self-hosted mac may be
           # Intel x64. The job builds for whichever arch the runner provides,
           # so it stays valid on both -- the name does not pin an arch.
           - name: macos
             os: ${{ vars.RUNNER_MACOS && fromJSON(vars.RUNNER_MACOS) || 'macos-latest' }}
             crypto: auto
+            sanitize: none
+
+          # Instrumented builds, over the same crypto matrix, because the
+          # backends are not interchangeable at this level: they allocate
+          # differently and they thread differently.
+          #
+          # AddressSanitizer (with UndefinedBehaviorSanitizer, and Leak where
+          # the platform has one) costs about what an ordinary run does here,
+          # so it is gated on the tests passing as well as on the report.
+          # ThreadSanitizer is gated on the report alone -- see the test steps.
+          - name: linux asan+ubsan (openssl backend)
+            os: ${{ vars.RUNNER_LINUX && fromJSON(vars.RUNNER_LINUX) || 'ubuntu-latest' }}
+            crypto: auto
+            sanitize: address
+          - name: linux asan+ubsan (gcrypt backend)
+            os: ${{ vars.RUNNER_LINUX && fromJSON(vars.RUNNER_LINUX) || 'ubuntu-latest' }}
+            crypto: gcrypt
+            sanitize: address
+          - name: linux asan+ubsan (monocypher backend)
+            os: ${{ vars.RUNNER_LINUX && fromJSON(vars.RUNNER_LINUX) || 'ubuntu-latest' }}
+            crypto: monocypher
+            sanitize: address
+          - name: linux tsan (openssl backend)
+            os: ${{ vars.RUNNER_LINUX && fromJSON(vars.RUNNER_LINUX) || 'ubuntu-latest' }}
+            crypto: auto
+            sanitize: thread
+          - name: linux tsan (gcrypt backend)
+            os: ${{ vars.RUNNER_LINUX && fromJSON(vars.RUNNER_LINUX) || 'ubuntu-latest' }}
+            crypto: gcrypt
+            sanitize: thread
+          - name: linux tsan (monocypher backend)
+            os: ${{ vars.RUNNER_LINUX && fromJSON(vars.RUNNER_LINUX) || 'ubuntu-latest' }}
+            crypto: monocypher
+            sanitize: thread
+          - name: macos asan+ubsan
+            os: ${{ vars.RUNNER_MACOS && fromJSON(vars.RUNNER_MACOS) || 'macos-latest' }}
+            crypto: auto
+            sanitize: address
+          - name: macos tsan
+            os: ${{ vars.RUNNER_MACOS && fromJSON(vars.RUNNER_MACOS) || 'macos-latest' }}
+            crypto: auto
+            sanitize: thread
+
+          # GCC's static analyser, which is not a sanitiser: it reasons about
+          # paths at compile time rather than watching a run, so it reaches
+          # code no test exercises. Build only, and NOT gating yet -- it
+          # reports thirteen things on this tree today, mostly file-descriptor
+          # leaks in test code that exits anyway and one infinite loop that is
+          # a for(;;) with returns in it. Turn COMRADE_WERROR back on for this
+          # entry once those are triaged and the baseline is nothing.
+          - name: linux gcc -fanalyzer
+            os: ${{ vars.RUNNER_LINUX && fromJSON(vars.RUNNER_LINUX) || 'ubuntu-latest' }}
+            crypto: auto
+            sanitize: none
+            analyze: true
+
+          # Valgrind earns its place on one thing AddressSanitizer cannot see:
+          # a read of an uninitialised value. Linux only -- there is no working
+          # valgrind for current macOS, and none at all for Windows.
+          - name: linux valgrind (openssl backend)
+            os: ${{ vars.RUNNER_LINUX && fromJSON(vars.RUNNER_LINUX) || 'ubuntu-latest' }}
+            crypto: auto
+            sanitize: none
+            memcheck: true
+          - name: linux valgrind (gcrypt backend)
+            os: ${{ vars.RUNNER_LINUX && fromJSON(vars.RUNNER_LINUX) || 'ubuntu-latest' }}
+            crypto: gcrypt
+            sanitize: none
+            memcheck: true
+          - name: linux valgrind (monocypher backend)
+            os: ${{ vars.RUNNER_LINUX && fromJSON(vars.RUNNER_LINUX) || 'ubuntu-latest' }}
+            crypto: monocypher
+            sanitize: none
+            memcheck: true
 
     steps:
       - uses: actions/checkout@v5
@@ -109,6 +186,7 @@ jobs:
             $SUDO apt-get update && $SUDO apt-get install -y --no-install-recommends \
               cmake ninja-build pkg-config build-essential git curl ca-certificates \
               libssh-dev tmux libgcrypt20-dev libsodium-dev \
+              ${{ matrix.memcheck && 'valgrind' || '' }} \
               || echo "note: could not apt-get; relying on the runner's provisioned packages"
           else
             brew install cmake ninja pkg-config libssh tmux libgcrypt \
@@ -220,7 +298,9 @@ jobs:
             -DCMAKE_PREFIX_PATH="$PP" \
             -DCOMRADE_DHT_DIR="$PWD/dht" \
             -DCOMRADE_CRYPTO=${{ matrix.crypto }} \
-            -DCOMRADE_WERROR=ON
+            -DCOMRADE_SANITIZE=${{ matrix.sanitize }} \
+            ${{ matrix.analyze && '-DCMAKE_C_FLAGS=-fanalyzer' || '' }} \
+            -DCOMRADE_WERROR=${{ matrix.analyze && 'OFF' || 'ON' }}
 
       - name: Build
         run: cmake --build build
@@ -229,8 +309,45 @@ jobs:
       # than as a bare red cross; --timeout 120 so a hung test fails fast with
       # diagnostics instead of stalling the worker (the e2e tests carry their
       # own longer per-test TIMEOUT in the CMake).
+      #
+      # What the tool reported and whether the tests passed are different
+      # questions, and under ThreadSanitizer they give different answers: the
+      # instrumented binaries are slow enough to miss the timing the e2e tests
+      # assert while reporting nothing wrong at all. So every instrumented run
+      # is judged by tests/sanreport.sh on what the tool wrote, and only a
+      # thread run is allowed to fail its tests on top of that.
+      #
+      # The reports are collected from files, not from ctest's output. The e2e
+      # tests drive comrade as a CHILD process, whose report goes to a stderr
+      # the harness captures into a temporary directory and deletes -- a job
+      # reading ctest's log alone sees none of it and passes green having
+      # checked nothing.
+      #
       - name: Test
-        run: ctest --test-dir build --output-on-failure --timeout 120 -E "_e2e|swarm_"
+        if: ${{ !matrix.memcheck && !matrix.analyze }}
+        run: |
+          set -uo pipefail
+          LOGS="$PWD/build/san-logs"
+          rm -rf "$LOGS"; mkdir -p "$LOGS"
+          eval "$(sh tests/sanenv.sh '${{ matrix.sanitize }}' "$LOGS")"
+          ctest --test-dir build --output-on-failure --timeout 600 \
+            -E "_e2e|swarm_" 2>&1 | tee unit.out
+          rc=${PIPESTATUS[0]}
+          sed -n 's/.*out of \([0-9][0-9]*\).*/\1/p' unit.out | tail -1 > "$LOGS/.ran"
+          sh tests/sanreport.sh "$LOGS" 40 || exit 1
+          [ '${{ matrix.sanitize }}' = thread ] || exit $rc
+
+      - name: Test (valgrind, unit)
+        if: ${{ matrix.memcheck && !matrix.analyze }}
+        run: |
+          set -uo pipefail
+          ctest --test-dir build -T memcheck --timeout 1800 \
+            -E "_e2e|swarm_" 2>&1 | tee mc.out
+          LOGS="$PWD/build/vg-logs"
+          rm -rf "$LOGS"; mkdir -p "$LOGS"
+          cp build/Testing/Temporary/MemoryChecker.*.log "$LOGS/" 2>/dev/null || true
+          sed -n 's/.*out of \([0-9][0-9]*\).*/\1/p' mc.out | tail -1 > "$LOGS/.ran"
+          sh tests/sanreport.sh "$LOGS" 40
 
       # The end-to-end tests, and only these, stop at the first failure. They
       # share one machine and one network, so when the environment cannot carry
@@ -239,18 +356,67 @@ jobs:
       # anything. One failure with its output is the useful report; the rest
       # would only repeat it.
       - name: Test (end to end)
+        if: ${{ !matrix.memcheck && !matrix.analyze }}
         run: |
+          set -uo pipefail
+          LOGS="$PWD/build/san-logs-e2e"
+          rm -rf "$LOGS"; mkdir -p "$LOGS"
+          eval "$(sh tests/sanenv.sh '${{ matrix.sanitize }}' "$LOGS")"
           ctest --test-dir build --output-on-failure --stop-on-failure \
-            -R "_e2e|swarm_" || rc=$?
+            -R "_e2e|swarm_" 2>&1 | tee e2e.out
+          rc=${PIPESTATUS[0]}
           # The swarm outlives a run that stopped early, so take it down by
           # hand before the next job on this worker builds its own.
           ctest --test-dir build -R swarm_down >/dev/null 2>&1 || true
-          exit ${rc:-0}
+          sed -n 's/.*out of \([0-9][0-9]*\).*/\1/p' e2e.out | tail -1 > "$LOGS/.ran"
+          sh tests/sanreport.sh "$LOGS" 1 || exit 1
+          [ '${{ matrix.sanitize }}' = thread ] || exit $rc
 
-      - name: Smoke test the binary
+      # Valgrind has to follow the harness into comrade to see anything: the
+      # test is a shell script, and the program under test is its child. The
+      # shell utilities it also spawns are skipped, or the log is mostly sed.
+      # Leak checking is off here -- these processes are killed rather than
+      # returning, so everything they hold reads as leaked.
+      - name: Test (valgrind, end to end)
+        if: ${{ matrix.memcheck }}
+        continue-on-error: true
         run: |
+          set -uo pipefail
+          ctest --test-dir build -T memcheck --timeout 3600 -R "_e2e|swarm_" \
+            --overwrite MemoryCheckCommandOptions="--trace-children=yes --trace-children-skip=*/sh,*/bash,*/sed,*/grep,*/awk,*/cat,*/rm,*/mktemp,*/sleep,*/kill,*/tail,*/head,*/tr,*/date,*/dirname,*/basename,*/wc,*/sort,*/uniq,*/cut,*/env,*/tmux,*/printf,*/expr,*/seq --leak-check=no --error-exitcode=1" \
+            2>&1 | tee mce2e.out || true
+          ctest --test-dir build -R swarm_down >/dev/null 2>&1 || true
+          LOGS="$PWD/build/vg-logs-e2e"
+          rm -rf "$LOGS"; mkdir -p "$LOGS"
+          cp build/Testing/Temporary/MemoryChecker.*.log "$LOGS/" 2>/dev/null || true
+          sed -n 's/.*out of \([0-9][0-9]*\).*/\1/p' mce2e.out | tail -1 > "$LOGS/.ran"
+          sh tests/sanreport.sh "$LOGS" 1
+
+      # The binary itself, not only the tests: main, the option parsing and the
+      # dashboard's own code are reached by nothing in the suite.
+      - name: Smoke test the binary
+        if: ${{ !matrix.analyze }}
+        run: |
+          set -uo pipefail
+          LOGS="$PWD/build/san-logs-smoke"
+          rm -rf "$LOGS"; mkdir -p "$LOGS"
+          eval "$(sh tests/sanenv.sh '${{ matrix.sanitize }}' "$LOGS")"
           ./build/comrade --help
+          ./build/comrade --version
           ./build/comrade show || true   # exits 1 with no session, as designed
+          echo 3 > "$LOGS/.ran"
+          sh tests/sanreport.sh "$LOGS" 1
+
+      - name: Keep the reports when something was found
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports-${{ matrix.name }}
+          path: |
+            build/san-logs*/**
+            build/vg-logs*/**
+          if-no-files-found: ignore
+          retention-days: 7
 
   # comrade also builds on Windows (static, llvm-mingw clang/UCRT). The e2e
   # harness is POSIX-only, so this is a build plus a --help smoke test rather
@@ -258,9 +424,23 @@ jobs:
   # up on every commit rather than only when a tag is cut. x64 only: an AMD64
   # runner cannot run an arm64 binary, and the release job compile-checks arm64.
   windows:
-    name: windows (x64)
+    name: windows (x64${{ matrix.sanitize != 'none' && format(', {0}', matrix.sanitize) || '' }})
     runs-on: ${{ vars.RUNNER_WINDOWS && fromJSON(vars.RUNNER_WINDOWS) || 'windows-latest' }}
     timeout-minutes: 40
+    # The instrumented entry is not gating. llvm-mingw is clang and may carry a
+    # sanitiser runtime where MinGW's gcc does not, but that is a claim about
+    # somebody else's release archive rather than about this code -- so the job
+    # exists to find out, and the CMake refuses the configure outright if there
+    # is no runtime to link, which is a clear answer either way. Make it gating
+    # once it has passed. ThreadSanitizer has no Windows support at all and is
+    # not attempted.
+    continue-on-error: ${{ matrix.sanitize != 'none' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - sanitize: none
+          - sanitize: address
     steps:
       - uses: actions/checkout@v5
         with:
@@ -304,7 +484,7 @@ jobs:
           pwsh packaging/windows/build.ps1
           -Triple x86_64-w64-mingw32 -Toolchain $env:LLVM_MINGW
           -Root "$env:RUNNER_TEMP\winbuild" -Out "$env:RUNNER_TEMP\out"
-          -Werror ON -Tests ON
+          -Werror ON -Tests ON -Sanitize ${{ matrix.sanitize }}
 
       # The unit tests, which are the portable ones: the bridge tests want a
       # socketpair and the end-to-end harness is shell, and both are left to
@@ -312,7 +492,27 @@ jobs:
       # worker, so what it builds it can also run.
       - name: Test
         shell: pwsh
-        run: ctest --test-dir "$env:RUNNER_TEMP\winbuild\build\x86_64-w64-mingw32\comrade" --output-on-failure --timeout 120
+        run: |
+          $b = "$env:RUNNER_TEMP\winbuild\build\x86_64-w64-mingw32\comrade"
+          if ("${{ matrix.sanitize }}" -ne "none") {
+            # Reports to files, for the same reason the POSIX jobs do it: what
+            # a child process writes to stderr does not survive the harness.
+            $logs = "$b\san-logs"
+            Remove-Item -Recurse -Force $logs -ErrorAction SilentlyContinue
+            New-Item -ItemType Directory -Force -Path $logs | Out-Null
+            $env:ASAN_OPTIONS = "abort_on_error=0:log_path=$logs/asan"
+            $env:UBSAN_OPTIONS = "print_stacktrace=1:log_path=$logs/ubsan"
+          }
+          ctest --test-dir $b --output-on-failure --timeout 600
+          if ("${{ matrix.sanitize }}" -ne "none") {
+            $found = Get-ChildItem "$b\san-logs" -File -ErrorAction SilentlyContinue
+            if ($found) {
+              Write-Host "sanitiser reports:"
+              $found | ForEach-Object { Get-Content $_.FullName | Select-Object -First 40 }
+              exit 1
+            }
+            Write-Host "sanreport: no reports. Clean."
+          }
 
       - name: Smoke test
         shell: pwsh

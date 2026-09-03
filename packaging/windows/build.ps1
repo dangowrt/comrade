@@ -16,7 +16,12 @@ param(
     [string]$ComradeSrc = $PWD,                             # comrade checkout
     [string]$Out        = (Join-Path $PWD "winbuild\out"), # where comrade-<arch>.exe lands
     [string]$Werror     = "OFF",                           # CI passes ON to fail on a comrade warning
-    [string]$Tests      = "OFF"                            # ON to build the test binaries too
+    [string]$Tests      = "OFF",                           # ON to build the test binaries too
+    # Instrument the build (see COMRADE_SANITIZE in CMakeLists.txt). llvm-mingw
+    # is clang, so it may carry a sanitiser runtime where MinGW's gcc does not;
+    # the CMake probes for one and refuses the configure if there is none,
+    # rather than quietly producing an uninstrumented binary.
+    [string]$Sanitize   = "none"
 )
 $ErrorActionPreference = "Stop"
 
@@ -170,6 +175,7 @@ Run "cmake" @("-G","Ninja","-S",$ComradeSrc,"-B","$bld\comrade",
     "-DCMAKE_FIND_ROOT_PATH=$pfx;$($tc -replace '\\','/')/$Triple",
     "-DCOMRADE_DHT_DIR=$($src -replace '\\','/')/dht",
     "-DCOMRADE_WERROR=$Werror",
+    "-DCOMRADE_SANITIZE=$Sanitize",
     "-DBUILD_TESTING=$Tests")
 Run "cmake" @("--build","$bld\comrade")
 
