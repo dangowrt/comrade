@@ -230,6 +230,12 @@ struct b44_node {
 	uint8_t state;
 	uint8_t token[B44_TOKEN_MAX];
 	uint8_t token_len;
+	/*
+	 * The sequence THIS node said it holds, which is not the operation's
+	 * best: every node keeps its own copy and they fall out of step.
+	 */
+	int64_t seq;
+	uint8_t have_seq;
 };
 
 struct b44_req {
@@ -731,6 +737,27 @@ static int get_send(struct b44_op *op, int node)
 	return 0;
 }
 
+/*
+ * The compare-and-swap a put to this node carries.
+ *
+ * WHAT THAT NODE HOLDS, NOT WHAT THE LOOKUP FOUND. Every node keeps its own
+ * copy, and one store carries one value: sending the best sequence seen to all
+ * of them means a node that has fallen behind answers 301 and is left exactly
+ * where it was. It is then never caught up -- not by the next store, which
+ * makes the same comparison, nor by any after it -- until its copy expires
+ * hours later. Whatever a peer wrote to that node in the meantime lives there
+ * and nowhere else.
+ *
+ * Told what it actually holds, it takes the store and rejoins the others. A
+ * node that said nothing about a sequence falls back to the operation's view,
+ * which is what it had before: it either holds nothing (so there is nothing to
+ * compare against) or served something we could not verify.
+ */
+static int64_t node_cas(const struct b44_node *n, int64_t op_cas)
+{
+	return n->have_seq ? n->seq : op_cas;
+}
+
 static int put_send(struct b44_op *op, int node)
 {
 	struct b44_req *req = req_alloc(op, node);
@@ -740,6 +767,7 @@ static int put_send(struct b44_op *op, int node)
 	size_t sigbuf_len, salt_len = strlen(op->salt);
 	uint8_t tid[4];
 	struct benc_buf b;
+	int64_t cas;
 
 	if (!req)
 		return -1;
@@ -781,11 +809,12 @@ static int put_send(struct b44_op *op, int node)
 		return -1;
 	}
 
+	cas = node_cas(&op->nodes[node], op->cas);
 	benc_buf_init(&b, msg, sizeof(msg));
 	benc_raw_add(&b, "d1:ad", 5);
-	if (op->cas >= 0) {
+	if (cas >= 0) {
 		benc_key_add(&b, "cas");	/* sorts before "id" */
-		benc_int_add(&b, op->cas);
+		benc_int_add(&b, cas);
 	}
 	benc_key_add(&b, "id");
 	benc_str_add(&b, op->e->myid, 20);
@@ -1278,7 +1307,8 @@ static void record_best_node(struct b44_op *op, const struct sockaddr *sa,
 	op->best_node_len[fam] = salen;
 }
 
-static void value_check(struct b44_op *op, const struct sockaddr *from,
+static void value_check(struct b44_op *op, struct b44_node *node,
+			const struct sockaddr *from,
 			socklen_t fromlen, const uint8_t *rdict, size_t rlen)
 {
 	const uint8_t *val;
@@ -1328,6 +1358,13 @@ static void value_check(struct b44_op *op, const struct sockaddr *from,
 				      v, v_len);
 	if (!sigbuf_len || cc_ed25519_check(sig, op->pk, sigbuf, sigbuf_len))
 		return;
+
+	/* Recorded whether or not it is the best: a node holding an older copy
+	 * is exactly the one this has to be right for. */
+	if (node) {
+		node->seq = seq;
+		node->have_seq = 1;
+	}
 
 	if (op->have_best && seq <= op->best_seq) {
 		/* Same value already held; still adopt a usable node if the
@@ -1438,7 +1475,7 @@ static void reply_handle(struct b44_op *op, struct b44_req *req,
 	}
 
 	if (!op->is_put)
-		value_check(op, from, fromlen, rdict, rlen);
+		value_check(op, node, from, fromlen, rdict, rlen);
 
 	op_step(op);
 }

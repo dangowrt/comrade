@@ -372,6 +372,42 @@ static void an_unchanged_re_store_keeps_the_sequence(void)
 	assert(store_seq(1, INT64_MAX, a, sizeof(a), b, sizeof(b)) == -1);
 }
 
+/*
+ * A NODE IS TOLD WHAT IT HOLDS, NOT WHAT THE LOOKUP FOUND.
+ *
+ * Every node keeps its own copy of a mutable item and they fall out of step.
+ * One store carries one value, so sending the best sequence seen as the
+ * compare-and-swap to all of them means a node that has fallen behind answers
+ * 301 and stays exactly where it is -- and is never caught up, because the
+ * next store makes the same comparison, until its copy expires hours later.
+ * Whatever a peer wrote to it meanwhile lives there and nowhere else, which is
+ * why an older copy has to go on being read from at all.
+ */
+static void a_node_is_told_the_sequence_it_holds(void)
+{
+	struct b44_node n;
+
+	memset(&n, 0, sizeof(n));
+
+	/* Said nothing about one: the operation's view, as before. */
+	assert(node_cas(&n, 7) == 7);
+	assert(node_cas(&n, -1) == -1);
+
+	/* Said what it holds: that, even where the lookup saw better. */
+	n.have_seq = 1;
+	n.seq = 3;
+	assert(node_cas(&n, 7) == 3);
+
+	/* Including a node that is ahead of what the lookup saw, which must
+	 * not be overwritten on the strength of somebody else's copy. */
+	n.seq = 9;
+	assert(node_cas(&n, 7) == 9);
+
+	/* And one holding nothing yet says so with a zero, not a silence. */
+	n.seq = 0;
+	assert(node_cas(&n, 7) == 0);
+}
+
 int main(void)
 {
 	void (*tests[])(void) = {
@@ -380,6 +416,7 @@ int main(void)
 		our_own_queries_to_one_node_are_budgeted,
 		the_sequence_ceiling_is_not_incremented,
 		an_unchanged_re_store_keeps_the_sequence,
+		a_node_is_told_the_sequence_it_holds,
 		peers_behind_one_address_are_not_banned_for_normal_use,
 	};
 	size_t i;
