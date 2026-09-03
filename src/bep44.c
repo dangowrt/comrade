@@ -1036,12 +1036,38 @@ static int store_start(struct b44_op *op)
 	return sent;
 }
 
+/*
+ * The sequence a store must carry to supersede what a lookup found, or -1
+ * where there is none to be had.
+ *
+ * BEP 44 caps the sequence at INT64_MAX, and incrementing there is signed
+ * overflow: undefined, and on the compilers we use a negative sequence on the
+ * wire, which every storing node refuses -- ours for being negative and any
+ * other for being below what it holds. The item under that key would then be
+ * read-only until it expired.
+ *
+ * Nothing reaches the ceiling organically. A key's sequence starts at one and
+ * only a holder of the private half can raise it, so this turns undefined
+ * behaviour into an ordinary failed update rather than recovering from
+ * anything: the caller is told the store reached nobody, which it already
+ * knows how to handle.
+ */
+static int64_t next_seq(int have_best, int64_t best)
+{
+	if (!have_best)
+		return 1;
+	if (best >= INT64_MAX)
+		return -1;
+	return best + 1;
+}
+
 /* Lookup done: let the caller merge its slot into the value we read, then
  * store it back on those same token-bearing nodes -- standard get-then-put. */
 static void update_store(struct b44_op *op)
 {
 	uint8_t nv[BEP44_MAX_VALUE];
 	size_t nvlen = 0;
+	int64_t next;
 
 	if (op->merge(op->merge_arg, op->have_best ? op->best : NULL,
 		      op->best_len, op->have_best ? op->best_seq : -1, nv,
@@ -1050,9 +1076,14 @@ static void update_store(struct b44_op *op)
 		op_finish(op);
 		return;
 	}
+	next = next_seq(op->have_best, op->best_seq);
+	if (next < 0) {
+		op_finish(op);
+		return;
+	}
 	memcpy(op->value, nv, nvlen);
 	op->value_len = (uint16_t)nvlen;
-	op->seq = op->have_best ? op->best_seq + 1 : 1;
+	op->seq = next;
 	op->cas = op->have_best ? op->best_seq : -1;
 	op->is_put = 1;
 	if (!store_start(op))

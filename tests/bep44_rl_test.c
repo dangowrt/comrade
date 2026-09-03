@@ -278,12 +278,32 @@ static void our_own_queries_to_one_node_are_budgeted(void)
 }
 
 
+/*
+ * THE SEQUENCE CEILING IS A FAILED UPDATE, NOT AN OVERFLOW.
+ *
+ * BEP 44 caps a mutable item's sequence at INT64_MAX. Incrementing there is
+ * signed overflow -- undefined, and in practice a negative sequence on the
+ * wire that every storing node refuses, leaving the item read-only until it
+ * expires. Nothing reaches the ceiling organically, so the point is to fail
+ * cleanly rather than to recover.
+ */
+static void the_sequence_ceiling_is_not_incremented(void)
+{
+	assert(next_seq(0, 0) == 1);		/* nothing stored: start at one */
+	assert(next_seq(0, INT64_MAX) == 1);	/* and best is not consulted */
+	assert(next_seq(1, 1) == 2);
+	assert(next_seq(1, INT64_MAX - 2) == INT64_MAX - 1);
+	assert(next_seq(1, INT64_MAX - 1) == INT64_MAX);	/* still room */
+	assert(next_seq(1, INT64_MAX) == -1);			/* none left */
+}
+
 int main(void)
 {
 	void (*tests[])(void) = {
 		ban_at_limit, window_resets, escalate_v6, lone_pair_no_wide,
 		escalate_v4, fail_closed, admission,
 		our_own_queries_to_one_node_are_budgeted,
+		the_sequence_ceiling_is_not_incremented,
 	};
 	size_t i;
 
