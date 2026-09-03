@@ -981,6 +981,11 @@ if(BUILD_TESTING)
 		target_link_libraries(sshkcp_test
 			comrade_ssh comrade_bridge comrade_stream comrade_token Threads::Threads)
 		add_test(NAME sshkcp_test COMMAND sshkcp_test)
+		add_executable(uipeer_test tests/uipeer_test.c)
+		target_include_directories(uipeer_test
+			PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")	# version.h
+		target_link_libraries(uipeer_test comrade_ui comrade_dbg)
+		add_test(NAME uipeer_test COMMAND uipeer_test)
 		add_executable(sshlinger_test tests/sshlinger_test.c)
 		target_link_libraries(sshlinger_test
 			comrade_bridge comrade_stream Threads::Threads)

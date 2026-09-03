@@ -1027,6 +1027,10 @@ static void um_peer(struct ui *u, int id, int state, const char *addr)
 		u->peer[at].id = id;
 		u->peer[at].addr[0] = '\0';
 		u->peer[at].read_only = 0;
+		/* Rows shift up as peers leave, so this slot may be holding
+		 * what somebody else's link was doing when they went. */
+		u->peer[at].link = CONN_CONNECTING;
+		u->peer[at].rtt_ms = -1;
 	}
 	u->peer[at].state = state;
 	if (have_addr)

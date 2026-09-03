@@ -403,7 +403,14 @@ struct conn {
 	 * SSH/KCP stream, it measures end-to-end liveness -- a pong stops arriving
 	 * once the link has truly stalled, which is exactly the signal we want. */
 	pthread_mutex_t hb_lock;
-	int link_told, rtt_told, link_told_any;	/* last reported to the view */
+	/*
+	 * The last link state and round trip reported to the view, and whether
+	 * anything has been. Cleared whenever this connection's row is created,
+	 * because a row that has just appeared has been told nothing -- and the
+	 * report is only made when one of the two CHANGES, so a state believed
+	 * already told is a row left showing whatever it had.
+	 */
+	int link_told, rtt_told, link_told_any;
 	unsigned live_gen;		/* the network generation this link was
 					 * last proven on; older means we have
 					 * no evidence about it here */
@@ -5771,6 +5778,7 @@ static void lan_drain(struct sess *s, struct worker *ws, int *dash_seq)
 		if (o && o->peer) {
 			o->peer(o->arg, c->dash_id, SESSION_PEER_SEEN, addr);
 			o->peer(o->arg, c->dash_id, SESSION_PEER_LIVE, addr);
+			c->link_told_any = 0;
 		}
 		if (worker_spawn(ws, c)) {	/* worker table full */
 			if (o && o->peer)
@@ -5859,6 +5867,7 @@ static void punch_scan(struct sess *s, struct worker *ws, struct conn **punching
 					addr);
 				o->peer(o->arg, c->dash_id, SESSION_PEER_LIVE,
 					addr);
+				c->link_told_any = 0;
 			}
 			punching[i] = NULL;
 			/*
