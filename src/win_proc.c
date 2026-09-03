@@ -211,13 +211,16 @@ static void chomp(char *s)
 int win_run_capture(char *const argv[], char *err, size_t errcap)
 {
 	char cmd[2048];
-	STARTUPINFOA si;
+	STARTUPINFOEXA si;
 	PROCESS_INFORMATION pi;
 	SECURITY_ATTRIBUTES sa;
 	HANDLE nul_in = INVALID_HANDLE_VALUE, nul_out = INVALID_HANDLE_VALUE;
 	HANDLE er = NULL, ew = NULL;
+	HANDLE hl[3];
+	SIZE_T asz = 0;
 	size_t got = 0;
 	DWORD code = (DWORD)-1;
+	int nhl = 0, attrs_ready = 0;
 	int rc = -1;
 
 	if (err && errcap)
@@ -225,11 +228,14 @@ int win_run_capture(char *const argv[], char *err, size_t errcap)
 	if (win_cmdline(cmd, sizeof(cmd), argv))
 		return -1;
 
+	memset(&si, 0, sizeof(si));
 	memset(&sa, 0, sizeof(sa));
 	sa.nLength = sizeof(sa);
 	sa.bInheritHandle = TRUE;
 	nul_in = open_nul(0);
 	nul_out = open_nul(1);
+	if (nul_in == INVALID_HANDLE_VALUE || nul_out == INVALID_HANDLE_VALUE)
+		goto out;
 	if (err && errcap > 1) {
 		if (!CreatePipe(&er, &ew, &sa, 0))
 			er = ew = NULL;
@@ -237,16 +243,40 @@ int win_run_capture(char *const argv[], char *err, size_t errcap)
 			SetHandleInformation(er, HANDLE_FLAG_INHERIT, 0);
 	}
 
-	memset(&si, 0, sizeof(si));
-	si.cb = sizeof(si);
-	si.dwFlags = STARTF_USESTDHANDLES;
-	si.hStdInput = nul_in;
-	si.hStdOutput = nul_out;
-	si.hStdError = ew ? ew : nul_out;
-	memset(&pi, 0, sizeof(pi));
+	si.StartupInfo.cb = sizeof(si);
+	si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+	si.StartupInfo.hStdInput = nul_in;
+	si.StartupInfo.hStdOutput = nul_out;
+	si.StartupInfo.hStdError = ew ? ew : nul_out;
 
+	/*
+	 * Winsock sockets are inheritable by default, and this runs in the
+	 * service's loop while the ICE, KCP and SSH sockets are all live, so
+	 * bInheritHandles alone would hand every one of them to tmux and to
+	 * whatever tmux goes on to run. Naming the three the child actually
+	 * needs is what keeps the rest out.
+	 */
+	hl[nhl++] = nul_in;
+	hl[nhl++] = nul_out;
+	if (ew)
+		hl[nhl++] = ew;
+	InitializeProcThreadAttributeList(NULL, 1, 0, &asz);
+	si.lpAttributeList = HeapAlloc(GetProcessHeap(), 0, asz);
+	if (!si.lpAttributeList)
+		goto out;
+	if (!InitializeProcThreadAttributeList(si.lpAttributeList, 1, 0, &asz))
+		goto out;
+	attrs_ready = 1;
+	if (!UpdateProcThreadAttribute(si.lpAttributeList, 0,
+				       PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+				       hl, (SIZE_T)nhl * sizeof(HANDLE),
+				       NULL, NULL))
+		goto out;
+
+	memset(&pi, 0, sizeof(pi));
 	if (!CreateProcessA(NULL, cmd, NULL, NULL, TRUE,
-			    CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
+			    CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT,
+			    NULL, NULL, &si.StartupInfo, &pi))
 		goto out;
 	if (ew) {
 		CloseHandle(ew);
@@ -281,6 +311,10 @@ int win_run_capture(char *const argv[], char *err, size_t errcap)
 	if (err)
 		chomp(err);
 out:
+	if (attrs_ready)
+		DeleteProcThreadAttributeList(si.lpAttributeList);
+	if (si.lpAttributeList)
+		HeapFree(GetProcessHeap(), 0, si.lpAttributeList);
 	if (er)
 		CloseHandle(er);
 	if (ew)

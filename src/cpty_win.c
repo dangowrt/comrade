@@ -235,11 +235,15 @@ out:
  * is what the POSIX side's pipe path does too. */
 static HANDLE spawn_pipes(struct cpty *p, char *cmd, char *env)
 {
-	STARTUPINFOA si;
+	STARTUPINFOEXA si;
 	PROCESS_INFORMATION pi;
 	SECURITY_ATTRIBUTES sa;
 	HANDLE in_r = NULL, out_w = NULL, ret = NULL;
+	HANDLE hl[2];
+	SIZE_T asz = 0;
+	int attrs_ready = 0;
 
+	memset(&si, 0, sizeof(si));
 	memset(&sa, 0, sizeof(sa));
 	sa.nLength = sizeof(sa);
 	sa.bInheritHandle = TRUE;
@@ -252,18 +256,41 @@ static HANDLE spawn_pipes(struct cpty *p, char *cmd, char *env)
 	SetHandleInformation(p->h_write, HANDLE_FLAG_INHERIT, 0);
 	SetHandleInformation(p->h_read, HANDLE_FLAG_INHERIT, 0);
 
-	memset(&si, 0, sizeof(si));
-	si.cb = sizeof(si);
-	si.dwFlags = STARTF_USESTDHANDLES;
-	si.hStdInput = in_r;
-	si.hStdOutput = out_w;
-	si.hStdError = out_w;
+	si.StartupInfo.cb = sizeof(si);
+	si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+	si.StartupInfo.hStdInput = in_r;
+	si.StartupInfo.hStdOutput = out_w;
+	si.StartupInfo.hStdError = out_w;
+
+	/* The two pipe ends and nothing else. Every socket this process holds
+	 * is inheritable by default, and bInheritHandles is all-or-nothing
+	 * without a handle list. */
+	hl[0] = in_r;
+	hl[1] = out_w;
+	InitializeProcThreadAttributeList(NULL, 1, 0, &asz);
+	si.lpAttributeList = HeapAlloc(GetProcessHeap(), 0, asz);
+	if (!si.lpAttributeList)
+		goto out;
+	if (!InitializeProcThreadAttributeList(si.lpAttributeList, 1, 0, &asz))
+		goto out;
+	attrs_ready = 1;
+	if (!UpdateProcThreadAttribute(si.lpAttributeList, 0,
+				       PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+				       hl, sizeof(hl), NULL, NULL))
+		goto out;
+
 	memset(&pi, 0, sizeof(pi));
-	if (CreateProcessA(NULL, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW,
-			   env, NULL, &si, &pi)) {
+	if (CreateProcessA(NULL, cmd, NULL, NULL, TRUE,
+			   CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT,
+			   env, NULL, &si.StartupInfo, &pi)) {
 		CloseHandle(pi.hThread);
 		ret = pi.hProcess;
 	}
+out:
+	if (attrs_ready)
+		DeleteProcThreadAttributeList(si.lpAttributeList);
+	if (si.lpAttributeList)
+		HeapFree(GetProcessHeap(), 0, si.lpAttributeList);
 	CloseHandle(in_r);
 	CloseHandle(out_w);
 	return ret;
