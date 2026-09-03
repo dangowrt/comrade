@@ -516,6 +516,12 @@ static void mkdir_p(const char *path)
 #ifndef MOUNT_ATTR_RDONLY
 #define MOUNT_ATTR_RDONLY 0x00000001
 #endif
+#ifndef MOUNT_ATTR_NODEV
+#define MOUNT_ATTR_NODEV 0x00000004
+#endif
+#ifndef MOUNT_ATTR_NOEXEC
+#define MOUNT_ATTR_NOEXEC 0x00000008
+#endif
 #ifndef MOUNT_ATTR_NOSUID
 #define MOUNT_ATTR_NOSUID 0x00000002
 #endif
@@ -544,7 +550,7 @@ static void remount_ro(const char *path)
 	struct sb_mount_attr a;
 
 	memset(&a, 0, sizeof(a));
-	a.attr_set = MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID;
+	a.attr_set = MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV;
 	if (syscall(SYS_mount_setattr, -1, path, AT_RECURSIVE, &a,
 		    sizeof(a)) == 0)
 		return;
@@ -559,6 +565,31 @@ static void remount_ro(const char *path)
 		  NULL) != 0)
 		dbg_logf("sandbox: %s left writable (read-only remount failed: "
 			 "%d)", path, errno);
+}
+
+/*
+ * The same for a mount that has to stay writable: no execution, no set-id, no
+ * device nodes. comrade runs nothing out of its data or state directory, and
+ * without this a process that can write there can map what it wrote as code.
+ * PR_SET_MDWE does not cover that -- it refuses a write-to-execute transition,
+ * not a fresh executable mapping of a file, which is how every dlopen works.
+ */
+static void remount_noexec(const char *path)
+{
+#ifdef SYS_mount_setattr
+	struct sb_mount_attr a;
+
+	memset(&a, 0, sizeof(a));
+	a.attr_set = MOUNT_ATTR_NOEXEC | MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV;
+	if (syscall(SYS_mount_setattr, -1, path, AT_RECURSIVE, &a,
+		    sizeof(a)) == 0)
+		return;
+#endif
+	if (mount(NULL, path, NULL,
+		  MS_REMOUNT | MS_BIND | MS_NOEXEC | MS_NOSUID | MS_NODEV,
+		  NULL) != 0)
+		dbg_logf("sandbox: %s left executable (remount failed: %d)",
+			 path, errno);
 }
 
 /*
@@ -627,6 +658,8 @@ static int bind_at(const char *root, const char *src, const char *at,
 	}
 	if (ro)
 		remount_ro(dst);
+	else
+		remount_noexec(dst);
 	return 0;
 }
 
@@ -913,9 +946,15 @@ static int fs_confine_ns(const struct sandbox_cfg *cfg)
 #define SB_FS_READ_DIR		(1ULL << 3)
 #define SB_FS_REMOVE_DIR	(1ULL << 4)
 #define SB_FS_REMOVE_FILE	(1ULL << 5)
+#define SB_FS_MAKE_CHAR		(1ULL << 6)
 #define SB_FS_MAKE_DIR		(1ULL << 7)
 #define SB_FS_MAKE_REG		(1ULL << 8)
+#define SB_FS_MAKE_SOCK		(1ULL << 9)
+#define SB_FS_MAKE_FIFO		(1ULL << 10)
+#define SB_FS_MAKE_BLOCK	(1ULL << 11)
+#define SB_FS_MAKE_SYM		(1ULL << 12)
 #define SB_FS_TRUNCATE		(1ULL << 14)
+#define SB_FS_IOCTL_DEV		(1ULL << 15)
 
 struct sb_ruleset_attr {
 	uint64_t handled_access_fs;
@@ -978,11 +1017,27 @@ static int fs_confine_landlock(const struct sandbox_cfg *cfg)
 	if (abi < 1)
 		return 0;		/* no Landlock on this kernel */
 
+	/*
+	 * An access left out of this mask is one Landlock never checks, so the
+	 * node-creating rights belong here even though nothing grants them: a
+	 * confined comrade makes no symlink, socket, fifo or device node
+	 * anywhere, and leaving them unhandled is what would let it plant one
+	 * wherever the ordinary permissions allow.
+	 */
 	handled = SB_FS_EXECUTE | SB_FS_WRITE_FILE | SB_FS_READ_FILE |
 		  SB_FS_READ_DIR | SB_FS_REMOVE_DIR | SB_FS_REMOVE_FILE |
-		  SB_FS_MAKE_DIR | SB_FS_MAKE_REG;
+		  SB_FS_MAKE_DIR | SB_FS_MAKE_REG | SB_FS_MAKE_CHAR |
+		  SB_FS_MAKE_SOCK | SB_FS_MAKE_FIFO | SB_FS_MAKE_BLOCK |
+		  SB_FS_MAKE_SYM;
 	if (abi >= 3)
 		handled |= SB_FS_TRUNCATE;
+	/*
+	 * Only devices opened after this point are affected, and the terminal
+	 * comrade drives was opened long before it, so this costs the roles
+	 * nothing and forbids driver ioctls on anything opened later.
+	 */
+	if (abi >= 5)
+		handled |= SB_FS_IOCTL_DEV;
 
 	memset(&attr, 0, sizeof(attr));
 	attr.handled_access_fs = handled;
@@ -1037,10 +1092,18 @@ static int fs_confine_landlock(const struct sandbox_cfg *cfg)
 }
 
 /*
- * Confine the visible filesystem: the mount namespace first (the strong,
- * OpenWrt-viable boundary), and where that cannot be built, the Landlock
- * ruleset. COMRADE_SANDBOX_NO_USERNS forces the Landlock path -- for exercising
- * it, and for a host where a mount namespace is unwanted.
+ * Confine the visible filesystem with both boundaries, because they fail in
+ * different places. The mount namespace decides what exists, and it has to
+ * bind in whichever directory resolv.conf lives in -- which is /etc on a host
+ * with a static one and the whole of /tmp on OpenWrt, where /etc/resolv.conf
+ * points into it. Landlock decides what may be reached, so it takes back what
+ * the namespace was obliged to make visible; and unlike a read-only bind it
+ * covers connecting to a unix socket, which is how the interesting things in
+ * those directories are spoken to.
+ *
+ * Either may be absent and the other still applies. COMRADE_SANDBOX_NO_USERNS
+ * forces the Landlock path alone -- for exercising it, and for a host where a
+ * mount namespace is unwanted.
  */
 static int fs_confine(const struct sandbox_cfg *cfg)
 {
@@ -1053,9 +1116,7 @@ static int fs_confine(const struct sandbox_cfg *cfg)
 	nons = getenv("COMRADE_SANDBOX_NO_USERNS");
 	if (!(nons && nons[0] && nons[0] != '0'))
 		r = fs_confine_ns(cfg);
-	if (r)
-		return r;
-	return fs_confine_landlock(cfg);
+	return r | fs_confine_landlock(cfg);
 }
 
 static int apply_linux(const struct sandbox_cfg *cfg)
