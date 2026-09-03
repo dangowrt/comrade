@@ -83,17 +83,20 @@ extern void sandbox_free_error(char *errorbuf) __attribute__((weak_import));
  * The confining profile (client and service): deny everything, then allow the
  * narrow set the work needs -- the library directories to map and read, the
  * resolver's pieces, the process's own data and state directories to read and
- * write, and IP. Exec and fork are covered by the default and denied again by
+ * write, and UDP. Exec and fork are covered by the default and denied again by
  * name, because a policy should state its own guarantee rather than leave a
  * reader to derive it; a compromised process cannot run anything, and the host
  * service does its spawning either from a broker forked before this applies or
  * not at all. DATA_DIR and STATE_DIR are passed as parameters so the one
  * profile serves any path.
  *
- * The IP peer is named rather than allowed with network*, which would also
- * carry every UNIX-domain socket on the machine -- an address there is a path,
- * so ssh-agent, a container daemon and any other program's control socket come
- * with it.
+ * The peer is named by protocol rather than allowed with network*, which would
+ * also carry every UNIX-domain socket on the machine -- an address there is a
+ * path, so ssh-agent, a container daemon and any other program's control
+ * socket come with it. UDP is all comrade's own transport ever speaks: the
+ * DHT, the multicast rendezvous, STUN, ICE and the KCP the session rides. TCP
+ * is not part of this profile at all; sb_profile_tcp below is appended for the
+ * roles that forward ports, which is the only place it is used.
  *
  * sysctl-read is granted by name rather than wholesale: net.route is what
  * getifaddrs() walks, hw.memsize is read directly (bep44.c sizes its store
@@ -154,9 +157,9 @@ static const char sb_profile_confine[] =
 "  (global-name \"com.apple.system.logger\"))\n"
 "(allow ipc-posix-shm-read-data\n"
 "  (ipc-posix-name \"apple.shm.notification_center\"))\n"
-"(allow network-bind (local ip \"*:*\"))\n"
-"(allow network-inbound (local ip \"*:*\"))\n"
-"(allow network-outbound (remote ip \"*:*\"))\n"
+"(allow network-bind (local udp \"*:*\"))\n"
+"(allow network-inbound (local udp \"*:*\"))\n"
+"(allow network-outbound (remote udp \"*:*\"))\n"
 "(allow network-outbound (literal \"/private/var/run/mDNSResponder\"))\n";
 
 /*
@@ -176,6 +179,26 @@ static const char sb_profile_confine[] =
  */
 static const char sb_profile_tty[] =
 "(allow file-ioctl (literal \"/dev/tty\") (regex #\"^/dev/ttys[0-9]+$\"))\n";
+
+/*
+ * Appended for a role that forwards ports, and left off every other one. A
+ * -L or -R is the only TCP comrade ever opens, so a client asked for no
+ * forwards and a host started --no-fwd both run with TCP denied outright,
+ * while the transport they exist for is untouched.
+ *
+ * All three operations are granted together because which of them a forward
+ * needs depends on the side and the direction: a -L has the client listening
+ * and the host connecting out, a -R is the mirror of that, and the host learns
+ * its port from the client long after it is confined.
+ *
+ * The pairing is the opposite way round from the terminal rule above: a
+ * forwarding-only host serves no shell but exists to forward, so it is the one
+ * service that must have this.
+ */
+static const char sb_profile_tcp[] =
+"(allow network-bind (local tcp \"*:*\"))\n"
+"(allow network-inbound (local tcp \"*:*\"))\n"
+"(allow network-outbound (remote tcp \"*:*\"))\n";
 
 /*
  * The foreground profile: it runs the operator's local tmux, so it keeps
@@ -218,12 +241,24 @@ static int seatbelt(const char *profile, const char *const *params)
 	return 0;
 }
 
+/*
+ * Whether this role will open a TCP socket at all. A client knows its forwards
+ * from its own -L and -R arguments; a host cannot know the ports in advance,
+ * so it says only whether it will forward at all. Neither is true for a role
+ * that forwards nothing, and that role gets no TCP.
+ */
+static int wants_tcp(const struct sandbox_cfg *cfg)
+{
+	return cfg->tcp_any || cfg->n_tcp_bind > 0 || cfg->n_tcp_connect > 0;
+}
+
 static int apply_macos(const struct sandbox_cfg *cfg)
 {
 	int layers = 0;
 	char dd[PATH_MAX];
 	char sd[PATH_MAX];
-	char prof[sizeof(sb_profile_confine) + sizeof(sb_profile_tty)];
+	char prof[sizeof(sb_profile_confine) + sizeof(sb_profile_tty) +
+		  sizeof(sb_profile_tcp)];
 	const char *params[5];
 	struct rlimit rl;
 	int confine;
@@ -266,8 +301,9 @@ static int apply_macos(const struct sandbox_cfg *cfg)
 	params[2] = "STATE_DIR";
 	params[3] = sd;
 	params[4] = (const char *)0;
-	snprintf(prof, sizeof(prof), "%s%s", sb_profile_confine,
-		 cfg->no_pty ? "" : sb_profile_tty);
+	snprintf(prof, sizeof(prof), "%s%s%s", sb_profile_confine,
+		 cfg->no_pty ? "" : sb_profile_tty,
+		 wants_tcp(cfg) ? sb_profile_tcp : "");
 	if (seatbelt(prof, params))
 		layers |= SANDBOX_L_SECCOMP | SANDBOX_L_LANDLOCK;
 	return layers;

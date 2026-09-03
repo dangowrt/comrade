@@ -46,6 +46,8 @@ static char g_marker[PATH_MAX];
 #define RC_OK		0
 #define RC_SKIP		77	/* ctest SKIP_RETURN_CODE: no seccomp here */
 #define RC_EXEC_RAN	42	/* a deliberately-run exec reached this code */
+#define RC_TCP_OPEN	43	/* the policy let a TCP connect be attempted */
+#define RC_TCP_BLOCKED	44	/* the policy refused it */
 #define RC_FAIL		1
 
 /* A client applies its profile, then attempts execve: it must be refused. */
@@ -245,6 +247,81 @@ static int child_ifaddrs_survive(void)
 	return after >= before ? RC_OK : RC_FAIL;
 }
 
+/*
+ * The two halves the network grant separates. The UDP socket is comrade's own
+ * transport and every role keeps it, so losing it is a failure whoever is
+ * asking. The TCP connect is the part that depends on the role: the answer is
+ * reported rather than judged here, because what it should be is the caller's
+ * business.
+ */
+static int probe_udp_and_tcp(void)
+{
+	struct sockaddr_in a;
+	int s, rc, err;
+
+	memset(&a, 0, sizeof(a));
+	a.sin_family = AF_INET;
+	a.sin_port = 0;
+	a.sin_addr.s_addr = inet_addr("127.0.0.1");
+	s = socket(AF_INET, SOCK_DGRAM, 0);
+	if (s < 0)
+		return RC_FAIL;
+	if (bind(s, (struct sockaddr *)&a, sizeof(a)) != 0) {
+		close(s);
+		return RC_FAIL;		/* the transport itself is gone */
+	}
+	close(s);
+
+	s = socket(AF_INET, SOCK_STREAM, 0);
+	if (s < 0)
+		return RC_TCP_BLOCKED;	/* refused before it had an address */
+	a.sin_port = htons(9);		/* discard: nothing is listening */
+	rc = connect(s, (struct sockaddr *)&a, sizeof(a));
+	err = errno;			/* before close(), which may set it */
+	close(s);
+	/*
+	 * Unconfined this ends in ECONNREFUSED, which is the connection being
+	 * declined rather than the attempt: only EPERM/EACCES is the policy.
+	 */
+	if (rc != 0 && (err == EPERM || err == EACCES))
+		return RC_TCP_BLOCKED;
+	return RC_TCP_OPEN;
+}
+
+/* A client that was asked for no forwards: it should have lost TCP. */
+static int child_forwards_nothing(void)
+{
+	struct sandbox_cfg sb;
+
+	memset(&sb, 0, sizeof(sb));
+	sb.role = SANDBOX_CLIENT;
+	sb.data_dir = g_datadir;
+	if (!sandbox_apply(&sb))
+		return RC_SKIP;
+	return probe_udp_and_tcp();
+}
+
+/*
+ * A forwarding-only host: no exec, no terminal, and TCP it cannot name the
+ * ports of. The tightest role of the three in every other respect, and the one
+ * that must keep TCP.
+ */
+static int child_forward_only_host(void)
+{
+	struct sandbox_cfg sb;
+
+	memset(&sb, 0, sizeof(sb));
+	sb.role = SANDBOX_SERVICE;
+	sb.data_dir = g_datadir;
+	sb.state_dir = g_datadir;
+	sb.no_exec = 1;
+	sb.no_pty = 1;
+	sb.tcp_any = 1;
+	if (!sandbox_apply(&sb))
+		return RC_SKIP;
+	return probe_udp_and_tcp();
+}
+
 /* Run one child helper to completion; return its exit status. */
 static int run_child(int (*fn)(void))
 {
@@ -315,6 +392,30 @@ static int the_confinement_keeps_every_local_address(void)
 	return RC_OK;
 }
 
+/*
+ * TCP follows the forwarding, and it follows it the right way round. The two
+ * roles are run against each other rather than against a fixed expectation, so
+ * a platform with no TCP restriction at all skips instead of passing
+ * vacuously -- but a forwarding role that lost its TCP fails on every
+ * platform, because that is the mistake worth catching: it is the pairing
+ * whose intuition points the wrong way, and getting it backwards breaks the
+ * one service built to forward while the suite otherwise stays green.
+ */
+static int the_tcp_grant_follows_the_forwards(void)
+{
+	int denied = run_child(child_forwards_nothing);
+	int granted = run_child(child_forward_only_host);
+
+	if (denied == RC_SKIP || granted == RC_SKIP)
+		return RC_SKIP;
+	assert(denied != RC_FAIL && granted != RC_FAIL);
+	assert(granted == RC_TCP_OPEN);
+	if (denied == RC_TCP_OPEN)
+		return RC_SKIP;		/* this platform restricts no TCP */
+	assert(denied == RC_TCP_BLOCKED);
+	return RC_OK;
+}
+
 /* Create the granted data dir and the ungranted marker, both under one temp
  * base; returns 0 on success. */
 static int make_fixture(char *base)
@@ -353,7 +454,7 @@ int main(void)
 {
 	char base[] = "/tmp/comrade-sbtest-XXXXXX";
 	int have_fixture = (make_fixture(base) == 0);
-	int seccomp_skipped, ns_skipped, ll_skipped, addr_skipped;
+	int seccomp_skipped, ns_skipped, ll_skipped, addr_skipped, tcp_skipped;
 
 	seccomp_skipped = (the_client_cannot_exec() == RC_SKIP) ||
 		(the_foreground_has_no_network_but_keeps_exec() == RC_SKIP);
@@ -363,19 +464,23 @@ int main(void)
 		(the_landlock_fallback_confines_the_filesystem() == RC_SKIP);
 	addr_skipped = !have_fixture ||
 		(the_confinement_keeps_every_local_address() == RC_SKIP);
+	tcp_skipped = !have_fixture ||
+		(the_tcp_grant_follows_the_forwards() == RC_SKIP);
 
 	if (have_fixture)
 		drop_fixture(base);
 
-	if (seccomp_skipped && ns_skipped && ll_skipped && addr_skipped) {
+	if (seccomp_skipped && ns_skipped && ll_skipped && addr_skipped &&
+	    tcp_skipped) {
 		fprintf(stderr, "sandbox_test: this kernel offers no seccomp, "
 			"user namespace or Landlock, skipping\n");
 		return 77;
 	}
-	printf("sandbox_test: ok%s%s%s%s\n",
+	printf("sandbox_test: ok%s%s%s%s%s\n",
 	       seccomp_skipped ? " (seccomp skipped)" : "",
 	       ns_skipped ? " (namespace skipped)" : "",
 	       ll_skipped ? " (landlock skipped)" : "",
-	       addr_skipped ? " (addresses skipped)" : "");
+	       addr_skipped ? " (addresses skipped)" : "",
+	       tcp_skipped ? " (tcp skipped)" : "");
 	return 0;
 }

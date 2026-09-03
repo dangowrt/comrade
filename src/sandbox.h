@@ -22,8 +22,9 @@
  *                      and the ability to gain them gone, and its view of the
  *                      filesystem narrowed to its own data directory plus the
  *                      read-only pieces the C library and TLS stack still read
- *                      (resolver config, shared objects). It keeps the whole
- *                      network stack -- it is a network program.
+ *                      (resolver config, shared objects). It keeps the UDP it
+ *                      is built on and, of TCP, only the ports its own -L and
+ *                      -R name; a client asked to forward nothing gets none.
  *
  *   SANDBOX_SERVICE    The host's connection service: the process that faces
  *                      the network and runs the punched sessions. It must keep
@@ -33,6 +34,11 @@
  *                      denies its own execve just like the client and delegates
  *                      every spawn across a socketpair. Its writable set adds
  *                      the host state directory (status, token, pid files).
+ *                      TCP is granted only where it will forward, and a
+ *                      --forward-only host is the tightest profile of the
+ *                      three rather than the loosest: it serves no shell, so
+ *                      it execs nothing and touches no terminal, while being
+ *                      the one role that does need TCP.
  *
  *   SANDBOX_FOREGROUND The operator's dashboard/attach process. The mirror
  *                      image of the service: it drives a local tmux (so it
@@ -102,17 +108,20 @@ struct sandbox_cfg {
 	 */
 	int no_pty;
 	/*
-	 * The TCP a role will actually use, so a kernel with Landlock's network
-	 * rules can refuse the rest. comrade's own transport is UDP throughout
-	 * -- the DHT, the multicast rendezvous, STUN, ICE and the KCP the
-	 * session rides on -- so the only TCP is port forwarding, and a process
-	 * doing none of it needs none at all.
+	 * The TCP a role will actually use, so the platform can refuse the rest
+	 * -- Landlock's network rules on Linux, the Seatbelt profile on macOS,
+	 * which grants TCP as a whole or not at all because SBPL is composed
+	 * once and the ports are not all known by then. comrade's own transport
+	 * is UDP throughout -- the DHT, the multicast rendezvous, STUN, ICE and
+	 * the KCP the session rides on -- so the only TCP is port forwarding,
+	 * and a process doing none of it needs none at all.
 	 *
 	 * tcp_any means the role cannot know its ports in advance and the
-	 * restriction is skipped: a host learns which port to listen on when a
-	 * client asks it to, long after it is confined. A client does know, from
-	 * its own -L and -R arguments, so it gets the exact ports and nothing
-	 * else. With neither set, a role gets no TCP whatsoever.
+	 * per-port restriction is skipped: a host learns which port to listen
+	 * on when a client asks it to, long after it is confined. A client does
+	 * know, from its own -L and -R arguments, so it gets the exact ports and
+	 * nothing else. With none of the three set, a role gets no TCP
+	 * whatsoever.
 	 */
 	const uint16_t *tcp_bind;	/* ports it will listen on */
 	int n_tcp_bind;
