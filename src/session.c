@@ -363,6 +363,16 @@ struct conn {
 	char claim_ufrag[40];
 	volatile int ice_up;		/* the agent is connected, for readers
 					 * that may not touch the agent */
+	/*
+	 * Each probe carries the next of these, and a receiver drops one whose
+	 * sequence it has already seen. Both the connection's own loop and the
+	 * host's main thread seal probes for it -- the main thread does so from
+	 * the segment receive path -- so the increment is a read-modify-write
+	 * from two threads. Two probes handed the same number is one of them
+	 * discarded as a replay, which on a segment where the pair have just
+	 * met is the direct path failing to prove for no visible reason.
+	 */
+	pthread_mutex_t probe_lock;
 	uint64_t probe_seq;
 	/*
 	 * The stream's own counter and the window that judges it. KCP carries
@@ -2286,7 +2296,9 @@ static size_t conn_probe_seal(struct conn *c, struct path_probe *pr,
 	struct conn_keys k;
 
 	snprintf(pr->ufrag, sizeof(pr->ufrag), "%s", c->claim_ufrag);
+	pthread_mutex_lock(&c->probe_lock);
 	pr->seq = ++c->probe_seq;
+	pthread_mutex_unlock(&c->probe_lock);
 	conn_keys_take(c, &k);
 	return path_probe_build(out, PROBE_MAX, c->sess->keys.probe_magic,
 				k.tx, pr);
@@ -5473,6 +5485,7 @@ static struct conn *conn_alloc(struct sess *s)
 	pthread_mutex_init(&c->stream_lock, NULL);
 	pthread_mutex_init(&c->path_lock, NULL);
 	pthread_mutex_init(&c->key_lock, NULL);
+	pthread_mutex_init(&c->probe_lock, NULL);
 	path_table_init(&c->paths);
 	/*
 	 * Frames are counted from the clock, not from one. A host that reaps a
@@ -5504,6 +5517,7 @@ static void conn_free(struct conn *c)
 	pthread_mutex_destroy(&c->stream_lock);
 	pthread_mutex_destroy(&c->path_lock);
 	pthread_mutex_destroy(&c->key_lock);
+	pthread_mutex_destroy(&c->probe_lock);
 	free(c);
 }
 
@@ -5512,9 +5526,32 @@ static void conn_free(struct conn *c)
 struct worker {
 	pthread_t th;
 	struct conn *c;
-	volatile int done;
+	/*
+	 * Set by the worker as it returns, polled by the main thread to know
+	 * the thread can be joined and the peer's row taken down. Volatile
+	 * orders nothing between threads; a lock does.
+	 */
+	pthread_mutex_t done_lock;
+	int done;
 	int used;
 };
+
+static void worker_set_done(struct worker *w)
+{
+	pthread_mutex_lock(&w->done_lock);
+	w->done = 1;
+	pthread_mutex_unlock(&w->done_lock);
+}
+
+static int worker_done(struct worker *w)
+{
+	int v;
+
+	pthread_mutex_lock(&w->done_lock);
+	v = w->done;
+	pthread_mutex_unlock(&w->done_lock);
+	return v;
+}
 
 /* Each served peer's link, whenever one moves. */
 static void report_peer_links(struct sess *s, struct worker *ws)
@@ -5551,7 +5588,7 @@ static void *worker_thread(void *p)
 	struct worker *w = p;
 
 	conn_run(w->c, 0);
-	w->done = 1;
+	worker_set_done(w);
 	return NULL;
 }
 
@@ -5562,10 +5599,13 @@ static int worker_spawn(struct worker *ws, struct conn *c)
 	for (i = 0; i < HOST_MAX_WORKERS; i++)
 		if (!ws[i].used) {
 			ws[i].c = c;
+			if (pthread_mutex_init(&ws[i].done_lock, NULL))
+				return -1;
 			ws[i].done = 0;
 			ws[i].used = 1;
 			if (pthread_create(&ws[i].th, NULL, worker_thread,
 					   &ws[i])) {
+				pthread_mutex_destroy(&ws[i].done_lock);
 				ws[i].used = 0;
 				return -1;
 			}
@@ -5583,7 +5623,7 @@ static struct conn *worker_by_ufrag(struct worker *ws, const char *ufrag)
 	if (!ufrag[0])
 		return NULL;
 	for (i = 0; i < HOST_MAX_WORKERS; i++)
-		if (ws[i].used && !ws[i].done &&
+		if (ws[i].used && !worker_done(&ws[i]) &&
 		    !strcmp(ws[i].c->claim_ufrag, ufrag))
 			return ws[i].c;
 	return NULL;
@@ -6226,7 +6266,7 @@ static int host_turnstile(struct sess *s)
 		}
 
 		for (i = 0; i < HOST_MAX_WORKERS; i++) {
-			if (ws[i].used && ws[i].done) {
+			if (ws[i].used && worker_done(&ws[i])) {
 				pthread_join(ws[i].th, NULL);
 				if (o && o->peer)
 					o->peer(o->arg, ws[i].c->dash_id,
@@ -6234,6 +6274,7 @@ static int host_turnstile(struct sess *s)
 						ws[i].c->status_peer);
 				/* Unregister a LAN worker so a rejoining client
 				 * (same endpoint) is admitted afresh. */
+				pthread_mutex_destroy(&ws[i].done_lock);
 				for (j = 0; j < HOST_MAX_WORKERS; j++)
 					if (s->lan_conns[j] == ws[i].c)
 						s->lan_conns[j] = NULL;
@@ -6710,10 +6751,11 @@ static int host_turnstile(struct sess *s)
 			conn_free(punching[i]);
 		if (!ws[i].used)
 			continue;
-		while (s->session_over && !ws[i].done &&
+		while (s->session_over && !worker_done(&ws[i]) &&
 		       !deadline_passed(wind, now_ms()))
 			pump_once(s, 50);
 		pthread_join(ws[i].th, NULL);
+		pthread_mutex_destroy(&ws[i].done_lock);
 		conn_free(ws[i].c);
 	}
 	return 0;
@@ -6782,6 +6824,7 @@ int session_run(const struct session_cfg *cfg)
 	pthread_mutex_init(&s.c.stream_lock, NULL);
 	pthread_mutex_init(&s.c.path_lock, NULL);
 	pthread_mutex_init(&s.c.key_lock, NULL);
+	pthread_mutex_init(&s.c.probe_lock, NULL);
 	pthread_mutex_init(&s.pub_lock, NULL);
 	path_table_init(&s.c.paths);
 	pthread_mutex_init(&s.ns_lock, NULL);
@@ -7235,6 +7278,7 @@ done:
 	stunlist_free(s.stun_servers, s.stun_count);
 	pthread_mutex_destroy(&s.trickle_lock);
 	pthread_mutex_destroy(&s.c.status_lock);
+	pthread_mutex_destroy(&s.c.probe_lock);
 	pthread_mutex_destroy(&s.c.hb_lock);
 	pthread_mutex_destroy(&s.c.peer_in_lock);
 	pthread_mutex_destroy(&s.c.stream_lock);

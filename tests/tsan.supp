@@ -22,3 +22,13 @@
 # If a production output callback ever grows a path back into stream_input,
 # this suppression must go and the cycle must be broken for real.
 deadlock:stream_input
+
+# on_term: the e2e tool's SIGTERM/SIGINT handler setting its stop flag.
+#
+# The flag is `volatile sig_atomic_t`, which is the only type the C standard
+# permits an object touched from a signal handler to have, and the handler
+# does nothing else. ThreadSanitizer does not model signal delivery, so it
+# sees the handler's write and the loop's read as unsynchronised and always
+# will; there is no synchronisation to add that would be correct inside a
+# handler anyway -- taking a lock there is what would be the bug.
+race:on_term

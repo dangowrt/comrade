@@ -30,7 +30,9 @@ static struct {
 	struct token tok;
 } host;
 
-static volatile int e2e_stop;
+/* Written from a signal handler: the only type the standard
+ * allows to be touched from one. */
+static volatile sig_atomic_t e2e_stop;
 
 static void on_term(int sig)
 {
