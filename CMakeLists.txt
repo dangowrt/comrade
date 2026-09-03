@@ -1198,16 +1198,26 @@ if(COMRADE_BUILD_TOOLS)
 			ENVIRONMENT COMRADE_SWARM_FILE=${COMRADE_SWARM_FILE})
 
 		# Each of these stands up its own DHT node and multicast
-		# announcer on this host, so under `ctest -j` they contend for
-		# the segment and each other's rendezvous timing. Serialise them
-		# however ctest is invoked.
-		set_tests_properties(multiuser_e2e isolated_lan_e2e
-			lan_concurrent_e2e lan_mixed_e2e turnstile_stuck_e2e
-			roam_lan_e2e roam_fam_e2e roam_client_e2e
-			path_switch_e2e resume_e2e
-			hostroam_e2e rdvsync_e2e
-			forward_e2e rejoin_e2e rejoin_lan_e2e
-			PROPERTIES RESOURCE_LOCK comrade_net)
+		# announcer on this host. Two at a time is what they were
+		# measured to tolerate: the announcer's port comes from the
+		# token so two sessions never hear each other, and what used to
+		# make them interfere -- every instance on this host reaching a
+		# node as one source address, and being banned as one -- is
+		# fixed in bep44.c rather than papered over here.
+		#
+		# The membership is by measured duration, so the two lanes
+		# finish together; they are a concurrency limit and not a
+		# grouping. The exception is the tests that turn on what a LAN
+		# segment does, which are kept in one lane so no two of them are
+		# ever in flight at once.
+		set_tests_properties(isolated_lan_e2e lan_concurrent_e2e
+			lan_mixed_e2e roam_lan_e2e rejoin_lan_e2e
+			multiuser_e2e turnstile_stuck_e2e roam_fam_e2e
+			path_switch_e2e
+			PROPERTIES RESOURCE_LOCK comrade_seg)
+		set_tests_properties(rejoin_e2e rdvsync_e2e hostroam_e2e
+			forward_e2e resume_e2e roam_client_e2e
+			PROPERTIES RESOURCE_LOCK comrade_dht)
 	endif()
 endif()
 
