@@ -125,6 +125,8 @@ void netstate_on_netmon(struct netstate *ns, unsigned changed, int have4,
 
 		f->anchor_confirmed = 0;
 		f->anchor_acks = 0;
+		/* anchor_vouched is deliberately kept: our own proof was about
+		 * the network we have left, a peer's is about the node. */
 		/* A candidate gets its full run on the network it is now to
 		 * prove itself on, rather than inheriting a clock from the one
 		 * we have left. What has qualified stays not-a-candidate: it
@@ -331,6 +333,7 @@ static int anchor_set(struct netstate *ns, int i, const uint8_t *node, int len,
 	memcpy(f->anchor, node, (size_t)len);
 	f->anchor_len = (uint8_t)len;
 	f->anchor_confirmed = 0;	/* arriving is never qualifying */
+	f->anchor_vouched = 0;
 	f->anchor_candidate = candidate;
 	f->anchor_acks = acks;
 	f->anchor_set_ms = now;
@@ -456,6 +459,22 @@ void netstate_on_rdv_offered(struct netstate *ns, int family,
 	 * that is the point. Failing to prove it here is not grounds for us to
 	 * pick somewhere else. */
 	anchor_set(ns, fam_idx(family), node, len, now, 0, 0);
+}
+
+void netstate_on_rdv_vouched(struct netstate *ns, int family,
+			     const uint8_t *node, int len, uint64_t now)
+{
+	int i = fam_idx(family);
+	struct netstate_fam *f = &ns->f[i];
+
+	anchor_set(ns, i, node, len, now, 0, 0);
+	if (!f->anchor_len || f->anchor_vouched)
+		return;
+	f->anchor_vouched = 1;
+	f->anchor_candidate = 0;	/* proven somewhere: no longer ours to
+					 * drop, only to replace */
+	raise_act(ns, i, NSA_EMIT_RDV);
+	facts_moved(ns, i);
 }
 
 void netstate_set_picking(struct netstate *ns, int family, int on)
@@ -660,7 +679,8 @@ void netstate_facts(const struct netstate *ns, int family,
 	 * -- advertising a meeting point this host cannot get to would strand
 	 * whoever went there.
 	 */
-	out->dht_acked = f->anchor_confirmed && f->conn == NET_CONN_UP;
+	out->dht_acked = (f->anchor_confirmed && f->conn == NET_CONN_UP) ||
+			 f->anchor_vouched;
 	out->dht_attempt_concluded = f->concluded;
 	out->public_port_proven = 0;	/* no UPnP/NAT-PMP/PCP in the tree */
 }
@@ -688,6 +708,6 @@ int netstate_anchor(const struct netstate *ns, int family, uint8_t *out,
 	if (out_len)
 		*out_len = f->anchor_len;
 	if (confirmed)
-		*confirmed = f->anchor_confirmed;
+		*confirmed = f->anchor_confirmed || f->anchor_vouched;
 	return 1;
 }

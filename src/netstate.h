@@ -251,6 +251,9 @@ struct netstate_fam {
 	struct netstate_cand cands[NETSTATE_CANDS_MAX];
 	int ncands;
 	int anchor_confirmed;		/* adopting a node never confirms it */
+	int anchor_vouched;		/* another end has proven it, for a
+					 * family we may not be able to reach
+					 * ourselves; see netstate_on_rdv_vouched */
 	int anchor_candidate;		/* ours, on trial, and shown to nobody:
 					 * droppable, unlike one that has
 					 * qualified (a token may name it) or
@@ -342,10 +345,30 @@ void netstate_on_dht_ack(struct netstate *ns, int family, uint32_t epoch,
  * that keeps it, and the only thing whose absence may eventually unseat it. */
 void netstate_on_anchor_seen(struct netstate *ns, int family, uint64_t now);
 
-/* An anchor handed to us (a token slot, or the peer's over the control
- * channel): authoritative, so it displaces whatever is held, and is never
- * confirmed by the handing over -- it was minted on another network. */
+/* An anchor handed to us in a token slot: authoritative, so it displaces
+ * whatever is held, and is never confirmed by the handing over -- it was
+ * minted on another network and has not answered here. */
 void netstate_on_rdv_offered(struct netstate *ns, int family,
+			     const uint8_t *node, int len, uint64_t now);
+
+/*
+ * The same, from a peer over the control channel, which is a stronger thing:
+ * a peer announces a node only once it has qualified it itself, so this one
+ * arrives already proven by somebody.
+ *
+ * WHICH IS THE ONLY PROOF THERE WILL EVER BE FOR A FAMILY WE CANNOT REACH.
+ * Qualifying is a round trip to the node, so a host with no IPv6 uplink can
+ * never qualify an IPv6 rendezvous -- yet that is exactly the rendezvous it
+ * most needs, since a dual-stack client can reach the node and it cannot.
+ * Requiring our own round trip asks the wrong question of the slot: a
+ * rendezvous names a node willing to hold this mutable key, and never said
+ * anything about who can reach it.
+ *
+ * A vouch survives a move of ours. What our own proof asserts is about this
+ * network and is dropped with it; what the peer proved is about the node, and
+ * changing networks here does not make it less true.
+ */
+void netstate_on_rdv_vouched(struct netstate *ns, int family,
 			     const uint8_t *node, int len, uint64_t now);
 
 /*

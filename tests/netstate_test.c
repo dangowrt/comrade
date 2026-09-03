@@ -284,6 +284,62 @@ static void a_shadow_address_is_not_a_translation(void)
 		assert(netstate_row_via(&ns, 6, &rows[i]) == NET_VIA_STUN);
 }
 
+/*
+ * A FAMILY THIS END CANNOT REACH IS STILL A RENDEZVOUS.
+ *
+ * Qualifying a node means a round trip to it, so a host with no IPv6 uplink
+ * can never qualify an IPv6 rendezvous -- and that is precisely the one it
+ * most needs, a dual-stack client being able to reach the node where it
+ * cannot. A peer announces a node only once it has qualified it itself, so
+ * its word is the proof, and the slot is worth naming in a token on the
+ * strength of it: the slot says a node holds this key, never that we can
+ * reach it.
+ */
+static void a_peers_vouch_qualifies_what_we_cannot_reach(void)
+{
+	struct netstate ns;
+	struct tokgen_facts f;
+	uint8_t node[16], out[NETSTATE_SA_MAX], olen = 0;
+	int confirmed = 1;
+
+	start(&ns, 1);
+	fill(node, 16, 30);
+
+	/* A token slot: adopted, and still owing us a proof. */
+	netstate_on_rdv_offered(&ns, 6, node, 16, t);
+	assert(netstate_anchor(&ns, 6, out, &olen, &confirmed));
+	assert(!confirmed);
+	netstate_facts(&ns, 6, &f);
+	assert(!f.dht_acked);
+
+	/* The same node, now named by a peer that qualified it. Nothing about
+	 * this end has changed, and it still cannot reach the family. */
+	netstate_on_rdv_vouched(&ns, 6, node, 16, t);
+	assert(netstate_conn(&ns, 6) != NET_CONN_UP);
+	assert(netstate_anchor(&ns, 6, out, &olen, &confirmed));
+	assert(confirmed);
+	netstate_facts(&ns, 6, &f);
+	assert(f.dht_acked);
+
+	/* A move of OURS does not take back what the peer proved: that was
+	 * about the node, not about the network we have left. */
+	netstate_on_netmon(&ns, NETMON_CH_V6, 1, 1, t);
+	drain(&ns);
+	netstate_facts(&ns, 6, &f);
+	assert(f.dht_acked);
+	assert(netstate_anchor(&ns, 6, out, &olen, &confirmed));
+	assert(confirmed);
+
+	/* A different node replacing it starts over: the vouch was for the
+	 * node that was vouched for, not for the slot. */
+	fill(node, 16, 70);
+	netstate_on_rdv_offered(&ns, 6, node, 16, t);
+	assert(netstate_anchor(&ns, 6, out, &olen, &confirmed));
+	assert(!confirmed);
+	netstate_facts(&ns, 6, &f);
+	assert(!f.dht_acked);
+}
+
 /* B6/B12, the visible half: the addresses arrive before the source does, so
  * whichever was shown first cannot be the answer. Once the source is known the
  * set is recomputed, which an append-only row list could never do. */
@@ -1305,6 +1361,7 @@ int main(void)
 	an_address_that_never_comes_stops_being_hurried();
 	late_src_retracts_the_wrong_row();
 	a_shadow_address_is_not_a_translation();
+	a_peers_vouch_qualifies_what_we_cannot_reach();
 	src_is_never_stale_on_the_wire();
 	an_answer_confirms_without_a_tick();
 	an_answer_alone_confirms_nothing();

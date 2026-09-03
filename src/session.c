@@ -3737,7 +3737,7 @@ static void rdv_adopt(struct sess *s, struct conn *c)
 				continue;
 			}
 		}
-		netstate_on_rdv_offered(&s->ns, famv[i],
+		netstate_on_rdv_vouched(&s->ns, famv[i],
 					(const uint8_t *)&in[i].sa,
 					(int)in[i].len, now_ms());
 		dbg_logf("rdv: adopted the peer's v%d node %s", famv[i], b);
