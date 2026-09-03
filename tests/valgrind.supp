@@ -1,0 +1,19 @@
+# Valgrind suppressions for the test suite.
+#
+# Same rule as tests/tsan.supp: every entry carries the argument for why it is
+# not a bug. A suppression file without those turns the tool into a machine for
+# producing green ticks.
+
+# The crypto backends and libjuice read uninitialised bytes deliberately, as
+# entropy or as part of constant-time code that touches both branches. The
+# reads are of memory they own and the values never leave the library.
+{
+   crypto-and-ice-libraries-read-their-own-uninitialised-bytes
+   Memcheck:Cond
+   obj:*/libcrypto.so*
+}
+{
+   crypto-and-ice-libraries-read-their-own-uninitialised-bytes-value
+   Memcheck:Value8
+   obj:*/libcrypto.so*
+}

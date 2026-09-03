@@ -3,6 +3,25 @@ cmake_minimum_required(VERSION 3.20)
 project(comrade VERSION 0.0.1 LANGUAGES C)
 
 include(GNUInstallDirs)
+#
+# Valgrind, through CTest's own driver (ctest -T memcheck). Set before
+# include(CTest), which is where these are read.
+#
+# It overlaps AddressSanitizer heavily and is far slower, so it earns its place
+# on one thing only: reading an uninitialised value, which ASan does not see
+# and which MemorySanitizer would need every dependency rebuilt to catch.
+#
+find_program(COMRADE_VALGRIND valgrind)
+if(COMRADE_VALGRIND)
+	set(MEMORYCHECK_COMMAND "${COMRADE_VALGRIND}" CACHE FILEPATH "" FORCE)
+	set(MEMORYCHECK_COMMAND_OPTIONS
+		"--leak-check=full --show-leak-kinds=definite,indirect --errors-for-leak-kinds=definite --track-origins=yes --error-exitcode=1"
+		CACHE STRING "" FORCE)
+	set(MEMORYCHECK_SUPPRESSIONS_FILE
+		"${CMAKE_CURRENT_SOURCE_DIR}/tests/valgrind.supp"
+		CACHE FILEPATH "" FORCE)
+endif()
+
 include(CTest)
 
 set(CMAKE_C_STANDARD 11)
@@ -21,6 +40,64 @@ if(COMRADE_WERROR)
 endif()
 
 include(CheckCCompilerFlag)
+include(CheckCSourceCompiles)
+
+#
+# INSTRUMENTED BUILDS.
+#
+# COMRADE_SANITIZE names a runtime to build the whole tree against. They are
+# not interchangeable and they do not compose: address and thread each want the
+# program's whole address space, so a build carries one or the other.
+#
+#   address    AddressSanitizer, with UndefinedBehaviorSanitizer beside it and
+#              LeakSanitizer where the platform has one. Measured here at about
+#              the cost of an ordinary build, so this one is worth gating on.
+#   thread     ThreadSanitizer, which is the only tool that has ever found the
+#              races in this program: four of them, in one afternoon, in code
+#              that had passed every other check for months.
+#   none       the default.
+#
+# What the tool reports and whether the tests pass are separate questions, and
+# on e2e under thread they give different answers -- the instrumented binaries
+# are slow enough to miss the timing the tests assert, while reporting nothing
+# wrong. So the report is collected on its own (see COMRADE_SAN_LOG_DIR below)
+# and a job may watch that while letting the outcome go.
+#
+set(COMRADE_SANITIZE "none" CACHE STRING
+	"Instrument the build: none, address (+undefined, +leak), or thread")
+set_property(CACHE COMRADE_SANITIZE PROPERTY STRINGS none address thread)
+
+set(COMRADE_SAN_FLAGS "")
+set(COMRADE_SAN_ENV "")
+if(NOT COMRADE_SANITIZE STREQUAL "none")
+	if(COMRADE_SANITIZE STREQUAL "address")
+		set(COMRADE_SAN_FLAGS -fsanitize=address,undefined
+			-fno-sanitize-recover=all)
+	elseif(COMRADE_SANITIZE STREQUAL "thread")
+		set(COMRADE_SAN_FLAGS -fsanitize=thread)
+	else()
+		message(FATAL_ERROR
+			"COMRADE_SANITIZE: expected none, address or thread, got '${COMRADE_SANITIZE}'")
+	endif()
+	list(APPEND COMRADE_SAN_FLAGS -fno-omit-frame-pointer -g)
+
+	# Probed rather than assumed: a toolchain can accept the flag and have
+	# no runtime to link against (MinGW is the one that bites), and a build
+	# that quietly produced an uninstrumented binary would be worse than no
+	# job at all -- it would report success having checked nothing.
+	set(CMAKE_REQUIRED_FLAGS "${COMRADE_SAN_FLAGS}")
+	set(CMAKE_REQUIRED_LINK_OPTIONS ${COMRADE_SAN_FLAGS})
+	check_c_source_compiles("int main(void){return 0;}" COMRADE_SAN_USABLE)
+	unset(CMAKE_REQUIRED_FLAGS)
+	unset(CMAKE_REQUIRED_LINK_OPTIONS)
+	if(NOT COMRADE_SAN_USABLE)
+		message(FATAL_ERROR
+			"COMRADE_SANITIZE=${COMRADE_SANITIZE}: this toolchain cannot link it")
+	endif()
+
+	add_compile_options(${COMRADE_SAN_FLAGS})
+	add_link_options(${COMRADE_SAN_FLAGS})
+endif()
 
 function(comrade_add_flag flag)
 	string(MAKE_C_IDENTIFIER "comrade_have_${flag}" var)
