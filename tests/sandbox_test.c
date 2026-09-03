@@ -9,6 +9,11 @@
  * exec. Each check runs in its own forked child because the confinement is
  * irreversible. Where the kernel offers no seccomp the whole test skips
  * (return 77), so it neither passes vacuously nor fails on an old kernel.
+ *
+ * Some of the checks are about what a profile must *not* take away, because
+ * that is the failure this confinement has actually produced: a rule that
+ * silently narrows what the process can see, with no error, no log line and a
+ * program that carries on looking healthy.
  */
 
 #include <assert.h>
@@ -22,6 +27,8 @@
 #include <unistd.h>
 
 #include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <net/if.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -186,6 +193,58 @@ static int child_confined_landlock(void)
 	return confined_checks();
 }
 
+/*
+ * Every address an ICE gather would offer: the up IPv4 and IPv6 addresses
+ * getifaddrs() reports. Returns -1 if the walk itself fails.
+ */
+static int count_ifaddrs(void)
+{
+	struct ifaddrs *list = NULL;
+	struct ifaddrs *p;
+	int n = 0;
+
+	if (getifaddrs(&list) != 0)
+		return -1;
+	for (p = list; p; p = p->ifa_next) {
+		if (!p->ifa_addr)
+			continue;
+		if (p->ifa_addr->sa_family != AF_INET &&
+		    p->ifa_addr->sa_family != AF_INET6)
+			continue;
+		if (!(p->ifa_flags & IFF_UP))
+			continue;
+		n++;
+	}
+	freeifaddrs(list);
+	return n;
+}
+
+/*
+ * A confined client must still see every local address. This is the check the
+ * macOS net.route rule needed: written with a trailing dot the profile
+ * compiles, applies and logs nothing, and getifaddrs() simply stops reporting
+ * -- after which the host gathers one ICE candidate where it should gather
+ * three and the punch fails for no visible reason. The count is taken twice in
+ * this one child, either side of the confinement and milliseconds apart, so an
+ * interface coming or going cannot make the comparison lie.
+ */
+static int child_ifaddrs_survive(void)
+{
+	struct sandbox_cfg sb;
+	int before, after;
+
+	before = count_ifaddrs();
+	if (before < 1)
+		return RC_SKIP;		/* nothing to compare against */
+	memset(&sb, 0, sizeof(sb));
+	sb.role = SANDBOX_CLIENT;
+	sb.data_dir = g_datadir;
+	if (!sandbox_apply(&sb))
+		return RC_SKIP;
+	after = count_ifaddrs();
+	return after >= before ? RC_OK : RC_FAIL;
+}
+
 /* Run one child helper to completion; return its exit status. */
 static int run_child(int (*fn)(void))
 {
@@ -244,6 +303,18 @@ static int the_landlock_fallback_confines_the_filesystem(void)
 	return RC_OK;
 }
 
+/* A confined client still sees every address a candidate could be gathered
+ * from. */
+static int the_confinement_keeps_every_local_address(void)
+{
+	int r = run_child(child_ifaddrs_survive);
+
+	if (r == RC_SKIP)
+		return RC_SKIP;
+	assert(r == RC_OK);
+	return RC_OK;
+}
+
 /* Create the granted data dir and the ungranted marker, both under one temp
  * base; returns 0 on success. */
 static int make_fixture(char *base)
@@ -282,7 +353,7 @@ int main(void)
 {
 	char base[] = "/tmp/comrade-sbtest-XXXXXX";
 	int have_fixture = (make_fixture(base) == 0);
-	int seccomp_skipped, ns_skipped, ll_skipped;
+	int seccomp_skipped, ns_skipped, ll_skipped, addr_skipped;
 
 	seccomp_skipped = (the_client_cannot_exec() == RC_SKIP) ||
 		(the_foreground_has_no_network_but_keeps_exec() == RC_SKIP);
@@ -290,18 +361,21 @@ int main(void)
 		(the_namespace_confines_the_filesystem() == RC_SKIP);
 	ll_skipped = !have_fixture ||
 		(the_landlock_fallback_confines_the_filesystem() == RC_SKIP);
+	addr_skipped = !have_fixture ||
+		(the_confinement_keeps_every_local_address() == RC_SKIP);
 
 	if (have_fixture)
 		drop_fixture(base);
 
-	if (seccomp_skipped && ns_skipped && ll_skipped) {
+	if (seccomp_skipped && ns_skipped && ll_skipped && addr_skipped) {
 		fprintf(stderr, "sandbox_test: this kernel offers no seccomp, "
 			"user namespace or Landlock, skipping\n");
 		return 77;
 	}
-	printf("sandbox_test: ok%s%s%s\n",
+	printf("sandbox_test: ok%s%s%s%s\n",
 	       seccomp_skipped ? " (seccomp skipped)" : "",
 	       ns_skipped ? " (namespace skipped)" : "",
-	       ll_skipped ? " (landlock skipped)" : "");
+	       ll_skipped ? " (landlock skipped)" : "",
+	       addr_skipped ? " (addresses skipped)" : "");
 	return 0;
 }

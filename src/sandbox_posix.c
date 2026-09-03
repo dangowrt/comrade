@@ -95,6 +95,14 @@ extern void sandbox_free_error(char *errorbuf) __attribute__((weak_import));
  * so ssh-agent, a container daemon and any other program's control socket come
  * with it.
  *
+ * sysctl-read is granted by name rather than wholesale: net.route is what
+ * getifaddrs() walks, hw.memsize is read directly (bep44.c sizes its store
+ * from it), and the three remaining hw names are what sysconf() reaches for
+ * underneath a threaded library. Nothing here needs the machine's identity,
+ * hostname or uptime, so those names are not granted -- and granting them
+ * would not have made uname() work either, since that also wants kern.version
+ * and hw.machine.
+ *
  * Two things about SBPL that this profile depends on, both of which fail
  * silently when they are got wrong:
  *
@@ -126,21 +134,16 @@ static const char sb_profile_confine[] =
 "  (subpath \"/opt/homebrew/Cellar\"))\n"
 "(allow file-read*\n"
 "  (subpath \"/private/etc\")\n"
-"  (subpath \"/Library/Preferences/Logging\")\n"
 "  (literal \"/private/var/run/resolv.conf\")\n"
-"  (literal \"/dev/null\") (literal \"/dev/zero\")\n"
+"  (literal \"/dev/null\")\n"
 "  (literal \"/dev/random\") (literal \"/dev/urandom\"))\n"
 "(allow file-write-data (literal \"/dev/null\"))\n"
-"(allow file-read* file-write* file-ioctl\n"
+"(allow file-read* file-write*\n"
 "  (subpath (param \"DATA_DIR\")) (subpath (param \"STATE_DIR\")))\n"
-"(allow process-info-pidinfo (target self))\n"
 "(allow signal (target self))\n"
 "(allow sysctl-read\n"
 "  (sysctl-name \"hw.memsize\") (sysctl-name \"hw.ncpu\")\n"
 "  (sysctl-name \"hw.activecpu\") (sysctl-name \"hw.pagesize\")\n"
-"  (sysctl-name \"kern.osrelease\") (sysctl-name \"kern.ostype\")\n"
-"  (sysctl-name \"kern.osversion\") (sysctl-name \"kern.boottime\")\n"
-"  (sysctl-name \"kern.hostname\") (sysctl-name \"kern.maxfilesperproc\")\n"
 "  (sysctl-name-prefix \"net.route\"))\n"
 "(allow mach-lookup\n"
 "  (global-name \"com.apple.dnssd.service\")\n"
