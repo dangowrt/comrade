@@ -83,6 +83,31 @@ enum sig_claim {
 	SIG_CLAIM_HELD,		/* our own answer occupies the slot */
 	SIG_CLAIM_BUSY		/* another client's answer occupies the slot */
 };
+/*
+ * When a changed offer becomes due to store, 0 meaning at once.
+ *
+ * A host gathers candidates over seconds and posts again for every one of
+ * them. Storing each time is a round trip and a sequence bump for a
+ * description about to be superseded a moment later, so a changed offer waits
+ * until the arrivals have stopped -- every new candidate putting the wait back
+ * to the beginning, since each is a fresh reason to think more are coming.
+ *
+ * ONLY MORE CANDIDATES WAIT, which is what `only_candidates` is for. A change
+ * to anything else in the description -- a rotation, a resumption under a
+ * fresh password, a rebuilt agent -- is not gathering: it is news somebody is
+ * already waiting on, and holding it back is holding up whoever is waiting.
+ *
+ * THE FIRST OFFER IS NEVER HELD BACK EITHER, which is what `stored_before` is
+ * for.
+ * Nothing can find this host until one is stored, so trading that latency for
+ * tidiness would spend the one number that matters to buy something nobody
+ * sees. The wait applies from the second offer on, which is where the
+ * repetition is. A client's answer is not waited on either: it is claiming a
+ * mutex, and a round it spends settling is a round the turnstile is held.
+ */
+uint64_t sig_offer_settle_until(int is_host, int stored_before,
+			       int only_candidates, uint64_t now);
+
 enum sig_claim sig_claim_status(struct sig *s);
 
 /* Client: stop advertising our answer, so a slot the host frees is not
