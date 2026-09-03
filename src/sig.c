@@ -283,6 +283,22 @@ static void sig_free(struct sig *s, int persist)
 	free(s);
 }
 
+void sig_use_claim_key(struct sig *s, const uint8_t sk[32])
+{
+	if (!s || !s->is_host || !sk)
+		return;
+	memcpy(s->claim_sk, sk, 32);
+	cc_x25519_public(s->claim_pk, s->claim_sk);
+}
+
+int sig_claim_key(const struct sig *s, uint8_t sk[32])
+{
+	if (!s || !s->is_host)
+		return -1;
+	memcpy(sk, s->claim_sk, 32);
+	return 0;
+}
+
 void sig_destroy(struct sig *s)
 {
 	sig_free(s, 1);

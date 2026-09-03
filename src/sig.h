@@ -334,4 +334,31 @@ int sig_rdv_stage(struct sig *s, int family);
 /* The up, multicast-capable interfaces this signaller services (view only). */
 int sig_link_ifaces(struct sig *s, struct sig_mcast_if *out, int max);
 
+/*
+ * Reuse a claim key across signallers, for a caller that rebuilds them.
+ *
+ * A host mints the key claims are boxed to when the signaller is created,
+ * because that is the natural lifetime when a signaller lasts as long as the
+ * rendezvous does. It is the WRONG lifetime for a caller that rebuilds: a
+ * claimant boxes to the key it read in the offer, and if a rebuild has minted
+ * a new one by the time the claim is read back, the box will not open. The
+ * host then declares the slot unreadable and RELEASES it -- erasing a claim
+ * that was perfectly good -- and the claimant writes another against the new
+ * offer, which the next rebuild strands in its turn.
+ *
+ * A session rebuilds its signaller whenever the network moves: a fresh one
+ * binds a new socket and joins the groups on the interfaces that exist now,
+ * where the old one stays bound to the one that vanished. So the key is held
+ * by whatever outlives the signaller and handed back in, and a claimant that
+ * was mid-claim when the host roamed is answered rather than erased.
+ *
+ * Must be called before the mailbox publishes anything. Ignored on a client,
+ * which mints no such key. `sk` is the secret half; the public half is derived.
+ */
+void sig_use_claim_key(struct sig *s, const uint8_t sk[32]);
+
+/* The key this signaller is using, so a caller can keep it for the next one.
+ * Returns 0 and fills `sk` on a host, -1 on a client. */
+int sig_claim_key(const struct sig *s, uint8_t sk[32]);
+
 #endif

@@ -475,6 +475,13 @@ struct sess {
 	uint8_t auth[TOKEN_AUTH_LEN];
 
 	struct sig *sig;
+	/*
+	 * The key a claimant boxes its claim to, held here rather than by the
+	 * signaller: a signaller is rebuilt on every move, and the claim a
+	 * client had in flight when the host roamed is boxed to the old one.
+	 */
+	uint8_t claim_sk[32];
+	int have_claim_sk;
 	struct lanlink *lan;
 	struct session_keys keys;	/* sig_key, for sealing transport probes */
 
@@ -5871,6 +5878,19 @@ static int sig_arm(struct sess *s)
 	s->sig = sig_create(cfg->tok.rdv, cfg->sig_flags, cfg->is_host);
 	if (!s->sig)
 		return -1;
+	/*
+	 * BEFORE ANYTHING IS PUBLISHED. A claimant boxes its claim to the key
+	 * it read in the offer, and this is a REBUILD as often as it is a
+	 * first arming -- every move makes one. A fresh key would strand the
+	 * claim in flight: the host cannot open it, calls the slot unreadable
+	 * and RELEASES it, erasing a claim that was perfectly good, and the
+	 * claimant answers the new offer instead. So the key belongs to the
+	 * session, which the rebuild does not replace.
+	 */
+	if (s->have_claim_sk)
+		sig_use_claim_key(s->sig, s->claim_sk);
+	else if (!sig_claim_key(s->sig, s->claim_sk))
+		s->have_claim_sk = 1;
 	s->dht_since_ms = now_ms();	/* a rebuild is a fresh attempt, and a
 					 * fresh grace, on the new network */
 	sig_subscribe(s->sig, on_peer_offer, s);

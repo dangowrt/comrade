@@ -27,6 +27,7 @@
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 #include <time.h>
 
 #include "sig.h"
@@ -94,14 +95,32 @@ int main(void)
 	 * The roam's own sequence. Each round also pins the jech/dht singleton
 	 * invariant sig_rebuild leans on: dht_init and dht_uninit must pair, or
 	 * the next node is never created and prepare offers no descriptor.
+	 *
+	 * AND THE CLAIM KEY SURVIVES IT. A claimant boxes its claim to the key
+	 * it read in the host's offer, so a rebuild that minted a fresh one
+	 * left the host unable to open a claim already in flight -- and a host
+	 * that cannot open a claim releases the slot, erasing one that was
+	 * perfectly good. Every round here is a roam, and the key a session
+	 * carries across them must be the one it started with.
 	 */
-	for (i = 0; i < ROUNDS; i++) {
-		t0 = now_ms();
+	{
+		uint8_t k0[32], k[32];
+
 		s = sig_create(rdv, SIG_DHT, 1);
-		assert(s);
-		assert(sig_prepare(s, fds, 8, &timeout_ms) > 0);
+		assert(s && !sig_claim_key(s, k0));
 		sig_discard(s);
-		assert(now_ms() - t0 < ROUND_MAX_MS);
+
+		for (i = 0; i < ROUNDS; i++) {
+			t0 = now_ms();
+			s = sig_create(rdv, SIG_DHT, 1);
+			assert(s);
+			/* What the session does across its own rebuild. */
+			sig_use_claim_key(s, k0);
+			assert(!sig_claim_key(s, k) && !memcmp(k, k0, 32));
+			assert(sig_prepare(s, fds, 8, &timeout_ms) > 0);
+			sig_discard(s);
+			assert(now_ms() - t0 < ROUND_MAX_MS);
+		}
 	}
 
 	/* The session's own teardown, which persists the node cache. */
