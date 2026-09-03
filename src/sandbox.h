@@ -82,13 +82,15 @@ struct sandbox_cfg {
 	const char *state_dir;		/* host state dir, writable; NULL unless
 					 * role == SANDBOX_SERVICE */
 	/*
-	 * SANDBOX_SERVICE only: whether the service has a spawner doing its
-	 * exec (see spawner.h). The filesystem confinement and the exec denial
-	 * apply only when it does -- without one the service forks tmux itself,
-	 * and those layers would wrongly be inherited by the shells. The other
-	 * layers apply either way.
+	 * SANDBOX_SERVICE only: whether this process will exec nothing itself,
+	 * which is what the filesystem confinement and the exec denial actually
+	 * depend on. Two different services satisfy it -- one whose spawning is
+	 * done by a broker forked beforehand (see spawner.h), and a
+	 * forwarding-only host, which runs no tmux at all. A service that still
+	 * forks tmux itself satisfies neither, and those two layers would be
+	 * wrongly inherited by every shell. The rest apply either way.
 	 */
-	int have_spawner;
+	int no_exec;
 };
 
 /*

@@ -877,7 +877,7 @@ static void svc_confine(struct svc *v)
 	sb.role = SANDBOX_SERVICE;
 	sb.data_dir = appdir_data();
 	sb.state_dir = state_dir();
-	sb.have_spawner = (v->sp != NULL);
+	sb.no_exec = (v->sp != NULL) || v->forward_only;
 	sandbox_apply(&sb);
 }
 

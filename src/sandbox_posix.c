@@ -68,42 +68,81 @@ static int limit_core(void)
 #include <limits.h>
 #include <sys/ptrace.h>
 
+/*
+ * Weakly imported, so the day Apple finally removes the SPI it has been
+ * deprecating since 10.8 the binary loses a layer instead of refusing to
+ * launch. An ordinary extern here is resolved by dyld at load time, which
+ * would make its absence fatal.
+ */
 extern int sandbox_init_with_parameters(const char *profile, uint64_t flags,
 					const char *const parameters[],
-					char **errorbuf);
-extern void sandbox_free_error(char *errorbuf);
+					char **errorbuf) __attribute__((weak_import));
+extern void sandbox_free_error(char *errorbuf) __attribute__((weak_import));
 
 /*
  * The confining profile (client and service): deny everything, then allow the
- * narrow set the work needs -- the system and Homebrew library trees to map and
- * read, the resolver's pieces, the process's own data (and state) directory to
- * read and write, and the network. process-exec and process-fork are left
- * denied by the default, so a compromised process cannot run anything; the host
- * service does its spawning from a separate process forked before this applies.
- * DATA_DIR and STATE_DIR are passed as parameters so the one profile serves any
- * path.
+ * narrow set the work needs -- the library directories to map and read, the
+ * resolver's pieces, the process's own data and state directories to read and
+ * write, and IP. Exec and fork are covered by the default and denied again by
+ * name, because a policy should state its own guarantee rather than leave a
+ * reader to derive it; a compromised process cannot run anything, and the host
+ * service does its spawning either from a broker forked before this applies or
+ * not at all. DATA_DIR and STATE_DIR are passed as parameters so the one
+ * profile serves any path.
+ *
+ * The IP peer is named rather than allowed with network*, which would also
+ * carry every UNIX-domain socket on the machine -- an address there is a path,
+ * so ssh-agent, a container daemon and any other program's control socket come
+ * with it.
+ *
+ * Two things about SBPL that this profile depends on, both of which fail
+ * silently when they are got wrong:
+ *
+ *  1. Path checks canonicalise, so (subpath "/etc") matches nothing -- /etc is
+ *     a symlink and /private/etc is what a rule must name. Following that
+ *     symlink is itself a metadata read of the link, which is why the three
+ *     literals below are granted: /etc, /tmp and /var. state_dir() hands back
+ *     an unresolved /tmp/... path while the grant is the realpath of it, and
+ *     $TMPDIR lives under /var/folders.
+ *  2. (sysctl-name-prefix "net.route.") -- with the trailing dot -- compiles,
+ *     runs, and denies getifaddrs() for the whole process. libjuice is only
+ *     where the symptom shows: the host gathers one ICE candidate instead of
+ *     three and the punch fails, with no error and no violation logged. The
+ *     name carries no trailing dot.
  */
 static const char sb_profile_confine[] =
 "(version 1)\n"
 "(deny default)\n"
-"(allow file-read-metadata)\n"
-"(allow process-info* (target self))\n"
-"(allow signal (target self))\n"
-"(allow sysctl-read)\n"
-"(allow mach-per-user-lookup)\n"
+"(deny process-exec* process-fork)\n"
+"(allow file-read-metadata\n"
+"  (literal \"/etc\") (literal \"/tmp\") (literal \"/var\"))\n"
 "(allow file-read* file-map-executable\n"
-"  (subpath \"/usr/lib\") (subpath \"/usr/share\") (subpath \"/System\")\n"
-"  (subpath \"/private/etc\") (subpath \"/opt/homebrew\")\n"
-"  (subpath \"/usr/local\") (subpath \"/Library/Preferences/Logging\")\n"
+"  (subpath \"/usr/lib\") (subpath \"/System/Library\")\n"
 "  (subpath \"/System/Cryptexes\")\n"
-"  (subpath \"/System/Volumes/Preboot/Cryptexes\"))\n"
+"  (subpath \"/System/Volumes/Preboot/Cryptexes\")\n"
+"  (subpath \"/usr/local/lib\") (subpath \"/usr/local/opt\")\n"
+"  (subpath \"/usr/local/Cellar\")\n"
+"  (subpath \"/opt/homebrew/lib\") (subpath \"/opt/homebrew/opt\")\n"
+"  (subpath \"/opt/homebrew/Cellar\"))\n"
 "(allow file-read*\n"
-"  (literal \"/dev/null\") (literal \"/dev/zero\") (literal \"/dev/random\")\n"
-"  (literal \"/dev/urandom\") (literal \"/dev/dtracehelper\"))\n"
+"  (subpath \"/private/etc\")\n"
+"  (subpath \"/Library/Preferences/Logging\")\n"
+"  (literal \"/private/var/run/resolv.conf\")\n"
+"  (literal \"/dev/null\") (literal \"/dev/zero\")\n"
+"  (literal \"/dev/random\") (literal \"/dev/urandom\"))\n"
 "(allow file-write-data (literal \"/dev/null\"))\n"
-"(allow file-ioctl (subpath \"/dev\"))\n"
-"(allow file-read* file-write* file-ioctl (subpath (param \"DATA_DIR\")))\n"
-"(allow file-read* file-write* file-ioctl (subpath (param \"STATE_DIR\")))\n"
+"(allow file-ioctl (literal \"/dev/tty\") (regex #\"^/dev/ttys[0-9]+$\"))\n"
+"(allow file-read* file-write* file-ioctl\n"
+"  (subpath (param \"DATA_DIR\")) (subpath (param \"STATE_DIR\")))\n"
+"(allow process-info-pidinfo (target self))\n"
+"(allow signal (target self))\n"
+"(allow sysctl-read\n"
+"  (sysctl-name \"hw.memsize\") (sysctl-name \"hw.ncpu\")\n"
+"  (sysctl-name \"hw.activecpu\") (sysctl-name \"hw.pagesize\")\n"
+"  (sysctl-name \"kern.osrelease\") (sysctl-name \"kern.ostype\")\n"
+"  (sysctl-name \"kern.osversion\") (sysctl-name \"kern.boottime\")\n"
+"  (sysctl-name \"kern.hostname\") (sysctl-name \"kern.maxfilesperproc\")\n"
+"  (sysctl-name-prefix \"net.route\"))\n"
 "(allow mach-lookup\n"
 "  (global-name \"com.apple.dnssd.service\")\n"
 "  (global-name \"com.apple.SystemConfiguration.configd\")\n"
@@ -113,31 +152,48 @@ static const char sb_profile_confine[] =
 "  (global-name \"com.apple.system.logger\"))\n"
 "(allow ipc-posix-shm-read-data\n"
 "  (ipc-posix-name \"apple.shm.notification_center\"))\n"
-"(allow network-outbound (literal \"/private/var/run/mDNSResponder\"))\n"
-"(allow network*)\n"
-"(allow system-socket)\n";
+"(allow network-bind (local ip \"*:*\"))\n"
+"(allow network-inbound (local ip \"*:*\"))\n"
+"(allow network-outbound (remote ip \"*:*\"))\n"
+"(allow network-outbound (literal \"/private/var/run/mDNSResponder\"))\n";
 
 /*
  * The foreground profile: it runs the operator's local tmux, so it keeps
  * everything a program normally does -- exec, files, a pty, local (unix)
- * sockets -- and loses only the network, denied to any IP peer. UNIX-domain
- * sockets are path-based, not (remote ip), so the tmux connection is untouched.
+ * sockets -- and loses the network. Each denial names an IP peer rather than
+ * being written as a blanket (deny network*), which is the mirror of the
+ * argument in the confining profile above: a UNIX-domain address is a path, so
+ * denying the whole operation would take the connection to the tmux socket with
+ * it and the attach would stop working.
+ *
+ * This profile is hygiene, not containment: the role can drive an unconfined
+ * tmux session, so anything denied here is reachable by typing into a shell.
  */
 static const char sb_profile_nonet[] =
 "(version 1)\n"
 "(allow default)\n"
-"(deny network-inbound (remote ip \"*:*\"))\n"
-"(deny network-outbound (remote ip \"*:*\"))\n";
+"(deny network-bind (local ip \"*:*\"))\n"
+"(deny network-inbound)\n"
+"(deny network-outbound (remote ip \"*:*\"))\n"
+"(deny system-socket)\n"
+"(deny sysctl-write)\n"
+"(deny nvram*)\n"
+"(deny job-creation)\n"
+"(deny authorization-right-obtain)\n";
 
 /* Apply an SBPL profile; returns 1 on success, 0 (logged) on failure. */
 static int seatbelt(const char *profile, const char *const *params)
 {
 	char *err = NULL;
 
+	if (!sandbox_init_with_parameters) {
+		dbg_logf("sandbox: no seatbelt on this system");
+		return 0;
+	}
 	if (sandbox_init_with_parameters(profile, 0, params, &err) == 0)
 		return 1;
 	dbg_logf("sandbox: seatbelt failed: %s", err ? err : "?");
-	if (err)
+	if (err && sandbox_free_error)
 		sandbox_free_error(err);
 	return 0;
 }
@@ -149,6 +205,7 @@ static int apply_macos(const struct sandbox_cfg *cfg)
 	char sd[PATH_MAX];
 	const char *params[5];
 	struct rlimit rl;
+	int confine;
 
 	layers |= limit_core();
 	if (ptrace(PT_DENY_ATTACH, 0, 0, 0) == 0)	/* refuse a debugger */
@@ -159,6 +216,18 @@ static int apply_macos(const struct sandbox_cfg *cfg)
 			layers |= SANDBOX_L_SECCOMP;
 		return layers;
 	}
+
+	/*
+	 * The same gate apply_linux() uses, and for the same reason: the fork
+	 * and exec denials below are only correct for a service whose spawning
+	 * is already done elsewhere. A service without a broker runs tmux
+	 * itself, and denying it both would leave every client attach failing
+	 * with nothing to explain it.
+	 */
+	confine = cfg->role == SANDBOX_CLIENT ||
+		  (cfg->role == SANDBOX_SERVICE && cfg->no_exec);
+	if (!confine)
+		return layers;
 
 	/* Block fork (the spawner is already made); macOS threads are not
 	 * processes, so this does not touch pthread_create. */
@@ -222,6 +291,21 @@ static int apply_macos(const struct sandbox_cfg *cfg)
 #ifndef PR_CAPBSET_READ
 #define PR_CAPBSET_READ 23
 #endif
+
+/*
+ * The securebits, spelled out here so no libcap header is needed. Each is a
+ * pair: the bit itself, and the lock that stops it being cleared again.
+ */
+#ifndef PR_SET_SECUREBITS
+#define PR_SET_SECUREBITS 28
+#endif
+#define SB_SECBIT_NOROOT			(1 << 0)
+#define SB_SECBIT_NOROOT_LOCKED			(1 << 1)
+#define SB_SECBIT_NO_SETUID_FIXUP		(1 << 2)
+#define SB_SECBIT_NO_SETUID_FIXUP_LOCKED	(1 << 3)
+#define SB_SECBIT_KEEP_CAPS_LOCKED		(1 << 5)
+#define SB_SECBIT_NO_CAP_AMBIENT_RAISE		(1 << 6)
+#define SB_SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED	(1 << 7)
 #ifndef PR_CAPBSET_DROP
 #define PR_CAPBSET_DROP 24
 #endif
@@ -274,6 +358,21 @@ static int drop_caps(void)
 	int i, last;
 
 	prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0);
+
+	/*
+	 * Clearing the sets is not enough for a process that starts as root,
+	 * which on a router is the normal case: uid 0 has its capabilities
+	 * recomputed at execve, and an empty permitted set fills straight back
+	 * up. These bits refuse that, refuse the recompute on a uid change, and
+	 * lock both decisions so nothing later can undo them. Needs CAP_SETPCAP,
+	 * so it runs before the sets are dropped and is skipped, like every
+	 * other layer, where the kernel refuses it.
+	 */
+	prctl(PR_SET_SECUREBITS,
+	      SB_SECBIT_NOROOT | SB_SECBIT_NOROOT_LOCKED |
+	      SB_SECBIT_NO_SETUID_FIXUP | SB_SECBIT_NO_SETUID_FIXUP_LOCKED |
+	      SB_SECBIT_KEEP_CAPS_LOCKED | SB_SECBIT_NO_CAP_AMBIENT_RAISE |
+	      SB_SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED, 0, 0, 0);
 
 	last = 0;
 	while (prctl(PR_CAPBSET_READ, last, 0, 0, 0) >= 0)
@@ -790,10 +889,17 @@ static int stage_etc(const char *root)
 	return fail ? -1 : 0;
 }
 
-/* Bind a single host device node into the new root's /dev, left writable --
- * /dev/null is written and /dev/urandom is read, and a musl TLS backend reads
- * /dev/urandom throughout the run. */
-static int bind_dev(const char *root, const char *node)
+/*
+ * Bind a single host device node into the new root's /dev. /dev/null is
+ * written and stays writable; /dev/urandom is only ever read, and a musl TLS
+ * backend reads it throughout the run, so it is bound read-only.
+ *
+ * The read-only remount here cannot be remount_ro(): that adds MS_NODEV, which
+ * would make the node it just bound unusable. Mount flags are per-mount, which
+ * is also why these binds keep their device permission inside a root mounted
+ * nodev.
+ */
+static int bind_dev(const char *root, const char *node, int ro)
 {
 	char dst[PATH_MAX];
 	char *slash;
@@ -817,6 +923,10 @@ static int bind_dev(const char *root, const char *node)
 		dbg_logf("sandbox: could not bind %s (%d)", node, errno);
 		return -1;
 	}
+	if (ro && mount(NULL, dst, NULL,
+			MS_REMOUNT | MS_BIND | MS_RDONLY | MS_NOSUID |
+			MS_NOEXEC, NULL) != 0)
+		dbg_logf("sandbox: %s left writable (%d)", node, errno);
 	return 0;
 }
 
@@ -871,11 +981,26 @@ static int fs_confine_ns(const struct sandbox_cfg *cfg)
 	uid = getuid();
 	gid = getgid();
 
-	if (unshare(CLONE_NEWUSER | CLONE_NEWNS) == 0) {
+	/*
+	 * IPC and UTS come along for free once a user namespace is being
+	 * created anyway, and they take away the System V and POSIX message
+	 * queues, semaphores and shared memory of every other process; comrade
+	 * uses none of them, and neither does anything it links. They are asked
+	 * for separately from the two that matter, because a kernel that
+	 * refuses the extra flags must still get its mount namespace -- losing
+	 * that to gain these would be a worse sandbox, not a better one.
+	 */
+	if (unshare(CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWIPC |
+		    CLONE_NEWUTS) == 0) {
 		map_ids(uid, gid);
-	} else if (geteuid() == 0 && unshare(CLONE_NEWNS) == 0) {
+	} else if (unshare(CLONE_NEWUSER | CLONE_NEWNS) == 0) {
+		map_ids(uid, gid);
+	} else if (geteuid() == 0 &&
+		   unshare(CLONE_NEWNS | CLONE_NEWIPC | CLONE_NEWUTS) == 0) {
 		/* Root without a user namespace: the real CAP_SYS_ADMIN carries
 		 * the mounts and no id map is needed. */
+	} else if (geteuid() == 0 && unshare(CLONE_NEWNS) == 0) {
+		/* As above, on a kernel that refused the extra namespaces. */
 	} else {
 		dbg_logf("sandbox: no mount namespace (%d); trying Landlock",
 			 errno);
@@ -890,7 +1015,19 @@ static int fs_confine_ns(const struct sandbox_cfg *cfg)
 	    sizeof(root))
 		return 0;
 	mkdir(root, 0700);
-	if (mount("tmpfs", root, "tmpfs", MS_NOSUID | MS_NODEV,
+	/*
+	 * noexec on the root itself, not only on the writable binds staged into
+	 * it: the tmpfs is writable, so without this it is somewhere a process
+	 * that has been taken over can write a shared object and map it as
+	 * code. PR_SET_MDWE does not cover that, since it refuses a
+	 * write-to-execute transition and not a fresh executable mapping of a
+	 * file. Mount flags are per-mount, so the library directories bound
+	 * over this root keep their own exec bit and dlopen is unaffected;
+	 * nothing is executed from the tmpfs itself, whose contents are mount
+	 * points and recreated symlinks, and a symlink's execute permission
+	 * comes from its target's mount rather than its own.
+	 */
+	if (mount("tmpfs", root, "tmpfs", MS_NOSUID | MS_NODEV | MS_NOEXEC,
 		  "mode=0755,size=1M") != 0) {
 		dbg_logf("sandbox: could not mount the confined root (%d)",
 			 errno);
@@ -903,9 +1040,9 @@ static int fs_confine_ns(const struct sandbox_cfg *cfg)
 			fail = 1;
 	if (stage_etc(root) < 0)
 		fail = 1;
-	if (bind_dev(root, "/dev/null") < 0)
+	if (bind_dev(root, "/dev/null", 0) < 0)
 		fail = 1;
-	if (bind_dev(root, "/dev/urandom") < 0)
+	if (bind_dev(root, "/dev/urandom", 1) < 0)
 		fail = 1;
 	if (bind_writable(root, cfg) < 0)
 		fail = 1;
@@ -1149,7 +1286,7 @@ static int apply_linux(const struct sandbox_cfg *cfg)
 	 * be inherited by the shells and must not apply; the rest still do.
 	 */
 	int confine = (cfg->role == SANDBOX_CLIENT) ||
-		(cfg->role == SANDBOX_SERVICE && cfg->have_spawner);
+		(cfg->role == SANDBOX_SERVICE && cfg->no_exec);
 
 	/*
 	 * Order matters. The filesystem confinement enters a user namespace and
