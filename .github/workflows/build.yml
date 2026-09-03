@@ -102,11 +102,10 @@ jobs:
 
           # GCC's static analyser, which is not a sanitiser: it reasons about
           # paths at compile time rather than watching a run, so it reaches
-          # code no test exercises. Build only, and NOT gating yet -- it
-          # reports thirteen things on this tree today, mostly file-descriptor
-          # leaks in test code that exits anyway and one infinite loop that is
-          # a for(;;) with returns in it. Turn COMRADE_WERROR back on for this
-          # entry once those are triaged and the baseline is nothing.
+          # code no test exercises. Build only, and gating: the baseline is
+          # nothing, so anything it says is a regression this job blocks on.
+          # COMRADE_ANALYZE carries the one checker exemption there is, with
+          # the reasoning for it (see CMakeLists.txt).
           - name: linux gcc -fanalyzer
             os: ${{ vars.RUNNER_LINUX && fromJSON(vars.RUNNER_LINUX) || 'ubuntu-latest' }}
             crypto: auto
@@ -299,8 +298,9 @@ jobs:
             -DCOMRADE_DHT_DIR="$PWD/dht" \
             -DCOMRADE_CRYPTO=${{ matrix.crypto }} \
             -DCOMRADE_SANITIZE=${{ matrix.sanitize }} \
-            ${{ matrix.analyze && '-DCMAKE_C_FLAGS=-fanalyzer' || '' }} \
-            -DCOMRADE_WERROR=${{ matrix.analyze && 'OFF' || 'ON' }}
+            ${{ matrix.analyze && '-DCOMRADE_ANALYZE=ON' || '' }} \
+            ${{ matrix.memcheck && '-DCOMRADE_TEST_TIMEOUT_SCALE=10' || '' }} \
+            -DCOMRADE_WERROR=ON
 
       - name: Build
         run: cmake --build build
@@ -341,8 +341,13 @@ jobs:
         if: ${{ matrix.memcheck && !matrix.analyze }}
         run: |
           set -uo pipefail
+          # ctest keeps the previous run's MemoryChecker logs, and the numbers
+          # in their names are test indices that move when the selection
+          # changes. On a runner that reuses its workspace the leftovers would
+          # be read as this run's findings.
+          rm -f build/Testing/Temporary/MemoryChecker.*.log
           ctest --test-dir build -T memcheck --timeout 1800 \
-            -E "_e2e|swarm_" 2>&1 | tee mc.out
+            -E "_e2e|swarm_" -LE harness 2>&1 | tee mc.out
           LOGS="$PWD/build/vg-logs"
           rm -rf "$LOGS"; mkdir -p "$LOGS"
           cp build/Testing/Temporary/MemoryChecker.*.log "$LOGS/" 2>/dev/null || true
@@ -382,8 +387,12 @@ jobs:
         continue-on-error: true
         run: |
           set -uo pipefail
+          # The unit step ran in this same job and left its logs behind, under
+          # different options: leak checking is on there and off here. Cleared
+          # so this step's report is its own.
+          rm -f build/Testing/Temporary/MemoryChecker.*.log
           ctest --test-dir build -T memcheck --timeout 3600 -R "_e2e|swarm_" \
-            --overwrite MemoryCheckCommandOptions="--trace-children=yes --trace-children-skip=*/sh,*/bash,*/sed,*/grep,*/awk,*/cat,*/rm,*/mktemp,*/sleep,*/kill,*/tail,*/head,*/tr,*/date,*/dirname,*/basename,*/wc,*/sort,*/uniq,*/cut,*/env,*/tmux,*/printf,*/expr,*/seq --leak-check=no --error-exitcode=1" \
+            --overwrite MemoryCheckCommandOptions="--fair-sched=yes --trace-children=yes --trace-children-skip=*/sh,*/bash,*/sed,*/grep,*/awk,*/cat,*/rm,*/mktemp,*/sleep,*/kill,*/tail,*/head,*/tr,*/date,*/dirname,*/basename,*/wc,*/sort,*/uniq,*/cut,*/env,*/tmux,*/printf,*/expr,*/seq --leak-check=no --error-exitcode=1" \
             2>&1 | tee mce2e.out || true
           ctest --test-dir build -R swarm_down >/dev/null 2>&1 || true
           LOGS="$PWD/build/vg-logs-e2e"

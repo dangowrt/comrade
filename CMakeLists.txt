@@ -11,11 +11,19 @@ include(GNUInstallDirs)
 # on one thing only: reading an uninitialised value, which ASan does not see
 # and which MemorySanitizer would need every dependency rebuilt to catch.
 #
+# --fair-sched=yes is not a tuning knob here, it is what makes the threaded
+# tests finish at all. Valgrind's default scheduler runs one guest thread at a
+# time and hands the turn over on its own terms, so a thread waiting on another
+# can hold the turn while the thread it waits for never gets one. sshloop_test
+# spins there for as long as it is given -- 705 seconds of processor time and
+# no further output, against 0.01 uninstrumented -- and finishes in two seconds
+# with the real scheduler doing the work.
+#
 find_program(COMRADE_VALGRIND valgrind)
 if(COMRADE_VALGRIND)
 	set(MEMORYCHECK_COMMAND "${COMRADE_VALGRIND}" CACHE FILEPATH "" FORCE)
 	set(MEMORYCHECK_COMMAND_OPTIONS
-		"--leak-check=full --show-leak-kinds=definite,indirect --errors-for-leak-kinds=definite --track-origins=yes --error-exitcode=1"
+		"--fair-sched=yes --leak-check=full --show-leak-kinds=definite,indirect --errors-for-leak-kinds=definite --track-origins=yes --error-exitcode=1"
 		CACHE STRING "" FORCE)
 	set(MEMORYCHECK_SUPPRESSIONS_FILE
 		"${CMAKE_CURRENT_SOURCE_DIR}/tests/valgrind.supp"
@@ -97,6 +105,34 @@ if(NOT COMRADE_SANITIZE STREQUAL "none")
 
 	add_compile_options(${COMRADE_SAN_FLAGS})
 	add_link_options(${COMRADE_SAN_FLAGS})
+endif()
+
+#
+# COMRADE_ANALYZE turns on GCC's symbolic execution of every path at compile
+# time, which reaches code no test runs. It has no runtime component, so it
+# composes with anything, but it is a GCC feature: clang's static analyser is a
+# separate tool driven from outside the build, not a flag.
+#
+# One checker is exempt, in one file. -Wanalyzer-fd-leak cannot model a
+# descriptor that a long-lived structure owns and a helper borrows. Given
+#
+#	void f(struct l *l) { int c = accept(l->fd, 0, 0);
+#			      if (c < 0) return; close(c); }
+#
+# it calls l->fd leaked, while the same body taking the descriptor as a plain
+# argument reports nothing -- and a listener the forwarding table holds open
+# for the length of the session is precisely that shape. The checker keeps its
+# place everywhere else, where it has found real leaks.
+#
+option(COMRADE_ANALYZE "Build with GCC's -fanalyzer (used by CI)" OFF)
+if(COMRADE_ANALYZE)
+	if(NOT CMAKE_C_COMPILER_ID STREQUAL "GNU")
+		message(FATAL_ERROR
+			"COMRADE_ANALYZE needs GCC; ${CMAKE_C_COMPILER_ID} has no -fanalyzer")
+	endif()
+	add_compile_options(-fanalyzer)
+	set_source_files_properties(src/sshfwd.c PROPERTIES
+		COMPILE_OPTIONS -Wno-analyzer-fd-leak)
 endif()
 
 function(comrade_add_flag flag)
@@ -1078,10 +1114,21 @@ if(BUILD_TESTING)
 	# (tests/redact.sh), since a workflow run publishes that output. Plain
 	# shell and no network, so it runs in every build rather than with the
 	# e2e tests it serves.
+	#
+	# The "harness" label marks a test whose command is a shell script. Under
+	# a memory checker such a test measures the shell: valgrind instruments
+	# the interpreter it was pointed at and does not follow the children the
+	# script spawns, so what it reports is the shell's own allocation
+	# behaviour and none of comrade's. The unit memcheck job excludes the
+	# label rather than suppressing a particular shell's internals. The e2e
+	# memcheck job is the other way round: it selects those tests by name
+	# and follows the harness into comrade with --trace-children.
+	#
 	if(UNIX)
 		add_test(NAME redact_test
 			COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/redact_test.sh)
-		set_tests_properties(redact_test PROPERTIES TIMEOUT 30)
+		set_tests_properties(redact_test PROPERTIES TIMEOUT 30
+			LABELS harness)
 	endif()
 endif()
 
@@ -1341,6 +1388,34 @@ if(BUILD_TESTING)
 				target_link_options(${t} PRIVATE
 					${COMRADE_WIN_LINK})
 			endif()
+		endif()
+	endforeach()
+endif()
+
+#
+# Every test limit here is written for an uninstrumented run. Valgrind is a
+# processor written in software, and the tests that drive a real key exchange
+# through it take tens of times longer: sshfwd_test is 27 seconds against a
+# limit of 60 on a fast machine, which is no margin at all on a hosted runner.
+# A test killed for time leaves no verdict, and a memcheck job whose verdicts
+# quietly go missing is worth less than one that is slow.
+#
+# So the memcheck jobs configure with a scale and every other build leaves it
+# at 1, keeping the limits as written. Applied here, after the last add_test,
+# by walking the tests rather than by spelling the arithmetic out at each of
+# the thirty-odd places one is set.
+#
+set(COMRADE_TEST_TIMEOUT_SCALE 1 CACHE STRING
+	"Multiply every test timeout by this (a memcheck build wants it)")
+if(BUILD_TESTING AND COMRADE_TEST_TIMEOUT_SCALE GREATER 1)
+	get_property(comrade_tests DIRECTORY PROPERTY TESTS)
+	foreach(t IN LISTS comrade_tests)
+		get_test_property(${t} TIMEOUT comrade_t_limit)
+		if(comrade_t_limit)
+			math(EXPR comrade_t_limit
+				"${comrade_t_limit} * ${COMRADE_TEST_TIMEOUT_SCALE}")
+			set_tests_properties(${t} PROPERTIES
+				TIMEOUT ${comrade_t_limit})
 		endif()
 	endforeach()
 endif()
