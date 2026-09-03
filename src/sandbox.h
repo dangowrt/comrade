@@ -91,6 +91,14 @@ struct sandbox_cfg {
 	 * wrongly inherited by every shell. The rest apply either way.
 	 */
 	int no_exec;
+	/*
+	 * Whether this process will never touch a terminal. A forwarding-only
+	 * host is the case: it serves no shell, so it opens no pty and drives
+	 * none, and the grants a terminal costs come off its profile. Every
+	 * other role keeps them -- the client renders into one, and a service
+	 * that serves shells reaches them through its broker.
+	 */
+	int no_pty;
 };
 
 /*

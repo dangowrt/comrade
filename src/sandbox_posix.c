@@ -131,7 +131,6 @@ static const char sb_profile_confine[] =
 "  (literal \"/dev/null\") (literal \"/dev/zero\")\n"
 "  (literal \"/dev/random\") (literal \"/dev/urandom\"))\n"
 "(allow file-write-data (literal \"/dev/null\"))\n"
-"(allow file-ioctl (literal \"/dev/tty\") (regex #\"^/dev/ttys[0-9]+$\"))\n"
 "(allow file-read* file-write* file-ioctl\n"
 "  (subpath (param \"DATA_DIR\")) (subpath (param \"STATE_DIR\")))\n"
 "(allow process-info-pidinfo (target self))\n"
@@ -156,6 +155,24 @@ static const char sb_profile_confine[] =
 "(allow network-inbound (local ip \"*:*\"))\n"
 "(allow network-outbound (remote ip \"*:*\"))\n"
 "(allow network-outbound (literal \"/private/var/run/mDNSResponder\"))\n";
+
+/*
+ * Appended to the profile above for a role that drives a terminal, and left off
+ * the one that cannot. A forwarding-only host serves no shell -- sshd sends it
+ * straight to the pump, so the shell request that is the only route to
+ * cpty_spawn never runs -- which makes it the tightest of the profiles rather
+ * than the loosest, the right way round for the only service that runs nothing
+ * at all.
+ *
+ * What the grant buys is the terminal-altering ioctls: putting one in raw mode
+ * or changing its settings. Asking a terminal about itself, its window size
+ * included, is permitted without it. And being appended, the rule sits at the
+ * end of the composed profile rather than beside the other file rules; SBPL
+ * takes the last match and nothing after it names a terminal, so the set of
+ * permissions is the same as when it was written in place.
+ */
+static const char sb_profile_tty[] =
+"(allow file-ioctl (literal \"/dev/tty\") (regex #\"^/dev/ttys[0-9]+$\"))\n";
 
 /*
  * The foreground profile: it runs the operator's local tmux, so it keeps
@@ -203,6 +220,7 @@ static int apply_macos(const struct sandbox_cfg *cfg)
 	int layers = 0;
 	char dd[PATH_MAX];
 	char sd[PATH_MAX];
+	char prof[sizeof(sb_profile_confine) + sizeof(sb_profile_tty)];
 	const char *params[5];
 	struct rlimit rl;
 	int confine;
@@ -245,7 +263,9 @@ static int apply_macos(const struct sandbox_cfg *cfg)
 	params[2] = "STATE_DIR";
 	params[3] = sd;
 	params[4] = (const char *)0;
-	if (seatbelt(sb_profile_confine, params))
+	snprintf(prof, sizeof(prof), "%s%s", sb_profile_confine,
+		 cfg->no_pty ? "" : sb_profile_tty);
+	if (seatbelt(prof, params))
 		layers |= SANDBOX_L_SECCOMP | SANDBOX_L_LANDLOCK;
 	return layers;
 }

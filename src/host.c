@@ -878,6 +878,8 @@ static void svc_confine(struct svc *v)
 	sb.data_dir = appdir_data();
 	sb.state_dir = state_dir();
 	sb.no_exec = (v->sp != NULL) || v->forward_only;
+	/* Forwarding-only serves no shell (see sshd.c), so it reaches no pty. */
+	sb.no_pty = v->forward_only;
 	sandbox_apply(&sb);
 }
 
