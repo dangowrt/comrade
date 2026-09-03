@@ -508,8 +508,16 @@ static void draw_mailbox_art(const struct session_mailbox *m, int f)
 static void draw_mailbox(struct ui *u, int f)
 {
 	const struct session_mailbox *m = &u->mb;
+	char seq[32];
 
-	line(CYN "MAILBOX" RST);
+	/* The container's sequence, which is what tells one copy of it from
+	 * another: a store that lands raises it, and two ends looking at
+	 * numbers that differ are looking at different copies. */
+	seq[0] = '\0';
+	if (u->have_mb && m->seq >= 0)
+		snprintf(seq, sizeof(seq), "  " DIM "seq %lld" RST,
+			 (long long)m->seq);
+	line(CYN "MAILBOX" RST "%s", seq);
 	if (!u->have_mb) {
 		line(DIM "  ( )----[ ]    ( )   starting up" RST);
 		line("");
