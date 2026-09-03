@@ -508,7 +508,10 @@ static void draw_mailbox_art(const struct session_mailbox *m, int f)
 static void draw_mailbox(struct ui *u, int f)
 {
 	const struct session_mailbox *m = &u->mb;
-	char seq[32];
+	/* Two escapes, the label, a full-width signed sequence and the
+	 * terminator: room for the longest this can print rather than the
+	 * longest anybody expects to see. */
+	char seq[48];
 
 	/* The container's sequence, which is what tells one copy of it from
 	 * another: a store that lands raises it, and two ends looking at
