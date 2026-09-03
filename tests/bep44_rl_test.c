@@ -339,6 +339,39 @@ static void peers_behind_one_address_are_not_banned_for_normal_use(void)
 	assert(!ban_ok(E, (struct sockaddr *)&a, sizeof(a)));
 }
 
+/*
+ * A RE-STORE OF WHAT IS ALREADY THERE DOES NOT NUMBER ITSELF.
+ *
+ * The mailbox is re-stored on a cadence: so it does not expire, so a node that
+ * missed the last put catches up, and so a family still looking for a
+ * rendezvous keeps placing itself where one can be captured. Most of those
+ * carry exactly the bytes already stored, and numbering each one walked the
+ * sequence up for the life of the session -- measured on a real pair, a
+ * hundred steps in half an hour with nothing happening on it.
+ *
+ * A put at the stored sequence with identical bytes is a refresh, which is
+ * what handle_put above already does with one.
+ */
+static void an_unchanged_re_store_keeps_the_sequence(void)
+{
+	static const uint8_t a[] = { 'd', '1', ':', 'a', 'e' };
+	static const uint8_t b[] = { 'd', '1', ':', 'b', 'e' };
+
+	/* Nothing stored: the first one starts the run, whatever it says. */
+	assert(store_seq(0, 0, NULL, 0, a, sizeof(a)) == 1);
+
+	/* The same bytes back: a refresh, at the sequence they are held at. */
+	assert(store_seq(1, 7, a, sizeof(a), a, sizeof(a)) == 7);
+
+	/* Different bytes, or the same prefix at a different length, are an
+	 * update and take the next one. */
+	assert(store_seq(1, 7, a, sizeof(a), b, sizeof(b)) == 8);
+	assert(store_seq(1, 7, a, sizeof(a), a, sizeof(a) - 1) == 8);
+
+	/* And the ceiling still stops an update, refresh or not. */
+	assert(store_seq(1, INT64_MAX, a, sizeof(a), b, sizeof(b)) == -1);
+}
+
 int main(void)
 {
 	void (*tests[])(void) = {
@@ -346,6 +379,7 @@ int main(void)
 		escalate_v4, fail_closed, admission,
 		our_own_queries_to_one_node_are_budgeted,
 		the_sequence_ceiling_is_not_incremented,
+		an_unchanged_re_store_keeps_the_sequence,
 		peers_behind_one_address_are_not_banned_for_normal_use,
 	};
 	size_t i;

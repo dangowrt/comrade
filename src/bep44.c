@@ -1088,6 +1088,35 @@ static int64_t next_seq(int have_best, int64_t best)
 
 /* Lookup done: let the caller merge its slot into the value we read, then
  * store it back on those same token-bearing nodes -- standard get-then-put. */
+/*
+ * The sequence a store should carry: the next one, or the CURRENT one where
+ * what we would write is already what is there.
+ *
+ * The mailbox is re-stored on a cadence -- so it does not expire, so a node
+ * that missed the last put catches up, and so a family still looking for a
+ * rendezvous keeps placing itself where one can be captured. Most of those
+ * carry exactly the bytes already stored. Numbering each one anyway walks the
+ * sequence up for the life of the session: a hundred steps in half an hour on
+ * a session where nothing happened, with every reader watching it climb and
+ * having to assume something changed each time.
+ *
+ * A put at the stored sequence with identical bytes is a refresh, which is
+ * what these are -- see handle_put, which takes exactly that and extends the
+ * item's life. So a re-store says so, and the sequence means what it looks
+ * like it means: the number of times this mailbox has actually changed.
+ */
+static int64_t store_seq(int have_best, int64_t best, const uint8_t *cur,
+			 size_t cur_len, const uint8_t *nv, size_t nvlen)
+{
+	int64_t next = next_seq(have_best, best);
+
+	if (next < 0)
+		return -1;
+	if (have_best && nvlen == cur_len && !memcmp(nv, cur, nvlen))
+		return best;
+	return next;
+}
+
 static void update_store(struct b44_op *op)
 {
 	uint8_t nv[BEP44_MAX_VALUE];
@@ -1101,7 +1130,8 @@ static void update_store(struct b44_op *op)
 		op_finish(op);
 		return;
 	}
-	next = next_seq(op->have_best, op->best_seq);
+	next = store_seq(op->have_best, op->best_seq, op->best, op->best_len,
+			 nv, nvlen);
 	if (next < 0) {
 		op_finish(op);
 		return;
