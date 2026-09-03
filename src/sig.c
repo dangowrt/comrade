@@ -1387,19 +1387,43 @@ static void dht_pump(struct sig *s, uint64_t now)
 			s->next_put_ms = now + SIG_DHT_PUT_MS;
 		}
 	} else if (mailbox_client_should_claim(&s->mb)) {
-		dbg_logf("sig: writing claim to the rendezvous");
-		sig_note_put(s);
 		/*
-		 * The client claims by writing its answer straight to the pinned
-		 * rendezvous node once it has read the offer -- a round-trip, not
-		 * a lookup, so it never clobbers the offer and never converges.
-		 * Only an EMPTY answer slot is claimed (the turnstile mutex): a
-		 * slot already holding an answer belongs to another client, so we
+		 * The claim goes to the pinned rendezvous first: a round trip
+		 * rather than a lookup, so the turnstile is taken as quickly as
+		 * it can be. Only an EMPTY answer slot is claimed (the mutex):
+		 * one already holding an answer belongs to another client, so we
 		 * leave it and back off until the host frees it.
+		 *
+		 * And also, more slowly, where the key says the value belongs.
+		 * The pinned nodes are the ones the TOKEN named, and a host that
+		 * has moved since holds its own anchor elsewhere -- it reads the
+		 * token's nodes only when its convergent get comes round, and a
+		 * claim written nowhere else waits for that. The convergent
+		 * store puts it on whoever is closest now, which is where both
+		 * ends' reads meet however either of them has moved.
+		 *
+		 * NEVER BOTH AT ONCE. They are read-modify-writes of one mutable
+		 * item, so two in flight read the same sequence and write the
+		 * same next one, and every node refuses the second for the
+		 * compare-and-swap it has just lost.
 		 */
-		bep44_update_direct(s->engine, s->keys.bep44_sk,
-				    s->keys.bep44_pk, SIG_SALT, sig_merge,
-				    s, NULL, NULL);
+		int wide = s->next_wide_put_ms && now >= s->next_wide_put_ms;
+
+		dbg_logf("sig: writing claim to the rendezvous%s",
+			 wide ? " (convergent)" : "");
+		sig_note_put(s);
+		if (wide)
+			bep44_update(s->engine, s->keys.bep44_sk,
+				     s->keys.bep44_pk, SIG_SALT, sig_merge, s,
+				     NULL, NULL);
+		else
+			bep44_update_direct(s->engine, s->keys.bep44_sk,
+					    s->keys.bep44_pk, SIG_SALT,
+					    sig_merge, s, NULL, NULL);
+		/* Eager while the claim is still unplaced, which is the whole
+		 * of the time it matters; the round after it lands is the one
+		 * that stops needing to be written at all. */
+		s->next_wide_put_ms = now + SIG_DHT_WIDE_GET_MS;
 		s->next_put_ms = now + SIG_DHT_PUT_MS;
 	} else if (relaying(s) && !s->put_inflight) {
 		/*
