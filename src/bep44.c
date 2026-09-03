@@ -109,7 +109,32 @@ _Static_assert(BEP44_MAX_SALT <= UINT8_MAX, "salt_len is stored in a uint8_t");
  */
 #define B44_BAN_MAX 128				/* blocklist / tracker entries */
 #define B44_BAN_WINDOW_MS 10000			/* the counting window (libtorrent's 10s) */
-#define B44_BAN_RATE 5				/* messages/sec over the window before a ban */
+/*
+ * The strictest per-source rate a foreign node is known to enforce, and so the
+ * rate our own outbound budget is measured against: libtorrent's dos_blocker
+ * serves this many a second from one source before banning it.
+ */
+#define B44_PEER_RATE_MAX 5
+
+/*
+ * What WE admit from one source before banning it.
+ *
+ * A SOURCE IS NOT A PEER. The limiter buckets by /32 and /64, so peers behind
+ * one NAT -- and, most often of all, two comrade instances on one machine --
+ * reach us as a single address with their traffic added together. Each of them
+ * is entitled to the budget the other half of this file grants it, and
+ * admitting fewer than that many is banning our own kind for using the
+ * rendezvous exactly as intended. What that costs is not a dropped query: it
+ * is five minutes of silence from a node those peers' sessions are waiting on,
+ * and neither end can see why.
+ *
+ * Five a second is the right shape for a public node among millions of
+ * distinct addresses. It is the wrong number for one whose correspondents are
+ * mostly its own peers, so the allowance is instead as many peers as plausibly
+ * share an address, each spending what a strict node would allow it.
+ */
+#define B44_PEERS_PER_SOURCE 8
+#define B44_BAN_RATE (B44_PEERS_PER_SOURCE * B44_PEER_RATE_MAX)
 /*
  * OUR OWN QUERY BUDGET TO ONE NODE.
  *
@@ -133,7 +158,7 @@ _Static_assert(BEP44_MAX_SALT <= UINT8_MAX, "salt_len is stored in a uint8_t");
  * libtorrent's dos_blocker and is the strictest behaviour we know of.
  */
 #define B44_NODE_BURST 4		/* queries a round may need back to back */
-#define B44_NODE_COST_MS (2 * 1000 / B44_BAN_RATE)
+#define B44_NODE_COST_MS (2 * 1000 / B44_PEER_RATE_MAX)
 #define B44_BAN_TIME_MS (5 * 60 * 1000)		/* ban duration (libtorrent's 5 min) */
 #define B44_FAILCLOSED_MS 30000			/* block-all window when the table saturates */
 #define B44_COMPACT_CACHE_MAX 4			/* cache entries taken from one reply */

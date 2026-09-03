@@ -56,7 +56,9 @@ static int hammer6(const uint8_t a[16])
 {
 	int served = 0, i;
 
-	for (i = 0; i < 300; i++)
+	for (i = 0; i < B44_BAN_RATE * 20; i++)		/* twice the window's
+							 * allowance, whatever it
+							 * is tuned to */
 		served += ask6(a);
 	return served;
 }
@@ -65,7 +67,7 @@ static void hammer4(uint32_t a)
 {
 	int i;
 
-	for (i = 0; i < 300; i++)
+	for (i = 0; i < B44_BAN_RATE * 20; i++)		/* as hammer6 */
 		ask4(a);
 }
 
@@ -98,8 +100,8 @@ static void ban_at_limit(void)
 		0x20, 0x01, 0x0d, 0xb8, 1, 2, 3, 4, 0, 0, 0, 0, 0, 0, 0, 1 };
 	int served = hammer6(a);
 
-	assert(served == B44_BAN_RATE * 10 - 1);	/* 49 in a 10s window */
-	assert(ask6(a) == 0);				/* the 50th onward: banned */
+	assert(served == B44_BAN_RATE * 10 - 1);	/* the window's allowance */
+	assert(ask6(a) == 0);				/* one past it: banned */
 	assert(banned_at(AF_INET6, 128) == 1);
 }
 
@@ -111,7 +113,7 @@ static void window_resets(void)
 	struct b44_ban *t;
 	int i;
 
-	for (i = 0; i < B44_BAN_RATE * 10 - 1; i++)	/* 49: one short of a ban */
+	for (i = 0; i < B44_BAN_RATE * 10 - 1; i++)	/* one short of a ban */
 		assert(ask6(a) == 1);
 	t = tracker6(a);
 	assert(t && t->count == B44_BAN_RATE * 10 - 1);
@@ -297,6 +299,46 @@ static void the_sequence_ceiling_is_not_incremented(void)
 	assert(next_seq(1, INT64_MAX) == -1);			/* none left */
 }
 
+/*
+ * A SOURCE IS NOT A PEER.
+ *
+ * The limiter buckets by /32, so two comrade instances on one machine -- or
+ * any peers behind one NAT -- reach this node as a single address with their
+ * traffic added together. Each is entitled to the outbound budget the engine
+ * grants it, and at libtorrent's five a second the pair of them crossed the
+ * ban threshold simply by using the rendezvous as intended: five minutes of
+ * silence from a node their sessions were waiting on, with neither end able to
+ * see why. It is what made two of these tests run at once unreliable.
+ */
+static void peers_behind_one_address_are_not_banned_for_normal_use(void)
+{
+	int per_peer = B44_BAN_WINDOW_MS / B44_NODE_COST_MS;
+	struct sockaddr_in a;
+	int i, p, served = 0;
+
+	memset(&a, 0, sizeof(a));
+	a.sin_family = AF_INET;
+	a.sin_addr.s_addr = htonl(0x0a000002);
+
+	/* Every peer that plausibly shares the address, each spending its whole
+	 * outbound budget for a window, all of it counted as one source. */
+	for (p = 0; p < B44_PEERS_PER_SOURCE; p++)
+		for (i = 0; i < per_peer; i++) {
+			a.sin_port = htons(5000 + p);
+			served += ban_ok(E, (struct sockaddr *)&a, sizeof(a));
+		}
+	assert(served == B44_PEERS_PER_SOURCE * per_peer);
+
+	/* Which is more than the rate a strict foreign node would have allowed
+	 * one source, and that is the whole point of the difference. */
+	assert(served > B44_PEER_RATE_MAX * (B44_BAN_WINDOW_MS / 1000));
+
+	/* The backstop is still there: past the allowance, the source goes. */
+	for (i = 0; i < B44_BAN_RATE * 10; i++)
+		ban_ok(E, (struct sockaddr *)&a, sizeof(a));
+	assert(!ban_ok(E, (struct sockaddr *)&a, sizeof(a)));
+}
+
 int main(void)
 {
 	void (*tests[])(void) = {
@@ -304,6 +346,7 @@ int main(void)
 		escalate_v4, fail_closed, admission,
 		our_own_queries_to_one_node_are_budgeted,
 		the_sequence_ceiling_is_not_incremented,
+		peers_behind_one_address_are_not_banned_for_normal_use,
 	};
 	size_t i;
 
