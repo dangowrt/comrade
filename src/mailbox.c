@@ -46,6 +46,15 @@ void mailbox_arm_release(struct mailbox *m)
 	recompute_need_write(m);
 }
 
+void mailbox_refuse(struct mailbox *m, const uint8_t *data, size_t len)
+{
+	if (!m->is_host || !len || len > sizeof(m->refused))
+		return;
+	memcpy(m->refused, data, len);
+	m->refused_len = len;
+	recompute_need_write(m);
+}
+
 void mailbox_entomb(struct mailbox *m, const uint8_t *data, size_t len)
 {
 	if (!m->is_host || len > sizeof(m->tomb) || !len)
@@ -72,6 +81,19 @@ static int releasing(const struct mailbox *m)
 {
 	return m->released_len && m->slot_a_len == m->released_len &&
 	       !memcmp(m->slot_a, m->released, m->released_len);
+}
+
+/*
+ * The claim in the slot is one that did not open. Unlike a release this is
+ * never completed by observing the slot empty: those bytes are held against
+ * for as long as they keep coming back, which is what a copy still serving
+ * them does. It ends when somebody writes something else, because whatever
+ * that is, it is not the claim nobody can open.
+ */
+static int refusing(const struct mailbox *m)
+{
+	return m->refused_len && m->slot_a_len == m->refused_len &&
+	       !memcmp(m->slot_a, m->refused, m->refused_len);
 }
 
 /* Pull one slot's sealed string out of the container into dst. */
@@ -124,10 +146,10 @@ static void recompute_need_write(struct mailbox *m)
 		m->need_write = 1;
 	else if (!m->have_mine)
 		m->need_write = 0;
-	else if (m->is_host && releasing(m))
+	else if (m->is_host && (releasing(m) || refusing(m)))
 		/*
-		 * The claim being released is still in the container, so what
-		 * is stored is not what we would write, whatever our own slot
+		 * The claim being let go is still in the container, so what is
+		 * stored is not what we would write, whatever our own slot
 		 * says. Without this a release armed without a fresh offer
 		 * beside it never reaches the DHT, and the answer slot -- the
 		 * turnstile mutex -- stays held by a claim nobody will serve.
@@ -188,7 +210,7 @@ size_t mailbox_build(struct mailbox *m, uint8_t *out, size_t outlen)
 		lo = m->mine_len;
 		pa = m->slot_a;
 		la = m->slot_a_len;
-		if (releasing(m))
+		if (releasing(m) || refusing(m))
 			la = 0;			/* release the answer slot */
 		/* A live host's write is what erases a tombstone it reads: lx
 		 * stays 0 whatever the container carried. */

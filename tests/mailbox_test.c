@@ -119,6 +119,134 @@ static void arming_a_release_makes_the_write_due(void)
 	assert(m.need_write);
 }
 
+/*
+ * A CLAIM THAT DOES NOT OPEN IS NEVER WRITTEN BACK, however many copies of the
+ * old container are still being served.
+ *
+ * This is the turnstile deadlock seen on hardware. A claimant that restarted
+ * leaves a claim sealed to a key nobody holds; the host cannot open it, so
+ * there is nothing it can do for it. Every write merges against a container
+ * READ FROM THE STORE, and copies of it lag -- so if seeing the slot empty
+ * settled the matter, the very next merge against a lagging copy would write
+ * the claim back out, at a higher sequence, where every reader believes it.
+ * The host cannot open that one either, and the pair alternates between the
+ * two states for ever with the sequence climbing. No reader is at fault and no
+ * sequence comparison can help: every container in the alternation genuinely
+ * is the newest one.
+ */
+static void a_claim_that_does_not_open_is_never_written_back(void)
+{
+	static const char offer[] = "OFFER-BYTES";
+	static const char dead[] = "CLAIM-SEALED-TO-A-KEY-NOBODY-HOLDS";
+	static const char fresh[] = "CLAIM-FROM-SOMEBODY-STILL-HERE";
+	uint8_t held[512], written[512], again[512];
+	size_t hlen, wlen, alen;
+	struct mailbox m, g;
+	int i;
+
+	/* The container as it stands: the host's offer and the dead claim. */
+	mailbox_init(&g, 0);
+	mailbox_set_mine(&g, (const uint8_t *)dead, sizeof(dead) - 1);
+	hlen = offer_only(held, sizeof(held), (const uint8_t *)offer,
+			  sizeof(offer) - 1);
+	assert(!mailbox_merge(&g, held, hlen, held, &hlen, sizeof(held)));
+
+	mailbox_init(&m, 1);
+	mailbox_set_mine(&m, (const uint8_t *)offer, sizeof(offer) - 1);
+	mailbox_parse(&m, held, hlen);
+
+	/* The box does not open, so the bytes are held against rather than
+	 * released, and the write is owed at once: the slot is the mutex. */
+	mailbox_refuse(&m, (const uint8_t *)dead, sizeof(dead) - 1);
+	assert(m.need_write);
+	assert(!mailbox_merge(&m, held, hlen, written, &wlen, sizeof(written)));
+	assert(wlen < hlen);		/* the claim is gone */
+
+	/*
+	 * AND NOW A LAGGING COPY IS MERGED AGAINST -- which is not an unlikely
+	 * event to be defended against but the ordinary one, since a store
+	 * holds a copy per node and a write merges against whichever answers.
+	 * Repeatedly, because the real failure was not one resurrection but an
+	 * unbounded alternation.
+	 */
+	mailbox_parse(&m, written, wlen);
+	for (i = 0; i < 20; i++) {
+		assert(!mailbox_merge(&m, held, hlen, again, &alen,
+				      sizeof(again)));
+		assert(alen == wlen && !memcmp(again, written, wlen));
+		mailbox_parse(&m, again, alen);
+	}
+
+	/*
+	 * A DIFFERENT CLAIMANT IS NOT SHUT OUT BY IT. What is held against is
+	 * one claim, not the slot: anything else written there is kept, which
+	 * is the whole point of clearing the unopenable one out of it.
+	 */
+	mailbox_init(&g, 0);
+	mailbox_set_mine(&g, (const uint8_t *)fresh, sizeof(fresh) - 1);
+	assert(!mailbox_merge(&g, written, wlen, again, &alen, sizeof(again)));
+	mailbox_parse(&m, again, alen);
+	assert(!mailbox_merge(&m, again, alen, held, &hlen, sizeof(held)));
+	assert(hlen == alen && !memcmp(held, again, alen));
+}
+
+/*
+ * A RELEASED CLAIM MAY BE CLAIMED AGAIN, WITH THE SAME BYTES.
+ *
+ * A release is not a judgement about the claim, it is the host declining to
+ * serve that claimant THIS ROUND -- its punch is already running, it holds a
+ * worker, the admission budget is spent. The claimant is still there, and what
+ * it does next is re-put the claim it already has: nothing about it changed,
+ * so the bytes are identical (sig_release even clears the delivery de-duplicate
+ * so the host hears them again).
+ *
+ * So the release has to end when the claim is observed gone. Holding the bytes
+ * against it instead -- which is right for a claim that does not open, and only
+ * for that -- erases every retry the claimant makes, and the two sit there for
+ * the life of the session, the client posting and the host waiting.
+ */
+static void a_released_claim_may_be_claimed_again(void)
+{
+	static const char offer[] = "OFFER-BYTES";
+	static const char claim[] = "CLAIM-FROM-A-CLIENT-STILL-HERE";
+	uint8_t cur[512], out[512];
+	struct mailbox h, c, probe;
+	size_t clen, olen;
+	int i;
+
+	/* The client claims; the container carries the offer and the claim. */
+	mailbox_init(&c, 0);
+	mailbox_set_mine(&c, (const uint8_t *)claim, sizeof(claim) - 1);
+	mailbox_init(&h, 1);
+	mailbox_set_mine(&h, (const uint8_t *)offer, sizeof(offer) - 1);
+	clen = mailbox_build(&h, cur, sizeof(cur));
+	assert(!mailbox_merge(&c, cur, clen, cur, &clen, sizeof(cur)));
+
+	/* The host picks it up and lets the mutex go for this round. */
+	mailbox_parse(&h, cur, clen);
+	mailbox_arm_release(&h);
+	assert(!mailbox_merge(&h, cur, clen, out, &olen, sizeof(out)));
+	memcpy(cur, out, olen);
+	clen = olen;
+	mailbox_parse(&h, cur, clen);		/* the slot is observed empty */
+
+	/* The claimant asks again, and goes on asking. Every round of it has
+	 * to reach the host: this is the ordinary retry, not a resurrection. */
+	for (i = 0; i < 20; i++) {
+		assert(!mailbox_merge(&c, cur, clen, out, &olen, sizeof(out)));
+		memcpy(cur, out, olen);
+		clen = olen;
+		assert(!mailbox_merge(&h, cur, clen, out, &olen, sizeof(out)));
+		memcpy(cur, out, olen);
+		clen = olen;
+		mailbox_parse(&h, cur, clen);
+		mailbox_init(&probe, 1);
+		mailbox_parse(&probe, cur, clen);
+		assert(probe.slot_a_len == sizeof(claim) - 1);
+		assert(!memcmp(probe.slot_a, claim, sizeof(claim) - 1));
+	}
+}
+
 int main(void)
 {
 	static const uint8_t OFFER_E[] = { 0xEE, 0x01, 0x02 };
@@ -755,6 +883,8 @@ int main(void)
 	}
 
 	arming_a_release_makes_the_write_due();
+	a_claim_that_does_not_open_is_never_written_back();
+	a_released_claim_may_be_claimed_again();
 
 	printf("mailbox: all container, turnstile, tombstone, CAS and relay "
 	       "cases pass\n");

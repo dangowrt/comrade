@@ -857,6 +857,24 @@ static int slot_unwrap(struct sig *s, const uint8_t *val, size_t n,
 }
 
 /* Open the peer's sealed slot and deliver it once, de-duplicated. */
+/*
+ * A claim in the turnstile that this host cannot open: the box is not to a key
+ * we hold, so there is no claimant to punch at and no description to read. The
+ * slot is the mutex, so leaving it there stops every other client from writing
+ * one -- and the ordinary release does not settle it, because the copies of the
+ * container still carrying those bytes put them straight back. Held against
+ * instead, for as long as they keep arriving.
+ */
+static void refuse_slot(struct sig *s, const uint8_t *sealed, size_t len)
+{
+	if (!s->is_host || !len)
+		return;
+	if (s->mb.refused_len == len && !memcmp(s->mb.refused, sealed, len))
+		return;			/* already held against; say it once */
+	dbg_logf("sig: the claim holding the slot does not open -- refusing it");
+	mailbox_refuse(&s->mb, sealed, len);
+}
+
 static void deliver_peer(struct sig *s, const uint8_t *sealed, size_t len)
 {
 	uint8_t plain[SIG_MAX_VALUE], packed[SIG_MAX_VALUE];
@@ -864,8 +882,10 @@ static void deliver_peer(struct sig *s, const uint8_t *sealed, size_t len)
 	int n = msg_open(plain, sizeof(plain), s->keys.sig_key, sealed, len);
 	int slen;
 
-	if (n < 0)
+	if (n < 0) {
+		refuse_slot(s, sealed, len);
 		return;
+	}
 	if (s->have_last && s->last_peer_len == (size_t)n &&
 	    !memcmp(s->last_peer, plain, (size_t)n))
 		return;
@@ -874,8 +894,10 @@ static void deliver_peer(struct sig *s, const uint8_t *sealed, size_t len)
 	s->last_peer_len = (size_t)n;
 	s->have_last = 1;
 	n = slot_unwrap(s, plain, (size_t)n, packed, sizeof(packed), NULL, 0);
-	if (n < 0)
+	if (n < 0) {
+		refuse_slot(s, sealed, len);
 		return;
+	}
 	slen = candpack_decode(packed, (size_t)n, sdp, sizeof(sdp));
 	if (slen < 0)
 		return;

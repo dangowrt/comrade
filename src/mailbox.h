@@ -68,6 +68,10 @@ struct mailbox {
 						 * omitted from builds until a read
 						 * shows it gone or superseded */
 	size_t released_len;
+	uint8_t refused[MAILBOX_SLOT_MAX];	/* host: a claim that did not open;
+						 * omitted from every build for as
+						 * long as the slot holds it */
+	size_t refused_len;
 	uint8_t tomb[MAILBOX_SLOT_MAX];	/* host: the tombstone we are placing */
 	size_t tomb_len;
 	int ending;			/* host: the container is a tombstone now */
@@ -87,6 +91,28 @@ void mailbox_withdraw(struct mailbox *m);
  * shows it gone or replaced, so a write that loses a store race and is
  * retried still releases it -- a new claim arriving meanwhile is kept. */
 void mailbox_arm_release(struct mailbox *m);
+
+/*
+ * Host: this exact claim did not open, so nothing can ever be served for it.
+ * It is omitted from every build for as long as it is what the answer slot
+ * holds -- however many copies of the container carrying it are still being
+ * served, and whichever of them a write happens to merge against.
+ *
+ * NOT THE SAME THING AS A RELEASE, AND THE DIFFERENCE IS THE WHOLE OF IT. A
+ * release is about a claimant that is HERE: the host will not serve it this
+ * round -- its punch is already running, it holds a worker, the admission
+ * budget is spent -- so the mutex goes back and the claimant asks again. It
+ * re-puts the claim it already has, unchanged, because nothing about it
+ * changed. A host that held those bytes against it would erase every retry,
+ * and the two would sit there for ever, one posting and the other waiting.
+ *
+ * A refusal is about a claimant that is GONE, or was never there: the box does
+ * not open, so there is nobody to serve and no later reading of those bytes
+ * that could become useful. Only that case may be held against the bytes --
+ * and it must be, because it is the one a lagging copy would otherwise put
+ * back in front of the turnstile for the life of the item.
+ */
+void mailbox_refuse(struct mailbox *m, const uint8_t *data, size_t len);
 
 /*
  * Host: the session is over. Every later build is the tombstone alone -- both
