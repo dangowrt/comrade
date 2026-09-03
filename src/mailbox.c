@@ -237,11 +237,25 @@ size_t mailbox_build(struct mailbox *m, uint8_t *out, size_t outlen)
 	return build_slots(pa, la, po, lo, px, lx, out, outlen);
 }
 
+void mailbox_note_seq(struct mailbox *m, int64_t seq)
+{
+	if (seq > m->seq_high)
+		m->seq_high = seq;
+}
+
+/* Whether a delivered copy may be written from: see mailbox_merge. */
+static int stale(const struct mailbox *m, const uint8_t *cur, int64_t seq)
+{
+	return cur && seq >= 0 && m->seq_high && seq < m->seq_high;
+}
+
 int mailbox_merge(struct mailbox *m, const uint8_t *cur, size_t cur_len,
-		  uint8_t *out, size_t *out_len, size_t max)
+		  int64_t seq, uint8_t *out, size_t *out_len, size_t max)
 {
 	size_t n;
 
+	if (stale(m, cur, seq))
+		cur = NULL;		/* merged over, not from */
 	if (cur)
 		parse_slots(m, cur, cur_len);
 	n = mailbox_build(m, out, max);
@@ -252,11 +266,13 @@ int mailbox_merge(struct mailbox *m, const uint8_t *cur, size_t cur_len,
 }
 
 int mailbox_relay(const struct mailbox *m, const uint8_t *cur, size_t cur_len,
-		  uint8_t *out, size_t *out_len, size_t max)
+		  int64_t seq, uint8_t *out, size_t *out_len, size_t max)
 {
 	uint8_t a[MAILBOX_SLOT_MAX], o[MAILBOX_SLOT_MAX], x[MAILBOX_SLOT_MAX];
 	size_t la = 0, lo = 0, lx = 0, n;
 
+	if (stale(m, cur, seq))
+		cur = NULL;
 	if (cur && cur_len) {
 		la = slot_extract(cur, cur_len, "a", a, sizeof(a));
 		lo = slot_extract(cur, cur_len, "o", o, sizeof(o));

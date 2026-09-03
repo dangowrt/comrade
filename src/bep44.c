@@ -971,7 +971,8 @@ static void update_store(struct b44_op *op)
 	size_t nvlen = 0;
 
 	if (op->merge(op->merge_arg, op->have_best ? op->best : NULL,
-		      op->best_len, nv, &nvlen, sizeof(nv)) ||
+		      op->best_len, op->have_best ? op->best_seq : -1, nv,
+		      &nvlen, sizeof(nv)) ||
 	    !nvlen || nvlen > BEP44_MAX_VALUE) {
 		op_finish(op);
 		return;

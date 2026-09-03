@@ -75,6 +75,8 @@ struct mailbox {
 	uint8_t tomb[MAILBOX_SLOT_MAX];	/* host: the tombstone we are placing */
 	size_t tomb_len;
 	int ending;			/* host: the container is a tombstone now */
+	int64_t seq_high;		/* the highest sequence any copy has been
+					 * seen at; 0 until one has */
 };
 
 void mailbox_init(struct mailbox *m, int is_host);
@@ -134,6 +136,13 @@ void mailbox_note_own_answer(struct mailbox *m, int own);
 /* Parse a container into its slots; marks it read and recomputes need_write. */
 void mailbox_parse(struct mailbox *m, const uint8_t *v, size_t v_len);
 
+/*
+ * A copy of the container has been seen at `seq`. Reads are not filtered on
+ * it -- what a delivered container says is taken as it comes -- it is only
+ * ever the high-water mark a write is judged against.
+ */
+void mailbox_note_seq(struct mailbox *m, int64_t seq);
+
 /* Build the merged container (our slot plus the peer's, if known) into out;
  * returns its length, or 0 on error. A pending host release omits the
  * released claim from the answer slot, and an ended host builds its tombstone
@@ -143,10 +152,34 @@ size_t mailbox_build(struct mailbox *m, uint8_t *out, size_t outlen);
 /*
  * Read-modify-write in one call, matching the bep44 merge-callback contract:
  * parse cur (the value currently stored, NULL if none) then build our merged
- * value into out. Returns 0 on success, -1 on error.
+ * value into out. `seq` is cur's sequence, -1 where there is none or it is not
+ * known. Returns 0 on success, -1 on error.
+ *
+ * A COPY OLDER THAN THE HIGHEST SEEN IS NOT A BASIS TO WRITE FROM.
+ *
+ * A mutable item lives on many nodes and a node that missed the last put goes
+ * on serving the old one, so a write merges against whichever answered -- and
+ * merging copies THE PEER'S slot out of that container and stores it at a
+ * higher sequence, where every reader then believes it. That is a container we
+ * already know to be superseded being laundered into the current one: the
+ * host's offer from before it moved, or a claim its claimant has replaced,
+ * put back in front of everybody by the end that did not write it.
+ *
+ * So an older copy is merged OVER rather than from: our own slot is written
+ * exactly as before, and the peer's stays whatever the newest container we saw
+ * had in it.
+ *
+ * Nothing needs a timeout to recover, and that is the point of drawing the
+ * line here rather than at the read. Each end is the sole author of its own
+ * slot and re-asserts it whenever the store disagrees, so declining to copy
+ * the other's can lose nothing permanently -- the worst a wrong high-water
+ * mark can do is carry a stale peer slot for a round, which its author then
+ * overwrites. Refusing to READ an older copy would need an escape hatch for
+ * an item that has aged out and begun again at one; refusing to write from it
+ * needs none.
  */
 int mailbox_merge(struct mailbox *m, const uint8_t *cur, size_t cur_len,
-		  uint8_t *out, size_t *out_len, size_t max);
+		  int64_t seq, uint8_t *out, size_t *out_len, size_t max);
 
 /*
  * Re-store the container as it stands, for an end publishing on somebody
@@ -159,17 +192,18 @@ int mailbox_merge(struct mailbox *m, const uint8_t *cur, size_t cur_len,
  * dropping the slot would throw away a claim in flight. So both go back
  * exactly as found.
  *
- * What the read found wins, since it is the newer of the two views; where it
- * found nothing -- which is the whole point, these being nodes that do not
- * hold the value yet -- what we last read is what gets placed. An end that has
- * never read the container has nothing to relay and this returns -1, rather
- * than storing an empty one over a good one.
+ * What the read found wins where it is not older than the highest sequence
+ * seen -- mailbox_merge says why an older copy is not written from. Where it
+ * found nothing, which is the whole point, these being nodes that do not hold
+ * the value yet, what we last read is what gets placed. An end that has never
+ * read the container has nothing to relay and this returns -1, rather than
+ * storing an empty one over a good one.
  *
  * Reads m and does not touch it: the relayer's own turnstile state is not this
  * operation's business. Matches the bep44 merge-callback contract otherwise.
  */
 int mailbox_relay(const struct mailbox *m, const uint8_t *cur, size_t cur_len,
-		  uint8_t *out, size_t *out_len, size_t max);
+		  int64_t seq, uint8_t *out, size_t *out_len, size_t max);
 
 /* The client's view of the answer slot in the last-read container. */
 enum mailbox_claim mailbox_claim_status(const struct mailbox *m);

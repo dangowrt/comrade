@@ -59,11 +59,18 @@ int bep44_get(struct bep44_engine *e, const uint8_t pk[32], const char *salt,
 
 /*
  * Merge callback for bep44_update: cur/cur_len is the value currently stored
- * (NULL if none). Write the value to store into out (up to max) and set
- * *out_len. Return 0 to proceed with the put, non-zero to abort.
+ * (NULL if none), and `seq` its sequence, -1 where there is none. Write the
+ * value to store into out (up to max) and set *out_len. Return 0 to proceed
+ * with the put, non-zero to abort.
+ *
+ * The sequence is passed because the responding nodes are not the whole store:
+ * they are whoever answered this lookup, and their copy can be older than one
+ * the caller has already read elsewhere. Only the caller knows that, so only
+ * the caller can decide what of it is still worth merging.
  */
 typedef int bep44_merge_fn(void *arg, const uint8_t *cur, size_t cur_len,
-			   uint8_t *out, size_t *out_len, size_t max);
+			   int64_t seq, uint8_t *out, size_t *out_len,
+			   size_t max);
 
 /*
  * Read-modify-write a mutable item the mainline way: get the current value and

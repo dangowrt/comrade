@@ -77,7 +77,7 @@ static int client_claim(struct store *st, struct mailbox *m,
 
 	if (!mailbox_client_should_claim(m))
 		return 1;
-	if (mailbox_merge(m, read_v, read_len, out, &olen, sizeof(out)))
+	if (mailbox_merge(m, read_v, read_len, -1, out, &olen, sizeof(out)))
 		return -2;
 	return store_put(st, out, olen, read_seq + 1, read_seq);
 }
@@ -105,7 +105,7 @@ static void arming_a_release_makes_the_write_due(void)
 	mailbox_set_mine(&g, (const uint8_t *)dead, sizeof(dead) - 1);
 	hlen = offer_only(held, sizeof(held), (const uint8_t *)offer,
 			  sizeof(offer) - 1);
-	assert(!mailbox_merge(&g, held, hlen, held, &hlen, sizeof(held)));
+	assert(!mailbox_merge(&g, held, hlen, -1, held, &hlen, sizeof(held)));
 
 	mailbox_init(&m, 1);
 	mailbox_set_mine(&m, (const uint8_t *)offer, sizeof(offer) - 1);
@@ -149,7 +149,7 @@ static void a_claim_that_does_not_open_is_never_written_back(void)
 	mailbox_set_mine(&g, (const uint8_t *)dead, sizeof(dead) - 1);
 	hlen = offer_only(held, sizeof(held), (const uint8_t *)offer,
 			  sizeof(offer) - 1);
-	assert(!mailbox_merge(&g, held, hlen, held, &hlen, sizeof(held)));
+	assert(!mailbox_merge(&g, held, hlen, -1, held, &hlen, sizeof(held)));
 
 	mailbox_init(&m, 1);
 	mailbox_set_mine(&m, (const uint8_t *)offer, sizeof(offer) - 1);
@@ -159,7 +159,7 @@ static void a_claim_that_does_not_open_is_never_written_back(void)
 	 * released, and the write is owed at once: the slot is the mutex. */
 	mailbox_refuse(&m, (const uint8_t *)dead, sizeof(dead) - 1);
 	assert(m.need_write);
-	assert(!mailbox_merge(&m, held, hlen, written, &wlen, sizeof(written)));
+	assert(!mailbox_merge(&m, held, hlen, -1, written, &wlen, sizeof(written)));
 	assert(wlen < hlen);		/* the claim is gone */
 
 	/*
@@ -171,7 +171,7 @@ static void a_claim_that_does_not_open_is_never_written_back(void)
 	 */
 	mailbox_parse(&m, written, wlen);
 	for (i = 0; i < 20; i++) {
-		assert(!mailbox_merge(&m, held, hlen, again, &alen,
+		assert(!mailbox_merge(&m, held, hlen, -1, again, &alen,
 				      sizeof(again)));
 		assert(alen == wlen && !memcmp(again, written, wlen));
 		mailbox_parse(&m, again, alen);
@@ -184,9 +184,9 @@ static void a_claim_that_does_not_open_is_never_written_back(void)
 	 */
 	mailbox_init(&g, 0);
 	mailbox_set_mine(&g, (const uint8_t *)fresh, sizeof(fresh) - 1);
-	assert(!mailbox_merge(&g, written, wlen, again, &alen, sizeof(again)));
+	assert(!mailbox_merge(&g, written, wlen, -1, again, &alen, sizeof(again)));
 	mailbox_parse(&m, again, alen);
-	assert(!mailbox_merge(&m, again, alen, held, &hlen, sizeof(held)));
+	assert(!mailbox_merge(&m, again, alen, -1, held, &hlen, sizeof(held)));
 	assert(hlen == alen && !memcmp(held, again, alen));
 }
 
@@ -220,12 +220,12 @@ static void a_released_claim_may_be_claimed_again(void)
 	mailbox_init(&h, 1);
 	mailbox_set_mine(&h, (const uint8_t *)offer, sizeof(offer) - 1);
 	clen = mailbox_build(&h, cur, sizeof(cur));
-	assert(!mailbox_merge(&c, cur, clen, cur, &clen, sizeof(cur)));
+	assert(!mailbox_merge(&c, cur, clen, -1, cur, &clen, sizeof(cur)));
 
 	/* The host picks it up and lets the mutex go for this round. */
 	mailbox_parse(&h, cur, clen);
 	mailbox_arm_release(&h);
-	assert(!mailbox_merge(&h, cur, clen, out, &olen, sizeof(out)));
+	assert(!mailbox_merge(&h, cur, clen, -1, out, &olen, sizeof(out)));
 	memcpy(cur, out, olen);
 	clen = olen;
 	mailbox_parse(&h, cur, clen);		/* the slot is observed empty */
@@ -233,10 +233,10 @@ static void a_released_claim_may_be_claimed_again(void)
 	/* The claimant asks again, and goes on asking. Every round of it has
 	 * to reach the host: this is the ordinary retry, not a resurrection. */
 	for (i = 0; i < 20; i++) {
-		assert(!mailbox_merge(&c, cur, clen, out, &olen, sizeof(out)));
+		assert(!mailbox_merge(&c, cur, clen, -1, out, &olen, sizeof(out)));
 		memcpy(cur, out, olen);
 		clen = olen;
-		assert(!mailbox_merge(&h, cur, clen, out, &olen, sizeof(out)));
+		assert(!mailbox_merge(&h, cur, clen, -1, out, &olen, sizeof(out)));
 		memcpy(cur, out, olen);
 		clen = olen;
 		mailbox_parse(&h, cur, clen);
@@ -245,6 +245,88 @@ static void a_released_claim_may_be_claimed_again(void)
 		assert(probe.slot_a_len == sizeof(claim) - 1);
 		assert(!memcmp(probe.slot_a, claim, sizeof(claim) - 1));
 	}
+}
+
+/*
+ * A LAGGING COPY IS MERGED OVER, NOT FROM.
+ *
+ * This is what makes a host roam slow. The host publishes a new offer, and
+ * some nodes go on serving the container from before the move -- old offer,
+ * old claim. Merging against one of those copies its slots out and stores
+ * them at a higher sequence, where every reader believes them: the claimant's
+ * live claim is erased by a superseded one, and the client's own writes put
+ * the pre-roam offer back in front of the host. Each end undoing the other,
+ * the pair iterates until a round happens to land on fresh copies at both.
+ *
+ * Merging over the old copy instead settles it. Our own slot is written
+ * exactly as before; the peer's stays whatever the newest container we saw
+ * held, and the peer re-asserts it anyway.
+ */
+static void a_lagging_copy_is_merged_over_not_from(void)
+{
+	static const uint8_t OFFER_OLD[] = { 0x01, 0x01, 0x01 };
+	static const uint8_t OFFER_NEW[] = { 0x02, 0x02, 0x02 };
+	static const uint8_t CLAIM_OLD[] = { 0xA0, 0xA0 };
+	static const uint8_t CLAIM_NEW[] = { 0xB0, 0xB0 };
+	uint8_t before[256], now[256], out[256];
+	size_t blen, nlen, olen;
+	struct mailbox h, c, probe;
+
+	/* The container as it stood before the move, still served by some. */
+	mailbox_init(&h, 1);
+	mailbox_set_mine(&h, OFFER_OLD, sizeof(OFFER_OLD));
+	blen = mailbox_build(&h, before, sizeof(before));
+	mailbox_init(&c, 0);
+	mailbox_set_mine(&c, CLAIM_OLD, sizeof(CLAIM_OLD));
+	assert(!mailbox_merge(&c, before, blen, -1, before, &blen,
+			      sizeof(before)));
+
+	/* And as it stands now, at a higher sequence: the host's new offer and
+	 * the claim the client replaced its own with. */
+	mailbox_init(&h, 1);
+	mailbox_set_mine(&h, OFFER_NEW, sizeof(OFFER_NEW));
+	nlen = mailbox_build(&h, now, sizeof(now));
+	mailbox_init(&c, 0);
+	mailbox_set_mine(&c, CLAIM_NEW, sizeof(CLAIM_NEW));
+	assert(!mailbox_merge(&c, now, nlen, -1, now, &nlen, sizeof(now)));
+
+	/* THE HOST. It has read the current container at 9, and now a store
+	 * answers from a node still holding the one from before, at 4. */
+	mailbox_note_seq(&h, 9);
+	mailbox_parse(&h, now, nlen);
+	assert(!mailbox_merge(&h, before, blen, 4, out, &olen, sizeof(out)));
+	mailbox_init(&probe, 1);
+	mailbox_parse(&probe, out, olen);
+	assert(probe.slot_a_len == sizeof(CLAIM_NEW));
+	assert(!memcmp(probe.slot_a, CLAIM_NEW, sizeof(CLAIM_NEW)));
+	assert(probe.slot_o_len == sizeof(OFFER_NEW));
+	assert(!memcmp(probe.slot_o, OFFER_NEW, sizeof(OFFER_NEW)));
+
+	/* THE CLIENT, the same way round: its claim is written, and the offer
+	 * it puts beside it is the one it last read, not the stale one it is
+	 * merging against. */
+	mailbox_note_seq(&c, 9);
+	mailbox_parse(&c, now, nlen);
+	assert(!mailbox_merge(&c, before, blen, 4, out, &olen, sizeof(out)));
+	mailbox_init(&probe, 1);
+	mailbox_parse(&probe, out, olen);
+	assert(probe.slot_o_len == sizeof(OFFER_NEW));
+	assert(!memcmp(probe.slot_o, OFFER_NEW, sizeof(OFFER_NEW)));
+	assert(probe.slot_a_len == sizeof(CLAIM_NEW));
+
+	/* A copy at the highest sequence seen is not old, and is merged from:
+	 * the rule is about what is superseded, not about what is unequal. */
+	assert(!mailbox_merge(&h, now, nlen, 9, out, &olen, sizeof(out)));
+	mailbox_init(&probe, 1);
+	mailbox_parse(&probe, out, olen);
+	assert(probe.slot_a_len == sizeof(CLAIM_NEW));
+
+	/* And a store that reports no sequence at all still merges, since
+	 * nothing says the copy is behind anything. */
+	assert(!mailbox_merge(&h, before, blen, -1, out, &olen, sizeof(out)));
+	mailbox_init(&probe, 1);
+	mailbox_parse(&probe, out, olen);
+	assert(probe.slot_a_len == sizeof(CLAIM_OLD));
 }
 
 int main(void)
@@ -338,7 +420,8 @@ int main(void)
 
 		mailbox_init(&h, 1);
 		mailbox_set_mine(&h, OFFER_E, sizeof(OFFER_E));
-		assert(mailbox_merge(&h, cur, clen, out, &olen, sizeof(out)) == 0);
+		assert(mailbox_merge(&h, cur, clen, -1, out, &olen,
+				     sizeof(out)) == 0);
 		mailbox_init(&probe, 1);
 		mailbox_parse(&probe, out, olen);
 		assert(probe.slot_a_len == sizeof(ANS1));	/* peer answer kept */
@@ -373,7 +456,8 @@ int main(void)
 
 		/* The write was lost and the store still holds ANS1: the retried
 		 * merge must STILL release it, not resurrect it. */
-		assert(mailbox_merge(&h, cur, clen, out, &b2, sizeof(out)) == 0);
+		assert(mailbox_merge(&h, cur, clen, -1, out, &b2,
+				     sizeof(out)) == 0);
 		mailbox_parse(&probe, out, b2);
 		assert(probe.slot_a_len == 0);
 
@@ -382,7 +466,8 @@ int main(void)
 		mailbox_init(&probe, 0);
 		mailbox_set_mine(&probe, ANS3, sizeof(ANS3));
 		c3len = mailbox_build(&probe, cur3, sizeof(cur3));
-		assert(mailbox_merge(&h, cur3, c3len, out, &b2, sizeof(out)) == 0);
+		assert(mailbox_merge(&h, cur3, c3len, -1, out, &b2,
+				     sizeof(out)) == 0);
 		mailbox_init(&probe, 1);
 		mailbox_parse(&probe, out, b2);
 		assert(probe.slot_a_len == sizeof(ANS3));
@@ -555,7 +640,7 @@ int main(void)
 			uint8_t hw[BEP44_MAX_VALUE];
 			size_t hlen;
 
-			assert(mailbox_merge(&host, st.v, st.len, hw, &hlen,
+			assert(mailbox_merge(&host, st.v, st.len, -1, hw, &hlen,
 					     sizeof(hw)) == 0);
 			rh = store_put(&st, hw, hlen, read_seq + 1, read_seq);
 		}
@@ -652,7 +737,8 @@ int main(void)
 		mailbox_parse(&hst, st.v, st.len);
 		mailbox_set_mine(&hst, OFFER_E1, sizeof(OFFER_E1));
 		mailbox_arm_release(&hst);
-		assert(mailbox_merge(&hst, st.v, st.len, hw, &hlen, sizeof(hw)) == 0);
+		assert(mailbox_merge(&hst, st.v, st.len, -1, hw, &hlen,
+				     sizeof(hw)) == 0);
 		assert(store_put(&st, hw, hlen, read_seq + 1, read_seq) == 0);
 		mailbox_init(&probe, 1);
 		mailbox_parse(&probe, st.v, st.len);
@@ -724,7 +810,7 @@ int main(void)
 		mailbox_set_mine(&c, ANS1, sizeof(ANS1));
 		mailbox_parse(&c, cur, curlen);
 
-		assert(!mailbox_relay(&c, cur, curlen, relayed, &outlen,
+		assert(!mailbox_relay(&c, cur, curlen, -1, relayed, &outlen,
 				      sizeof(relayed)));
 		/* Byte for byte what was read: not our answer, and not a
 		 * container with the other client's claim missing. */
@@ -742,7 +828,7 @@ int main(void)
 		 * container where the mailbox belongs.
 		 */
 		outlen = 0;
-		assert(!mailbox_relay(&c, NULL, 0, relayed, &outlen,
+		assert(!mailbox_relay(&c, NULL, 0, -1, relayed, &outlen,
 				      sizeof(relayed)));
 		assert(outlen == curlen && !memcmp(relayed, cur, curlen));
 
@@ -751,7 +837,7 @@ int main(void)
 		mailbox_init(&blank, 0);
 		mailbox_set_mine(&blank, ANS1, sizeof(ANS1));
 		outlen = 0;
-		assert(mailbox_relay(&blank, NULL, 0, relayed, &outlen,
+		assert(mailbox_relay(&blank, NULL, 0, -1, relayed, &outlen,
 				     sizeof(relayed)) == -1);
 
 		/* Relaying leaves the relayer's own turnstile state alone: it
@@ -775,7 +861,7 @@ int main(void)
 		mailbox_parse(&h, offv, offlen);
 		mailbox_init(&c, 0);
 		mailbox_set_mine(&c, ANS1, sizeof(ANS1));
-		assert(!mailbox_merge(&c, offv, offlen, claimed, &outlen,
+		assert(!mailbox_merge(&c, offv, offlen, -1, claimed, &outlen,
 				      sizeof(claimed)));
 		mailbox_parse(&h, claimed, outlen);
 		assert(mailbox_peer_slot(&h, &slot) == sizeof(ANS1));
@@ -811,7 +897,7 @@ int main(void)
 		 * through rather than being erased. */
 		mailbox_set_mine(&c, ANS2, sizeof(ANS2));
 		assert(!mailbox_client_should_claim(&c));
-		assert(!mailbox_merge(&c, ended, endlen, claimed, &outlen,
+		assert(!mailbox_merge(&c, ended, endlen, -1, claimed, &outlen,
 				      sizeof(claimed)));
 		mailbox_init(&h, 0);
 		mailbox_parse(&h, claimed, outlen);
@@ -864,7 +950,7 @@ int main(void)
 			/* The claim it then writes drops the contradicted
 			 * tombstone, so the container never carries three
 			 * sealed slots at once. */
-			assert(!mailbox_merge(&c, both, bl, claimed, &outlen,
+			assert(!mailbox_merge(&c, both, bl, -1, claimed, &outlen,
 					      sizeof(claimed)));
 			mailbox_init(&h, 0);
 			mailbox_parse(&h, claimed, outlen);
@@ -877,7 +963,7 @@ int main(void)
 		 * does not quietly revive a session that has ended. */
 		mailbox_init(&c, 0);
 		mailbox_parse(&c, ended, endlen);
-		assert(!mailbox_relay(&c, ended, endlen, claimed, &outlen,
+		assert(!mailbox_relay(&c, ended, endlen, -1, claimed, &outlen,
 				      sizeof(claimed)));
 		assert(outlen == endlen && !memcmp(claimed, ended, endlen));
 	}
@@ -885,6 +971,7 @@ int main(void)
 	arming_a_release_makes_the_write_due();
 	a_claim_that_does_not_open_is_never_written_back();
 	a_released_claim_may_be_claimed_again();
+	a_lagging_copy_is_merged_over_not_from();
 
 	printf("mailbox: all container, turnstile, tombstone, CAS and relay "
 	       "cases pass\n");

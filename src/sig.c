@@ -914,6 +914,10 @@ static void on_dht_get(void *arg, const uint8_t *v, size_t v_len, int64_t seq,
 
 	if (!v)
 		return;
+	/* Evidence of what the store holds even where the copy itself is not
+	 * taken: a write is judged against the highest sequence, not the last
+	 * one believed. */
+	mailbox_note_seq(&s->mb, seq);
 	/*
 	 * Two reads are in flight at once -- the direct one and the convergent
 	 * one -- and they answer from different nodes, so an older container can
@@ -1140,22 +1144,23 @@ static void on_mcast_recv(void *arg, const char *salt, const uint8_t *data,
 }
 
 /* Merge our slot into the value just read, preserving the peer's slot. */
-static int sig_merge(void *arg, const uint8_t *cur, size_t cur_len,
+static int sig_merge(void *arg, const uint8_t *cur, size_t cur_len, int64_t seq,
 		     uint8_t *out, size_t *out_len, size_t max)
 {
 	struct sig *s = arg;
 
-	return mailbox_merge(&s->mb, cur, cur_len, out, out_len, max);
+	return mailbox_merge(&s->mb, cur, cur_len, seq, out, out_len, max);
 }
 
 /* Place the container unchanged, for a store made on the peer's behalf: see
  * mailbox_relay for why neither slot may be written here. */
 static int sig_relay_merge(void *arg, const uint8_t *cur, size_t cur_len,
-			   uint8_t *out, size_t *out_len, size_t max)
+			   int64_t seq, uint8_t *out, size_t *out_len,
+			   size_t max)
 {
 	struct sig *s = arg;
 
-	return mailbox_relay(&s->mb, cur, cur_len, out, out_len, max);
+	return mailbox_relay(&s->mb, cur, cur_len, seq, out, out_len, max);
 }
 
 /*
