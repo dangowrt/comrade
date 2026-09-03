@@ -1385,9 +1385,21 @@ static int resolve_id(const char *id_opt, char *id, size_t n)
 
 static volatile sig_atomic_t g_stop;
 
+/*
+ * The first signal asks for a wind-down, which the stop watch below carries
+ * out. The second is taken at its word: the handler puts the default back and
+ * re-raises, so a process that cannot reach its own exit -- because it is
+ * wedged somewhere after the watch has been joined, or before it ever ran --
+ * still answers the signal rather than needing to be killed outright. Both
+ * calls are async-signal-safe.
+ */
 static void on_stop_sig(int sig)
 {
-	(void)sig;
+	if (g_stop) {
+		signal(sig, SIG_DFL);
+		raise(sig);
+		return;
+	}
 	g_stop = 1;
 }
 
