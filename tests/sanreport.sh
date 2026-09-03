@@ -55,14 +55,26 @@ all=$(find "$dir" -type f ! -name '.ran' 2>/dev/null)
 # write a file only when they have something to say, so no file means clean.
 # Valgrind writes one every run and states its error count inside, so its files
 # are read rather than counted.
+#
+# Which kind a file is, is decided by valgrind's own banner and not by whether
+# it holds a verdict: a test killed while valgrind was still running leaves the
+# banner and nothing after it, and reading that as a sanitiser report failed
+# the run while having nothing to show for it.
 logs=""
 vgn=0
 vgbad=""
+vgcut=""
 for f in $all; do
-	if grep -q "ERROR SUMMARY:" "$f" 2>/dev/null; then
-		vgn=$((vgn + 1))
-		if grep -q -E "ERROR SUMMARY: [1-9][0-9]* errors" "$f" 2>/dev/null; then
-			vgbad="$vgbad $f"
+	if grep -q -E "Using Valgrind-|a memory error detector|ERROR SUMMARY:" \
+	   "$f" 2>/dev/null; then
+		if grep -q "ERROR SUMMARY:" "$f" 2>/dev/null; then
+			vgn=$((vgn + 1))
+			if grep -q -E "ERROR SUMMARY: [1-9][0-9]* errors" "$f" \
+			   2>/dev/null; then
+				vgbad="$vgbad $f"
+			fi
+		else
+			vgcut="$vgcut $f"
 		fi
 	else
 		logs="$logs $f"
@@ -71,31 +83,83 @@ done
 
 logs=$(echo "$logs" | sed 's/^ *//')
 vgbad=$(echo "$vgbad" | sed 's/^ *//')
+vgcut=$(echo "$vgcut" | sed 's/^ *//')
+
+# A test that was killed before valgrind reported is neither a finding nor a
+# clean result: it is a hole in what was checked, so it is named rather than
+# counted as either. Tests carrying their own TIMEOUT property are the ones
+# this happens to, since valgrind's slowdown overruns a limit set for an
+# uninstrumented run.
+if [ -n "$vgcut" ]; then
+	echo "sanreport: killed before valgrind reached a verdict:"
+	for f in $vgcut; do
+		echo "  $f"
+	done
+fi
 
 if [ -z "$logs" ] && [ -z "$vgbad" ]; then
+	# The hole is allowed to be small and not to be everything. Whole-run
+	# failures -- no valgrind, a wrong path, a build without symbols --
+	# collapse the number of verdicts, and that is refused for the same
+	# reason too few runs is. Asked only of a run with nothing else to
+	# report, so a finding is never answered with a complaint about
+	# coverage.
+	if [ "$vgn" -gt 0 ] && [ "$vgn" -lt "$minruns" ]; then
+		echo "sanreport: only $vgn of $runs test(s) reached a valgrind verdict,"
+		echo "sanreport: expected at least $minruns. Not a pass."
+		exit 2
+	fi
 	if [ "$vgn" -gt 0 ]; then
-		echo "sanreport: $runs test(s) ran, $vgn valgrind log(s), no errors. Clean."
+		echo "sanreport: $runs test(s) ran, $vgn valgrind verdict(s), no errors. Clean."
 	else
 		echo "sanreport: $runs test(s) ran, no reports. Clean."
 	fi
 	exit 0
 fi
 
+# A valgrind log holds one summary per process it followed, and a script test
+# forks plenty, so the count that failed is quoted rather than the last one in
+# the file -- the file's last word is routinely "0 errors" while an earlier
+# process reported the fault.
 if [ -n "$vgbad" ]; then
 	echo "sanreport: valgrind reported errors in:"
 	for f in $vgbad; do
-		echo "  $f: $(grep -h -E "ERROR SUMMARY: [0-9]+" "$f" | tail -1)"
+		echo "  $f: $(grep -h -E "ERROR SUMMARY: [1-9][0-9]* errors" "$f" |
+			head -1)"
 	done
-	logs="$logs $vgbad"
 fi
 
-# One line per distinct finding, then the whole of the first few so a reader
-# has something to act on without downloading the artefact.
-echo "sanreport: findings across $runs test(s):"
-# shellcheck disable=SC2086
-grep -h "^SUMMARY: " $logs 2>/dev/null | sed 's/^SUMMARY: //' | sort | uniq -c | sort -rn
-echo
-echo "sanreport: first report in full:"
-# shellcheck disable=SC2086
-grep -l -E "^(WARNING|==[0-9]+==ERROR|SUMMARY)" $logs 2>/dev/null | head -1 | xargs -r sed -n '1,60p'
+# One line per distinct finding, then the whole of the first so a reader has
+# something to act on without downloading the artefact. The two kinds of log
+# are read differently: a sanitiser names its finding on a SUMMARY line, while
+# valgrind describes it in a block above its counts.
+if [ -n "$logs" ]; then
+	echo "sanreport: findings across $runs test(s):"
+	# shellcheck disable=SC2086
+	grep -h "^SUMMARY: " $logs 2>/dev/null | sed 's/^SUMMARY: //' |
+		sort | uniq -c | sort -rn
+	echo
+	echo "sanreport: first report in full:"
+	# shellcheck disable=SC2086
+	first=$(grep -l -E "^(WARNING|==[0-9]+==ERROR|SUMMARY)" $logs 2>/dev/null |
+		head -1)
+	if [ -n "$first" ]; then
+		sed -n '1,60p' "$first"
+	fi
+fi
+
+if [ -n "$vgbad" ]; then
+	echo
+	echo "sanreport: first valgrind report in full:"
+	# shellcheck disable=SC2086
+	set -- $vgbad
+	awk '/Invalid |uninitialised|Mismatched |Syscall param|blocks are ([a-z]* )*lost/ {
+		p = 1
+	}
+	p {
+		print
+		if (++n >= 40)
+			exit
+	}' "$1"
+fi
 exit 1

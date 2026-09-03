@@ -17,3 +17,18 @@
    Memcheck:Value8
    obj:*/libcrypto.so*
 }
+
+# libssh asks the crypto backend for random bytes while it negotiates a key
+# exchange, and the backend answers out of a per-thread generator that only
+# its own thread-exit hook releases. The tests reach it twice over: the block
+# is charged to a forkpty() child that inherited it, and that child is
+# signalled dead inside login_tty() before it can exec, so no hook of any kind
+# runs. Neither process allocated it and neither could free it.
+{
+   crypto-per-thread-generator-outlives-the-thread-that-asked-for-random
+   Memcheck:Leak
+   match-leak-kinds: definite,indirect
+   ...
+   fun:CRYPTO_THREAD_set_local_ex
+   ...
+}
