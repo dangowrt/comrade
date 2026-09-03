@@ -638,9 +638,15 @@ static void draw(struct ui *u)
 
 		if (!r->family)			/* empty slot */
 			continue;
-		if (r->addr[0] && r->ready)
+		if (r->addr[0] && r->ready == RDV_ROW_PROVEN)
 			line("  " DIM "v%d" RST "  " CYN "%s" RST,
 			     r->family, r->addr);
+		else if (r->addr[0] && r->ready == RDV_ROW_VOUCHED)
+			/* Proven by an end that can reach it, which for a
+			 * family this host has no route to is the only proof
+			 * there will ever be. */
+			line("  " DIM "v%d" RST "  " CYN "%s" RST DIM
+			     "  vouched for" RST, r->family, r->addr);
 		else if (r->addr[0])		/* held, not yet in the invite */
 			line("  " DIM "v%d" RST "  " DIM "%s" RST DIM
 			     "  checking ..." RST, r->family, r->addr);

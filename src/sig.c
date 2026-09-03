@@ -815,7 +815,15 @@ void sig_mailbox_state(struct sig *s, struct sig_mailbox *out)
 	out->mine_stored = s->mb.have_mine && s->mb.have_cur && !s->mb.need_write;
 	out->peer_seen = s->mb.is_host ? s->mb.slot_a_len != 0 :
 					 s->mb.slot_o_len != 0;
-	out->seq = s->mb.have_cur ? s->cur_seq : -1;
+	/*
+	 * The highest sequence any copy has been seen at, not the last one
+	 * believed. A read answers from whichever node was quickest, so the
+	 * last one believed steps backwards whenever a lagging copy is taken
+	 * -- which is ordinary, and reads on the panel as the mailbox itself
+	 * going backwards in time. What a reader wants of this number is where
+	 * the container has got to, and that only ever climbs.
+	 */
+	out->seq = s->mb.have_cur ? s->mb.seq_high : -1;
 	out->gets = s->gets_ok;
 	out->puts = s->puts_ok;
 	out->claim = (int)sig_claim_status(s);

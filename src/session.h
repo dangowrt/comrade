@@ -35,6 +35,12 @@ enum {					/* peer lifecycle for obs.peer */
 	SESSION_PEER_LIVE,		/* a path carries the session */
 	SESSION_PEER_GONE		/* this peer's connection ended (reaped) */
 };
+enum {					/* what is known about a rendezvous node */
+	RDV_ROW_CHECKING = 0,		/* held, and owed a proof from us */
+	RDV_ROW_PROVEN,			/* it has answered us */
+	RDV_ROW_VOUCHED			/* an end that can reach it proved it */
+};
+
 enum {					/* per-family rendezvous progress (spinner) */
 	RDV_COLD,			/* the DHT is not warm yet */
 	RDV_WARMUP,			/* finding nodes close to the key */
@@ -94,7 +100,15 @@ struct session_obs {
 	/* Forget the interfaces: a cable going in or out changes which exist,
 	 * and what is listed has to be the machine as it is now. */
 	void (*link_reset)(void *arg);
-	/* A per-family rendezvous node: located (host) or seeded (client). */
+	/*
+	 * A per-family rendezvous node: located (host) or seeded (client).
+	 *
+	 * `ready` is RDV_ROW_*. Three states rather than two, because "not
+	 * proven here" and "not proven at all" are different things to be
+	 * told: a node another end vouched for is good, and a host with no
+	 * route to that family will never confirm it itself. Reporting that
+	 * as still being checked leaves it checking for the whole session.
+	 */
 	void (*rendezvous)(void *arg, int family, const char *addr, int ready);
 	/* A family's rendezvous progress advanced (RDV_*); drives the spinner. */
 	void (*rdv_stage)(void *arg, int family, int stage);

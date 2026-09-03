@@ -492,6 +492,10 @@ struct sess {
 
 	char local_sdp[NAT_SDP_MAX];
 	volatile int have_local_sdp;
+	/* Some peer, at some point, got all the way through the control
+	 * handshake here. Written by whichever connection's thread sees the
+	 * first pong; only ever set, so a stale read costs one round. */
+	volatile int handshake_seen;
 	/*
 	 * Candidates as they trickle in (libjuice's gather thread appends here
 	 * under trickle_lock; the main loop drains and reports them), so the local
@@ -2114,6 +2118,7 @@ static void ctl_dispatch(void *arg, int type, const uint8_t *pl, size_t plen)
 		c->hb_last_pong = now;
 		c->hb_rtt = (int)(now - ctl_get_u64(pl));
 		c->hb_pong_seen = 1;
+		c->sess->handshake_seen = 1;
 		/* Traffic arriving is the only thing that proves a path on the
 		 * network we are on now. */
 		c->live_gen = c->sess->netgen;
@@ -4524,7 +4529,18 @@ static int conn_run(struct conn *c, int drive_sig)
 				verdict = host_reap_due(&hr, now);
 				if (verdict != HOST_REAP_KEEP)
 					done = 1;
+				/*
+				 * Only where NOBODY has ever got through. The
+				 * advice is about a firewall in front of this
+				 * host, and one peer that finished the
+				 * handshake is proof there is not one -- a
+				 * later attempt that dies mid-handshake is
+				 * that attempt's problem, and sending the
+				 * operator after their firewall points them
+				 * at something that demonstrably works.
+				 */
 				if (verdict == HOST_REAP_NO_HANDSHAKE &&
+				    !s->handshake_seen &&
 				    s->cfg->obs && s->cfg->obs->escalate)
 					s->cfg->obs->escalate(
 						s->cfg->obs->arg,
@@ -5190,16 +5206,20 @@ static void report_rendezvous(struct sess *s)
 		return;
 	for (i = 0; i < 2; i++) {
 		uint8_t node[NETSTATE_SA_MAX], nlen = 0;
-		int confirmed = 0;
+		int proven = 0, vouched = 0, row;
 		char b[80];
 
-		if (netstate_anchor(&s->ns, famv[i], node, &nlen, &confirmed) &&
+		if (netstate_anchor(&s->ns, famv[i], node, &nlen, NULL) &&
 		    nlen) {
+			netstate_anchor_state(&s->ns, famv[i], &proven,
+					      &vouched, NULL);
+			row = proven ? RDV_ROW_PROVEN :
+			      vouched ? RDV_ROW_VOUCHED : RDV_ROW_CHECKING;
 			addr_str((const struct sockaddr *)node, b, sizeof(b));
-			o->rendezvous(o->arg, famv[i], b, confirmed);
+			o->rendezvous(o->arg, famv[i], b, row);
 		} else if (s->cfg->is_host &&
 			   (famv[i] == 4 ? s->expect4 : s->expect6)) {
-			o->rendezvous(o->arg, famv[i], "", 0);
+			o->rendezvous(o->arg, famv[i], "", RDV_ROW_CHECKING);
 		}
 	}
 }
