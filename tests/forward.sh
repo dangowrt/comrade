@@ -39,8 +39,29 @@ tmp=$(mktemp -d)
 hpid=""
 cpid=""
 tpid=""
+# Each phase starts its own host, so every one of them is ended where it was
+# started rather than left to the exit trap, which only ever knew the last.
+# The first signal asks for a wind-down and the second is the one comrade takes
+# at its word; SIGKILL is the last resort, so an instrumented build that stalls
+# on its way out cannot outlive the run.
+end_host() {
+	hp=$1
+	[ -n "$hp" ] || return 0
+	for sig in TERM TERM KILL; do
+		kill -"$sig" "$hp" 2>/dev/null || return 0
+		i=0
+		while kill -0 "$hp" 2>/dev/null && [ "$i" -lt 20 ]; do
+			sleep 0.1
+			i=$((i + 1))
+		done
+		kill -0 "$hp" 2>/dev/null || break
+	done
+	wait "$hp" 2>/dev/null
+}
+
 cleanup() {
-	kill "$hpid" "$cpid" "$tpid" 2>/dev/null
+	kill "$cpid" "$tpid" 2>/dev/null
+	end_host "$hpid"
 	"$CR" stop --id fwdtest >/dev/null 2>&1
 	swarm_stop
 	rm -rf "$tmp"
@@ -97,7 +118,8 @@ else
 	echo "forward with a shell: FAILED"
 	rc=1
 fi
-kill "$cpid" "$hpid" 2>/dev/null
+kill "$cpid" 2>/dev/null
+end_host "$hpid"
 "$CR" stop --id fwdtest >/dev/null 2>&1
 wait "$cpid" 2>/dev/null
 sleep 2
@@ -119,7 +141,8 @@ else
 	rc=1
 fi
 
-kill "$cpid" "$hpid" 2>/dev/null
+kill "$cpid" 2>/dev/null
+end_host "$hpid"
 "$CR" stop --id fwdtest >/dev/null 2>&1
 wait "$cpid" 2>/dev/null
 sleep 2
@@ -143,7 +166,8 @@ else
 	rc=1
 fi
 
-kill "$cpid" "$hpid" 2>/dev/null
+kill "$cpid" 2>/dev/null
+end_host "$hpid"
 "$CR" stop --id fwdtest >/dev/null 2>&1
 wait "$cpid" 2>/dev/null
 sleep 2
