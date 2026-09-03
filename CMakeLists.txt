@@ -1251,7 +1251,8 @@ if(BUILD_TESTING)
 		bep44_pin_test bep44_store_test bep44_rl_test
 		sig_rebuild_test natstream_test stream_room_test
 		stream_cc_test sshloop_test sshfwd_test sshexit_test sshro_test
-		sshkcp_test sshctl_test qr_test showfmt_test mview_test
+		sshkcp_test sshctl_test sshlinger_test uipeer_test
+		qr_test showfmt_test mview_test
 		sandbox_test spawner_test)
 		if(TARGET ${t})
 			target_compile_options(${t} PRIVATE -UNDEBUG)
