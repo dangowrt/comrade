@@ -91,7 +91,7 @@ static void pump_in(struct sshbridge *b)
 static void pump_out(struct sshbridge *b)
 {
 	for (;;) {
-		if (b->out_pos == b->out_len) {
+		if (b->out_pos >= b->out_len) {
 			int n = stream_recv(b->s, b->out, sizeof(b->out));
 
 			if (n <= 0)

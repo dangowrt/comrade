@@ -124,7 +124,7 @@ static int child_foreground(void)
 static int confined_checks(void)
 {
 	struct addrinfo hints, *ai = NULL;
-	int rc;
+	int rc, fd;
 
 	if (access(g_datadir, F_OK) != 0)
 		return RC_FAIL;		/* the kept data dir must survive */
@@ -137,8 +137,11 @@ static int confined_checks(void)
 		return RC_FAIL;		/* the granted resolver must still work */
 	freeaddrinfo(ai);
 
-	if (open(g_marker, O_RDONLY) >= 0)
+	fd = open(g_marker, O_RDONLY);
+	if (fd >= 0) {
+		close(fd);
 		return RC_FAIL;		/* a file outside the grant must not open */
+	}
 	return RC_OK;
 }
 

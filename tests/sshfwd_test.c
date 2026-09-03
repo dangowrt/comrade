@@ -94,9 +94,11 @@ static void *echo_thread(void *p)
 {
 	struct echo *e = p;
 	char buf[4096];
-	int fd = accept(e->lfd, NULL, NULL);
+	int lfd = e->lfd;
+	int fd = accept(lfd, NULL, NULL);
 	ssize_t n;
 
+	close(lfd);			/* one connection, then done with it */
 	if (fd < 0)
 		return NULL;
 	while ((n = read(fd, buf, sizeof(buf))) > 0) {
@@ -119,15 +121,17 @@ static void serve_start(struct echo *e, void *(*fn)(void *))
 {
 	struct sockaddr_in a;
 	socklen_t sl = sizeof(a);
+	int fd;
 
 	memset(&a, 0, sizeof(a));
 	a.sin_family = AF_INET;
 	a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-	e->lfd = socket(AF_INET, SOCK_STREAM, 0);
-	assert(e->lfd >= 0);
-	assert(!bind(e->lfd, (struct sockaddr *)&a, sizeof(a)));
-	assert(!listen(e->lfd, 1));
-	assert(!getsockname(e->lfd, (struct sockaddr *)&a, &sl));
+	fd = socket(AF_INET, SOCK_STREAM, 0);
+	assert(fd >= 0);
+	assert(!bind(fd, (struct sockaddr *)&a, sizeof(a)));
+	assert(!listen(fd, 1));
+	assert(!getsockname(fd, (struct sockaddr *)&a, &sl));
+	e->lfd = fd;
 	e->port = ntohs(a.sin_port);
 	assert(!pthread_create(&e->th, NULL, fn, e));
 }
@@ -140,7 +144,6 @@ static void echo_start(struct echo *e)
 static void echo_stop(struct echo *e)
 {
 	pthread_join(e->th, NULL);
-	close(e->lfd);
 }
 
 /* A one-way source: serves one connection BULK_LEN bytes, then closes. */
@@ -148,9 +151,11 @@ static void *bulk_thread(void *p)
 {
 	struct echo *e = p;
 	char buf[4096];
-	int fd = accept(e->lfd, NULL, NULL);
+	int lfd = e->lfd;
+	int fd = accept(lfd, NULL, NULL);
 	size_t left = BULK_LEN;
 
+	close(lfd);			/* one connection, then done with it */
 	if (fd < 0)
 		return NULL;
 	memset(buf, 'B', sizeof(buf));
@@ -516,8 +521,7 @@ int main(void)
 		fprintf(stderr, "FWD FAIL: --no-forwarding still forwarded\n");
 		return 1;
 	}
-	close(e.lfd);		/* never connected to: unblock and drop */
-	pthread_cancel(e.th);
+	pthread_cancel(e.th);	/* never connected to: still in accept */
 	pthread_join(e.th, NULL);
 
 	/* Forward-only: the host serves no shell, yet -R still tunnels. */
@@ -546,7 +550,6 @@ int main(void)
 			"forwarded\n");
 		return 1;
 	}
-	close(e.lfd);
 	pthread_cancel(e.th);
 	pthread_join(e.th, NULL);
 

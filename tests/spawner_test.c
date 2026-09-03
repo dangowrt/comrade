@@ -61,6 +61,8 @@ static void *hammer(void *arg)
 	int i;
 
 	(void)arg;
+	if (!res)
+		return NULL;
 	for (i = 0; i < ITERS; i++) {
 		sock_t in, out, ex;
 		int h = -1;

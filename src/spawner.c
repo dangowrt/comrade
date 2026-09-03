@@ -460,9 +460,11 @@ static void sp_handle(struct sp_state *s, const struct sp_req *req)
 {
 	struct sp_rep rep;
 	int fds[SP_MAX_FDS];
-	int nfds = 0;
+	int nfds = 0, i;
 
 	memset(&rep, 0, sizeof(rep));
+	for (i = 0; i < SP_MAX_FDS; i++)
+		fds[i] = -1;
 
 	switch (req->op) {
 	case SP_ALIVE: {
@@ -559,19 +561,11 @@ static void sp_handle(struct sp_state *s, const struct sp_req *req)
 	}
 
 	rep.nfds = (uint8_t)nfds;
-	if (send_msg(s->ctl, &rep, sizeof(rep), fds, nfds) != 0) {
-		/* The service is gone; drop the fds we were about to hand it. */
-		int i;
-
-		for (i = 0; i < nfds; i++)
+	/* Sent or not, our copies go: the service holds its own, or is gone. */
+	send_msg(s->ctl, &rep, sizeof(rep), fds, nfds);
+	for (i = 0; i < SP_MAX_FDS; i++)
+		if (fds[i] >= 0)
 			close(fds[i]);
-	} else {
-		int i;
-
-		/* The service now holds copies; release ours. */
-		for (i = 0; i < nfds; i++)
-			close(fds[i]);
-	}
 }
 
 /* The spawner's whole life: serve requests, reap children, escalate kills,
