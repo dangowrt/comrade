@@ -898,6 +898,19 @@ if(BUILD_TESTING)
 			SKIP_RETURN_CODE 77 TIMEOUT 60)
 	endif()
 
+	# The Windows self-sandbox, which has no fork to confine a child in:
+	# the test re-runs itself with a marker instead, and each copy applies
+	# one profile and then tries what that profile forbids and what it must
+	# leave alone. Skips (77) where COMRADE_SANDBOX=0 turns it all off.
+	if(WIN32)
+		add_executable(sandbox_win_test tests/sandbox_win_test.c)
+		target_link_libraries(sandbox_win_test comrade_sandbox
+			${COMRADE_WIN_LIBS})
+		add_test(NAME sandbox_win_test COMMAND sandbox_win_test)
+		set_tests_properties(sandbox_win_test PROPERTIES
+			SKIP_RETURN_CODE 77 TIMEOUT 120)
+	endif()
+
 	add_executable(showfmt_test tests/showfmt_test.c src/showfmt.c)
 	target_link_libraries(showfmt_test comrade_token comrade_compat)
 	add_test(NAME showfmt_test COMMAND showfmt_test)
@@ -1384,7 +1397,7 @@ if(BUILD_TESTING)
 		sshterm_test
 		sshkcp_test sshctl_test sshlinger_test uipeer_test
 		qr_test showfmt_test mview_test
-		sandbox_test spawner_test)
+		sandbox_test sandbox_win_test spawner_test)
 		if(TARGET ${t})
 			target_compile_options(${t} PRIVATE -UNDEBUG)
 			# A test binary should run from where it was built, as
