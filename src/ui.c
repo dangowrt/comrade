@@ -357,9 +357,9 @@ static int notice_live(struct ui *u)
 	return u->notice[0] && now_ms() < u->notice_until;
 }
 
-/* The token's reachability classification, one dashboard line after
- * whatever `pre` puts in front of it. */
-static void token_class_line(struct ui *u, const char *pre)
+/* The families the token carries a rendezvous on, as one short phrase for
+ * the RENDEZVOUS header line. */
+static const char *token_class_text(struct ui *u)
 {
 	int r4 = u->tok_st4 == TOKEN_STATE_RENDEZVOUS ||
 		 u->tok_st4 == TOKEN_STATE_DIRECT;
@@ -368,27 +368,24 @@ static void token_class_line(struct ui *u, const char *pre)
 
 	/* Green is the best this network can do, not the best there is. */
 	if (r4 && r6)
-		line("%s" BGR "reachable over IPv4 and IPv6" RST, pre);
-	else if (r4 && u->tok_st6 == TOKEN_STATE_PENDING)
-		line("%s" YEL "IPv4 ready" RST DIM
-		     " -- locating IPv6 ..." RST, pre);
-	else if (r6 && u->tok_st4 == TOKEN_STATE_PENDING)
-		line("%s" YEL "IPv6 ready" RST DIM
-		     " -- locating IPv4 ..." RST, pre);
-	else if (r4)
-		line("%s" BGR "IPv4 only" RST, pre);
-	else if (r6)
-		line("%s" RED "! IPv6 only" RST DIM
-		     " -- IPv4-only peers cannot connect" RST, pre);
-	else if (u->tok_st4 == TOKEN_STATE_PENDING ||
-		 u->tok_st6 == TOKEN_STATE_PENDING)
-		line("%s" YEL "locating rendezvous nodes ..." RST
-		     DIM " -- joining works now, via a full DHT "
-		     "warm-up" RST, pre);
-	else
-		line("%s" YEL "! no rendezvous nodes" RST DIM
-		     " -- joining needs a full DHT warm-up "
-		     "(slower, less reliable)" RST, pre);
+		return BGR "rendezvous on IPv4 and IPv6" RST;
+	if (r4 && u->tok_st6 == TOKEN_STATE_PENDING)
+		return YEL "rendezvous on IPv4" RST DIM
+		       " -- locating IPv6 ..." RST;
+	if (r6 && u->tok_st4 == TOKEN_STATE_PENDING)
+		return YEL "rendezvous on IPv6" RST DIM
+		       " -- locating IPv4 ..." RST;
+	if (r4)
+		return BGR "rendezvous on IPv4 only" RST;
+	if (r6)
+		return RED "! rendezvous on IPv6 only" RST DIM
+		       " -- IPv4-only peers cannot reach it" RST;
+	if (u->tok_st4 == TOKEN_STATE_PENDING ||
+	    u->tok_st6 == TOKEN_STATE_PENDING)
+		return YEL "locating rendezvous nodes ..." RST DIM
+		       " -- joining works meanwhile" RST;
+	return YEL "! no rendezvous nodes" RST DIM
+	       " -- joining is slower and less reliable" RST;
 }
 
 /*
@@ -430,7 +427,7 @@ static void draw_qr(struct ui *u)
 	line("");
 	snprintf(pre, sizeof(pre),
 		 CYN "INVITE" RST "  " WHT "%s" RST DIM " -- " RST, kind);
-	token_class_line(u, pre);
+	line("%s%s", pre, token_class_text(u));
 	/* The footer may sit on the last row: no newline, or it scrolls. */
 	if (notice_live(u)) {
 		snprintf(pre, sizeof(pre), BGR "[ %s ]" RST "\033[K",
@@ -623,8 +620,9 @@ static void draw(struct ui *u)
 	line("");
 
 	rc = u->role == UI_ROLE_HOST ? rdv_combined(u->stage4, u->stage6) : -1;
-	line(CYN "RENDEZVOUS" RST "  " YEL "%c" RST,
-	     rc < 0 ? net_flavor[0][f] : rdv_flavor[rc][f]);
+	line(CYN "RENDEZVOUS" RST "  " YEL "%c" RST "  %s",
+	     rc < 0 ? net_flavor[0][f] : rdv_flavor[rc][f],
+	     u->role == UI_ROLE_HOST ? token_class_text(u) : "");
 	if (!u->rdv[0].family && !u->rdv[1].family)
 		line(DIM "  locating a close node ..." RST);
 	for (i = 0; i < 2; i++) {
@@ -654,7 +652,6 @@ static void draw(struct ui *u)
 			if (u->have_token_ro)
 				line("  " WHT "$ comrade %s" RST DIM
 				     "   (read-only)" RST, u->token_ro);
-			token_class_line(u, "  ");
 		} else {
 			line(DIM "  locating a rendezvous node ..." RST);
 		}
