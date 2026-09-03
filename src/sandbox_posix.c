@@ -1132,6 +1132,7 @@ static int fs_confine_ns(const struct sandbox_cfg *cfg)
 #define SB_FS_MAKE_SYM		(1ULL << 12)
 #define SB_FS_TRUNCATE		(1ULL << 14)
 #define SB_FS_IOCTL_DEV		(1ULL << 15)
+#define SB_FS_RESOLVE_UNIX	(1ULL << 16)
 
 /*
  * The kernel takes the size of this and refuses a field it does not know only
@@ -1141,7 +1142,11 @@ static int fs_confine_ns(const struct sandbox_cfg *cfg)
 struct sb_ruleset_attr {
 	uint64_t handled_access_fs;
 	uint64_t handled_access_net;
+	uint64_t scoped;
 };
+
+#define SB_SCOPE_ABSTRACT_UNIX_SOCKET	(1ULL << 0)
+#define SB_SCOPE_SIGNAL			(1ULL << 1)
 
 #define SB_LANDLOCK_RULE_NET_PORT 2
 
@@ -1213,7 +1218,7 @@ static int fs_confine_landlock(const struct sandbox_cfg *cfg)
 	char dir[PATH_MAX];
 	const char *dbg;
 	char *slash;
-	uint64_t handled, ro, rwx, rw, net;
+	uint64_t handled, ro, rwx, rw, net, scoped;
 	long abi;
 	int rs;
 	int have_resolv;
@@ -1245,6 +1250,16 @@ static int fs_confine_landlock(const struct sandbox_cfg *cfg)
 	 */
 	if (abi >= 5)
 		handled |= SB_FS_IOCTL_DEV;
+	/*
+	 * Reaching a unix socket by its pathname is a filesystem right from
+	 * version 9, and it is the one the mount namespace already refuses by
+	 * simply not having those paths -- ssh-agent, a session bus, a
+	 * container daemon, a router's control socket. Handling it here brings
+	 * the two backends back into agreement, which is what the two lists
+	 * above exist for.
+	 */
+	if (abi >= 9)
+		handled |= SB_FS_RESOLVE_UNIX;
 
 	/*
 	 * Network rules arrive at version 4, and only a role that knows its
@@ -1257,9 +1272,23 @@ static int fs_confine_landlock(const struct sandbox_cfg *cfg)
 	if (abi >= 4 && !cfg->tcp_any)
 		net = SB_NET_BIND_TCP | SB_NET_CONNECT_TCP;
 
+	/*
+	 * Version 6 adds scopes, which reach two things a path cannot name. A
+	 * confined comrade signals nothing outside itself -- the client signals
+	 * nobody at all, and a service ends its broker by closing the socket
+	 * pair and waiting, never by signal -- and it speaks to no abstract
+	 * unix socket, which is where a display server and a session bus
+	 * listen. Both are refused for everything outside this process's own
+	 * domain; its own threads and children are unaffected.
+	 */
+	scoped = 0;
+	if (abi >= 6)
+		scoped = SB_SCOPE_ABSTRACT_UNIX_SOCKET | SB_SCOPE_SIGNAL;
+
 	memset(&attr, 0, sizeof(attr));
 	attr.handled_access_fs = handled;
 	attr.handled_access_net = net;
+	attr.scoped = scoped;
 	rs = (int)syscall(__NR_landlock_create_ruleset, &attr, sizeof(attr), 0U);
 	if (rs < 0)
 		return 0;
