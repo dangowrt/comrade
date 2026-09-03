@@ -28,10 +28,22 @@ void mailbox_withdraw(struct mailbox *m)
 	m->need_write = 0;
 }
 
+static void recompute_need_write(struct mailbox *m);
+
 void mailbox_arm_release(struct mailbox *m)
 {
 	memcpy(m->released, m->slot_a, m->slot_a_len);
 	m->released_len = m->slot_a_len;
+	/*
+	 * Scheduled here rather than left to the next read of the container.
+	 * The rule that a releasing host must write is in
+	 * recompute_need_write, and recompute ran only on a parse -- so arming
+	 * a release marked nothing, and the turnstile stayed held until some
+	 * other reason to write came along. The slot is a mutex: every round
+	 * it is held for is a round in which no claimant may write, so the
+	 * release has to be due at once.
+	 */
+	recompute_need_write(m);
 }
 
 void mailbox_entomb(struct mailbox *m, const uint8_t *data, size_t len)

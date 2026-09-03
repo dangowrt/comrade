@@ -82,6 +82,43 @@ static int client_claim(struct store *st, struct mailbox *m,
 	return store_put(st, out, olen, read_seq + 1, read_seq);
 }
 
+/*
+ * ARMING A RELEASE MAKES THE WRITE DUE AT ONCE.
+ *
+ * The answer slot is a mutex, so every round it is held for is a round in
+ * which no claimant may write. The rule that a releasing host owes a write
+ * lives in the need-write computation, and that ran only when a container was
+ * parsed -- so arming a release marked nothing, and the turnstile stayed held
+ * until some unrelated reason to write came along. On a host with nothing else
+ * to say, that is for ever.
+ */
+static void arming_a_release_makes_the_write_due(void)
+{
+	static const char offer[] = "OFFER-BYTES";
+	static const char dead[] = "CLAIM-NOBODY-CAN-OPEN";
+	uint8_t held[512];
+	size_t hlen;
+	struct mailbox m, g;
+
+	/* A container carrying the host's offer and somebody's claim. */
+	mailbox_init(&g, 0);
+	mailbox_set_mine(&g, (const uint8_t *)dead, sizeof(dead) - 1);
+	hlen = offer_only(held, sizeof(held), (const uint8_t *)offer,
+			  sizeof(offer) - 1);
+	assert(!mailbox_merge(&g, held, hlen, held, &hlen, sizeof(held)));
+
+	mailbox_init(&m, 1);
+	mailbox_set_mine(&m, (const uint8_t *)offer, sizeof(offer) - 1);
+	mailbox_parse(&m, held, hlen);
+
+	/* Its own slot is already what it would write, so nothing is owed. */
+	assert(!m.need_write);
+
+	/* Until it releases the claim it cannot open. */
+	mailbox_arm_release(&m);
+	assert(m.need_write);
+}
+
 int main(void)
 {
 	static const uint8_t OFFER_E[] = { 0xEE, 0x01, 0x02 };
@@ -716,6 +753,8 @@ int main(void)
 				      sizeof(claimed)));
 		assert(outlen == endlen && !memcmp(claimed, ended, endlen));
 	}
+
+	arming_a_release_makes_the_write_due();
 
 	printf("mailbox: all container, turnstile, tombstone, CAS and relay "
 	       "cases pass\n");
