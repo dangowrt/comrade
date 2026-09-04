@@ -228,4 +228,19 @@ int sandbox_apply(const struct sandbox_cfg *cfg);
  */
 int sandbox_filter_insns(void);
 
+/*
+ * The battery behind `comrade --sandbox-selftest`: install the confining
+ * profile's syscall filter and then do the things the program does -- resolve
+ * a name, create threads, open and drive a UDP socket, take a signal -- each
+ * in its own forked child, so that a syscall the list omits is reported by
+ * name of probe rather than killing the run. The negative half matters as
+ * much: exec, fork and an unlisted ioctl must not come back.
+ *
+ * This is the only thing that notices a libc reaching for a syscall the list
+ * was never measured against, which is how a default-deny filter breaks. 0
+ * means every probe agreed, 1 that one did not, 77 that this build or this
+ * kernel has no filter to test (which includes every platform but Linux).
+ */
+int sandbox_selftest(void);
+
 #endif

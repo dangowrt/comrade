@@ -420,7 +420,9 @@ target_link_libraries(comrade_dbg PUBLIC comrade_compat)
 #
 add_library(comrade_sandbox STATIC src/sandbox_posix.c src/sandbox_win.c)
 target_include_directories(comrade_sandbox PUBLIC src)
-target_link_libraries(comrade_sandbox PUBLIC comrade_dbg)
+# The selftest's probe battery creates threads, because the clone3 -> ENOSYS
+# -> clone(CLONE_THREAD) fallback is one of the things it has to prove.
+target_link_libraries(comrade_sandbox PUBLIC comrade_dbg Threads::Threads)
 
 #
 # A command running on its own terminal: forkpty plus /bin/sh, or a
@@ -890,6 +892,16 @@ if(BUILD_TESTING)
 		target_link_libraries(sandbox_test comrade_sandbox)
 		add_test(NAME sandbox_test COMMAND sandbox_test)
 		set_tests_properties(sandbox_test PROPERTIES SKIP_RETURN_CODE 77)
+
+		# The same probe battery through the shipped binary, which is the
+		# only thing that also exercises the command line reaching it.
+		# Labelled harness: it drives a real comrade and forks a child per
+		# probe, each of which is meant to be killed by the kernel, and
+		# valgrind has nothing to say about any of that.
+		add_test(NAME sandbox_selftest
+			COMMAND comrade --sandbox-selftest)
+		set_tests_properties(sandbox_selftest PROPERTIES
+			SKIP_RETURN_CODE 77 TIMEOUT 60 LABELS harness)
 
 		# The tmux spawner under concurrent load: many threads spawning
 		# and closing while another queries liveness, proving the one

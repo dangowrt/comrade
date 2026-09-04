@@ -16,10 +16,13 @@
  * silently narrows what the process can see, with no error, no log line and a
  * program that carries on looking healthy.
  *
- * One check exists because the ones above it are individually true and
- * jointly insufficient: it applies a client profile and asserts every
- * layer this kernel was just shown to have engages in that same call, so a
- * layer that quietly stopped engaging is a failure rather than a skip.
+ * Two more exist because the ones above them are individually true and jointly
+ * insufficient. One applies a client profile and asserts every layer this
+ * kernel was just shown to have engages in that same call, so a layer that
+ * quietly stopped engaging is a failure rather than a skip. The other hands
+ * over to sandbox_selftest(), which runs the whole probe battery behind the
+ * real filter: the point of a default-deny list is what it still lets through,
+ * and nothing else here would notice that changing.
  */
 
 #include <assert.h>
@@ -379,7 +382,6 @@ static int child_forward_only_host(void)
 
 /* Run one child helper to completion; return its raw wait status. */
 static int run_child_status(int (*fn)(void))
-
 {
 	pid_t pid = fork();
 	int status;
@@ -450,6 +452,21 @@ static int the_layers_engage_together(void)
 		return RC_SKIP;
 	r = run_child(child_client_layers);
 	assert(r == RC_OK);
+	return RC_OK;
+}
+
+/*
+ * The confinement's own probe battery: the filter installed for real, and then
+ * the things a session does. It reports 77 where there is no filter to test,
+ * and 1 the moment this libc reaches for something the list does not carry.
+ */
+static int the_selftest_agrees(void)
+{
+	int r = sandbox_selftest();
+
+	if (r == 77)
+		return RC_SKIP;
+	assert(r == 0);
 	return RC_OK;
 }
 
@@ -561,6 +578,7 @@ int main(void)
 	char base[] = "/tmp/comrade-sbtest-XXXXXX";
 	int have_fixture = (make_fixture(base) == 0);
 	int seccomp_skipped, ns_skipped, ll_skipped, addr_skipped, tcp_skipped;
+	int self_skipped;
 
 	seccomp_skipped = (the_client_cannot_exec() == RC_SKIP) ||
 		(the_foreground_has_no_network_but_keeps_exec() == RC_SKIP) ||
@@ -593,17 +611,20 @@ int main(void)
 	if (have_fixture)
 		drop_fixture(base);
 
+	self_skipped = (the_selftest_agrees() == RC_SKIP);
+
 	if (seccomp_skipped && ns_skipped && ll_skipped && addr_skipped &&
-	    tcp_skipped) {
+	    tcp_skipped && self_skipped) {
 		fprintf(stderr, "sandbox_test: this kernel offers no seccomp, "
 			"user namespace or Landlock, skipping\n");
 		return 77;
 	}
-	printf("sandbox_test: ok%s%s%s%s%s\n",
+	printf("sandbox_test: ok%s%s%s%s%s%s\n",
 	       seccomp_skipped ? " (seccomp skipped)" : "",
 	       ns_skipped ? " (namespace skipped)" : "",
 	       ll_skipped ? " (landlock skipped)" : "",
 	       addr_skipped ? " (addresses skipped)" : "",
-	       tcp_skipped ? " (tcp skipped)" : "");
+	       tcp_skipped ? " (tcp skipped)" : "",
+	       self_skipped ? " (selftest skipped)" : "");
 	return 0;
 }

@@ -339,9 +339,22 @@ static int apply_macos(const struct sandbox_cfg *cfg)
 #include <sys/ioctl.h>
 #include <sys/statvfs.h>
 #include <sys/syscall.h>
+#include <sys/time.h>
 
 #include <signal.h>		/* the SIGSYS handler of COMRADE_SANDBOX=warn */
 #include <linux/sockios.h>	/* SIOCGIFINDEX/SIOCGIFNAME for the ioctl rule */
+
+/* --sandbox-selftest does the things the program does, behind the filter. */
+#include <dirent.h>
+#include <netdb.h>
+#include <net/if.h>
+#include <poll.h>
+#include <pthread.h>
+#include <sys/mman.h>
+#include <sys/ptrace.h>
+#include <sys/utsname.h>
+#include <sys/wait.h>
+#include <netinet/in.h>
 
 #include <linux/filter.h>
 #include <linux/audit.h>
@@ -2857,6 +2870,475 @@ static int apply_linux(const struct sandbox_cfg *cfg)
 	return layers;
 }
 
+/*
+ * --sandbox-selftest. The allowlist is measured from one libc on one
+ * architecture, and the thing that will quietly break it is a different libc
+ * -- or a newer one -- reaching for a syscall nobody listed. Nothing in the
+ * ordinary test suite would notice: the filter installs, the layers report,
+ * and the process dies later under load on somebody's router.
+ *
+ * So this installs the real filter, default action and all, and then does the
+ * things the program does. Each probe runs in its own forked child, because a
+ * syscall the list omits kills the process outright and one death must not
+ * hide the rest; the parent reads the exit or the signal and says which probe
+ * it was. The negative probes are the other half: a thing that must be refused
+ * and is not is just as much a failure.
+ *
+ * It needs no privilege, no network and no kernel feature beyond seccomp, so
+ * it is the one confinement check a cross-build's CI can run under qemu-user
+ * -- with the caveat that qemu-user does not emulate seccomp at all, so there
+ * it collects the syscalls a build issues and proves nothing about the filter.
+ * Only a real kernel makes it a test of the confinement.
+ */
+
+#define SB_PROBE_OK	0
+#define SB_PROBE_FAIL	1
+#define SB_PROBE_SKIP	77
+#define SB_PROBE_TRAPPED 159	/* what the warn-mode handler exits with */
+
+static int sbp_basics(void)
+{
+	struct utsname u;
+
+	if (getpid() <= 0 || uname(&u) != 0)
+		return SB_PROBE_FAIL;
+	(void)getuid();
+	(void)geteuid();
+	(void)getgid();
+	/* sysconf(_SC_PHYS_PAGES) is sysinfo(2) on musl: bep44.c sizes its
+	 * store from exactly this call. */
+	if (sysconf(_SC_PHYS_PAGES) == 0)
+		return SB_PROBE_FAIL;
+	(void)sysconf(_SC_NPROCESSORS_ONLN);
+	return SB_PROBE_OK;
+}
+
+static int sbp_time(void)
+{
+	struct timespec ts;
+	struct timeval tv;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+		return SB_PROBE_FAIL;
+	if (clock_gettime(CLOCK_REALTIME, &ts) != 0)
+		return SB_PROBE_FAIL;
+	if (clock_getres(CLOCK_MONOTONIC, &ts) != 0)
+		return SB_PROBE_FAIL;
+	if (gettimeofday(&tv, (struct timezone *)0) != 0)
+		return SB_PROBE_FAIL;
+	ts.tv_sec = 0;
+	ts.tv_nsec = 1000000;
+	(void)nanosleep(&ts, (struct timespec *)0);
+	return SB_PROBE_OK;
+}
+
+static int sbp_memory(void)
+{
+	void *big = malloc(4u << 20);
+	void *m;
+
+	if (!big)
+		return SB_PROBE_FAIL;
+	memset(big, 0, 4u << 20);
+	free(big);
+	m = mmap((void *)0, 65536, PROT_READ | PROT_WRITE,
+		 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (m == MAP_FAILED)
+		return SB_PROBE_FAIL;
+	if (mprotect(m, 65536, PROT_READ) != 0)
+		return SB_PROBE_FAIL;
+	(void)madvise(m, 65536, MADV_DONTNEED);
+	if (munmap(m, 65536) != 0)
+		return SB_PROBE_FAIL;
+	return SB_PROBE_OK;
+}
+
+static int sbp_files(void)
+{
+	char path[64], other[68];
+	struct stat st;
+	char buf[16];
+	DIR *d;
+	int fd, rc = SB_PROBE_FAIL;
+
+	snprintf(path, sizeof(path), "/tmp/comrade-sbx-%ld", (long)getpid());
+	snprintf(other, sizeof(other), "%s.2", path);
+	fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+	if (fd < 0)
+		return SB_PROBE_FAIL;
+	do {
+		if (write(fd, "hello\n", 6) != 6)
+			break;
+		if (lseek(fd, 0, SEEK_SET) != 0)
+			break;
+		if (read(fd, buf, sizeof(buf)) != 6)
+			break;
+		if (fstat(fd, &st) != 0 || fsync(fd) != 0)
+			break;
+		if (ftruncate(fd, 3) != 0)
+			break;
+		if (fchmod(fd, 0600) != 0)
+			break;
+		if (fcntl(fd, F_GETFL) < 0)
+			break;
+		if (stat(path, &st) != 0 || access(path, R_OK) != 0)
+			break;
+		if (rename(path, other) != 0)
+			break;
+		if (unlink(other) != 0)
+			break;
+		d = opendir("/tmp");
+		if (!d)
+			break;
+		(void)readdir(d);
+		closedir(d);
+		rc = SB_PROBE_OK;
+	} while (0);
+	close(fd);
+	unlink(path);
+	unlink(other);
+	return rc;
+}
+
+static int sbp_sockets(void)
+{
+	struct sockaddr_in a;
+	socklen_t alen = sizeof(a);
+	struct pollfd pfd;
+	char buf[8];
+	int s, s6, u, sp[2], on = 1, n;
+
+	s = socket(AF_INET, SOCK_DGRAM, 0);
+	if (s < 0)
+		return SB_PROBE_FAIL;
+	memset(&a, 0, sizeof(a));
+	a.sin_family = AF_INET;
+	a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	if (setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) != 0 ||
+	    bind(s, (struct sockaddr *)&a, sizeof(a)) != 0 ||
+	    getsockname(s, (struct sockaddr *)&a, &alen) != 0) {
+		close(s);
+		return SB_PROBE_FAIL;
+	}
+	if (ioctl(s, FIONBIO, &on) != 0 || ioctl(s, FIONREAD, &n) != 0) {
+		close(s);
+		return SB_PROBE_FAIL;
+	}
+	if (sendto(s, "x", 1, 0, (struct sockaddr *)&a, alen) != 1) {
+		close(s);
+		return SB_PROBE_FAIL;
+	}
+	pfd.fd = s;
+	pfd.events = POLLIN;
+	pfd.revents = 0;
+	if (poll(&pfd, 1, 500) < 0) {
+		close(s);
+		return SB_PROBE_FAIL;
+	}
+	(void)recvfrom(s, buf, sizeof(buf), 0, (struct sockaddr *)0,
+		       (socklen_t *)0);
+	close(s);
+
+	s6 = socket(AF_INET6, SOCK_DGRAM, 0);
+	if (s6 >= 0)
+		close(s6);		/* a kernel without IPv6 is not a fault */
+	u = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (u < 0)
+		return SB_PROBE_FAIL;	/* NSS and the tmux socket need it */
+	close(u);
+	if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) != 0)
+		return SB_PROBE_FAIL;
+	close(sp[0]);
+	close(sp[1]);
+	return SB_PROBE_OK;
+}
+
+static void *sbp_thread_body(void *arg)
+{
+	(void)arg;
+	sched_yield();
+	return (void *)0;
+}
+
+/*
+ * The clone3-denied-with-ENOSYS path, end to end: glibc asks for clone3 first,
+ * takes the ENOSYS as "this kernel is too old", and comes back through clone
+ * with CLONE_THREAD where the argument rule can see it.
+ */
+static int sbp_threads(void)
+{
+	pthread_t th[4];
+	int i;
+
+	for (i = 0; i < 4; i++) {
+		if (pthread_create(&th[i], (pthread_attr_t *)0,
+				   sbp_thread_body, (void *)0) != 0)
+			return SB_PROBE_FAIL;
+	}
+	for (i = 0; i < 4; i++) {
+		if (pthread_join(th[i], (void **)0) != 0)
+			return SB_PROBE_FAIL;
+	}
+	return SB_PROBE_OK;
+}
+
+/*
+ * Name resolution, which is the deepest the confined process reaches into the
+ * C library: NSS modules are dlopen-ed, and on glibc the lookup itself opens a
+ * netlink socket and may use sendmmsg.
+ */
+static int sbp_resolver(void)
+{
+	struct addrinfo hints, *ai = (struct addrinfo *)0;
+	int nl;
+
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_STREAM;
+	if (getaddrinfo("localhost", (const char *)0, &hints, &ai) != 0)
+		return SB_PROBE_FAIL;
+	freeaddrinfo(ai);
+	if (if_nametoindex("lo") == 0)
+		return SB_PROBE_FAIL;	/* SIOCGIFINDEX through the ioctl rule */
+	nl = socket(AF_NETLINK, SOCK_RAW, 0);
+	if (nl < 0)
+		return SB_PROBE_FAIL;	/* getifaddrs is built on it */
+	close(nl);
+	return SB_PROBE_OK;
+}
+
+static volatile sig_atomic_t sbp_caught;
+
+static void sbp_handler(int sig)
+{
+	(void)sig;
+	sbp_caught = 1;
+}
+
+/*
+ * A signal delivered and returned from. The return is the point: rt_sigreturn
+ * never appears in a trace, and without it the handler's own return traps.
+ */
+static int sbp_signals(void)
+{
+	struct sigaction sa, old;
+	sigset_t set;
+
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = sbp_handler;
+	sigemptyset(&sa.sa_mask);
+	if (sigaction(SIGUSR1, &sa, &old) != 0)
+		return SB_PROBE_FAIL;
+	sigemptyset(&set);
+	sigaddset(&set, SIGUSR2);
+	if (sigprocmask(SIG_BLOCK, &set, (sigset_t *)0) != 0)
+		return SB_PROBE_FAIL;
+	if (raise(SIGUSR1) != 0)
+		return SB_PROBE_FAIL;
+	if (!sbp_caught)
+		return SB_PROBE_FAIL;
+	(void)sigprocmask(SIG_UNBLOCK, &set, (sigset_t *)0);
+	(void)sigaction(SIGUSR1, &old, (struct sigaction *)0);
+	return SB_PROBE_OK;
+}
+
+static int sbp_prctl(void)
+{
+	char name[24];
+
+	if (prctl(PR_SET_NAME, "comrade-sbx", 0, 0, 0) != 0)
+		return SB_PROBE_FAIL;
+	memset(name, 0, sizeof(name));
+	if (prctl(PR_GET_NAME, name, 0, 0, 0) != 0)
+		return SB_PROBE_FAIL;
+	return SB_PROBE_OK;
+}
+
+/* Denied with an errno, not a death: the probe-and-fall-back carve-outs. */
+static int sbp_carveouts(void)
+{
+#ifdef __NR_clone3
+	errno = 0;
+	if (syscall(__NR_clone3, (void *)0, (size_t)0) != -1 ||
+	    errno != ENOSYS)
+		return SB_PROBE_FAIL;
+#endif
+	errno = 0;
+	if (syscall(SYS_ptrace, (long)PTRACE_TRACEME, 0, 0, 0) != -1 ||
+	    errno != EPERM)
+		return SB_PROBE_FAIL;
+	errno = 0;
+	if (mount("none", "/", "tmpfs", 0, (void *)0) != -1 || errno != EPERM)
+		return SB_PROBE_FAIL;
+	return SB_PROBE_OK;
+}
+
+/* The negative probes. Each must not come back. */
+static int sbp_exec(void)
+{
+	execl("/bin/sh", "sh", "-c", "exit 0", (char *)0);
+	return SB_PROBE_FAIL;
+}
+
+static int sbp_fork(void)
+{
+	pid_t pid = fork();
+
+	if (pid == 0)
+		_exit(SB_PROBE_FAIL);	/* the fork was allowed: a failure */
+	return SB_PROBE_FAIL;
+}
+
+static int sbp_packet_socket(void)
+{
+	int s = socket(AF_PACKET, SOCK_RAW, 0);
+
+	if (s >= 0)
+		close(s);
+	return SB_PROBE_FAIL;
+}
+
+static int sbp_tiocsti(void)
+{
+	int sp[2];
+	char c = 'x';
+
+	if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) != 0)
+		return SB_PROBE_FAIL;
+	(void)ioctl(sp[0], TIOCSTI, &c);
+	close(sp[0]);
+	close(sp[1]);
+	return SB_PROBE_FAIL;
+}
+
+static int sbp_unlisted_prctl(void)
+{
+	(void)prctl(PR_SET_DUMPABLE, 1, 0, 0, 0);
+	return SB_PROBE_FAIL;
+}
+
+struct sb_probe {
+	const char *name;
+	int (*fn)(void);
+	int must_be_refused;
+};
+
+static const struct sb_probe sb_probes[] = {
+	{ "basics", sbp_basics, 0 },
+	{ "time", sbp_time, 0 },
+	{ "memory", sbp_memory, 0 },
+	{ "files", sbp_files, 0 },
+	{ "sockets", sbp_sockets, 0 },
+	{ "threads", sbp_threads, 0 },
+	{ "resolver", sbp_resolver, 0 },
+	{ "signals", sbp_signals, 0 },
+	{ "prctl", sbp_prctl, 0 },
+	{ "carve-outs", sbp_carveouts, 0 },
+	{ "execve", sbp_exec, 1 },
+	{ "fork", sbp_fork, 1 },
+	{ "socket(AF_PACKET)", sbp_packet_socket, 1 },
+	{ "ioctl(TIOCSTI)", sbp_tiocsti, 1 },
+	{ "prctl(PR_SET_DUMPABLE)", sbp_unlisted_prctl, 1 }
+};
+
+/*
+ * Run one probe behind the real filter. The child installs it itself, so the
+ * parent stays unconfined and can report on however many probes die.
+ */
+static int sb_run_probe(const struct sb_probe *pr)
+{
+	pid_t pid;
+	int st = 0, refused;
+
+	/* Whatever is still sitting in the buffer would be inherited and, on
+	 * the paths where the child's exit does flush, printed a second time
+	 * per probe. Empty it before there are two of us. */
+	fflush(stdout);
+	pid = fork();
+	if (pid < 0)
+		return SB_PROBE_FAIL;
+	if (pid == 0) {
+		prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+#if defined(SYS_seccomp) && defined(SB_AUDIT_ARCH)
+		if (!(seccomp_allowlist(SANDBOX_CLIENT, 0) & SANDBOX_L_SECCOMP))
+			_exit(SB_PROBE_SKIP);
+#else
+		_exit(SB_PROBE_SKIP);
+#endif
+		_exit(pr->fn());
+	}
+	if (waitpid(pid, &st, 0) != pid)
+		return SB_PROBE_FAIL;
+	/*
+	 * Refused means killed by the default action -- or, under
+	 * COMRADE_SANDBOX=warn, trapped and reported by the handler, which is
+	 * the same verdict reached the other way.
+	 */
+	refused = (WIFSIGNALED(st) && WTERMSIG(st) == SIGSYS) ||
+		  (WIFEXITED(st) && WEXITSTATUS(st) == SB_PROBE_TRAPPED);
+	if (refused)
+		return pr->must_be_refused ? SB_PROBE_OK : SB_PROBE_FAIL;
+	if (WIFSIGNALED(st))
+		return SB_PROBE_FAIL;
+	if (WEXITSTATUS(st) == SB_PROBE_SKIP)
+		return SB_PROBE_SKIP;
+	if (pr->must_be_refused)
+		return SB_PROBE_FAIL;	/* it came back: nothing stopped it */
+	return WEXITSTATUS(st) == 0 ? SB_PROBE_OK : SB_PROBE_FAIL;
+}
+
+/*
+ * Under a sanitizer the runtime is a second program sharing this process, with
+ * a syscall set of its own that the allowlist was never measured against; a
+ * failure there would say nothing about comrade. The instrumented builds run
+ * the rest of the suite, and this probe skips.
+ */
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+#define SB_INSTRUMENTED 1
+#endif
+#if defined(__has_feature)
+# if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer) || \
+     __has_feature(memory_sanitizer)
+#  undef SB_INSTRUMENTED
+#  define SB_INSTRUMENTED 1
+# endif
+#endif
+
+static int selftest_linux(void)
+{
+	unsigned i;
+	int bad = 0, skipped = 0;
+
+#ifdef SB_INSTRUMENTED
+	printf("sandbox selftest: skipped, this build is instrumented\n");
+	return SB_PROBE_SKIP;
+#endif
+#if defined(SYS_seccomp) && defined(SB_AUDIT_ARCH)
+	printf("sandbox selftest: %s, seccomp %s\n", SB_ARCH_NAME,
+	       seccomp_available() ? "available" : "absent");
+#else
+	printf("sandbox selftest: this build names no audit arch\n");
+	return SB_PROBE_SKIP;
+#endif
+	for (i = 0; i < sizeof(sb_probes) / sizeof(sb_probes[0]); i++) {
+		int r = sb_run_probe(&sb_probes[i]);
+
+		printf("  %-24s %s\n", sb_probes[i].name,
+		       r == SB_PROBE_OK ? "ok" :
+		       r == SB_PROBE_SKIP ? "skipped" : "FAILED");
+		if (r == SB_PROBE_FAIL)
+			bad++;
+		else if (r == SB_PROBE_SKIP)
+			skipped++;
+	}
+	if (skipped == (int)(sizeof(sb_probes) / sizeof(sb_probes[0]))) {
+		printf("sandbox selftest: no seccomp on this kernel\n");
+		return SB_PROBE_SKIP;
+	}
+	printf("sandbox selftest: %s\n", bad ? "FAILED" : "ok");
+	return bad ? 1 : 0;
+}
+
 #else /* a Unix that is neither macOS nor Linux */
 
 static int apply_generic(const struct sandbox_cfg *cfg)
@@ -2889,6 +3371,26 @@ int sandbox_apply(const struct sandbox_cfg *cfg)
 int sandbox_filter_insns(void)
 {
 	return sb_filter_insns;
+}
+
+/*
+ * The probe battery of --sandbox-selftest. Linux only in substance: the macOS
+ * confinement is a Seatbelt profile rather than a syscall filter, and there is
+ * nothing here that would test it. 0 means every probe passed, 1 that one did
+ * not, and 77 that this build or kernel has no filter to test.
+ */
+int sandbox_selftest(void)
+{
+	if (sandbox_disabled()) {
+		printf("sandbox selftest: COMRADE_SANDBOX=0, nothing applied\n");
+		return 77;
+	}
+#if defined(__linux__)
+	return selftest_linux();
+#else
+	printf("sandbox selftest: no syscall filter on this platform\n");
+	return 77;
+#endif
 }
 
 int sandbox_needs_spawner(void)

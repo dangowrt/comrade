@@ -46,6 +46,8 @@ static int usage(int ret)
 		"       comrade attach [--id NAME] [-r]  exec tmux attach (for a\n"
 		"                                    web front end on a PTY)\n"
 		"       comrade stun-update  refresh the STUN server list\n"
+		"       comrade --sandbox-selftest  apply the confining syscall\n"
+		"                            filter and report what it lets through\n"
 		"opts:  -v, --verbose      log lines instead of the dashboard\n"
 		"       --plain            log lines, no colour, no animation\n"
 		"       -V, --version      print the version and exit\n"
@@ -291,6 +293,15 @@ int main(int argc, char **argv)
 	if (argc == 3 && !strcmp(argv[1], "--win-service"))
 		return host_win_service(argv[2]);
 #endif
+
+	/*
+	 * The confinement's own probe battery, before the option loop because
+	 * it is not a session at all: it forks a child per probe, each behind
+	 * the real filter, and says which syscalls the list lets through and
+	 * which it refuses. 77 where there is no filter to test.
+	 */
+	if (argc == 2 && !strcmp(argv[1], "--sandbox-selftest"))
+		return sandbox_selftest();
 
 	/* The machine verbs before the option loop: their flags are not
 	 * session options. */

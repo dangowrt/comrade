@@ -9,7 +9,7 @@
 
 #include <aclapi.h>
 #include <sddl.h>
-
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -327,6 +327,15 @@ int sandbox_needs_spawner(void)
 int sandbox_filter_insns(void)
 {
 	return 0;
+}
+
+/* There is no syscall filter here to probe either: the Windows confinement is
+ * job objects and mitigation policies, which the mask sandbox_apply returns
+ * already reports. */
+int sandbox_selftest(void)
+{
+	printf("sandbox selftest: no syscall filter on this platform\n");
+	return 77;
 }
 
 #endif /* _WIN32 */
