@@ -46,6 +46,72 @@ static int sandbox_disabled(void)
 }
 
 /*
+ * An instrumented build, where a sanitiser runtime shares the process.
+ */
+#if defined(__has_feature)
+# if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer) || \
+     __has_feature(memory_sanitizer)
+#  define SB_INSTRUMENTED 1
+# endif
+#endif
+#if !defined(SB_INSTRUMENTED) && \
+    (defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__))
+# define SB_INSTRUMENTED 1
+#endif
+
+/*
+ * The directory a sanitiser has been told to write its reports into, or NULL.
+ *
+ * A sanitiser reports through a file of its own, named by log_path in its
+ * options, and it opens that file only when it has something to say. The
+ * confinement is applied long before then, so a report arriving afterwards
+ * finds the path unreachable -- and the runtime's answer to a log it cannot
+ * open is to abort the process. Measured on macOS: a race in a confined
+ * forward-only host became "Can't open file: .../tsan.1426 (reason: 1)" and
+ * SIGABRT, so the finding was destroyed by the confinement that provoked it,
+ * and the test that saw it reported only that a host had disappeared.
+ *
+ * Read only in an instrumented build, so a release binary grants nothing on
+ * the strength of an environment variable.
+ */
+static const char *san_log_dir(char *dir, size_t dn)
+{
+#ifdef SB_INSTRUMENTED
+	static const char *const vars[] = {
+		"TSAN_OPTIONS", "ASAN_OPTIONS", "LSAN_OPTIONS", "UBSAN_OPTIONS"
+	};
+	const char *v, *p, *end;
+	char *slash;
+	size_t i, len;
+
+	for (i = 0; i < sizeof(vars) / sizeof(vars[0]); i++) {
+		v = getenv(vars[i]);
+		if (!v)
+			continue;
+		p = strstr(v, "log_path=");
+		if (!p)
+			continue;
+		p += sizeof("log_path=") - 1;
+		end = strchr(p, ':');
+		len = end ? (size_t)(end - p) : strlen(p);
+		if (len == 0 || len >= dn)
+			continue;
+		memcpy(dir, p, len);
+		dir[len] = '\0';
+		slash = strrchr(dir, '/');
+		if (!slash || slash == dir)
+			continue;
+		*slash = '\0';
+		return dir;
+	}
+#else
+	(void)dir;
+	(void)dn;
+#endif
+	return NULL;
+}
+
+/*
  * RLIMIT_CORE = 0 keeps a crash from spilling the token, session keys and
  * terminal scrollback into a core file. Honoured on every Unix, so it is the
  * one thing the generic fallback still does.
@@ -149,7 +215,8 @@ static const char sb_profile_confine[] =
 "  (literal \"/dev/random\") (literal \"/dev/urandom\"))\n"
 "(allow file-write-data (literal \"/dev/null\"))\n"
 "(allow file-read* file-write*\n"
-"  (subpath (param \"DATA_DIR\")) (subpath (param \"STATE_DIR\")))\n"
+"  (subpath (param \"DATA_DIR\")) (subpath (param \"STATE_DIR\"))\n"
+"  (subpath (param \"SAN_DIR\")))\n"
 "(allow signal (target self))\n"
 "(allow sysctl-read\n"
 "  (sysctl-name \"hw.memsize\") (sysctl-name \"hw.ncpu\")\n"
@@ -266,7 +333,8 @@ static int apply_macos(const struct sandbox_cfg *cfg)
 	char sd[PATH_MAX];
 	char prof[sizeof(sb_profile_confine) + sizeof(sb_profile_tty) +
 		  sizeof(sb_profile_tcp)];
-	const char *params[5];
+	const char *params[7];
+	char sanbuf[PATH_MAX];
 	struct rlimit rl;
 	int confine;
 
@@ -307,7 +375,14 @@ static int apply_macos(const struct sandbox_cfg *cfg)
 	params[1] = dd;
 	params[2] = "STATE_DIR";
 	params[3] = sd;
-	params[4] = (const char *)0;
+	/* A sanitiser's report destination, and the data directory again where
+	 * there is none: every parameter the profile names has to be given a
+	 * value, and granting that directory twice grants nothing new. */
+	params[4] = "SAN_DIR";
+	params[5] = san_log_dir(sanbuf, sizeof(sanbuf));
+	if (!params[5])
+		params[5] = dd;
+	params[6] = (const char *)0;
 	snprintf(prof, sizeof(prof), "%s%s%s", sb_profile_confine,
 		 cfg->no_pty ? "" : sb_profile_tty,
 		 wants_tcp(cfg) ? sb_profile_tcp : "");
@@ -2441,7 +2516,8 @@ static const char *dbg_grant(char *dir, size_t dn, const char *dbg)
 static int bind_writable(const char *root, const struct sandbox_cfg *cfg)
 {
 	char dir[PATH_MAX];
-	const char *dbg;
+	char sandir[PATH_MAX];
+	const char *dbg, *san;
 	int fail = 0;
 
 	if (bind_at(root, cfg->data_dir, cfg->data_dir, 0, 0) < 0)
@@ -2454,6 +2530,9 @@ static int bind_writable(const char *root, const struct sandbox_cfg *cfg)
 	dbg = dbg_grant(dir, sizeof(dir), getenv("COMRADE_DEBUG"));
 	if (dbg)
 		bind_at(root, dbg, dbg, 0, 0);
+	san = san_log_dir(sandir, sizeof(sandir));
+	if (san)
+		bind_at(root, san, san, 0, 0);
 	return fail ? -1 : 0;
 }
 
@@ -2692,7 +2771,8 @@ static int fs_confine_landlock(const struct sandbox_cfg *cfg)
 	struct sb_ruleset_attr attr;
 	char resolv[PATH_MAX];
 	char dir[PATH_MAX];
-	const char *dbg;
+	char sandir[PATH_MAX];
+	const char *dbg, *san;
 	uint64_t handled, ro, rwx, rw, net, scoped;
 	long abi;
 	int rs;
@@ -2814,6 +2894,9 @@ static int fs_confine_landlock(const struct sandbox_cfg *cfg)
 	dbg = dbg_grant(dir, sizeof(dir), getenv("COMRADE_DEBUG"));
 	if (dbg)
 		ll_allow(rs, dbg, rw);
+	san = san_log_dir(sandir, sizeof(sandir));
+	if (san)
+		ll_allow(rs, san, rw);
 
 	/* Landlock enforcement requires no_new_privs; setting it here is
 	 * harmless -- apply_linux sets it again for the other layers. */
@@ -3319,17 +3402,6 @@ static int sb_run_probe(const struct sb_probe *pr)
  * failure there would say nothing about comrade. The instrumented builds run
  * the rest of the suite, and this probe skips.
  */
-#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
-#define SB_INSTRUMENTED 1
-#endif
-#if defined(__has_feature)
-# if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer) || \
-     __has_feature(memory_sanitizer)
-#  undef SB_INSTRUMENTED
-#  define SB_INSTRUMENTED 1
-# endif
-#endif
-
 static int selftest_linux(void)
 {
 	unsigned i;
