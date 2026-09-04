@@ -41,12 +41,26 @@ mkdir -p "$COMRADE_STATE_DIR" "$XDG_DATA_HOME" || exit 1
 chmod 700 "$COMRADE_STATE_DIR" || exit 1
 
 rc=0
-fail() { echo "FAILED: $*"; rc=1; }
+
+# Whatever the host wrote before it died, said here. A service that aborts
+# leaves its reason on a stderr this script captures and then deletes with its
+# temporary directory, so a CI run judged from the output alone sees a failed
+# assertion about stop and nothing at all about why the host was not there.
+say_err() {
+	for _e in "$tmp"/*.err; do
+		[ -s "$_e" ] || continue
+		echo "--- ${_e##*/} ---"
+		tail -20 "$_e"
+	done
+}
+
+fail() { echo "FAILED: $*"; say_err; rc=1; }
 
 # A phase that cannot run at all is a skip -- unless something has already
 # failed, and then the failure is the answer.
 skip() {
 	echo "skipped: $*"
+	say_err
 	[ "$rc" = 0 ] && exit 77
 	exit "$rc"
 }
@@ -83,7 +97,7 @@ else
 fi
 
 # ---- 2: a live session ----------------------------------------------------
-start live || skip "the host never started (see $tmp)"
+start live || skip "the host never started"
 if ! out=$("$CR" stop --id live 2>&1); then
 	fail "stopping a live session reported failure: $out"
 elif kill -0 "$hpid" 2>/dev/null; then
@@ -101,7 +115,7 @@ hpid=""
 # SIGSTOP is a service that is there and does not answer: the signals stop
 # sends are never handled, so the process outlives the call. That is the
 # wedged host, without needing one to actually wedge.
-start wedged || skip "the second host never started (see $tmp)"
+start wedged || skip "the second host never started"
 kill -STOP "$hpid" 2>/dev/null || skip "this system cannot SIGSTOP a process"
 out=$("$CR" stop --id wedged 2>&1)
 sc=$?
