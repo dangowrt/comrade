@@ -48,7 +48,7 @@ static void a_claimant_served_before_is_known(void)
 	 * simply treated as new. */
 	memset(&l, 0, sizeof(l));
 	for (i = 0; i < CLAIM_SERVED_MAX; i++) {
-		sprintf(u, "ufrag%d", i);
+		snprintf(u, sizeof(u), "ufrag%d", i);
 		claim_served_note(&l, u);
 	}
 	assert(claim_served_has(&l, "ufrag0"));

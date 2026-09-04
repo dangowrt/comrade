@@ -18,6 +18,7 @@
 #include <assert.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>

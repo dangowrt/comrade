@@ -994,13 +994,15 @@ int main(void)
 			size_t bl = 0;
 
 			memcpy(both, "d1:o", 4); bl = 4;
-			bl += (size_t)sprintf((char *)both + bl, "%u:",
-					      (unsigned)sizeof(OFFER_E));
+			bl += (size_t)snprintf((char *)both + bl,
+					       sizeof(both) - bl, "%u:",
+					       (unsigned)sizeof(OFFER_E));
 			memcpy(both + bl, OFFER_E, sizeof(OFFER_E));
 			bl += sizeof(OFFER_E);
 			memcpy(both + bl, "1:x", 3); bl += 3;
-			bl += (size_t)sprintf((char *)both + bl, "%u:",
-					      (unsigned)sizeof(TOMB));
+			bl += (size_t)snprintf((char *)both + bl,
+					       sizeof(both) - bl, "%u:",
+					       (unsigned)sizeof(TOMB));
 			memcpy(both + bl, TOMB, sizeof(TOMB));
 			bl += sizeof(TOMB);
 			both[bl++] = 'e';
