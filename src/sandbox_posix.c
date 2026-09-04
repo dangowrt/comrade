@@ -326,8 +326,22 @@ static int apply_macos(const struct sandbox_cfg *cfg)
 #include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+/*
+ * Before <sys/ioctl.h>, and on purpose: TCGETS2 and TCSETS2 are _IOR/_IOW
+ * macros over struct termios2, which asm/ioctls.h names but does not define,
+ * so the ioctl argument rule cannot use them without this. It is the only
+ * header that declares that struct, and unlike <linux/termios.h> it redefines
+ * nothing the C library owns -- no struct winsize, no ioctl numbers -- as long
+ * as <termios.h> stays out of this file.
+ */
+#include <asm/termbits.h>
+
+#include <sys/ioctl.h>
 #include <sys/statvfs.h>
 #include <sys/syscall.h>
+
+#include <signal.h>		/* the SIGSYS handler of COMRADE_SANDBOX=warn */
+#include <linux/sockios.h>	/* SIOCGIFINDEX/SIOCGIFNAME for the ioctl rule */
 
 #include <linux/filter.h>
 #include <linux/audit.h>
@@ -469,39 +483,1205 @@ static int no_new_privs(void)
 }
 
 /*
- * The audit arch constant for the seccomp filter. Only arches whose syscall
- * ABI this filter is written for are named; anywhere else the seccomp layer is
- * skipped rather than risking a wrong-arch filter.
+ * The audit arch constant the kernel stamps into every seccomp_data, chosen
+ * from the target this build is for. It has to be exactly right: a filter
+ * whose preamble compares the wrong constant kills the process on its first
+ * syscall, so an architecture that cannot be named here is left without a
+ * filter rather than guessed at.
+ *
+ * Three of the answers below are not what the target triple suggests, and all
+ * three come from the kernel's own syscall_get_arch():
+ *
+ *   - arm returns AUDIT_ARCH_ARM whatever the endianness, so a big-endian arm
+ *     process reports the little-endian-flagged constant. AUDIT_ARCH_ARMEB
+ *     exists but the kernel never reports it, so it must never be selected.
+ *   - 32-bit powerpc likewise returns AUDIT_ARCH_PPC in both endiannesses,
+ *     including for a 32-bit task on a ppc64le kernel.
+ *   - mips is the only family that folds endianness in, and it folds the ABI
+ *     in as well: three number bases (o32 4000, n64 5000, n32 6000) times two
+ *     endiannesses gives six constants.
+ *
+ * riscv32 is deliberately absent. The kernel returns AUDIT_ARCH_RISCV64
+ * whenever CONFIG_64BIT, so the same rv32 binary reports one constant on an
+ * rv32 kernel and another on an rv64 one, and nothing available at build time
+ * can tell which it will meet.
+ *
+ * SB_COMPAT_* names a second ABI the same kernel may report, for the one role
+ * that still execs: a filter survives execve and is inherited by every
+ * descendant, so a preamble that kills on any other constant kills a
+ * foreign-ABI child. The roles that deny exec cannot reach that case, and
+ * there the kill stays as a tripwire.
  */
+
+/* Constants a build host's headers may predate. */
+#ifndef EM_RISCV
+#define EM_RISCV 243
+#endif
+#ifndef EM_LOONGARCH
+#define EM_LOONGARCH 258
+#endif
+#ifndef AUDIT_ARCH_RISCV64
+#define AUDIT_ARCH_RISCV64 (EM_RISCV | __AUDIT_ARCH_64BIT | __AUDIT_ARCH_LE)
+#endif
+#ifndef AUDIT_ARCH_PPC64LE
+#define AUDIT_ARCH_PPC64LE (EM_PPC64 | __AUDIT_ARCH_64BIT | __AUDIT_ARCH_LE)
+#endif
+#ifndef AUDIT_ARCH_LOONGARCH64
+#define AUDIT_ARCH_LOONGARCH64 \
+	(EM_LOONGARCH | __AUDIT_ARCH_64BIT | __AUDIT_ARCH_LE)
+#endif
+
 #if defined(__x86_64__)
-#define SB_AUDIT_ARCH AUDIT_ARCH_X86_64
-#define SB_X32_GUARD 1
-#elif defined(__aarch64__)
-#define SB_AUDIT_ARCH AUDIT_ARCH_AARCH64
-#elif defined(__arm__)
-#define SB_AUDIT_ARCH AUDIT_ARCH_ARM
+# if defined(__ILP32__)
+/* x32: the kernel reports AUDIT_ARCH_X86_64 and sets bit 30 in nr, so the
+ * numbers in the tables below already carry it and no guard is wanted. */
+#  define SB_AUDIT_ARCH AUDIT_ARCH_X86_64
+#  define SB_ARCH_NAME "AUDIT_ARCH_X86_64 (x32)"
+# else
+#  define SB_AUDIT_ARCH AUDIT_ARCH_X86_64
+#  define SB_ARCH_NAME "AUDIT_ARCH_X86_64"
+#  define SB_X32_GUARD 1
+#  define SB_COMPAT_AUDIT_ARCH AUDIT_ARCH_I386
+#  define SB_COMPAT_NR_SOCKET 359
+#  define SB_COMPAT_NR_SOCKETCALL 102
+# endif
 #elif defined(__i386__)
-#define SB_AUDIT_ARCH AUDIT_ARCH_I386
+# define SB_AUDIT_ARCH AUDIT_ARCH_I386
+# define SB_ARCH_NAME "AUDIT_ARCH_I386"
+#elif defined(__aarch64__)
+/* arm64 reports AUDIT_ARCH_AARCH64 for both endiannesses; an AArch32 task on
+ * the same kernel reports AUDIT_ARCH_ARM. */
+# define SB_AUDIT_ARCH AUDIT_ARCH_AARCH64
+# define SB_ARCH_NAME "AUDIT_ARCH_AARCH64"
+# define SB_COMPAT_AUDIT_ARCH AUDIT_ARCH_ARM
+# define SB_COMPAT_NR_SOCKET 281
+# define SB_COMPAT_NR_SOCKETCALL 102
+#elif defined(__arm__)
+/* Never AUDIT_ARCH_ARMEB: see the block comment. */
+# define SB_AUDIT_ARCH AUDIT_ARCH_ARM
+# define SB_ARCH_NAME "AUDIT_ARCH_ARM"
+#elif defined(__mips__)
+# if _MIPS_SIM == _ABIO32
+#  ifdef __MIPSEL__
+#   define SB_AUDIT_ARCH AUDIT_ARCH_MIPSEL
+#   define SB_ARCH_NAME "AUDIT_ARCH_MIPSEL"
+#  else
+#   define SB_AUDIT_ARCH AUDIT_ARCH_MIPS
+#   define SB_ARCH_NAME "AUDIT_ARCH_MIPS"
+#  endif
+# elif _MIPS_SIM == _ABI64
+#  ifdef __MIPSEL__
+#   define SB_AUDIT_ARCH AUDIT_ARCH_MIPSEL64
+#   define SB_ARCH_NAME "AUDIT_ARCH_MIPSEL64"
+#   define SB_COMPAT_AUDIT_ARCH AUDIT_ARCH_MIPSEL
+#   define SB_COMPAT2_AUDIT_ARCH AUDIT_ARCH_MIPSEL64N32
+#  else
+#   define SB_AUDIT_ARCH AUDIT_ARCH_MIPS64
+#   define SB_ARCH_NAME "AUDIT_ARCH_MIPS64"
+#   define SB_COMPAT_AUDIT_ARCH AUDIT_ARCH_MIPS
+#   define SB_COMPAT2_AUDIT_ARCH AUDIT_ARCH_MIPS64N32
+#  endif
+/* o32 and n32 respectively; the n32 table has no socketcall at all. */
+#  define SB_COMPAT_NR_SOCKET 4183
+#  define SB_COMPAT_NR_SOCKETCALL 4102
+#  define SB_COMPAT2_NR_SOCKET 6040
+# elif _MIPS_SIM == _ABIN32
+#  ifdef __MIPSEL__
+#   define SB_AUDIT_ARCH AUDIT_ARCH_MIPSEL64N32
+#   define SB_ARCH_NAME "AUDIT_ARCH_MIPSEL64N32"
+#   define SB_COMPAT_AUDIT_ARCH AUDIT_ARCH_MIPSEL
+#  else
+#   define SB_AUDIT_ARCH AUDIT_ARCH_MIPS64N32
+#   define SB_ARCH_NAME "AUDIT_ARCH_MIPS64N32"
+#   define SB_COMPAT_AUDIT_ARCH AUDIT_ARCH_MIPS
+#  endif
+#  define SB_COMPAT_NR_SOCKET 4183
+#  define SB_COMPAT_NR_SOCKETCALL 4102
+# endif
+#elif defined(__powerpc64__)
+# if defined(__LITTLE_ENDIAN__)
+#  define SB_AUDIT_ARCH AUDIT_ARCH_PPC64LE
+#  define SB_ARCH_NAME "AUDIT_ARCH_PPC64LE"
+# else
+#  define SB_AUDIT_ARCH AUDIT_ARCH_PPC64
+#  define SB_ARCH_NAME "AUDIT_ARCH_PPC64"
+# endif
+/* AUDIT_ARCH_PPC either way, on an LE kernel too: see the block comment. */
+# define SB_COMPAT_AUDIT_ARCH AUDIT_ARCH_PPC
+# define SB_COMPAT_NR_SOCKET 326
+# define SB_COMPAT_NR_SOCKETCALL 102
+#elif defined(__powerpc__)
+# define SB_AUDIT_ARCH AUDIT_ARCH_PPC
+# define SB_ARCH_NAME "AUDIT_ARCH_PPC"
 #elif defined(__riscv) && __riscv_xlen == 64
-#define SB_AUDIT_ARCH AUDIT_ARCH_RISCV64
+# define SB_AUDIT_ARCH AUDIT_ARCH_RISCV64
+# define SB_ARCH_NAME "AUDIT_ARCH_RISCV64"
+#elif defined(__loongarch64)
+# define SB_AUDIT_ARCH AUDIT_ARCH_LOONGARCH64
+# define SB_ARCH_NAME "AUDIT_ARCH_LOONGARCH64"
 #endif
 
 #ifdef SYS_seccomp
 #ifdef SB_AUDIT_ARCH
 
+/*
+ * Every syscall family the allowlist needs a name from, asserted here rather
+ * than left to the #ifdef around each entry. A name that vanishes behind its
+ * guard would drop silently out of the filter and take the process with it on
+ * the first call; this turns that into a build failure instead.
+ *
+ * The trap this exists for: 32-bit musl does not define __NR_clock_gettime at
+ * all. It defines __NR_clock_gettime32 and __NR_clock_gettime64, and nine
+ * other legacy time syscalls are renamed the same way.
+ */
+#if !defined(__NR_read) || !defined(__NR_write) || !defined(__NR_close) || \
+    !defined(__NR_ioctl) || !defined(__NR_prctl) || !defined(__NR_exit_group)
+#error "seccomp allowlist: this ABI lacks a syscall nothing can run without"
+#endif
+#if !defined(__NR_open) && !defined(__NR_openat)
+#error "seccomp allowlist: no open or openat on this ABI"
+#endif
+#if !defined(__NR_stat) && !defined(__NR_stat64) && \
+    !defined(__NR_newfstatat) && !defined(__NR_fstatat64) && \
+    !defined(__NR_statx)
+#error "seccomp allowlist: no way to stat a path on this ABI"
+#endif
+#if !defined(__NR_fstat) && !defined(__NR_fstat64) && !defined(__NR_statx)
+#error "seccomp allowlist: no way to stat a descriptor on this ABI"
+#endif
+#if !defined(__NR_poll) && !defined(__NR_ppoll) && \
+    !defined(__NR_ppoll_time64) && !defined(__NR_ppoll_time32)
+#error "seccomp allowlist: no poll family on this ABI"
+#endif
+#if !defined(__NR_dup) || (!defined(__NR_dup2) && !defined(__NR_dup3))
+#error "seccomp allowlist: no dup family on this ABI"
+#endif
+#if !defined(__NR_pipe) && !defined(__NR_pipe2)
+#error "seccomp allowlist: no pipe family on this ABI"
+#endif
+#if !defined(__NR_clock_gettime) && !defined(__NR_clock_gettime64) && \
+    !defined(__NR_clock_gettime32)
+#error "seccomp allowlist: no clock_gettime here (32-bit musl renames it)"
+#endif
+#if !defined(__NR_clock_getres) && !defined(__NR_clock_getres_time64) && \
+    !defined(__NR_clock_getres_time32)
+#error "seccomp allowlist: no clock_getres on this ABI"
+#endif
+#if !defined(__NR_clock_nanosleep) && \
+    !defined(__NR_clock_nanosleep_time64) && \
+    !defined(__NR_clock_nanosleep_time32) && !defined(__NR_nanosleep)
+#error "seccomp allowlist: no way to sleep on this ABI"
+#endif
+#if !defined(__NR_futex) && !defined(__NR_futex_time64)
+#error "seccomp allowlist: no futex on this ABI"
+#endif
+#if !defined(__NR_socket)
+#error "seccomp allowlist: this ABI has no socket(2), only socketcall(2)"
+#endif
+#if !defined(__NR_mmap) && !defined(__NR_mmap2)
+#error "seccomp allowlist: no mmap family on this ABI"
+#endif
+#if !defined(__NR_clone)
+#error "seccomp allowlist: no clone(2) to fall back to when clone3 is denied"
+#endif
+#if !defined(__NR_rt_sigreturn) && !defined(__NR_sigreturn)
+#error "seccomp allowlist: no sigreturn -- every signal handler would trap"
+#endif
+#if !defined(__NR_rename) && !defined(__NR_renameat) && \
+    !defined(__NR_renameat2)
+#error "seccomp allowlist: no rename family on this ABI"
+#endif
+#if !defined(__NR_mkdir) && !defined(__NR_mkdirat)
+#error "seccomp allowlist: no mkdir family on this ABI"
+#endif
+#if !defined(__NR_unlink) && !defined(__NR_unlinkat)
+#error "seccomp allowlist: no unlink family on this ABI"
+#endif
+#if !defined(__NR_readlink) && !defined(__NR_readlinkat)
+#error "seccomp allowlist: no readlink family on this ABI"
+#endif
+#if !defined(__NR_lseek) && !defined(__NR__llseek)
+#error "seccomp allowlist: no lseek family on this ABI"
+#endif
+#if !defined(__NR_fcntl) && !defined(__NR_fcntl64)
+#error "seccomp allowlist: no fcntl family on this ABI"
+#endif
+#if !defined(__NR_ftruncate) && !defined(__NR_ftruncate64)
+#error "seccomp allowlist: no ftruncate family on this ABI"
+#endif
+#if !defined(__NR_statfs) && !defined(__NR_statfs64)
+#error "seccomp allowlist: no statfs family on this ABI"
+#endif
+#if !defined(__NR_getdents64) && !defined(__NR_getdents)
+#error "seccomp allowlist: no getdents family on this ABI"
+#endif
+
+/*
+ * The ioctl commands the argument rule names, guarded the same way and for the
+ * same reason. The terminal pair is per-libc (glibc TCGETS2, musl TCGETS) so
+ * either will do; the rest have no alternative spelling.
+ */
+#if !defined(FIONBIO) || !defined(FIONREAD) || !defined(TIOCGWINSZ)
+#error "seccomp allowlist: <sys/ioctl.h> named none of FIONBIO/FIONREAD/TIOCGWINSZ"
+#endif
+#if !defined(SIOCGIFINDEX) || !defined(SIOCGIFNAME)
+#error "seccomp allowlist: no SIOCGIFINDEX/SIOCGIFNAME; if_nametoindex needs them"
+#endif
+#if !defined(TCGETS) && !defined(TCGETS2)
+#error "seccomp allowlist: no terminal ioctls; tcgetattr would be killed"
+#endif
+
 /* seccomp_data field offsets, for the BPF that reads them. */
 #define SB_OFF_NR	(offsetof(struct seccomp_data, nr))
 #define SB_OFF_ARCH	(offsetof(struct seccomp_data, arch))
-#define SB_OFF_ARG0_LO	(offsetof(struct seccomp_data, args[0]))
 
 /*
- * Deny one syscall number, returning EPERM, as a self-contained two-word
- * block: if nr matches, fall through to the RET; otherwise jump past it. Used
- * only while the accumulator holds nr.
+ * BPF loads 32 bits at a time and seccomp_data::args is an array of 64-bit
+ * words, so the half holding a 32-bit argument sits at the front of its word
+ * on a little-endian target and at the back on a big-endian one. Getting this
+ * wrong does not fail loudly: the comparison simply never matches, so an
+ * argument rule silently permits everything -- which is what a plain
+ * offsetof() does on the big-endian members of the mips and ppc families.
  */
-#define SB_DENY(nr) \
-	BPF_JUMP(BPF_JMP + BPF_JEQ + BPF_K, (nr), 0, 1), \
-	BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_ERRNO + (EPERM & SECCOMP_RET_DATA))
+#if defined(__BYTE_ORDER__) && defined(__ORDER_BIG_ENDIAN__)
+# if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+#  define SB_ARG_LO(n)	(offsetof(struct seccomp_data, args[n]) + 4)
+# else
+#  define SB_ARG_LO(n)	(offsetof(struct seccomp_data, args[n]))
+# endif
+#else
+#error "seccomp: the compiler does not say which endianness this target is"
+#endif
+
+#ifndef SECCOMP_RET_KILL_PROCESS
+#define SECCOMP_RET_KILL_PROCESS 0x80000000U
+#endif
+#ifndef SECCOMP_RET_TRAP
+#define SECCOMP_RET_TRAP 0x00030000U
+#endif
+
+#define SB_RET_ALLOW	((unsigned int)SECCOMP_RET_ALLOW)
+#define SB_RET_ERRNO(e)	((unsigned int)SECCOMP_RET_ERRNO | \
+			 ((unsigned int)(e) & SECCOMP_RET_DATA))
+
+/*
+ * The filter is assembled at run time rather than written out as a table of
+ * hand-counted jump offsets. Two things make the emitter worth its lines: the
+ * allowlist runs to a few hundred instructions, so a single jump over it would
+ * not fit the one-byte jt/jf field a hand-written preamble has to use; and the
+ * same list is built twice, once killing and once trapping, for the
+ * COMRADE_SANDBOX=warn diagnostic.
+ *
+ * Every block emitted here is self-contained: it is entered with nr in the
+ * accumulator and left only by returning or by being jumped over whole, so no
+ * block depends on what another left in the accumulator.
+ */
+struct sb_prog {
+	struct sock_filter *f;
+	unsigned short n;
+	unsigned short max;
+	int overflow;			/* set once; checked before install */
+};
+
+static void sb_emit(struct sb_prog *p, unsigned short code, unsigned char jt,
+		    unsigned char jf, unsigned int k)
+{
+	if (p->n >= p->max) {
+		p->overflow = 1;
+		return;
+	}
+	p->f[p->n].code = code;
+	p->f[p->n].jt = jt;
+	p->f[p->n].jf = jf;
+	p->f[p->n].k = k;
+	p->n++;
+}
+
+static void sb_ld_nr(struct sb_prog *p)
+{
+	sb_emit(p, BPF_LD + BPF_W + BPF_ABS, 0, 0, SB_OFF_NR);
+}
+
+static void sb_ld_arch(struct sb_prog *p)
+{
+	sb_emit(p, BPF_LD + BPF_W + BPF_ABS, 0, 0, SB_OFF_ARCH);
+}
+
+static void sb_ld_arg(struct sb_prog *p, unsigned int off)
+{
+	sb_emit(p, BPF_LD + BPF_W + BPF_ABS, 0, 0, off);
+}
+
+static void sb_ret(struct sb_prog *p, unsigned int action)
+{
+	sb_emit(p, BPF_RET + BPF_K, 0, 0, action);
+}
+
+/* If the accumulator equals k, return action; otherwise carry on. */
+static void sb_eq_ret(struct sb_prog *p, unsigned int k, unsigned int action)
+{
+	sb_emit(p, BPF_JMP + BPF_JEQ + BPF_K, 0, 1, k);
+	sb_ret(p, action);
+}
+
+/*
+ * Emit an equality test whose branches are filled in later, and return its
+ * index for sb_land_jt()/sb_land_jf(). A block reached by falling through such
+ * a test must never fall out of its end, so that the code the other branch
+ * lands on still has the same word in the accumulator.
+ */
+static unsigned short sb_test(struct sb_prog *p, unsigned int k)
+{
+	sb_emit(p, BPF_JMP + BPF_JEQ + BPF_K, 0, 0, k);
+	return (unsigned short)(p->n - 1);
+}
+
+static void sb_land(struct sb_prog *p, unsigned short at, int on_true)
+{
+	unsigned int d;
+
+	if (at >= p->n)
+		return;
+	d = (unsigned int)(p->n - at - 1);
+	if (d > 255) {
+		p->overflow = 1;	/* jt/jf are one byte: never wrap it */
+		return;
+	}
+	if (on_true)
+		p->f[at].jt = (unsigned char)d;
+	else
+		p->f[at].jf = (unsigned char)d;
+}
+
+static void sb_land_jt(struct sb_prog *p, unsigned short at)
+{
+	sb_land(p, at, 1);
+}
+
+static void sb_land_jf(struct sb_prog *p, unsigned short at)
+{
+	sb_land(p, at, 0);
+}
+
+/* Emit an "allow every entry in this table" run, two words per entry. */
+static void sb_allow_table(struct sb_prog *p, const int *nrs, unsigned n)
+{
+	unsigned i;
+
+	for (i = 0; i < n; i++)
+		sb_eq_ret(p, (unsigned int)nrs[i], SB_RET_ALLOW);
+}
+
+static void sb_errno_table(struct sb_prog *p, const int *nrs, unsigned n,
+			   int err)
+{
+	unsigned i;
+
+	for (i = 0; i < n; i++)
+		sb_eq_ret(p, (unsigned int)nrs[i], SB_RET_ERRNO(err));
+}
+
+/*
+ * Each table ends in a 0 that is never emitted: it only keeps the array
+ * non-empty on an ABI where every other entry is compiled out.
+ */
+#define SB_N(t)   ((unsigned)(sizeof(t) / sizeof((t)[0])))
+#define SB_TBL(t) (t), (SB_N(t) - 1u)
+
+/*
+ * The list. Measured from 18 traced runs of the real program -- 6 client, 7
+ * service and 3 foreground processes -- and then widened by hand with the
+ * entries a trace can never show and the partners another architecture or libc
+ * reaches for instead. Client and service share one list: their measured sets
+ * differ by six names, which is not worth two filters.
+ *
+ * The hot table comes first because the chain is walked in order and these are
+ * nearly all of the traffic: poll 84,910 calls, read 57,402, recvfrom 9,162,
+ * sendto 8,386, write 6,463, futex 4,694, against a few hundred for everything
+ * else. On a target with the BPF JIT the whole chain costs some fifteen
+ * nanoseconds; on a router without one it is interpreted and this order is
+ * what keeps it cheap.
+ */
+static const int sb_nr_hot[] = {
+#ifdef __NR_poll
+	__NR_poll,
+#endif
+#ifdef __NR_read
+	__NR_read,
+#endif
+#ifdef __NR_recvfrom
+	__NR_recvfrom,
+#endif
+#ifdef __NR_sendto
+	__NR_sendto,
+#endif
+#ifdef __NR_write
+	__NR_write,
+#endif
+#ifdef __NR_futex
+	__NR_futex,
+#endif
+#ifdef __NR_futex_time64
+	__NR_futex_time64,
+#endif
+#ifdef __NR_ppoll
+	__NR_ppoll,		/* the whole of it where there is no poll(2) */
+#endif
+#ifdef __NR_ppoll_time64
+	__NR_ppoll_time64,
+#endif
+#ifdef __NR_ppoll_time32
+	__NR_ppoll_time32,
+#endif
+	0
+};
+
+/* Descriptors: the transport, the terminal and every file comrade keeps. */
+static const int sb_nr_io[] = {
+#ifdef __NR_readv
+	__NR_readv,
+#endif
+#ifdef __NR_writev
+	__NR_writev,
+#endif
+#ifdef __NR_pread64
+	__NR_pread64,
+#endif
+#ifdef __NR_pwrite64
+	__NR_pwrite64,
+#endif
+#ifdef __NR_close
+	__NR_close,
+#endif
+#ifdef __NR_close_range
+	__NR_close_range,
+#endif
+#ifdef __NR_lseek
+	__NR_lseek,
+#endif
+#ifdef __NR__llseek
+	__NR__llseek,		/* 32-bit: what lseek(2) is called there */
+#endif
+#ifdef __NR_dup
+	__NR_dup,
+#endif
+#ifdef __NR_dup2
+	__NR_dup2,
+#endif
+#ifdef __NR_dup3
+	__NR_dup3,
+#endif
+#ifdef __NR_fcntl
+	__NR_fcntl,
+#endif
+#ifdef __NR_fcntl64
+	__NR_fcntl64,
+#endif
+#ifdef __NR_ftruncate
+	__NR_ftruncate,
+#endif
+#ifdef __NR_ftruncate64
+	__NR_ftruncate64,
+#endif
+#ifdef __NR_fsync
+	__NR_fsync,
+#endif
+#ifdef __NR_fdatasync
+	__NR_fdatasync,
+#endif
+#ifdef __NR_pipe
+	__NR_pipe,
+#endif
+#ifdef __NR_pipe2
+	__NR_pipe2,
+#endif
+#ifdef __NR_eventfd2
+	__NR_eventfd2,
+#endif
+	0
+};
+
+/*
+ * Paths and metadata. The write side is what the state and data directories
+ * need -- the status, token and pid files are written, chmod-ed and renamed
+ * into place -- and the read side is the resolver configuration and the shared
+ * objects the C library and TLS stack keep opening. statx, and socket(AF_UNIX)
+ * below, move with the libc: glibc from 2.28 answers stat() with statx, and
+ * NSS reaches for a unix socket.
+ */
+static const int sb_nr_path[] = {
+#ifdef __NR_open
+	__NR_open,
+#endif
+#ifdef __NR_openat
+	__NR_openat,
+#endif
+#ifdef __NR_access
+	__NR_access,
+#endif
+#ifdef __NR_faccessat
+	__NR_faccessat,
+#endif
+#ifdef __NR_stat
+	__NR_stat,
+#endif
+#ifdef __NR_stat64
+	__NR_stat64,
+#endif
+#ifdef __NR_lstat
+	__NR_lstat,
+#endif
+#ifdef __NR_lstat64
+	__NR_lstat64,
+#endif
+#ifdef __NR_fstat
+	__NR_fstat,
+#endif
+#ifdef __NR_fstat64
+	__NR_fstat64,
+#endif
+#ifdef __NR_fstatat64
+	__NR_fstatat64,
+#endif
+#ifdef __NR_newfstatat
+	__NR_newfstatat,
+#endif
+#ifdef __NR_statx
+	__NR_statx,
+#endif
+#ifdef __NR_statfs
+	__NR_statfs,
+#endif
+#ifdef __NR_statfs64
+	__NR_statfs64,
+#endif
+#ifdef __NR_fstatfs
+	__NR_fstatfs,
+#endif
+#ifdef __NR_fstatfs64
+	__NR_fstatfs64,
+#endif
+#ifdef __NR_readlink
+	__NR_readlink,
+#endif
+#ifdef __NR_readlinkat
+	__NR_readlinkat,
+#endif
+#ifdef __NR_getdents64
+	__NR_getdents64,
+#endif
+#ifdef __NR_getdents
+	__NR_getdents,
+#endif
+#ifdef __NR_rename
+	__NR_rename,
+#endif
+#ifdef __NR_renameat
+	__NR_renameat,
+#endif
+#ifdef __NR_renameat2
+	__NR_renameat2,
+#endif
+#ifdef __NR_mkdir
+	__NR_mkdir,
+#endif
+#ifdef __NR_mkdirat
+	__NR_mkdirat,
+#endif
+#ifdef __NR_rmdir
+	__NR_rmdir,
+#endif
+#ifdef __NR_unlink
+	__NR_unlink,
+#endif
+#ifdef __NR_unlinkat
+	__NR_unlinkat,
+#endif
+#ifdef __NR_chmod
+	__NR_chmod,
+#endif
+#ifdef __NR_fchmod
+	__NR_fchmod,
+#endif
+#ifdef __NR_fchmodat
+	__NR_fchmodat,
+#endif
+	0
+};
+
+/*
+ * Memory. There is deliberately no PROT_EXEC rule: new executable mappings are
+ * banned at the mount level instead, where the private root is MS_NOEXEC,
+ * which leaves dlopen working for the life of the session. comrade re-resolves
+ * names throughout a run -- roaming and connectivity changes are the point of
+ * the program -- and a filter rule whose failure mode is glibc silently
+ * degrading to another resolution path is the wrong trade for a protection a
+ * mount flag already gives.
+ */
+static const int sb_nr_mem[] = {
+#ifdef __NR_brk
+	__NR_brk,
+#endif
+#ifdef __NR_mmap
+	__NR_mmap,
+#endif
+#ifdef __NR_mmap2
+	__NR_mmap2,		/* 32-bit: what mmap(2) is called there */
+#endif
+#ifdef __NR_munmap
+	__NR_munmap,
+#endif
+#ifdef __NR_mprotect
+	__NR_mprotect,
+#endif
+#ifdef __NR_mremap
+	__NR_mremap,
+#endif
+#ifdef __NR_madvise
+	__NR_madvise,		/* MADV_GUARD_INSTALL from glibc 2.42 */
+#endif
+	0
+};
+
+/*
+ * Time. The three clock reads are served by the vDSO on the box these traces
+ * came from, so no trace will ever show them -- but the vDSO is not there on
+ * every architecture, nor for every clocksource where it is, and then they are
+ * real syscalls and their absence is fatal. Both the time64 and the legacy
+ * names are listed because 32-bit musl defines only the renamed pair.
+ */
+static const int sb_nr_time[] = {
+#ifdef __NR_clock_gettime
+	__NR_clock_gettime,
+#endif
+#ifdef __NR_clock_gettime64
+	__NR_clock_gettime64,
+#endif
+#ifdef __NR_clock_gettime32
+	__NR_clock_gettime32,
+#endif
+#ifdef __NR_clock_getres
+	__NR_clock_getres,
+#endif
+#ifdef __NR_clock_getres_time64
+	__NR_clock_getres_time64,
+#endif
+#ifdef __NR_clock_getres_time32
+	__NR_clock_getres_time32,
+#endif
+#ifdef __NR_clock_nanosleep
+	__NR_clock_nanosleep,
+#endif
+#ifdef __NR_clock_nanosleep_time64
+	__NR_clock_nanosleep_time64,
+#endif
+#ifdef __NR_clock_nanosleep_time32
+	__NR_clock_nanosleep_time32,
+#endif
+#ifdef __NR_gettimeofday
+	__NR_gettimeofday,
+#endif
+#ifdef __NR_gettimeofday_time32
+	__NR_gettimeofday_time32,
+#endif
+#ifdef __NR_nanosleep
+	__NR_nanosleep,
+#endif
+#ifdef __NR_time
+	__NR_time,
+#endif
+	0
+};
+
+/* Waiting on descriptors, beyond the poll already in the hot table. */
+static const int sb_nr_wait[] = {
+#ifdef __NR_select
+	__NR_select,
+#endif
+#ifdef __NR__newselect
+	__NR__newselect,
+#endif
+#ifdef __NR_pselect6
+	__NR_pselect6,
+#endif
+#ifdef __NR_pselect6_time64
+	__NR_pselect6_time64,
+#endif
+#ifdef __NR_pselect6_time32
+	__NR_pselect6_time32,
+#endif
+#ifdef __NR_epoll_create1
+	__NR_epoll_create1,
+#endif
+#ifdef __NR_epoll_ctl
+	__NR_epoll_ctl,
+#endif
+#ifdef __NR_epoll_wait
+	__NR_epoll_wait,
+#endif
+#ifdef __NR_epoll_pwait
+	__NR_epoll_pwait,
+#endif
+	0
+};
+
+/*
+ * Threads. clone is not here: it takes an argument rule of its own below, so
+ * that CLONE_THREAD can be required and fork(2) leaves the confined roles
+ * altogether. wait4 stays because the service reaps the spawner, which was
+ * forked before any of this was applied.
+ */
+static const int sb_nr_task[] = {
+#ifdef __NR_set_tid_address
+	__NR_set_tid_address,
+#endif
+#ifdef __NR_set_robust_list
+	__NR_set_robust_list,
+#endif
+#ifdef __NR_set_thread_area
+	__NR_set_thread_area,	/* i386 and mips put TLS setup here */
+#endif
+#ifdef __NR_rseq
+	__NR_rseq,
+#endif
+#ifdef __NR_gettid
+	__NR_gettid,
+#endif
+#ifdef __NR_getpid
+	__NR_getpid,
+#endif
+#ifdef __NR_getppid
+	__NR_getppid,
+#endif
+#ifdef __NR_sched_yield
+	__NR_sched_yield,
+#endif
+#ifdef __NR_sched_getaffinity
+	__NR_sched_getaffinity,
+#endif
+#ifdef __NR_membarrier
+	__NR_membarrier,
+#endif
+#ifdef __NR_getcpu
+	__NR_getcpu,
+#endif
+#ifdef __NR_exit
+	__NR_exit,
+#endif
+#ifdef __NR_exit_group
+	__NR_exit_group,
+#endif
+#ifdef __NR_wait4
+	__NR_wait4,
+#endif
+#ifdef __NR_waitid
+	__NR_waitid,
+#endif
+	0
+};
+
+/*
+ * Signals. Three of these no trace can ever show and none may be missing:
+ * rt_sigreturn and sigreturn are how a handler returns at all, and
+ * restart_syscall is what the kernel puts in the process's mouth after a stop
+ * -- Ctrl-Z on the client's terminal is enough to reach it.
+ *
+ * kill is here although neither confined role has a reachable call to it,
+ * because a liveness probe that turns into a killed process is a worse failure
+ * than the reach it grants, and LANDLOCK_SCOPE_SIGNAL already bounds that
+ * reach to this process's own domain wherever the kernel has it.
+ */
+static const int sb_nr_signal[] = {
+#ifdef __NR_rt_sigaction
+	__NR_rt_sigaction,
+#endif
+#ifdef __NR_rt_sigprocmask
+	__NR_rt_sigprocmask,
+#endif
+#ifdef __NR_rt_sigreturn
+	__NR_rt_sigreturn,
+#endif
+#ifdef __NR_sigreturn
+	__NR_sigreturn,
+#endif
+#ifdef __NR_rt_sigsuspend
+	__NR_rt_sigsuspend,
+#endif
+#ifdef __NR_rt_sigtimedwait
+	__NR_rt_sigtimedwait,
+#endif
+#ifdef __NR_rt_sigtimedwait_time64
+	__NR_rt_sigtimedwait_time64,
+#endif
+#ifdef __NR_sigaltstack
+	__NR_sigaltstack,
+#endif
+#ifdef __NR_restart_syscall
+	__NR_restart_syscall,
+#endif
+#ifdef __NR_tgkill
+	__NR_tgkill,		/* raise(), abort(), pthread_kill() */
+#endif
+#ifdef __NR_tkill
+	__NR_tkill,
+#endif
+#ifdef __NR_kill
+	__NR_kill,
+#endif
+	0
+};
+
+/*
+ * Sockets. socket(2) itself takes an argument rule below; everything here
+ * operates on a descriptor that rule has already vouched for. Four entries
+ * move with a dependency rather than with comrade: sendmmsg and the netlink
+ * socket are the glibc resolver's, and FIONBIO, FIONREAD and IP_RECVERR are
+ * libssh's and libjuice's.
+ */
+static const int sb_nr_net[] = {
+#ifdef __NR_socketpair
+	__NR_socketpair,
+#endif
+#ifdef __NR_bind
+	__NR_bind,
+#endif
+#ifdef __NR_listen
+	__NR_listen,
+#endif
+#ifdef __NR_accept
+	__NR_accept,
+#endif
+#ifdef __NR_accept4
+	__NR_accept4,
+#endif
+#ifdef __NR_connect
+	__NR_connect,
+#endif
+#ifdef __NR_getsockname
+	__NR_getsockname,
+#endif
+#ifdef __NR_getpeername
+	__NR_getpeername,
+#endif
+#ifdef __NR_getsockopt
+	__NR_getsockopt,
+#endif
+#ifdef __NR_setsockopt
+	__NR_setsockopt,
+#endif
+#ifdef __NR_sendmsg
+	__NR_sendmsg,
+#endif
+#ifdef __NR_sendmmsg
+	__NR_sendmmsg,
+#endif
+#ifdef __NR_recvmsg
+	__NR_recvmsg,
+#endif
+#ifdef __NR_recvmmsg
+	__NR_recvmmsg,
+#endif
+#ifdef __NR_recvmmsg_time64
+	__NR_recvmmsg_time64,
+#endif
+#ifdef __NR_shutdown
+	__NR_shutdown,
+#endif
+	0
+};
+
+/*
+ * What the process asks about itself and the machine. sysinfo is how musl
+ * answers sysconf(_SC_PHYS_PAGES), which is what bep44.c sizes its store from.
+ */
+static const int sb_nr_self[] = {
+#ifdef __NR_uname
+	__NR_uname,
+#endif
+#ifdef __NR_sysinfo
+	__NR_sysinfo,
+#endif
+#ifdef __NR_getrandom
+	__NR_getrandom,
+#endif
+#ifdef __NR_getuid
+	__NR_getuid,
+#endif
+#ifdef __NR_getuid32
+	__NR_getuid32,
+#endif
+#ifdef __NR_geteuid
+	__NR_geteuid,
+#endif
+#ifdef __NR_geteuid32
+	__NR_geteuid32,
+#endif
+#ifdef __NR_getgid
+	__NR_getgid,
+#endif
+#ifdef __NR_getgid32
+	__NR_getgid32,
+#endif
+#ifdef __NR_getegid
+	__NR_getegid,
+#endif
+#ifdef __NR_getegid32
+	__NR_getegid32,
+#endif
+#ifdef __NR_getrlimit
+	__NR_getrlimit,
+#endif
+#ifdef __NR_ugetrlimit
+	__NR_ugetrlimit,
+#endif
+#ifdef __NR_prlimit64
+	__NR_prlimit64,
+#endif
+	0
+};
+
+#ifdef __arm__
+/*
+ * arm's private range, which lives outside the __NR_ namespace entirely and so
+ * has to go in as raw numbers. musl's src/thread/arm/__set_thread_area.c ends
+ * in an unconditional __syscall(0xf0005, p), and AUDIT_ARCH_ARM is enabled
+ * above, so a list without these bricks 32-bit arm at thread creation.
+ */
+static const int sb_nr_arm_private[] = {
+	0x0f0001,		/* breakpoint */
+	0x0f0002,		/* cacheflush */
+	0x0f0003,		/* usr26 */
+	0x0f0004,		/* usr32 */
+	0x0f0005,		/* set_tls */
+	0x0f0006,		/* get_tls */
+	0
+};
+#define SB_ARM_PRIVATE_N SB_N(sb_nr_arm_private)
+#else
+#define SB_ARM_PRIVATE_N 0u
+#endif
+
+/*
+ * Denied with ENOSYS rather than killed, because each is something a library
+ * probes for and then does without. Denying clone3 with EPERM breaks
+ * pthread_create; with ENOSYS glibc marks it unsupported and falls back to
+ * clone, which is the whole point -- clone3 takes its arguments in a userspace
+ * struct no BPF can read, so a filter that allows it cannot tell a thread from
+ * a fork.
+ *
+ * ENOSYS has to be the symbol and never the number 38: it is 89 on all three
+ * MIPS ABIs.
+ */
+static const int sb_nr_enosys[] = {
+#ifdef __NR_clone3
+	__NR_clone3,		/* glibc >= 2.34 asks for it first */
+#endif
+#ifdef __NR_openat2
+	__NR_openat2,
+#endif
+#ifdef __NR_faccessat2
+	__NR_faccessat2,
+#endif
+#ifdef __NR_futex_waitv
+	__NR_futex_waitv,
+#endif
+#ifdef __NR_epoll_pwait2
+	__NR_epoll_pwait2,
+#endif
+#ifdef __NR_io_uring_setup
+	__NR_io_uring_setup,
+#endif
+#ifdef __NR_io_uring_enter
+	__NR_io_uring_enter,
+#endif
+#ifdef __NR_io_uring_register
+	__NR_io_uring_register,
+#endif
+	0
+};
+
+/*
+ * Denied with EPERM: the honest answer for a thing the kernel has and this
+ * process may not do. ptrace is the memory-disclosure route the threat model
+ * is about; the mount family is what the confinement itself used on the way
+ * in, and a retry of it should be refused rather than fatal.
+ */
+static const int sb_nr_eperm[] = {
+#ifdef __NR_ptrace
+	__NR_ptrace,
+#endif
+#ifdef __NR_mount
+	__NR_mount,
+#endif
+#ifdef __NR_umount2
+	__NR_umount2,
+#endif
+#ifdef __NR_mount_setattr
+	__NR_mount_setattr,
+#endif
+#ifdef __NR_move_mount
+	__NR_move_mount,
+#endif
+#ifdef __NR_open_tree
+	__NR_open_tree,
+#endif
+#ifdef __NR_fsopen
+	__NR_fsopen,
+#endif
+#ifdef __NR_fsconfig
+	__NR_fsconfig,
+#endif
+#ifdef __NR_fsmount
+	__NR_fsmount,
+#endif
+#ifdef __NR_fspick
+	__NR_fspick,
+#endif
+#ifdef __NR_pivot_root
+	__NR_pivot_root,
+#endif
+#ifdef __NR_chroot
+	__NR_chroot,
+#endif
+#ifdef __NR_unshare
+	__NR_unshare,
+#endif
+	0
+};
+
+/*
+ * The argument rules. Each is a block entered only when nr matches and left
+ * only by returning, so the chain after it still has nr in the accumulator. A
+ * value the rule does not name gets the filter's default action, which is the
+ * point of them: they are allowlists inside the allowlist.
+ */
+static void sb_rule_prctl(struct sb_prog *p, unsigned int deflt)
+{
+	unsigned short at = sb_test(p, __NR_prctl);
+
+	sb_ld_arg(p, SB_ARG_LO(0));
+	sb_eq_ret(p, PR_SET_NAME, SB_RET_ALLOW);
+	sb_eq_ret(p, PR_GET_NAME, SB_RET_ALLOW);
+	sb_ret(p, deflt);
+	sb_land_jf(p, at);
+}
+
+static void sb_rule_socket(struct sb_prog *p, unsigned int deflt)
+{
+	unsigned short at = sb_test(p, __NR_socket);
+
+	sb_ld_arg(p, SB_ARG_LO(0));
+	sb_eq_ret(p, AF_INET, SB_RET_ALLOW);
+	sb_eq_ret(p, AF_INET6, SB_RET_ALLOW);
+	sb_eq_ret(p, AF_UNIX, SB_RET_ALLOW);	/* NSS, and the tmux socket */
+	sb_eq_ret(p, AF_NETLINK, SB_RET_ALLOW);	/* getifaddrs */
+	sb_ret(p, deflt);
+	sb_land_jf(p, at);
+}
+
+/*
+ * ioctl's command, in args[1]. Naming the handful the program actually issues
+ * also denies TIOCSTI, which pushes bytes into a terminal's input queue and is
+ * worth more here than in most programs.
+ *
+ * The terminal attribute commands come in pairs because the two C libraries
+ * differ: glibc issues TCGETS2/TCSETS2 where musl issues TCGETS/TCSETS, and a
+ * list carrying only one pair kills the other libc's client at its first
+ * tcgetattr(). A role that drives no terminal -- a forwarding-only host --
+ * gets neither pair.
+ *
+ * TIOCGWINSZ stays for every role, that one included. musl's __stdout_write
+ * issues it on the first write to stdout whatever the descriptor is, to decide
+ * line buffering (checked in the mips musl libc.a: ioctl with 0x40087468), so
+ * taking it away would kill a forwarding-only host on OpenWrt the first time
+ * it printed anything. Reading a window size is not what the rest of this
+ * grant is guarding against.
+ */
+static void sb_rule_ioctl(struct sb_prog *p, unsigned int deflt, int no_pty)
+{
+	unsigned short at = sb_test(p, __NR_ioctl);
+
+	sb_ld_arg(p, SB_ARG_LO(1));
+	sb_eq_ret(p, FIONBIO, SB_RET_ALLOW);
+	sb_eq_ret(p, FIONREAD, SB_RET_ALLOW);
+	sb_eq_ret(p, SIOCGIFINDEX, SB_RET_ALLOW);
+	sb_eq_ret(p, SIOCGIFNAME, SB_RET_ALLOW);
+	sb_eq_ret(p, TIOCGWINSZ, SB_RET_ALLOW);
+	if (!no_pty) {
+#ifdef TCGETS
+		sb_eq_ret(p, TCGETS, SB_RET_ALLOW);
+		sb_eq_ret(p, TCSETS, SB_RET_ALLOW);
+#endif
+#ifdef TCGETS2
+		sb_eq_ret(p, TCGETS2, SB_RET_ALLOW);
+		sb_eq_ret(p, TCSETS2, SB_RET_ALLOW);
+#endif
+	}
+	sb_ret(p, deflt);
+	sb_land_jf(p, at);
+}
+
+/*
+ * clone must carry CLONE_THREAD. With clone3 answered ENOSYS above, every
+ * thread creation comes back through here with its flags in args[0] where BPF
+ * can see them, so requiring the bit takes fork(2) away from the confined
+ * roles outright -- which the denylist this replaces could not do.
+ */
+static void sb_rule_clone(struct sb_prog *p, unsigned int deflt)
+{
+	unsigned short at = sb_test(p, __NR_clone);
+
+	sb_ld_arg(p, SB_ARG_LO(0));
+	sb_emit(p, BPF_ALU + BPF_AND + BPF_K, 0, 0, CLONE_THREAD);
+	sb_eq_ret(p, CLONE_THREAD, SB_RET_ALLOW);
+	sb_ret(p, deflt);
+	sb_land_jf(p, at);
+}
+
+/*
+ * The arch preamble for the roles that deny exec. A syscall arriving under any
+ * ABI but the one these numbers belong to is killed; nothing they can do
+ * reaches that case, so it stands as a tripwire. seccomp_nonet() gives the
+ * exec-permitting foreground a compat branch instead.
+ */
+static void sb_arch_preamble(struct sb_prog *p)
+{
+	sb_ld_arch(p);
+	sb_emit(p, BPF_JMP + BPF_JEQ + BPF_K, 1, 0, SB_AUDIT_ARCH);
+	sb_ret(p, SECCOMP_RET_KILL_PROCESS);
+	sb_ld_nr(p);
+#ifdef SB_X32_GUARD
+	/* x32 numbers, which a native x86-64 filter must never judge. */
+	sb_emit(p, BPF_JMP + BPF_JGE + BPF_K, 0, 1, 0x40000000U);
+	sb_ret(p, SECCOMP_RET_KILL_PROCESS);
+#endif
+}
+
+static void sb_build_allowlist(struct sb_prog *p, unsigned int deflt,
+			       int no_pty)
+{
+	sb_arch_preamble(p);
+	sb_allow_table(p, SB_TBL(sb_nr_hot));
+	sb_rule_socket(p, deflt);
+	sb_rule_ioctl(p, deflt, no_pty);
+	sb_allow_table(p, SB_TBL(sb_nr_net));
+	sb_allow_table(p, SB_TBL(sb_nr_io));
+	sb_allow_table(p, SB_TBL(sb_nr_path));
+	sb_allow_table(p, SB_TBL(sb_nr_mem));
+	sb_allow_table(p, SB_TBL(sb_nr_time));
+	sb_allow_table(p, SB_TBL(sb_nr_wait));
+	sb_allow_table(p, SB_TBL(sb_nr_task));
+	sb_allow_table(p, SB_TBL(sb_nr_signal));
+	sb_allow_table(p, SB_TBL(sb_nr_self));
+#ifdef __arm__
+	sb_allow_table(p, SB_TBL(sb_nr_arm_private));
+#endif
+	sb_rule_prctl(p, deflt);
+	sb_rule_clone(p, deflt);
+	sb_errno_table(p, SB_TBL(sb_nr_enosys), ENOSYS);
+	sb_errno_table(p, SB_TBL(sb_nr_eperm), EPERM);
+	sb_ret(p, deflt);
+}
 
 static int install_filter(struct sock_filter *f, unsigned short n)
 {
@@ -510,8 +1690,7 @@ static int install_filter(struct sock_filter *f, unsigned short n)
 	prog.len = n;
 	prog.filter = f;
 	/* TSYNC is harmless here (we are single-threaded) but correct if that
-	 * ever changes. The filter is a denylist returning errno, never a
-	 * kill, except on a wrong-arch syscall. */
+	 * ever changes. */
 	if (syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER,
 		    SECCOMP_FILTER_FLAG_TSYNC, &prog) == 0) {
 		sb_filter_insns = n;
@@ -521,75 +1700,252 @@ static int install_filter(struct sock_filter *f, unsigned short n)
 }
 
 /*
- * The exec-denying filter (client, and the host service once its spawner does
- * all the real spawning): forbid the program from executing anything or from
- * prying into another process's memory, while leaving fork/clone alone -- a
- * fork with no exec only clones this same confined process, and the thread
- * creation the DHT/ICE/SSH stacks do all through the run must keep working.
+ * COMRADE_SANDBOX=warn: the same filter, but a syscall the list omits traps
+ * instead of killing and a handler names it. This exists because
+ * SECCOMP_RET_KILL_PROCESS leaves no record whatsoever on a stock OpenWrt
+ * kernel, where CONFIG_AUDIT is off -- no audit event, no dmesg line, nothing
+ * but a process that is suddenly gone.
+ *
+ * One case reports itself as a kill even here, and it is not a fault: a trap
+ * raised where the C library has every signal blocked -- inside fork(), which
+ * is exactly one of the things this filter refuses -- is forced to the default
+ * action by the kernel, because a blocked synchronous signal has nowhere to
+ * go. Observed under strace: the clone traps, SIGSYS is forced, and the
+ * process dies unnamed. The verdict is the same, only the line is missing.
  */
-static int seccomp_noexec(void)
+static int sb_warn_mode(void)
 {
-	static struct sock_filter filt[] = {
-		BPF_STMT(BPF_LD + BPF_W + BPF_ABS, SB_OFF_ARCH),
-		BPF_JUMP(BPF_JMP + BPF_JEQ + BPF_K, SB_AUDIT_ARCH, 1, 0),
-		BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_KILL_PROCESS),
-		BPF_STMT(BPF_LD + BPF_W + BPF_ABS, SB_OFF_NR),
-#ifdef SB_X32_GUARD
-		BPF_JUMP(BPF_JMP + BPF_JGE + BPF_K, 0x40000000, 0, 1),
-		BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_KILL_PROCESS),
-#endif
-		SB_DENY(__NR_execve),
-#ifdef __NR_execveat
-		SB_DENY(__NR_execveat),
-#endif
-#ifdef __NR_ptrace
-		SB_DENY(__NR_ptrace),
-#endif
-#ifdef __NR_process_vm_readv
-		SB_DENY(__NR_process_vm_readv),
-#endif
-#ifdef __NR_process_vm_writev
-		SB_DENY(__NR_process_vm_writev),
-#endif
-#ifdef __NR_io_uring_setup
-		SB_DENY(__NR_io_uring_setup),
-#endif
-		BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_ALLOW)
-	};
+	const char *e = getenv("COMRADE_SANDBOX");
 
-	return install_filter(filt, sizeof(filt) / sizeof(filt[0]));
+	return e && !strcmp(e, "warn");
 }
 
 /*
- * The no-network filter (host operator foreground): it drives a local tmux and
- * must keep exec and the AF_UNIX connect to the tmux socket, but never touches
- * the network, so deny only the creation of INET/INET6 sockets. socket(2)'s
- * domain is args[0] on every arch this filter is enabled for.
+ * Read by the SIGSYS handler, so neither is a plain int. Both are set before
+ * the filter that can raise it goes on -- the descriptor especially, since a
+ * log opened after the confinement is unreachable from inside the pivoted root
+ * and the run would look clean.
+ */
+static volatile sig_atomic_t sb_warn_fd = -1;
+static volatile sig_atomic_t sb_warn_role = -1;
+
+/* Append an unsigned value in base 10 or 16; returns the new length. */
+static size_t sb_putnum(char *buf, size_t len, unsigned long v, int hex)
+{
+	char tmp[24];
+	size_t n = 0;
+	unsigned long base = hex ? 16UL : 10UL;
+
+	do {
+		unsigned d = (unsigned)(v % base);
+
+		tmp[n++] = (char)(d < 10 ? '0' + d : 'a' + (d - 10));
+		v /= base;
+	} while (v && n < sizeof(tmp));
+	while (n)
+		buf[len++] = tmp[--n];
+	return len;
+}
+
+static size_t sb_putstr(char *buf, size_t len, const char *s)
+{
+	while (*s)
+		buf[len++] = *s++;
+	return len;
+}
+
+/*
+ * The SIGSYS handler. Everything it does is async-signal-safe on purpose: it
+ * formats into a stack buffer and write(2)s it, because dbg_logf() opens its
+ * file on every call and that file is not reachable from inside a pivoted root
+ * -- a log opened after the confinement fails silently and reports a clean
+ * run. The descriptor written to here was opened before.
+ *
+ * The syscall is named by number, not by name: the only table that could give
+ * a name is the allowlist itself, and by construction the number that trapped
+ * is not in it.
+ *
+ * rt_sigreturn is in the list above. Without it this handler's own return
+ * traps and the process live-locks in a SIGSYS storm instead of reporting.
+ */
+static void sb_sigsys(int sig, siginfo_t *si, void *uctx)
+{
+	char buf[256];
+	size_t n = 0;
+	ssize_t w;
+
+	(void)sig;
+	(void)uctx;
+	n = sb_putstr(buf, n, "comrade: sandbox: SIGSYS role=");
+	n = sb_putnum(buf, n, (unsigned long)sb_warn_role, 0);
+	n = sb_putstr(buf, n, " arch=0x");
+	n = sb_putnum(buf, n, (unsigned long)(unsigned int)SB_AUDIT_ARCH, 1);
+	n = sb_putstr(buf, n, " (" SB_ARCH_NAME ") syscall=");
+	n = sb_putnum(buf, n, (unsigned long)si->si_syscall, 0);
+	n = sb_putstr(buf, n, ": not in the allowlist. Resolve the number with"
+			      " scmp_sys_resolver or ausyscall.\n");
+	w = write(2, buf, n);
+	if (sb_warn_fd >= 0)
+		w = write((int)sb_warn_fd, buf, n);
+	(void)w;			/* nothing left to report a failure to */
+	_exit(159);			/* 128 + SIGSYS, the shell's numbering */
+}
+
+/*
+ * Arm the handler and open the log, both before the filter goes on. After it,
+ * rt_sigaction would still be permitted but the open would no longer reach the
+ * file, and the run would look clean.
+ */
+static void sb_warn_arm(int role)
+{
+	struct sigaction sa;
+	const char *path = getenv("COMRADE_DEBUG");
+
+	sb_warn_role = role;
+	if (path && path[0]) {
+		if (!strcmp(path, "1"))
+			path = "/tmp/comrade-debug.log";
+		sb_warn_fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0600);
+	}
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_sigaction = sb_sigsys;
+	sa.sa_flags = SA_SIGINFO;
+	sigemptyset(&sa.sa_mask);
+	sigaction(SIGSYS, &sa, (struct sigaction *)0);
+}
+
+/*
+ * The filter for the client and the host service: a default-deny allowlist.
+ * execve, execveat, fork, ptrace and everything else unnamed above are refused
+ * by simply not being there, which is a stronger statement than the denylist
+ * this replaces could make -- that one had to enumerate what to forbid, and a
+ * syscall nobody had thought of was allowed.
+ */
+/*
+ * The buffer is sized from the tables themselves rather than guessed at, so a
+ * name added to one of them can never overflow it. That matters more than the
+ * few hundred bytes it costs: an overflow is caught and reported, but the only
+ * thing seccomp_allowlist() can do about it is install nothing, and a role
+ * that expected a default-deny filter and silently got none is the worst
+ * outcome this file has. Two instructions per entry, plus room for the
+ * argument rules, the preamble and the arch dispatch.
+ */
+#define SB_MAX_FILTER (2 * (SB_N(sb_nr_hot) + SB_N(sb_nr_io) + \
+			    SB_N(sb_nr_path) + SB_N(sb_nr_mem) + \
+			    SB_N(sb_nr_time) + SB_N(sb_nr_wait) + \
+			    SB_N(sb_nr_task) + SB_N(sb_nr_signal) + \
+			    SB_N(sb_nr_net) + SB_N(sb_nr_self) + \
+			    SB_N(sb_nr_enosys) + SB_N(sb_nr_eperm) + \
+			    SB_ARM_PRIVATE_N) + 128)
+
+static int seccomp_allowlist(int role, int no_pty)
+{
+	static struct sock_filter filt[SB_MAX_FILTER];
+	struct sb_prog p;
+	unsigned int deflt = SECCOMP_RET_KILL_PROCESS;
+
+	if (sb_warn_mode()) {
+		sb_warn_arm(role);
+		deflt = SECCOMP_RET_TRAP;
+	}
+	p.f = filt;
+	p.n = 0;
+	p.max = SB_MAX_FILTER;
+	p.overflow = 0;
+	sb_build_allowlist(&p, deflt, no_pty);
+	if (p.overflow) {
+		dbg_logf("sandbox: the filter did not fit in %d instructions",
+			 SB_MAX_FILTER);
+		return 0;
+	}
+	dbg_logf("sandbox: allowlist %u instructions, arch %s%s",
+		 (unsigned)p.n, SB_ARCH_NAME,
+		 deflt == SECCOMP_RET_TRAP ? ", warn mode" : "");
+	return install_filter(filt, p.n);
+}
+
+/*
+ * The body of the no-network filter, for one ABI: refuse to create an INET or
+ * INET6 socket, permit every other syscall. Entered with nr in the
+ * accumulator, and never falls out of its end.
+ */
+static void sb_nonet_body(struct sb_prog *p, unsigned int nr_socket)
+{
+	unsigned short at = sb_test(p, nr_socket);
+
+	sb_ld_arg(p, SB_ARG_LO(0));
+	sb_eq_ret(p, AF_INET, SB_RET_ERRNO(EPERM));
+	sb_eq_ret(p, AF_INET6, SB_RET_ERRNO(EPERM));
+	sb_ret(p, SB_RET_ALLOW);
+	sb_land_jf(p, at);
+	sb_ret(p, SB_RET_ALLOW);
+}
+
+/*
+ * The no-network filter for the host operator's foreground. This one stays a
+ * denylist, deliberately: the role drives an unconfined tmux, so anything
+ * denied to it directly is reachable by typing into the shell that tmux opens,
+ * and an allowlist would have to become a superset of the tmux client's own
+ * syscall set -- third-party, and moving with tmux versions -- for nothing.
+ *
+ * socketcall goes wherever the ABI has one (i686, mips o32, ppc, ppc64).
+ * Measured on i386 against the filter this replaces: socket(AF_INET) was
+ * refused while socketcall(SYS_SOCKET, AF_INET) succeeded. Its argument array
+ * lives in userspace, where no BPF can read it, so the whole call has to go.
+ *
+ * The compat branches are what makes the role's exec safe. A filter survives
+ * execve, so without them a foreign-ABI child -- an i386 tmux under an x86-64
+ * comrade, say -- would meet the wrong-arch kill on its first syscall. They
+ * come first in the program so that the single jump over them to the native
+ * body stays inside the one byte a jt field has.
  */
 static int seccomp_nonet(void)
 {
-	static struct sock_filter filt[] = {
-		BPF_STMT(BPF_LD + BPF_W + BPF_ABS, SB_OFF_ARCH),
-		BPF_JUMP(BPF_JMP + BPF_JEQ + BPF_K, SB_AUDIT_ARCH, 1, 0),
-		BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_KILL_PROCESS),
-		BPF_STMT(BPF_LD + BPF_W + BPF_ABS, SB_OFF_NR),
-#ifdef __NR_io_uring_setup
-		SB_DENY(__NR_io_uring_setup),
+	static struct sock_filter filt[64];
+	struct sb_prog p;
+	unsigned short to_native;
+#if defined(SB_COMPAT_AUDIT_ARCH) || defined(SB_COMPAT2_AUDIT_ARCH)
+	unsigned short skip;
 #endif
-#ifdef __NR_socket
-		/* if nr != socket, skip the family test (jump to ALLOW) */
-		BPF_JUMP(BPF_JMP + BPF_JEQ + BPF_K, __NR_socket, 0, 5),
-		BPF_STMT(BPF_LD + BPF_W + BPF_ABS, SB_OFF_ARG0_LO),
-		BPF_JUMP(BPF_JMP + BPF_JEQ + BPF_K, AF_INET, 1, 0),
-		BPF_JUMP(BPF_JMP + BPF_JEQ + BPF_K, AF_INET6, 0, 1),
-		BPF_STMT(BPF_RET + BPF_K,
-			 SECCOMP_RET_ERRNO + (EPERM & SECCOMP_RET_DATA)),
-		BPF_STMT(BPF_LD + BPF_W + BPF_ABS, SB_OFF_NR),
-#endif
-		BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_ALLOW)
-	};
 
-	return install_filter(filt, sizeof(filt) / sizeof(filt[0]));
+	p.f = filt;
+	p.n = 0;
+	p.max = (unsigned short)(sizeof(filt) / sizeof(filt[0]));
+	p.overflow = 0;
+
+	sb_ld_arch(&p);
+	to_native = sb_test(&p, SB_AUDIT_ARCH);
+#ifdef SB_COMPAT_AUDIT_ARCH
+	skip = sb_test(&p, SB_COMPAT_AUDIT_ARCH);
+	sb_ld_nr(&p);
+#ifdef SB_COMPAT_NR_SOCKETCALL
+	sb_eq_ret(&p, SB_COMPAT_NR_SOCKETCALL, SB_RET_ERRNO(EPERM));
+#endif
+	sb_nonet_body(&p, SB_COMPAT_NR_SOCKET);
+	sb_land_jf(&p, skip);
+#endif
+#ifdef SB_COMPAT2_AUDIT_ARCH
+	skip = sb_test(&p, SB_COMPAT2_AUDIT_ARCH);
+	sb_ld_nr(&p);
+	sb_nonet_body(&p, SB_COMPAT2_NR_SOCKET);
+	sb_land_jf(&p, skip);
+#endif
+	sb_ret(&p, SECCOMP_RET_KILL_PROCESS);
+
+	sb_land_jt(&p, to_native);
+	sb_ld_nr(&p);
+#ifdef __NR_socketcall
+	sb_eq_ret(&p, __NR_socketcall, SB_RET_ERRNO(EPERM));
+#endif
+#ifdef __NR_io_uring_setup
+	sb_eq_ret(&p, __NR_io_uring_setup, SB_RET_ERRNO(EPERM));
+#endif
+	sb_nonet_body(&p, __NR_socket);
+	if (p.overflow) {
+		dbg_logf("sandbox: the no-network filter did not fit");
+		return 0;
+	}
+	return install_filter(filt, p.n);
 }
 
 #endif /* SB_AUDIT_ARCH */
@@ -613,18 +1969,18 @@ static int seccomp_available(void)
 #endif
 }
 
-static int seccomp_apply(int role, int confine)
+static int seccomp_apply(const struct sandbox_cfg *cfg, int confine)
 {
 #if defined(SYS_seccomp) && defined(SB_AUDIT_ARCH)
 	if (!seccomp_available())
 		return 0;
-	if (role == SANDBOX_FOREGROUND)
+	if (cfg->role == SANDBOX_FOREGROUND)
 		return seccomp_nonet();
 	if (confine)
-		return seccomp_noexec();
+		return seccomp_allowlist(cfg->role, cfg->no_pty);
 	return 0;
 #else
-	(void)role;
+	(void)cfg;
 	(void)confine;
 	return 0;
 #endif
@@ -1497,7 +2853,7 @@ static int apply_linux(const struct sandbox_cfg *cfg)
 	layers |= no_dumpable();
 	layers |= drop_caps();
 	layers |= no_new_privs();
-	layers |= seccomp_apply(cfg->role, confine);
+	layers |= seccomp_apply(cfg, confine);
 	return layers;
 }
 

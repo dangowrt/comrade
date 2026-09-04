@@ -46,6 +46,25 @@
  *                      so its profile forbids INET/INET6 sockets and leaves
  *                      exec alone.
  *
+ *                      This one is not a security boundary and its profile
+ *                      should not be read as one. It can drive an unconfined
+ *                      tmux session, so anything denied to it directly is
+ *                      reachable by typing into the shell that session opens.
+ *                      Its profile is hygiene -- it keeps a process that has
+ *                      no business on the network off the network -- and that
+ *                      is also why it stays a denylist where the other two
+ *                      roles take an allowlist: an allowlist here would have
+ *                      to become a superset of the tmux client's own syscall
+ *                      set, which is third-party and moves with tmux, and
+ *                      would buy nothing.
+ *
+ * The two confining roles take a default-deny syscall filter: what the program
+ * was measured to use is permitted and everything else ends the process, so
+ * execve and fork are refused by not being named rather than by being listed.
+ * A handful of calls that libraries probe for and then do without are answered
+ * ENOSYS instead, and ptrace and the mount family EPERM, because a library
+ * that asks and is told no keeps working while one that is killed does not.
+ *
  * What a platform can actually take away differs, and Windows differs most: it
  * cannot narrow a running process's view of the filesystem at all, and nothing
  * there refuses a system call by name. What it can do is drop the privileges
@@ -82,6 +101,12 @@
  *
  * The environment variable COMRADE_SANDBOX=0 turns the whole thing off, for
  * diagnosing a confinement that gets in the way on some unusual system.
+ * COMRADE_SANDBOX=warn leaves it on but makes a refused syscall report itself:
+ * the same filter is built to trap rather than to kill, and a handler names
+ * the syscall number and the role on stderr and in the COMRADE_DEBUG log
+ * before ending the process. That is the only way to see what happened on a
+ * stock OpenWrt kernel, where CONFIG_AUDIT is off and a kill leaves no record
+ * at all.
  */
 
 /* Which process is being confined; see the block comment above. */
@@ -102,7 +127,11 @@
 					 * file ruleset */
 #define SANDBOX_L_SECCOMP	0x0008	/* a syscall/operation filter is active:
 					 * a Linux seccomp filter, or a macOS
-					 * Seatbelt profile */
+					 * Seatbelt profile. On Linux this is a
+					 * default-deny allowlist for the two
+					 * confining roles and a denylist for
+					 * the foreground; the bit says only
+					 * that a filter installed, not which */
 #define SANDBOX_L_CAPS		0x0010	/* privileges dropped: the Linux
 					 * capability and bounding sets, or the
 					 * Windows token's privileges */

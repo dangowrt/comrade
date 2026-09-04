@@ -4,16 +4,22 @@
 /*
  * The self-sandbox proves itself by outcome, not by inspecting its own return
  * value: a child applies a profile and then tries the thing that profile is
- * meant to forbid. A client must not be able to execve; the operator
- * foreground must not be able to open an INET socket yet must keep AF_UNIX and
- * exec. Each check runs in its own forked child because the confinement is
- * irreversible. Where the kernel offers no seccomp the whole test skips
- * (return 77), so it neither passes vacuously nor fails on an old kernel.
+ * meant to forbid. A client must not be able to execve, nor to reach a syscall
+ * its allowlist leaves out; the operator foreground must not be able to open an
+ * INET socket yet must keep AF_UNIX and exec. Each check runs in its own forked
+ * child because the confinement is irreversible. Where the kernel offers no
+ * seccomp the whole test skips (return 77), so it neither passes vacuously nor
+ * fails on an old kernel.
  *
  * Some of the checks are about what a profile must *not* take away, because
  * that is the failure this confinement has actually produced: a rule that
  * silently narrows what the process can see, with no error, no log line and a
  * program that carries on looking healthy.
+ *
+ * One check exists because the ones above it are individually true and
+ * jointly insufficient: it applies a client profile and asserts every
+ * layer this kernel was just shown to have engages in that same call, so a
+ * layer that quietly stopped engaging is a failure rather than a skip.
  */
 
 #include <assert.h>
@@ -30,8 +36,10 @@
 #include <ifaddrs.h>
 #include <net/if.h>
 #include <netinet/in.h>
+#include <signal.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 
 #include "sandbox.h"
@@ -62,14 +70,61 @@ static int child_client_no_exec(void)
 	if (!(layers & SANDBOX_L_SECCOMP))
 		return RC_SKIP;
 	/*
-	 * Were exec allowed, this child would become `exit 42` and never return;
-	 * that it returns at all means exec was refused. The two sandboxes refuse
-	 * it differently: Linux seccomp with EPERM, macOS Seatbelt with ENOENT
-	 * (it hides the unreadable binary).
+	 * Were exec allowed, this child would become `exit 42` and never return.
+	 * The two sandboxes refuse it in ways that differ in kind, not only in
+	 * errno: the Linux profile is a default-deny allowlist that execve is
+	 * simply not in, so the kernel ends the process and nothing comes back at
+	 * all, while macOS Seatbelt returns ENOENT (it hides the binary it will
+	 * not let this process read). The caller reads the death; this code only
+	 * runs on the platforms that return.
 	 */
 	execl("/bin/sh", "sh", "-c", "exit 42", (char *)NULL);
 	return (errno == EPERM || errno == EACCES || errno == ENOENT)
 		? RC_OK : RC_FAIL;
+}
+
+#ifdef __linux__
+/*
+ * A syscall the allowlist leaves out. getpriority is chosen for being harmless
+ * and for having no business in a session: the assertion is not about that
+ * call but about the shape of the profile, that a name nobody listed is
+ * refused rather than quietly permitted. It must not return.
+ */
+static int child_client_unlisted_syscall(void)
+{
+	struct sandbox_cfg sb;
+	int layers;
+
+	memset(&sb, 0, sizeof(sb));
+	sb.role = SANDBOX_CLIENT;
+	layers = sandbox_apply(&sb);
+	if (!(layers & SANDBOX_L_SECCOMP))
+		return RC_SKIP;
+	(void)syscall(SYS_getpriority, 0, 0);
+	return RC_FAIL;
+}
+#endif
+
+/*
+ * Every layer this kernel has, engaging in one application of one profile.
+ * Each of the checks around this one skips where its layer is missing, which
+ * is right for a probe of that layer alone and useless as a whole: all three
+ * could skip for ever and the suite would still pass. g_expect_layers is set
+ * by main() from what the individual probes just demonstrated is available,
+ * so anything that stops engaging fails here.
+ */
+static int g_expect_layers;
+
+static int child_client_layers(void)
+{
+	struct sandbox_cfg sb;
+	int layers;
+
+	memset(&sb, 0, sizeof(sb));
+	sb.role = SANDBOX_CLIENT;
+	sb.data_dir = g_datadir;
+	layers = sandbox_apply(&sb);
+	return (layers & g_expect_layers) == g_expect_layers ? RC_OK : RC_FAIL;
 }
 
 /*
@@ -322,8 +377,9 @@ static int child_forward_only_host(void)
 	return probe_udp_and_tcp();
 }
 
-/* Run one child helper to completion; return its exit status. */
-static int run_child(int (*fn)(void))
+/* Run one child helper to completion; return its raw wait status. */
+static int run_child_status(int (*fn)(void))
+
 {
 	pid_t pid = fork();
 	int status;
@@ -332,17 +388,67 @@ static int run_child(int (*fn)(void))
 		_exit(fn());
 	assert(pid > 0);
 	assert(waitpid(pid, &status, 0) == pid);
+	return status;
+}
+
+/* The same, for the children that are expected to come back. */
+static int run_child(int (*fn)(void))
+{
+	int status = run_child_status(fn);
+
 	assert(WIFEXITED(status));
 	return WEXITSTATUS(status);
+}
+
+/*
+ * A child that the profile is expected to end: killed outright by the filter's
+ * default action, or -- under COMRADE_SANDBOX=warn -- reported by the SIGSYS
+ * handler and exited with 159. Returns 1 if it was stopped either way.
+ */
+static int was_refused(int status)
+{
+	return (WIFSIGNALED(status) && WTERMSIG(status) == SIGSYS) ||
+	       (WIFEXITED(status) && WEXITSTATUS(status) == 159);
 }
 
 /* A client cannot exec. */
 static int the_client_cannot_exec(void)
 {
-	int r = run_child(child_client_no_exec);
+	int st = run_child_status(child_client_no_exec);
 
-	if (r == RC_SKIP)
+	if (was_refused(st))
+		return RC_OK;
+	assert(WIFEXITED(st));
+	if (WEXITSTATUS(st) == RC_SKIP)
 		return RC_SKIP;
+	assert(WEXITSTATUS(st) == RC_OK);
+	return RC_OK;
+}
+
+/* A client cannot reach a syscall its allowlist omits. */
+static int the_client_cannot_reach_an_unlisted_syscall(void)
+{
+#ifdef __linux__
+	int st = run_child_status(child_client_unlisted_syscall);
+
+	if (was_refused(st))
+		return RC_OK;
+	assert(WIFEXITED(st));
+	if (WEXITSTATUS(st) == RC_SKIP)
+		return RC_SKIP;
+	assert(!"a syscall outside the allowlist was permitted");
+#endif
+	return RC_SKIP;
+}
+
+/* Every layer this kernel has engages, and in the same call. */
+static int the_layers_engage_together(void)
+{
+	int r;
+
+	if (!g_expect_layers)
+		return RC_SKIP;
+	r = run_child(child_client_layers);
 	assert(r == RC_OK);
 	return RC_OK;
 }
@@ -457,7 +563,8 @@ int main(void)
 	int seccomp_skipped, ns_skipped, ll_skipped, addr_skipped, tcp_skipped;
 
 	seccomp_skipped = (the_client_cannot_exec() == RC_SKIP) ||
-		(the_foreground_has_no_network_but_keeps_exec() == RC_SKIP);
+		(the_foreground_has_no_network_but_keeps_exec() == RC_SKIP) ||
+		(the_client_cannot_reach_an_unlisted_syscall() == RC_SKIP);
 	ns_skipped = !have_fixture ||
 		(the_namespace_confines_the_filesystem() == RC_SKIP);
 	ll_skipped = !have_fixture ||
@@ -466,6 +573,22 @@ int main(void)
 		(the_confinement_keeps_every_local_address() == RC_SKIP);
 	tcp_skipped = !have_fixture ||
 		(the_tcp_grant_follows_the_forwards() == RC_SKIP);
+
+	/*
+	 * Only now is it known which layers this kernel actually has, so only now
+	 * can one application of one profile be held to all of them at once.
+	 * RLIMIT joins them because it is the one layer no kernel can refuse, and
+	 * its absence would mean the call never ran.
+	 */
+	g_expect_layers = SANDBOX_L_RLIMIT;
+	if (!seccomp_skipped)
+		g_expect_layers |= SANDBOX_L_SECCOMP;
+	if (!ns_skipped)
+		g_expect_layers |= SANDBOX_L_USERNS | SANDBOX_L_MOUNTNS;
+	if (!ll_skipped)
+		g_expect_layers |= SANDBOX_L_LANDLOCK;
+	if (have_fixture)
+		the_layers_engage_together();
 
 	if (have_fixture)
 		drop_fixture(base);
