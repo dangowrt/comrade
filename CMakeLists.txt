@@ -882,7 +882,10 @@ if(BUILD_TESTING)
 		# Self-sandboxing: a child applies a profile and is then refused
 		# the thing that profile forbids (exec for the client, INET
 		# sockets for the foreground). Skips where the kernel offers no
-		# seccomp.
+		# seccomp, and cannot be run under valgrind at all -- the
+		# profile's W^X denies valgrind its own executable mappings, so
+		# the child dies as valgrind rather than as a confined comrade
+		# (the memcheck job excludes it by name).
 		add_executable(sandbox_test tests/sandbox_test.c)
 		target_link_libraries(sandbox_test comrade_sandbox)
 		add_test(NAME sandbox_test COMMAND sandbox_test)

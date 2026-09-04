@@ -20,8 +20,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     # A stuck test must fail the job fast rather than tie up a self-hosted
     # worker until a human cancels it; ctest --timeout below is the per-test
-    # guard, this is the coarse backstop.
-    timeout-minutes: 20
+    # guard, this is the coarse backstop. The memcheck entries get their own:
+    # valgrind is a processor written in software, and the two runs it does
+    # here took eight minutes each on a fast machine -- a backstop that killed
+    # them would report a stuck test that was merely slow, which is the same
+    # mistake COMRADE_TEST_TIMEOUT_SCALE exists to avoid one level down.
+    timeout-minutes: ${{ matrix.memcheck && 45 || 20 }}
     env:
       # Homebrew pulls bottles from ghcr.io, which is anonymous-per-IP on a
       # shared-egress fleet; the job token lifts the limit.
@@ -346,8 +350,14 @@ jobs:
           # changes. On a runner that reuses its workspace the leftovers would
           # be read as this run's findings.
           rm -f build/Testing/Temporary/MemoryChecker.*.log
+          # sandbox_test is excluded for the same reason the e2e step turns
+          # the confinement off (see below): its children apply a profile whose
+          # W^X layer refuses valgrind the executable mapping valgrind needs to
+          # keep running, so under a memory checker the test measures nothing
+          # and fails on its own assertion. The confinement is checked by the
+          # uninstrumented run of this same test.
           ctest --test-dir build -T memcheck --timeout 1800 \
-            -E "_e2e|swarm_" -LE harness 2>&1 | tee mc.out
+            -E "_e2e|swarm_|^sandbox_test$" -LE harness 2>&1 | tee mc.out
           LOGS="$PWD/build/vg-logs"
           rm -rf "$LOGS"; mkdir -p "$LOGS"
           cp build/Testing/Temporary/MemoryChecker.*.log "$LOGS/" 2>/dev/null || true
@@ -382,24 +392,42 @@ jobs:
       # shell utilities it also spawns are skipped, or the log is mostly sed.
       # Leak checking is off here -- these processes are killed rather than
       # returning, so everything they hold reads as leaked.
+      #
+      # COMRADE_SANDBOX=0 because valgrind and the confinement cannot share an
+      # address space. Memcheck maps its own shadow memory as it runs, and it
+      # maps it executable; the W^X layer (PR_SET_MDWE, applied to every role)
+      # refuses exactly that, so the first allocation valgrind needs after
+      # comrade confines itself kills valgrind outright -- "out of memory:
+      # Permission denied", no report, no comrade. Measured: forward_e2e, the
+      # one test here that drives the real binary rather than the C harness,
+      # never reached the point of publishing a token. Nothing in comrade can
+      # fix that, and the answer is not to drop W^X. The confinement is covered
+      # by the uninstrumented e2e run on every platform and by sandbox_test;
+      # what this step is for is the reads of uninitialised memory underneath
+      # it, which no other tool in the matrix can see.
       - name: Test (valgrind, end to end)
         if: ${{ matrix.memcheck }}
-        continue-on-error: true
         run: |
           set -uo pipefail
+          export COMRADE_SANDBOX=0        # see above: W^X kills valgrind
           # The unit step ran in this same job and left its logs behind, under
           # different options: leak checking is on there and off here. Cleared
           # so this step's report is its own.
           rm -f build/Testing/Temporary/MemoryChecker.*.log
           ctest --test-dir build -T memcheck --timeout 3600 -R "_e2e|swarm_" \
             --overwrite MemoryCheckCommandOptions="--fair-sched=yes --trace-children=yes --trace-children-skip=*/sh,*/bash,*/sed,*/grep,*/awk,*/cat,*/rm,*/mktemp,*/sleep,*/kill,*/tail,*/head,*/tr,*/date,*/dirname,*/basename,*/wc,*/sort,*/uniq,*/cut,*/env,*/tmux,*/printf,*/expr,*/seq --leak-check=no --error-exitcode=1" \
-            2>&1 | tee mce2e.out || true
+            2>&1 | tee mce2e.out
+          rc=${PIPESTATUS[0]}
           ctest --test-dir build -R swarm_down >/dev/null 2>&1 || true
           LOGS="$PWD/build/vg-logs-e2e"
           rm -rf "$LOGS"; mkdir -p "$LOGS"
           cp build/Testing/Temporary/MemoryChecker.*.log "$LOGS/" 2>/dev/null || true
           sed -n 's/.*out of \([0-9][0-9]*\).*/\1/p' mce2e.out | tail -1 > "$LOGS/.ran"
-          sh tests/sanreport.sh "$LOGS" 1
+          # Both questions, as everywhere else: what the tool said, and whether
+          # the tests passed. A run whose sessions never connected reports no
+          # memory errors and has checked nothing, so its verdicts count too.
+          sh tests/sanreport.sh "$LOGS" 1 || exit 1
+          exit $rc
 
       # The binary itself, not only the tests: main, the option parsing and the
       # dashboard's own code are reached by nothing in the suite.
@@ -436,13 +464,19 @@ jobs:
     name: windows (x64${{ matrix.sanitize != 'none' && format(', {0}', matrix.sanitize) || '' }})
     runs-on: ${{ vars.RUNNER_WINDOWS && fromJSON(vars.RUNNER_WINDOWS) || 'windows-latest' }}
     timeout-minutes: 40
-    # The instrumented entry is not gating. llvm-mingw is clang and may carry a
-    # sanitiser runtime where MinGW's gcc does not, but that is a claim about
-    # somebody else's release archive rather than about this code -- so the job
-    # exists to find out, and the CMake refuses the configure outright if there
-    # is no runtime to link, which is a clear answer either way. Make it gating
-    # once it has passed. ThreadSanitizer has no Windows support at all and is
-    # not attempted.
+    # The instrumented entry is not gating yet, but the archive question is
+    # settled: llvm-mingw 20260616 (ucrt-x86_64) does ship the runtimes this
+    # build needs for x86_64-w64-mingw32 --
+    # lib/clang/22/lib/windows/libclang_rt.asan_dynamic-x86_64.dll.a with its
+    # runtime thunk, libclang_rt.ubsan_standalone-x86_64.a, and the
+    # libclang_rt.asan_dynamic-x86_64.dll itself in the toolchain's bin
+    # directory. So the CMake's link probe will pass rather than refuse the
+    # configure, and ASan on Windows is dynamic-only: the DLL has to be
+    # findable when the tests and the smoke test run the binary, which is why
+    # those steps put the toolchain's bin on PATH. What is left before this
+    # gates is a green run -- the entry has never actually run, so nothing here
+    # has been observed rather than reasoned. ThreadSanitizer has no Windows
+    # support at all and is not attempted.
     continue-on-error: ${{ matrix.sanitize != 'none' }}
     strategy:
       fail-fast: false
@@ -504,6 +538,10 @@ jobs:
         run: |
           $b = "$env:RUNNER_TEMP\winbuild\build\x86_64-w64-mingw32\comrade"
           if ("${{ matrix.sanitize }}" -ne "none") {
+            # AddressSanitizer on Windows is a DLL, always: clang links the
+            # import library and libclang_rt.asan_dynamic-x86_64.dll has to be
+            # on PATH or every instrumented binary fails to start, before main.
+            $env:PATH = "$env:LLVM_MINGW\bin;$env:PATH"
             # Reports to files, for the same reason the POSIX jobs do it: what
             # a child process writes to stderr does not survive the harness.
             $logs = "$b\san-logs"
@@ -526,4 +564,7 @@ jobs:
       - name: Smoke test
         shell: pwsh
         run: |
+          if ("${{ matrix.sanitize }}" -ne "none") {
+            $env:PATH = "$env:LLVM_MINGW\bin;$env:PATH"   # the ASan DLL
+          }
           & "$env:RUNNER_TEMP\out\comrade-x64.exe" --help
