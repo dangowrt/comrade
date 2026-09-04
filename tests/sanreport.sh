@@ -64,7 +64,16 @@ logs=""
 vgn=0
 vgbad=""
 vgcut=""
+empty=""
 for f in $all; do
+	# A runtime that is allowed to open its log opens it whether or not it
+	# ends up with anything to put there, so an empty file is silence and
+	# not a finding. It is named rather than passed over, because a report
+	# cut off before its first line would look exactly the same.
+	if [ ! -s "$f" ]; then
+		empty="$empty $f"
+		continue
+	fi
 	if grep -q -E "Using Valgrind-|a memory error detector|ERROR SUMMARY:" \
 	   "$f" 2>/dev/null; then
 		if grep -q "ERROR SUMMARY:" "$f" 2>/dev/null; then
@@ -90,6 +99,13 @@ vgcut=$(echo "$vgcut" | sed 's/^ *//')
 # counted as either. Tests carrying their own TIMEOUT property are the ones
 # this happens to, since valgrind's slowdown overruns a limit set for an
 # uninstrumented run.
+if [ -n "$empty" ]; then
+	echo "sanreport: empty report file(s), nothing written to them:"
+	for f in $empty; do
+		echo "  $f"
+	done
+fi
+
 if [ -n "$vgcut" ]; then
 	echo "sanreport: killed before valgrind reached a verdict:"
 	for f in $vgcut; do
