@@ -401,11 +401,13 @@ int sig_mcast_prepare(struct sig_mcast *m, struct pollfd *fds, int maxfds)
 	if (sock_valid(m->s4) && nfds < maxfds) {
 		fds[nfds].fd = m->s4;
 		fds[nfds].events = POLLIN;
+		fds[nfds].revents = 0;
 		nfds++;
 	}
 	if (sock_valid(m->s6) && nfds < maxfds) {
 		fds[nfds].fd = m->s6;
 		fds[nfds].events = POLLIN;
+		fds[nfds].revents = 0;
 		nfds++;
 	}
 	return nfds;

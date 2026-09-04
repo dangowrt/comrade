@@ -795,11 +795,13 @@ int dhtnode_prepare(struct dhtnode *n, struct pollfd *fds, int maxfds,
 	if (sock_valid(n->s4) && nfds < maxfds) {
 		fds[nfds].fd = n->s4;
 		fds[nfds].events = POLLIN;
+		fds[nfds].revents = 0;
 		nfds++;
 	}
 	if (sock_valid(n->s6) && nfds < maxfds) {
 		fds[nfds].fd = n->s6;
 		fds[nfds].events = POLLIN;
+		fds[nfds].revents = 0;
 		nfds++;
 	}
 
