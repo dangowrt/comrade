@@ -456,6 +456,20 @@ static void sp_escalate(struct sp_state *s)
 	}
 }
 
+/*
+ * -Wanalyzer-fd-leak cannot follow a descriptor into fds[] and back out
+ * through the loop at the end that closes every entry: the count is dynamic,
+ * so the checker gives up and calls the last one parked there leaked. Every
+ * descriptor this function opens or is handed goes into that array, and the
+ * array is drained before it returns. Scoped to this one function rather than
+ * the file, because the checker has found real leaks in the rest of it. GCC 13
+ * reports it and later versions do not, so the build has to carry this whoever
+ * compiles it.
+ */
+#pragma GCC diagnostic push
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic ignored "-Wanalyzer-fd-leak"
+#endif
 static void sp_handle(struct sp_state *s, const struct sp_req *req)
 {
 	struct sp_rep rep;
@@ -567,6 +581,7 @@ static void sp_handle(struct sp_state *s, const struct sp_req *req)
 		if (fds[i] >= 0)
 			close(fds[i]);
 }
+#pragma GCC diagnostic pop
 
 /* The spawner's whole life: serve requests, reap children, escalate kills,
  * exit when the control channel closes. Never returns. */
