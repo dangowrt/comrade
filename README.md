@@ -166,6 +166,10 @@ launching tmux and before opening any network socket, so the shared tmux session
 and the shells it runs keep the caller's full privileges while comrade's own
 network-facing process does not. Every layer is best-effort -- one the platform
 lacks is skipped, never fatal -- and `COMRADE_SANDBOX=0` turns it all off.
+`COMRADE_SANDBOX=warn` leaves it on but makes a refused syscall name itself
+before the process ends, which on a kernel built without audit is the only way
+to see one at all; `comrade --sandbox-selftest` applies the filter and reports
+what it still lets through.
 
 Because it is best-effort, what actually engaged is a property of the machine
 rather than of the build, so a headless session reports it: the `sandbox` object
@@ -176,7 +180,7 @@ supervisor's log answers, not one that needs a debug build.
 
 |         | joining client | host service | operator foreground |
 |---------|----------------|--------------|---------------------|
-| Linux   | drop capabilities, `no_new_privs`, W^X, a seccomp filter denying `execve`, and a mount-namespace (or Landlock) filesystem confinement | the same, with tmux launched through a small unsandboxed broker | a seccomp filter denying the network |
+| Linux   | drop capabilities, `no_new_privs`, W^X, a default-deny seccomp filter (no `execve`, no `fork`), and a mount-namespace (or Landlock) filesystem confinement | the same, with tmux launched through a small unsandboxed broker | a seccomp filter denying the network |
 | macOS   | a Seatbelt `deny default` profile, `fork` blocked, `ptrace` refused | the same, through the broker | a Seatbelt profile denying the network |
 | Windows | every token privilege removed, low integrity with the data directory labelled to accept it, the child-process ban, a one-process job object with no desktop or window access, and the process-mitigation policies | the privileges and the mitigation policies (it launches tmux directly, so the job and the child ban would land on every guest's shell) | the same as the service |
 
