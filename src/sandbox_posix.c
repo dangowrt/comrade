@@ -2406,11 +2406,41 @@ static int bind_dev(const char *root, const char *node, int ro)
 	return 0;
 }
 
+/*
+ * What to grant a debug log: its own file where the directory holding it is
+ * one of the shared roots above, and the directory otherwise. A log in /tmp
+ * would otherwise widen the grant to everything else in /tmp, writably. The
+ * file has to exist before it can be bound, and creating it is what the first
+ * log line would do anyway. NULL where there is nothing to grant.
+ */
+static const char *dbg_grant(char *dir, size_t dn, const char *dbg)
+{
+	char *slash;
+	int fd;
+
+	if (!dbg || dbg[0] != '/')
+		return NULL;
+	if ((size_t)snprintf(dir, dn, "%s", dbg) >= dn)
+		return NULL;
+	slash = strrchr(dir, '/');
+	if (!slash || slash == dir)
+		return NULL;
+	*slash = '\0';
+	if (!dir_is_shared(dir))
+		return dir;
+	fd = open(dbg, O_WRONLY | O_CREAT | O_APPEND, 0600);
+	if (fd < 0)
+		return NULL;
+	close(fd);
+	return dbg;
+}
+
 /* Bind the writable directories -- the data dir (non-recursively, so the tmpfs
  * staged on its own .ns does not nest into the bind), a host state dir, and the
  * debug log's directory. Shared by the namespace builder below. */
 static int bind_writable(const char *root, const struct sandbox_cfg *cfg)
 {
+	char dir[PATH_MAX];
 	const char *dbg;
 	int fail = 0;
 
@@ -2419,21 +2449,11 @@ static int bind_writable(const char *root, const struct sandbox_cfg *cfg)
 	if (cfg->state_dir && cfg->state_dir[0] &&
 	    bind_at(root, cfg->state_dir, cfg->state_dir, 0, 0) < 0)
 		fail = 1;
-	dbg = getenv("COMRADE_DEBUG");
-	if (dbg && dbg[0] == '/') {
-		char dir[PATH_MAX];
-		char *slash;
-
-		/* The debug log's directory is convenient, not essential -- its
-		 * bind failing (bind_at logs it) does not fail the confinement. */
-		if ((size_t)snprintf(dir, sizeof(dir), "%s", dbg) < sizeof(dir)) {
-			slash = strrchr(dir, '/');
-			if (slash && slash != dir) {
-				*slash = '\0';
-				bind_at(root, dir, dir, 0, 0);
-			}
-		}
-	}
+	/* The debug log is convenient, not essential -- its bind failing
+	 * (bind_at logs it) does not fail the confinement. */
+	dbg = dbg_grant(dir, sizeof(dir), getenv("COMRADE_DEBUG"));
+	if (dbg)
+		bind_at(root, dbg, dbg, 0, 0);
 	return fail ? -1 : 0;
 }
 
@@ -2673,7 +2693,6 @@ static int fs_confine_landlock(const struct sandbox_cfg *cfg)
 	char resolv[PATH_MAX];
 	char dir[PATH_MAX];
 	const char *dbg;
-	char *slash;
 	uint64_t handled, ro, rwx, rw, net, scoped;
 	long abi;
 	int rs;
@@ -2792,15 +2811,9 @@ static int fs_confine_landlock(const struct sandbox_cfg *cfg)
 	ll_allow(rs, cfg->data_dir, rw);
 	if (cfg->state_dir && cfg->state_dir[0])
 		ll_allow(rs, cfg->state_dir, rw);
-	dbg = getenv("COMRADE_DEBUG");
-	if (dbg && dbg[0] == '/' &&
-	    (size_t)snprintf(dir, sizeof(dir), "%s", dbg) < sizeof(dir)) {
-		slash = strrchr(dir, '/');
-		if (slash && slash != dir) {
-			*slash = '\0';
-			ll_allow(rs, dir, rw);
-		}
-	}
+	dbg = dbg_grant(dir, sizeof(dir), getenv("COMRADE_DEBUG"));
+	if (dbg)
+		ll_allow(rs, dbg, rw);
 
 	/* Landlock enforcement requires no_new_privs; setting it here is
 	 * harmless -- apply_linux sets it again for the other layers. */

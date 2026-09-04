@@ -492,6 +492,38 @@ static int the_namespace_confines_the_filesystem(void)
 	return RC_OK;
 }
 
+/*
+ * The same confinement, with a debug log asked for in a shared directory. The
+ * grant is meant to reach the log and nothing else: a log named in /tmp must
+ * not carry the rest of /tmp in with it, which is the whole of /var on
+ * OpenWrt and so every session token. The child is the namespace one, whose
+ * marker file sits in exactly that directory.
+ */
+static int the_debug_log_does_not_widen_the_grant(void)
+{
+	char log[sizeof("/tmp/comrade-sbtest-dbg-4294967295.log")];
+	const char *prev = getenv("COMRADE_DEBUG");
+	char keep[PATH_MAX];
+	int r;
+
+	keep[0] = '\0';
+	if (prev)
+		snprintf(keep, sizeof(keep), "%s", prev);
+	snprintf(log, sizeof(log), "/tmp/comrade-sbtest-dbg-%u.log",
+		 (unsigned)getpid());
+	setenv("COMRADE_DEBUG", log, 1);
+	r = run_child(child_confined_ns);
+	if (keep[0])
+		setenv("COMRADE_DEBUG", keep, 1);
+	else
+		unsetenv("COMRADE_DEBUG");
+	unlink(log);
+	if (r == RC_SKIP)
+		return RC_SKIP;
+	assert(r == RC_OK);
+	return RC_OK;
+}
+
 /* A Landlock-confined client is refused the files it was not granted. */
 static int the_landlock_fallback_confines_the_filesystem(void)
 {
@@ -584,7 +616,8 @@ int main(void)
 		(the_foreground_has_no_network_but_keeps_exec() == RC_SKIP) ||
 		(the_client_cannot_reach_an_unlisted_syscall() == RC_SKIP);
 	ns_skipped = !have_fixture ||
-		(the_namespace_confines_the_filesystem() == RC_SKIP);
+		(the_namespace_confines_the_filesystem() == RC_SKIP) ||
+		(the_debug_log_does_not_widen_the_grant() == RC_SKIP);
 	ll_skipped = !have_fixture ||
 		(the_landlock_fallback_confines_the_filesystem() == RC_SKIP);
 	addr_skipped = !have_fixture ||
