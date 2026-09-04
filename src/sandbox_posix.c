@@ -751,6 +751,28 @@ static const char *const sb_lib_dirs[] = {
 
 /* The individual loader, resolver and TLS files the C library reads at runtime.
  * resolv.conf is handled apart (it is usually a symlink to a volatile file). */
+/*
+ * Directories that hold far more than a resolver. /etc/resolv.conf can
+ * resolve straight into one of these: on OpenWrt dnsmasq, whenever it serves
+ * as the box's own resolver, replaces the /tmp/resolv.conf.d symlink with a
+ * file it writes directly in /tmp, which is also where /var, and with it
+ * every session token, lives. For these the resolver's file is staged and
+ * the directory around it is not.
+ */
+static const char *const sb_shared_dirs[] = {
+	"/tmp", "/var", "/var/tmp", "/run", "/var/run", "/dev/shm"
+};
+
+static int dir_is_shared(const char *dir)
+{
+	size_t i;
+
+	for (i = 0; i < sizeof(sb_shared_dirs) / sizeof(sb_shared_dirs[0]); i++)
+		if (strcmp(dir, sb_shared_dirs[i]) == 0)
+			return 1;
+	return 0;
+}
+
 static const char *const sb_etc_files[] = {
 	"/etc/ld.so.cache", "/etc/ld.so.conf", "/etc/ld.so.conf.d",
 	"/etc/ld-musl-x86_64.path", "/etc/ld-musl-aarch64.path",
@@ -898,8 +920,12 @@ static int stage_etc(const char *root)
 		bind_at(root, "/etc/resolv.conf", "/etc/resolv.conf", 0, 1);
 		return fail ? -1 : 0;
 	}
-	if (stage_ro(root, rdir) < 0)
+	if (dir_is_shared(rdir)) {
+		if (bind_at(root, target, target, 0, 1) < 0)
+			fail = 1;
+	} else if (stage_ro(root, rdir) < 0) {
 		fail = 1;
+	}
 	if ((size_t)snprintf(etc, sizeof(etc), "%s/etc", root) < sizeof(etc))
 		mkdir_p(etc);
 	if ((size_t)snprintf(dst, sizeof(dst), "%s/etc/resolv.conf", root) <
