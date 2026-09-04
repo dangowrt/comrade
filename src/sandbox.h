@@ -83,6 +83,14 @@
 #define SANDBOX_L_JOB		0x0200	/* Windows job object (child ban) */
 #define SANDBOX_L_MITIGATION	0x0400	/* Windows process mitigation policies */
 
+/*
+ * A layer that engaged is reported, not only logged: a headless session names
+ * them in its state document, so "did the confinement install on that box"
+ * is answered by `comrade show --json` rather than by a debug build (see
+ * INTEGRATION.md). The spellings the document uses live with the renderer
+ * that writes it (mview.c); a bit added here needs one there.
+ */
+
 struct sandbox_cfg {
 	int role;			/* one of SANDBOX_* above */
 	const char *data_dir;		/* appdir_data(), made writable; may be
@@ -145,5 +153,15 @@ int sandbox_needs_spawner(void);
  * program keeps running with whatever confinement it could get. Not reversible.
  */
 int sandbox_apply(const struct sandbox_cfg *cfg);
+
+/*
+ * How long the syscall filter this process installed is, in BPF instructions:
+ * 0 where the platform compiles none, where the kernel refused it, or before
+ * anything has been applied. A layer bit says a filter is in force; this says
+ * which one, since the profiles differ in nothing else an outside observer can
+ * see, and that it is not an empty program. Linux only -- macOS compiles a
+ * profile rather than a filter, and Windows installs neither.
+ */
+int sandbox_filter_insns(void);
 
 #endif

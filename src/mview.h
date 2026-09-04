@@ -25,6 +25,13 @@ void mview_bind(struct mview *m, struct session_obs *obs);
 /* Advertise the configured bounds in the state document (0 = unbounded). */
 void mview_limits(struct mview *m, int expire_s, int max_clients);
 
+/*
+ * What the self-sandbox engaged (the SANDBOX_L_* mask sandbox_apply returned)
+ * and how long the syscall filter it installed is, so a supervisor can see
+ * whether the confinement took on this machine without a debug build.
+ */
+void mview_sandbox(struct mview *m, int layers, int filter_insns);
+
 /* A fatal setup condition (stable enum, e.g. "no_tmux"): state file says
  * state=error so a supervisor's page can name the problem. */
 void mview_error(struct mview *m, const char *err);

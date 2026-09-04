@@ -114,4 +114,11 @@ int sandbox_needs_spawner(void)
 	return 0;
 }
 
+/* No syscall filter on this platform: the mitigations are policies, not a
+ * program with a length. */
+int sandbox_filter_insns(void)
+{
+	return 0;
+}
+
 #endif /* _WIN32 */

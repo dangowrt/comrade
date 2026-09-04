@@ -35,7 +35,50 @@ struct mview {
 	int expire_s;
 	int max_clients;
 	double expire_deadline;		/* os_uptime_s() at which the grant ends */
+	int sb_layers;			/* SANDBOX_L_* the confinement engaged */
+	int sb_insns;			/* its syscall filter's length, 0 = none */
+	int have_sb;			/* the confinement has been applied */
 };
+
+/*
+ * How the engaged sandbox layers are spelled in the document, by bit position,
+ * lowest first: SANDBOX_L_USERNS is bit 0. The names are contract
+ * (INTEGRATION.md) and the bits are sandbox.h's, so a layer added there needs
+ * a name added here. A bit with no name is reported by its number rather than
+ * dropped: a document that quietly omitted the very layer being asked about
+ * would be worse than an ugly one.
+ */
+static const char *const mv_sb_name[] = {
+	"userns", "mountns", "landlock", "seccomp", "caps", "nonewprivs",
+	"mdwe", "rlimit", "nodump", "job", "mitigation"
+};
+
+/*
+ * What the confinement did, for the report that arrives saying it died on
+ * somebody's box: the mask exactly as sandbox_apply() returned it, the layers
+ * by name, and the syscall filter's length where the platform has one.
+ */
+static void mv_sandbox(const struct mview *m, FILE *out)
+{
+	int bit, first = 1, named = (int)(sizeof(mv_sb_name) /
+					  sizeof(mv_sb_name[0]));
+
+	fprintf(out, ",\"sandbox\":{\"mask\":%d,\"layers\":[", m->sb_layers);
+	for (bit = 0; bit < 31; bit++) {
+		if (!(m->sb_layers & (1 << bit)))
+			continue;
+		if (bit < named)
+			fprintf(out, "%s\"%s\"", first ? "" : ",",
+				mv_sb_name[bit]);
+		else
+			fprintf(out, "%s\"bit%d\"", first ? "" : ",", bit);
+		first = 0;
+	}
+	fputc(']', out);
+	if (m->sb_insns)
+		fprintf(out, ",\"filter_insns\":%d", m->sb_insns);
+	fputc('}', out);
+}
 
 /* The stable service-state enum, derived from what has been observed. */
 static const char *mv_state(const struct mview *m)
@@ -90,6 +133,8 @@ static void mv_doc(const struct mview *m, FILE *out)
 	}
 	if (m->max_clients)
 		fprintf(out, ",\"max_clients\":%d", m->max_clients);
+	if (m->have_sb)
+		mv_sandbox(m, out);
 	if (m->error[0])
 		fprintf(out, ",\"error\":\"%s\"", m->error);
 	if (m->token[0]) {
@@ -250,6 +295,12 @@ static void det_peer(const struct mview *m, FILE *out, int i)
 	fputc('}', out);
 }
 
+static void det_sandbox(const struct mview *m, FILE *out, int a)
+{
+	(void)a;
+	mv_sandbox(m, out);
+}
+
 static void det_warning(const struct mview *m, FILE *out, int a)
 {
 	(void)a;
@@ -378,6 +429,22 @@ void mview_limits(struct mview *m, int expire_s, int max_clients)
 	if (expire_s > 0)
 		m->expire_deadline = os_uptime_s() + expire_s;
 	mv_write(m);
+}
+
+/*
+ * The confinement is applied once, during startup, and is never reversed, so
+ * this arrives once. It is an event as well as a document field because the
+ * document is removed when the session ends: a supervisor's log is then the
+ * only place the answer survives a session that is over, which is exactly the
+ * session anybody asks about.
+ */
+void mview_sandbox(struct mview *m, int layers, int filter_insns)
+{
+	m->sb_layers = layers;
+	m->sb_insns = filter_insns;
+	m->have_sb = 1;
+	mv_write(m);
+	mv_event(m, "sandbox", det_sandbox, 0);
 }
 
 void mview_bind(struct mview *m, struct session_obs *obs)

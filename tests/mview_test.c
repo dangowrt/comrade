@@ -15,6 +15,7 @@
 #include <string.h>
 
 #include "mview.h"
+#include "sandbox.h"
 #include "token.h"
 
 /* Slurp the state file; returns the bytes read (0 if absent). */
@@ -56,8 +57,10 @@ int main(void)
 	mview_limits(m, 1800, 1);
 	mview_bind(m, &obs);
 
-	/* Freshly created, before any token: starting, and stamped. */
+	/* Freshly created, before any token: starting, and stamped. Nothing
+	 * has been confined yet, so the document claims nothing about it. */
 	assert(slurp(path, buf, sizeof(buf)));
+	assert(!strstr(buf, "\"sandbox\""));
 	assert(strstr(buf, "\"schema\":1"));
 	assert(strstr(buf, "\"id\":\"remoteassist\""));
 	assert(strstr(buf, "\"state\":\"starting\""));
@@ -65,6 +68,27 @@ int main(void)
 	assert(strstr(buf, "\"expire_s\":1800"));
 	assert(strstr(buf, "\"expires_in_s\":"));
 	assert(strstr(buf, "\"max_clients\":1"));
+
+	/*
+	 * What the confinement engaged, by mask and by name, with the length of
+	 * the filter it installed. The names are the contract INTEGRATION.md
+	 * carries; the bits are sandbox.h's, lowest first.
+	 */
+	mview_sandbox(m, 0x013b, 74);
+	assert(slurp(path, buf, sizeof(buf)));
+	assert(strstr(buf, "\"sandbox\":{\"mask\":315,\"layers\":[\"userns\","
+		      "\"mountns\",\"seccomp\",\"caps\",\"nonewprivs\","
+		      "\"nodump\"],\"filter_insns\":74}"));
+
+	/* A layer with no filter behind it says so by leaving the length out,
+	 * and a confinement that engaged nothing at all -- COMRADE_SANDBOX=0,
+	 * or a kernel too old for any of it -- is reported, not omitted. */
+	mview_sandbox(m, SANDBOX_L_RLIMIT, 0);
+	assert(slurp(path, buf, sizeof(buf)));
+	assert(strstr(buf, "\"sandbox\":{\"mask\":128,\"layers\":[\"rlimit\"]}"));
+	mview_sandbox(m, 0, 0);
+	assert(slurp(path, buf, sizeof(buf)));
+	assert(strstr(buf, "\"sandbox\":{\"mask\":0,\"layers\":[]}"));
 
 	/* Token minted with a v4 rendezvous: state advances to ready, the
 	 * reach carries the enum and endpoint, v6 is none. */
@@ -120,7 +144,7 @@ int main(void)
 	mview_destroy(m);
 	remove(path);
 
-	printf("MVIEW PASS: state document schema, reach, peers, grants, "
-	       "refusal, error, stop\n");
+	printf("MVIEW PASS: state document schema, sandbox report, reach, "
+	       "peers, grants, refusal, error, stop\n");
 	return 0;
 }

@@ -167,6 +167,13 @@ and the shells it runs keep the caller's full privileges while comrade's own
 network-facing process does not. Every layer is best-effort -- one the platform
 lacks is skipped, never fatal -- and `COMRADE_SANDBOX=0` turns it all off.
 
+Because it is best-effort, what actually engaged is a property of the machine
+rather than of the build, so a headless session reports it: the `sandbox` object
+in its state document (`comrade show --json`, INTEGRATION.md) names the layers
+that took and how long the syscall filter is, and the same goes out as an event
+line on stdout. "Did the confinement install on that box" is then a question the
+supervisor's log answers, not one that needs a debug build.
+
 |         | joining client | host service | operator foreground |
 |---------|----------------|--------------|---------------------|
 | Linux   | drop capabilities, `no_new_privs`, W^X, a seccomp filter denying `execve`, and a mount-namespace (or Landlock) filesystem confinement | the same, with tmux launched through a small unsandboxed broker | a seccomp filter denying the network |

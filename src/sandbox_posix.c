@@ -30,6 +30,13 @@
  * (house style is C89); the kernel structs are filled member by member.
  */
 
+/*
+ * The installed filter's length, for sandbox_filter_insns(). Set where a
+ * filter is actually accepted by the kernel, so it stays 0 on a platform that
+ * compiles none and on a kernel that refused the one it was given.
+ */
+static int sb_filter_insns;
+
 /* COMRADE_SANDBOX=0 turns the whole thing off. */
 static int sandbox_disabled(void)
 {
@@ -506,8 +513,10 @@ static int install_filter(struct sock_filter *f, unsigned short n)
 	 * ever changes. The filter is a denylist returning errno, never a
 	 * kill, except on a wrong-arch syscall. */
 	if (syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER,
-		    SECCOMP_FILTER_FLAG_TSYNC, &prog) == 0)
+		    SECCOMP_FILTER_FLAG_TSYNC, &prog) == 0) {
+		sb_filter_insns = n;
 		return SANDBOX_L_SECCOMP;
+	}
 	return 0;
 }
 
@@ -1519,6 +1528,11 @@ int sandbox_apply(const struct sandbox_cfg *cfg)
 #endif
 	dbg_logf("sandbox: role=%d layers=0x%x", cfg->role, layers);
 	return layers;
+}
+
+int sandbox_filter_insns(void)
+{
+	return sb_filter_insns;
 }
 
 int sandbox_needs_spawner(void)

@@ -159,6 +159,10 @@ server left standing by a service that was killed outright.
       "doc_uptime_s": 4821.7,
       "expire_s": 1800,
       "expires_in_s": 1523,
+      "sandbox": {"mask": 315,
+                  "layers": ["userns", "mountns", "seccomp", "caps",
+                             "nonewprivs", "nodump"],
+                  "filter_insns": 74},
       "token": "112F...",
       "token_ro": "112F...",
       "reach": {
@@ -186,6 +190,20 @@ server left standing by a service that was killed outright.
   works via a full DHT warm-up) | `ready` (a rendezvous is in the token)
   | `serving` (at least one connected peer) | `error`.
 - `error`: present with `state=error`; stable enum, today `no_tmux`.
+- `sandbox`: what comrade's self-confinement engaged in this service
+  process. `mask` is the layer bitmask (`src/sandbox.h`), `layers` the
+  same set by stable name -- `userns`, `mountns`, `landlock`, `seccomp`,
+  `caps`, `nonewprivs`, `mdwe`, `rlimit`, `nodump`, `job`, `mitigation`,
+  in that bit order, with a bit this comrade has no name for appearing as
+  `bitN` -- and `filter_insns` the length of the syscall filter that
+  installed, in BPF instructions, present only where the platform compiles
+  one and the kernel took it. `"mask": 0` with an empty `layers` is the
+  answer that matters most: nothing was applied, because
+  `COMRADE_SANDBOX=0` is set or because the kernel offers none of it.
+  Every layer is best-effort by design, so a short list is a fact about
+  the machine rather than an error. Absent until the confinement has been
+  applied (a document written before that, an error document from a
+  failed start, and the reduced document an interactive session gets).
 - `token_ro` is omitted entirely when the session mints none, never an
   empty string.
 - `reach.*.state`: `ready` | `pending` | `none`; `kind` (`rendezvous` |
@@ -209,6 +227,8 @@ the token (no `pid`, `state`, `peers`).
 One JSON object per line. Every event carries the resulting `"state"`.
 
     {"event":"started","state":"starting"}
+    {"event":"sandbox","sandbox":{"mask":315,"layers":["..."],
+     "filter_insns":74},"state":"starting"}
     {"event":"token","token":"...","token_ro":"...","state":"rendezvous"}
     {"event":"peer","peer":{"id":1,"peer_state":"connected","grade":"rw",
      "addr":"..."},"state":"serving"}

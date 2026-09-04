@@ -863,8 +863,11 @@ static int svc_alive(struct svc *v)
  * socket -- so the confinement covers every thread that follows and the spawner
  * inherits none of it. Where the platform will not deny exec there is no
  * spawner, and the service keeps running tmux directly.
+ *
+ * Returns the layers that engaged, which is a fact about this machine rather
+ * than about the build and so is worth reporting rather than only logging.
  */
-static void svc_confine(struct svc *v)
+static int svc_confine(struct svc *v)
 {
 	struct sandbox_cfg sb;
 
@@ -887,7 +890,7 @@ static void svc_confine(struct svc *v)
 	 * makes it none, and then the service keeps only the UDP it runs on.
 	 */
 	sb.tcp_any = !v->no_fwd;
-	sandbox_apply(&sb);
+	return sandbox_apply(&sb);
 }
 
 /*
@@ -1454,6 +1457,7 @@ int host_headless(const char *id_opt, int no_mcast, int no_dht, int no_fwd,
 	void *hostkey;
 	pthread_t th;
 	FILE *pf;
+	int layers;
 
 	memset(&v, 0, sizeof(v));
 	v.no_fwd = no_fwd;
@@ -1513,7 +1517,8 @@ int host_headless(const char *id_opt, int no_mcast, int no_dht, int no_fwd,
 	}
 	/* Fork the spawner and confine, while still single-threaded and before
 	 * the first socket -- the stop-watch thread and the serving come after. */
-	svc_confine(&v);
+	layers = svc_confine(&v);
+	mview_sandbox(m, layers, sandbox_filter_insns());
 	signal(SIGTERM, on_stop_sig);
 	signal(SIGINT, on_stop_sig);
 	signal(SIGPIPE, SIG_IGN);
