@@ -427,13 +427,26 @@ static int no_dumpable(void)
 	return 0;
 }
 
-/* Write^execute: no page may become executable after having been writable.
+/*
+ * Write^execute: no page may become executable after having been writable.
  * dlopen still works (it maps executable directly); only a JIT would care, and
- * nothing comrade links has one. Irreversible; harmless where unsupported. */
+ * nothing comrade links has one. Irreversible; harmless where unsupported.
+ *
+ * A debug build leaves it off, and that is what makes the program runnable
+ * under valgrind at all: memcheck maps its own shadow memory executable, so
+ * the first mapping it needs after this dies with "out of memory: Permission
+ * denied" and takes the whole run with it. Gating on the build type means a
+ * release ships hardened while the tool that has to rewrite the program's
+ * memory can still see every other layer -- the namespaces, the filesystem
+ * confinement, the capability drop and the syscall filter -- rather than
+ * having to be handed a process with no confinement at all.
+ */
 static int mdwe(void)
 {
+#ifdef NDEBUG
 	if (prctl(PR_SET_MDWE, PR_MDWE_REFUSE_EXEC_GAIN, 0, 0, 0) == 0)
 		return SANDBOX_L_MDWE;
+#endif
 	return 0;
 }
 

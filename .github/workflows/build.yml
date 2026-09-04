@@ -296,8 +296,13 @@ jobs:
               p=$(brew --prefix "$keg" 2>/dev/null) && [ -n "$p" ] && PP="$PP;$p"
             done
           fi
+          # The memcheck entries build Debug on purpose: the write-xor-execute
+          # layer is compiled in only for a release, because memcheck maps its
+          # own shadow memory executable and cannot run under it. A debug build
+          # therefore keeps every other layer while valgrind watches, instead
+          # of the whole confinement having to be switched off.
           cmake -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_BUILD_TYPE=${{ matrix.memcheck && 'Debug' || 'Release' }} \
             -DCMAKE_PREFIX_PATH="$PP" \
             -DCOMRADE_DHT_DIR="$PWD/dht" \
             -DCOMRADE_CRYPTO=${{ matrix.crypto }} \
@@ -350,14 +355,8 @@ jobs:
           # changes. On a runner that reuses its workspace the leftovers would
           # be read as this run's findings.
           rm -f build/Testing/Temporary/MemoryChecker.*.log
-          # sandbox_test is excluded for the same reason the e2e step turns
-          # the confinement off (see below): its children apply a profile whose
-          # W^X layer refuses valgrind the executable mapping valgrind needs to
-          # keep running, so under a memory checker the test measures nothing
-          # and fails on its own assertion. The confinement is checked by the
-          # uninstrumented run of this same test.
           ctest --test-dir build -T memcheck --timeout 1800 \
-            -E "_e2e|swarm_|^sandbox_test$" -LE harness 2>&1 | tee mc.out
+            -E "_e2e|swarm_" -LE harness 2>&1 | tee mc.out
           LOGS="$PWD/build/vg-logs"
           rm -rf "$LOGS"; mkdir -p "$LOGS"
           cp build/Testing/Temporary/MemoryChecker.*.log "$LOGS/" 2>/dev/null || true
@@ -393,23 +392,19 @@ jobs:
       # Leak checking is off here -- these processes are killed rather than
       # returning, so everything they hold reads as leaked.
       #
-      # COMRADE_SANDBOX=0 because valgrind and the confinement cannot share an
-      # address space. Memcheck maps its own shadow memory as it runs, and it
-      # maps it executable; the W^X layer (PR_SET_MDWE, applied to every role)
-      # refuses exactly that, so the first allocation valgrind needs after
-      # comrade confines itself kills valgrind outright -- "out of memory:
-      # Permission denied", no report, no comrade. Measured: forward_e2e, the
-      # one test here that drives the real binary rather than the C harness,
-      # never reached the point of publishing a token. Nothing in comrade can
-      # fix that, and the answer is not to drop W^X. The confinement is covered
-      # by the uninstrumented e2e run on every platform and by sandbox_test;
-      # what this step is for is the reads of uninitialised memory underneath
-      # it, which no other tool in the matrix can see.
+      # The confinement stays on here. Memcheck maps its own shadow memory
+      # executable, which the write-xor-execute layer refuses -- the first
+      # mapping valgrind needs after comrade confines itself used to kill
+      # valgrind outright, "out of memory: Permission denied", no report and no
+      # comrade, with forward_e2e never reaching the point of publishing a
+      # token. That layer is compiled in for a release build only, and these
+      # jobs build Debug, so the tool and every other layer coexist: the
+      # namespaces, the filesystem confinement, the capability drop and the
+      # syscall filter are all in force under the reads this step is for.
       - name: Test (valgrind, end to end)
         if: ${{ matrix.memcheck }}
         run: |
           set -uo pipefail
-          export COMRADE_SANDBOX=0        # see above: W^X kills valgrind
           # The unit step ran in this same job and left its logs behind, under
           # different options: leak checking is on there and off here. Cleared
           # so this step's report is its own.
