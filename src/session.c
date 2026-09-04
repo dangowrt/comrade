@@ -508,7 +508,18 @@ struct sess {
 	int roams;			/* synthetic changes reported so far */
 
 	char local_sdp[NAT_SDP_MAX];
-	volatile int have_local_sdp;
+	int have_local_sdp;
+	/*
+	 * The description libjuice hands back, staged for the loop. The
+	 * callback runs on libjuice's thread while the loop is reading
+	 * local_sdp and rewriting it (fan_local_sdp), so the two cannot share
+	 * that buffer: the callback leaves the description here under
+	 * trickle_lock and pool_pump takes it, which is the same shape as the
+	 * candidates trickling in below. local_sdp and have_local_sdp are the
+	 * loop's alone.
+	 */
+	char pending_sdp[NAT_SDP_MAX];
+	int pending_sdp_set;
 	/* Some peer, at some point, got all the way through the control
 	 * handshake here. Written by whichever connection's thread sees the
 	 * first pong; only ever set, so a stale read costs one round. */
@@ -1496,6 +1507,32 @@ static int fan_local_sdp(struct sess *s)
  */
 static void log_offer(const char *sdp, int served, int active);
 
+/*
+ * Whether the description libjuice produced is in hand, taking it out of the
+ * staging buffer first if it is waiting there.
+ *
+ * The callback that produces it runs on libjuice's thread and can leave one at
+ * any moment, so every reader has to look -- not just the one in the loop that
+ * posts it. Reading it anywhere else would see the description a whole
+ * iteration late, and a caller that gathers and then immediately asks whether
+ * it may post would see "not yet" and never post at all.
+ */
+static int sdp_ready(struct sess *s)
+{
+	int staged;
+
+	pthread_mutex_lock(&s->trickle_lock);
+	staged = s->pending_sdp_set;
+	if (staged) {
+		memcpy(s->local_sdp, s->pending_sdp, sizeof(s->local_sdp));
+		s->pending_sdp_set = 0;
+	}
+	pthread_mutex_unlock(&s->trickle_lock);
+	if (staged)
+		s->have_local_sdp = 1;
+	return s->have_local_sdp;
+}
+
 static void pool_pump(struct sess *s)
 {
 	const struct session_obs *o = s->cfg->obs;
@@ -1526,7 +1563,7 @@ static void pool_pump(struct sess *s)
 				o->mapping4(o->arg, rep == 2);
 		}
 	}
-	if (s->have_local_sdp && n >= 2 && n > s->pool_posted) {
+	if (sdp_ready(s) && n >= 2 && n > s->pool_posted) {
 		s->pool_posted = fan_local_sdp(s);
 		sig_post(s->sig, (const uint8_t *)s->local_sdp,
 			 strlen(s->local_sdp));
@@ -1730,10 +1767,13 @@ static void canon_v6(const char *in, const char *src6, char *out, size_t cap)
 static void on_local_sdp(void *arg, const char *sdp)
 {
 	struct sess *s = ((struct ice_ctx *)arg)->c->sess;
+	char canon[NAT_SDP_MAX];
 
-	canon_v6(sdp, netstate_src_text(&s->ns, 6), s->local_sdp,
-		 sizeof(s->local_sdp));
-	s->have_local_sdp = 1;
+	canon_v6(sdp, netstate_src_text(&s->ns, 6), canon, sizeof(canon));
+	pthread_mutex_lock(&s->trickle_lock);
+	memcpy(s->pending_sdp, canon, sizeof(canon));
+	s->pending_sdp_set = 1;
+	pthread_mutex_unlock(&s->trickle_lock);
 }
 
 /* Leave a fact for the loop: called from threads that own none of the model,
@@ -4157,6 +4197,7 @@ static void resume_tick(struct conn *c)
 		pthread_mutex_lock(&s->trickle_lock);
 		s->trickle_sdp[0] = '\0';
 		s->trickle_dirty = 0;
+		s->pending_sdp_set = 0;
 		pthread_mutex_unlock(&s->trickle_lock);
 		if (nat_setup(c))
 			return;
@@ -4165,7 +4206,7 @@ static void resume_tick(struct conn *c)
 		dbg_logf("resume: re-claiming under the session identity");
 		return;
 	case 1:
-		if (s->have_local_sdp) {
+		if (sdp_ready(s)) {
 			char filtered[NAT_SDP_MAX];
 
 			sdp_filter(s->local_sdp, s->cfg->family, filtered,
@@ -4657,6 +4698,7 @@ static int client_regather(struct sess *s)
 	pthread_mutex_lock(&s->trickle_lock);
 	s->trickle_sdp[0] = '\0';	/* drop the old agent's trickle */
 	s->trickle_dirty = 0;
+	s->pending_sdp_set = 0;
 	pthread_mutex_unlock(&s->trickle_lock);
 	s->peer_state = SESSION_PEER_SEEN;
 	sig_redeliver(s->sig);		/* we discarded the offer we were given */
@@ -5056,6 +5098,7 @@ static void net_change_reset(struct sess *s)
 	pthread_mutex_lock(&s->trickle_lock);
 	s->trickle_sdp[0] = '\0';
 	s->trickle_dirty = 0;
+	s->pending_sdp_set = 0;
 	s->npool4 = 0;
 	stun_mapping_reset(&s->map4);
 	pthread_mutex_unlock(&s->trickle_lock);
@@ -5188,7 +5231,7 @@ static void maybe_announce_rendezvous(struct sess *s)
 
 	if (!s->cfg->is_host)
 		return;
-	if (!s->have_local_sdp)		/* no candidates yet: cannot decide */
+	if (!sdp_ready(s))		/* no candidates yet: cannot decide */
 		return;
 
 	update_expect(s);
@@ -5398,7 +5441,7 @@ static void token_pump(struct sess *s)
 	 * each family holds the state it was seeded with -- which is how the
 	 * t=0 report happens with no special case, and how a re-gather holds
 	 * the token steady instead of flapping it back to PENDING. */
-	if (s->have_local_sdp) {
+	if (sdp_ready(s)) {
 		gather_facts(s, 4, &f4);
 		gather_facts(s, 6, &f6);
 		if (tokgen_decide_host(&f4, &f6, &verdict) < 0) {
@@ -5424,7 +5467,7 @@ static void token_pump(struct sess *s)
 		uint16_t port = 0;
 		int st;
 
-		if (s->have_local_sdp) {
+		if (sdp_ready(s)) {
 			st = advert_state(s, famv[i], adv[i], a, &port);
 		} else {
 			st = s->tok_state[i];
@@ -6262,7 +6305,7 @@ static int host_turnstile(struct sess *s)
 				pthread_mutex_unlock(&s->trickle_lock);
 				report_candidates(s, buf);
 			}
-			if (o->net && s->have_local_sdp)
+			if (o->net && sdp_ready(s))
 				obs_report_net(s);
 			if (o->tick)
 				o->tick(o->arg);
@@ -6431,7 +6474,7 @@ static int host_turnstile(struct sess *s)
 					break;
 				}
 			}
-			if (s->have_local_sdp) {
+			if (sdp_ready(s)) {
 				sdp_filter(s->local_sdp, cfg->family, filtered,
 					   sizeof(filtered));
 				snprintf(s->local_sdp, sizeof(s->local_sdp),
@@ -6996,7 +7039,7 @@ int session_run(const struct session_cfg *cfg)
 				pthread_mutex_unlock(&s.trickle_lock);
 				report_candidates(&s, buf);
 			}
-			if (o->net && s.have_local_sdp)
+			if (o->net && sdp_ready(&s))
 				obs_report_net(&s);	/* view de-dups */
 			if (o->tick)
 				o->tick(o->arg);
@@ -7043,7 +7086,7 @@ int session_run(const struct session_cfg *cfg)
 			}
 			break;
 		case ST_GATHER:
-			if (s.have_local_sdp) {
+			if (sdp_ready(&s)) {
 				sdp_filter(s.local_sdp, cfg->family, filtered,
 					   sizeof(filtered));
 				snprintf(s.local_sdp, sizeof(s.local_sdp),
