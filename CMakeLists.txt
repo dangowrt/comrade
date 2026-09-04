@@ -1148,6 +1148,17 @@ if(BUILD_TESTING)
 			COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/redact_test.sh)
 		set_tests_properties(redact_test PROPERTIES TIMEOUT 30
 			LABELS harness)
+
+		# What `comrade stop` reports, against a live session and
+		# against one that never ran. It drives the real binary, but
+		# needs neither a peer nor a rendezvous -- the hosts it starts
+		# are told to keep off the DHT and to serve no shell -- so it
+		# belongs with the offline suite rather than with the e2e tests.
+		add_test(NAME stop_test
+			COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/stop.sh
+				$<TARGET_FILE:comrade>)
+		set_tests_properties(stop_test PROPERTIES TIMEOUT 120
+			SKIP_RETURN_CODE 77 LABELS harness)
 	endif()
 endif()
 

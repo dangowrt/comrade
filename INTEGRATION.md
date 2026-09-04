@@ -80,19 +80,37 @@ only written once startup has succeeded, an error document with no
 `NAME.pid` beside it reads as "failed, not running now" rather than
 "failing".
 
+The pidfile is the last thing the service removes, after its document
+and its tokens are gone, because it is the only file that names the
+process: a service still winding down -- or wedged on its way out --
+stays a session `stop` can act on and `show` can resolve, rather than
+becoming an invisible process still holding the port. A pidfile naming a
+pid that is not running is stale state, and any comrade invocation
+sweeps it.
+
     comrade stop [--id NAME]
 
 Ends any session, interactive or headless, completely: the tmux server
 is killed first, which closes every attached client's channel through
 the end monitor, and `stop` then waits for the service to finish going
--- a headless one on SIGTERM (~3 s), an interactive one on its own,
-watched by its token file disappearing (~6 s). When `stop` returns,
-access has ended and the state file is gone. A client still holding the
-token is told so rather than left waiting: the service replaces the
-mailbox offer with a tombstone on its way out (PROTOCOL.md §4.1), so a
-join attempt fails with an error in a few seconds. Idempotent: exit 0
-when nothing was running. Without `--id` it acts on the single live
-session and refuses (exit 1) when there are several.
+-- a headless one on SIGTERM (~3 s, then a second SIGTERM the service
+takes at its word, so ~6 s at worst), an interactive one on its own,
+watched by its token file disappearing (~6 s). When `stop` returns 0,
+access has ended, the service is gone and the state file with it. A
+client still holding the token is told so rather than left waiting: the
+service replaces the mailbox offer with a tombstone on its way out
+(PROTOCOL.md §4.1), so a join attempt fails with an error in a few
+seconds. Idempotent: exit 0 when nothing was running. Without `--id` it
+acts on the single live session and refuses (exit 1) when there are
+several.
+
+A service that does not go is reported rather than assumed: `stop`
+checks, and exits **3** with a line on stderr naming the session and the
+pid still running. That is the case a supervisor has to be told about --
+one that sends SIGTERM and waits for the process to disappear would
+otherwise wait for ever on a `stop` that had already said it succeeded.
+Exit 3 says the session is still there and a retry is worth making;
+exit 0 said the opposite.
 
     comrade capture [--id NAME] [--ansi]
 
@@ -136,7 +154,7 @@ so nothing lives in `/etc` and no grant survives a reboot.
 For `--id NAME` the paths are exactly:
 
     $DIR/NAME.json      the session document (the poll target)
-    $DIR/NAME.pid       the service pid
+    $DIR/NAME.pid       the service pid, removed as it exits
     $DIR/NAME.sock      the shared tmux server's socket
     $DIR/NAME.tok       both tokens, read-write then read-only, one per line
     $DIR/NAME.status    connection status for comrade's own status row

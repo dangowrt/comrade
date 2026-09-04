@@ -90,6 +90,10 @@
 #define ID_LEN 12			/* hex chars of a generated session id */
 #define ID_MAX 32			/* longest id, generated or named */
 
+/* How long `stop` gives a signalled service to go, in 100 ms ticks, before it
+ * signals again and then reports the session as still running. */
+#define STOP_GRACE_TICKS 30
+
 struct svc {
 	int serve_max;			/* bounded grant: sessions to serve */
 	int admit_max;			/* and claimants to admit */
@@ -1539,17 +1543,35 @@ int host_headless(const char *id_opt, int no_mcast, int no_dht, int no_fwd,
 	w.done = 1;
 	pthread_join(th, NULL);
 	spawner_destroy(v.sp);
-	unlink(pidp);
 	mview_destroy(m);
 	sshd_hostkey_free(hostkey);
+	/*
+	 * Last, because the pidfile is the only thing that names this process
+	 * to `comrade stop`: a teardown that wedges -- a broker that will not
+	 * be reaped, a library exit hook that never returns -- must leave a
+	 * session somebody can still act on, not an invisible process holding
+	 * the port. Removing it here also leaves nothing behind on the way out.
+	 */
+	unlink(pidp);
 	return 0;
+}
+
+/* Signal a service and wait out the grace period; non-zero if it is still
+ * there when that runs out. */
+static int term_wait(long pid)
+{
+	int i;
+
+	kill((pid_t)pid, SIGTERM);
+	for (i = 0; i < STOP_GRACE_TICKS && !kill((pid_t)pid, 0); i++)
+		usleep(100 * 1000);
+	return kill((pid_t)pid, 0) == 0;
 }
 
 int host_stop(const char *id_opt)
 {
-	char id[ID_MAX + 1], sock[512], path[512];
-	FILE *pf;
-	long pid = 0;
+	char id[ID_MAX + 1], sock[512];
+	long pid;
 	int r, i;
 
 	sweep_stale();
@@ -1559,22 +1581,22 @@ int host_stop(const char *id_opt)
 	if (r > 0)
 		return 0;		/* nothing running: stop is idempotent */
 	sock_path(sock, sizeof(sock), id);
-	pid_path(path, sizeof(path), id);
-	pf = fopen(path, "r");
-	if (pf) {
-		if (fscanf(pf, "%ld", &pid) != 1)
-			pid = 0;
-		fclose(pf);
-	}
+	pid = pid_of(id);
 	if (tmux_alive(sock)) {
 		char *k[] = { "tmux", "-S", sock, "kill-server", NULL };
 
 		run_wait(k);
 	}
 	if (pid > 0) {
-		kill((pid_t)pid, SIGTERM);
-		for (i = 0; i < 30 && !kill((pid_t)pid, 0); i++)
-			usleep(100 * 1000);
+		/*
+		 * The second signal is the one a wedged service is taken at its
+		 * word on: its handler puts the default action back and
+		 * re-raises (see on_stop_sig), so a process that cannot reach
+		 * its own exit still answers this rather than needing a kill
+		 * from outside.
+		 */
+		if (term_wait(pid))
+			term_wait(pid);
 	} else {
 		/*
 		 * An interactive session's service records no pid -- its
@@ -1589,6 +1611,29 @@ int host_stop(const char *id_opt)
 		tok_path(tf, sizeof(tf), id);
 		for (i = 0; i < 120 && access(tf, F_OK) == 0; i++)
 			usleep(50 * 1000);
+	}
+	/*
+	 * A tmux server exits behind the client that told it to, and a service
+	 * that was already gone leaves nothing to wait on above, so a session
+	 * can still read as live for a moment after everything has been asked
+	 * to go. Wait that out before calling it stuck.
+	 */
+	for (i = 0; i < 10 && session_live(id); i++)
+		usleep(100 * 1000);
+	/*
+	 * Say so when it is still there. `stop` returning 0 means access has
+	 * ended, and a supervisor that sends SIGTERM and waits on that promise
+	 * waits for ever if this reports a session it did not actually end --
+	 * which is a worse answer than an error naming the process that is
+	 * still running.
+	 */
+	if (session_live(id)) {
+		fprintf(stderr, "comrade: session '%s' is still running", id);
+		pid = pid_of(id);
+		if (pid > 0)
+			fprintf(stderr, " (pid %ld)", pid);
+		fprintf(stderr, "\n");
+		return 3;
 	}
 	sweep_stale();			/* collect whatever the exit left */
 	return 0;
