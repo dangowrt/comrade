@@ -178,6 +178,12 @@ static void apply_winch(struct cpty *child, ssh_message m)
 }
 
 /*
+ * How much of the child's terminal is moved in one pass. Bigger would only
+ * buy queueing: what is not read stays in the terminal, which is the point.
+ */
+#define SSHD_TERM_SLICE 8192
+
+/*
  * State the pump loop carries so drain_messages() can accept and wire up extra
  * channels that arrive after the shell channel. Channels are dispatched by
  * subsystem name; today only "comrade-ctl" (an authenticated control plane
@@ -194,8 +200,13 @@ struct pump_ctx {
 	struct cpty *child;		/* the shell pty, once one is asked for;
 					 * NULL until then, and for good where
 					 * no shell is ever requested */
-	ssh_connector c_in;		/* channel -> child, once spawned */
-	ssh_connector c_out;		/* child -> channel */
+	int term_ready;			/* the child's terminal has output */
+	int term_polled;		/* and is in the event to say so */
+	int term_eof;			/* it ended: nothing more will come */
+	size_t out_off, out_len;	/* terminal output the channel has not taken */
+	char out_buf[SSHD_TERM_SLICE];
+	size_t in_off, in_len;		/* guest input the terminal has not taken */
+	char in_buf[SSHD_TERM_SLICE];
 	int want_pty;			/* what the pty request asked for */
 	int rows, cols;
 	char term[64];
@@ -228,6 +239,169 @@ static int ctl_bridge_up(struct pump_ctx *c)
 	return 0;
 }
 
+/* On the event only so the terminal waking dopoll is noticed; term_pump
+ * moves what it holds. */
+static int term_wake(socket_t fd, int revents, void *userdata)
+{
+	(void)fd;
+	if (revents & (POLLIN | POLLHUP | POLLERR))
+		*(int *)userdata = 1;
+	return 0;
+}
+
+/* Does the transport underneath take more bulk? A host with none under it
+ * (the local tests, a plain fd) is never asked to wait. */
+static int term_room(const struct pump_ctx *c)
+{
+	return !c->o->tx_room || c->o->tx_room(c->o->tx_room_arg);
+}
+
+/*
+ * Poll the child's terminal only while what it holds can go somewhere.
+ *
+ * Not spinning dopoll is the small reason. The large one is that tmux has to
+ * be TOLD, and the only way to tell it is to stop reading: it keeps a screen,
+ * not a stream, and for a client it cannot keep up with it drops the backlog
+ * and redraws the screen whole. Read it regardless and that never happens --
+ * the output goes into the channel window and the transport's send queue
+ * instead, and a guest coming back from a roam is served the seconds it missed,
+ * frame by frame, at a rate that never catches up. Leaving it in the terminal
+ * is what makes the guest's first screen the current one.
+ */
+static void term_poll_sync(struct pump_ctx *c)
+{
+	int want;
+
+	if (!c->child)
+		return;
+	want = !c->term_eof && c->out_off >= c->out_len &&
+	       ssh_channel_window_size(c->chan) > 0 && term_room(c);
+	if (want && !c->term_polled) {
+		if (ssh_event_add_fd(c->event, cpty_out(c->child), POLLIN,
+				     term_wake, &c->term_ready) == SSH_OK)
+			c->term_polled = 1;
+	} else if (!want && c->term_polled) {
+		ssh_event_remove_fd(c->event, cpty_out(c->child));
+		c->term_polled = 0;
+		c->term_ready = 0;
+	}
+}
+
+/*
+ * Hand what has been read on to the channel, as much of it as the window will
+ * take. Returns 0 with some of it still here, to go again next pass: a key
+ * re-exchange blocks writes for as long as it runs, and half a screen is not
+ * a thing to drop. A write that fails outright ends the terminal instead.
+ */
+static int term_flush(struct pump_ctx *c)
+{
+	uint32_t win;
+	size_t cap;
+	int w;
+
+	while (c->out_off < c->out_len) {
+		win = ssh_channel_window_size(c->chan);
+		if (!win)
+			return 0;
+		cap = c->out_len - c->out_off;
+		if (cap > (size_t)win)
+			cap = (size_t)win;
+		w = ssh_channel_write(c->chan, c->out_buf + c->out_off,
+				      (uint32_t)cap);
+		if (w < 0) {
+			c->term_eof = 1;
+			return 1;
+		}
+		if (w == 0)
+			return 0;
+		c->out_off += (size_t)w;
+	}
+	c->out_off = 0;
+	c->out_len = 0;
+	return 1;
+}
+
+/*
+ * One slice of terminal -> channel, when the poll said there is one. The read
+ * is capped by the window because writing past it would block the session, and
+ * taken once per pass because a pty master is a blocking descriptor: the poll
+ * is the whole of what says a read will return.
+ */
+static void term_pump(struct pump_ctx *c)
+{
+	uint32_t win;
+	size_t cap;
+	ssize_t n;
+
+	if (!c->child || c->term_eof)
+		goto sync;
+	if (!term_flush(c) || c->term_eof || !c->term_ready)
+		goto sync;
+	win = ssh_channel_window_size(c->chan);
+	if (!win || !term_room(c))
+		goto sync;
+	c->term_ready = 0;
+	cap = sizeof(c->out_buf);
+	if (cap > (size_t)win)
+		cap = (size_t)win;
+	n = sock_read(cpty_out(c->child), c->out_buf, cap);
+	if (n == 0) {
+		/* The end of the child's output, where the platform gives one:
+		 * a Linux pty master answers EIO instead, and either way the
+		 * child exiting is what ends the pump. */
+		ssh_channel_send_eof(c->chan);
+		c->term_eof = 1;
+	} else if (n < 0) {
+		int e = sock_errno();
+
+		if (!sock_err_would_block(e) && !sock_err_intr(e))
+			c->term_eof = 1;
+	} else {
+		c->out_len = (size_t)n;
+		term_flush(c);
+	}
+sync:
+	term_poll_sync(c);
+}
+
+/*
+ * Channel -> the child's terminal: what the guest types, and the answers its
+ * terminal gives to what tmux asks. Never gated -- it is small, and it is the
+ * half somebody is waiting on. A terminal that will not take all of it keeps
+ * the rest here until it will.
+ */
+static void term_feed(struct pump_ctx *c)
+{
+	int n;
+
+	if (!c->child)
+		return;
+	for (;;) {
+		while (c->in_off < c->in_len) {
+			ssize_t w = sock_write(cpty_in(c->child),
+					       c->in_buf + c->in_off,
+					       c->in_len - c->in_off);
+
+			if (w > 0) {
+				c->in_off += (size_t)w;
+				continue;
+			}
+			if (w < 0 && sock_err_intr(sock_errno()))
+				continue;
+			return;
+		}
+		c->in_off = 0;
+		c->in_len = 0;
+		if (ssh_channel_poll(c->chan, 0) <= 0)
+			return;
+		n = ssh_channel_read_nonblocking(c->chan, c->in_buf,
+						 sizeof(c->in_buf), 0);
+		if (n <= 0)
+			return;
+		c->in_len = (size_t)n;
+	}
+}
+
 /*
  * Drain pending session messages: apply window-change to the pty, accept a
  * second session channel and, if it requests the comrade-ctl subsystem, bridge
@@ -235,10 +409,16 @@ static int ctl_bridge_up(struct pump_ctx *c)
  * session is in non-blocking mode), so it returns once the queue is empty.
  */
 /*
- * A shell was asked for, so become a shell session: spawn the command and
- * bridge it to the channel. Until this happens -- and where it never does,
- * because the client asked for no shell -- the pump is already running and
- * serving the control channel and forwarding, which is the whole point.
+ * A shell was asked for, so become a shell session: spawn the command and put
+ * its terminal on the event, from where term_pump and term_feed bridge it to
+ * the channel. Until this happens -- and where it never does, because the
+ * client asked for no shell -- the pump is already running and serving the
+ * control channel and forwarding, which is the whole point.
+ *
+ * The bridging is comrade's own rather than a pair of libssh connectors
+ * because a connector reads its descriptor whenever the channel has any window
+ * left at all, and the terminal must instead be left unread while the
+ * transport is behind (see term_poll_sync).
  */
 static int spawn_shell(struct pump_ctx *c)
 {
@@ -261,22 +441,7 @@ static int spawn_shell(struct pump_ctx *c)
 		dbg_logf("sshd: cpty_spawn failed");
 		return -1;
 	}
-	c->c_in = ssh_connector_new(c->s);
-	c->c_out = ssh_connector_new(c->s);
-	if (!c->c_in || !c->c_out)
-		return -1;
-	ssh_connector_set_out_fd(c->c_in, cpty_in(c->child));
-	ssh_connector_set_in_channel(c->c_in, c->chan, SSH_CONNECTOR_STDOUT);
-	ssh_connector_set_in_fd(c->c_out, cpty_out(c->child));
-	ssh_connector_set_out_channel(c->c_out, c->chan, SSH_CONNECTOR_STDOUT);
-	/* The connectors carry the session's socket from here; leaving it
-	 * registered as well would put one fd in the event twice. */
-	if (c->session_added) {
-		ssh_event_remove_session(c->event, c->s);
-		c->session_added = 0;
-	}
-	ssh_event_add_connector(c->event, c->c_in);
-	ssh_event_add_connector(c->event, c->c_out);
+	term_poll_sync(c);
 	dbg_logf("sshd: shell requested -- cpty_spawn ok");
 	return 0;
 }
@@ -390,10 +555,10 @@ static int on_end_fd(socket_t fd, int revents, void *userdata)
 /*
  * Bridge the channel to the child's fds until either side ends. The child
  * exiting is one authoritative end of a session, but a pty master returns EIO
- * rather than a clean EOF when its slave goes away, so the connectors do not
+ * rather than a clean EOF when its slave goes away, so the bridging does not
  * reliably surface it. Worse, our command is `tmux attach`, which does not
  * reliably exit when the shared session it serves is gone. So we end the loop
- * on any of: the connectors erroring, the child exiting (watched directly;
+ * on any of: the transport erroring, the child exiting (watched directly;
  * WNOWAIT leaves it for the caller to reap), or the optional end-of-session fd
  * signalling (event-driven, so the client is released the moment the session
  * ends, not after a poll interval).
@@ -447,10 +612,9 @@ static int pump(ssh_session s, ssh_channel chan, const struct sshd_opts *o,
 	if (!c.event)
 		goto out;
 	/*
-	 * Nothing bridges the session's socket into the event until a shell is
-	 * spawned and its connectors do, so the session goes in directly or
-	 * dopoll would never see an incoming packet -- a forwarding request, a
-	 * ctl open, or the shell request itself.
+	 * The session's own socket, or dopoll would never see an incoming
+	 * packet -- a forwarding request, a ctl open, the shell request itself,
+	 * or a keystroke once one is running.
 	 */
 	ssh_event_add_session(c.event, s);
 	c.session_added = 1;
@@ -463,9 +627,20 @@ static int pump(ssh_session s, ssh_channel chan, const struct sshd_opts *o,
 	ssh_set_blocking(s, 0);
 
 	while (ssh_channel_is_open(chan) && !ssh_channel_is_eof(chan)) {
-		if (ssh_event_dopoll(c.event, 200) == SSH_ERROR)
+		/*
+		 * A terminal held back by the transport, or input a full one
+		 * has not taken, is waiting on nothing the event can report,
+		 * so ask again soon rather than sit out the whole idle wait
+		 * with a screen to deliver.
+		 */
+		int wait = (c.child && !c.term_eof &&
+			    (!c.term_polled || c.in_off < c.in_len)) ? 20 : 200;
+
+		if (ssh_event_dopoll(c.event, wait) == SSH_ERROR)
 			break;
 		drain_messages(&c);
+		term_pump(&c);
+		term_feed(&c);
 		sshfwd_tick(c.fwd);
 		if (c.end_hit && !end_ms) {
 			ending = 1;
@@ -489,10 +664,10 @@ static int pump(ssh_session s, ssh_channel chan, const struct sshd_opts *o,
 	c.fwd = NULL;
 	if (sock_isset(end_fd))
 		ssh_event_remove_fd(c.event, end_fd);
-	if (c.c_in)
-		ssh_event_remove_connector(c.event, c.c_in);
-	if (c.c_out)
-		ssh_event_remove_connector(c.event, c.c_out);
+	if (c.term_polled) {
+		ssh_event_remove_fd(c.event, cpty_out(c.child));
+		c.term_polled = 0;
+	}
 	if (c.session_added)
 		ssh_event_remove_session(c.event, s);
 	if (c.ctl_in) {
@@ -504,10 +679,6 @@ static int pump(ssh_session s, ssh_channel chan, const struct sshd_opts *o,
 out:
 	if (c.child)
 		exit_code = cpty_close(c.child);
-	if (c.c_in)
-		ssh_connector_free(c.c_in);
-	if (c.c_out)
-		ssh_connector_free(c.c_out);
 	if (c.ctl_in)
 		ssh_connector_free(c.ctl_in);
 	if (c.ctl_out)

@@ -1079,6 +1079,12 @@ if(BUILD_TESTING)
 		add_test(NAME sshfwd_test COMMAND sshfwd_test)
 		set_tests_properties(sshfwd_test PROPERTIES TIMEOUT 60)
 
+		add_executable(sshterm_test tests/sshterm_test.c)
+		target_link_libraries(sshterm_test
+			comrade_ssh comrade_crypto comrade_token Threads::Threads)
+		add_test(NAME sshterm_test COMMAND sshterm_test)
+		set_tests_properties(sshterm_test PROPERTIES TIMEOUT 60)
+
 		add_executable(sshexit_test tests/sshexit_test.c)
 		target_link_libraries(sshexit_test comrade_ssh comrade_token Threads::Threads)
 		add_test(NAME sshexit_test COMMAND sshexit_test)
@@ -1375,6 +1381,7 @@ if(BUILD_TESTING)
 		bep44_pin_test bep44_store_test bep44_rl_test
 		sig_rebuild_test natstream_test stream_room_test
 		stream_cc_test sshloop_test sshfwd_test sshexit_test sshro_test
+		sshterm_test
 		sshkcp_test sshctl_test sshlinger_test uipeer_test
 		qr_test showfmt_test mview_test
 		sandbox_test spawner_test)
