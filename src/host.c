@@ -1439,14 +1439,14 @@ static void *stop_watch_thread(void *arg)
 	struct stop_watch *w = arg;
 	int fire = 0;
 
-	while (!w->done) {
+	while (!__atomic_load_n(&w->done, __ATOMIC_RELAXED)) {
 		if (g_stop || (w->deadline && mono_ms() >= w->deadline)) {
 			fire = 1;
 			break;
 		}
 		usleep(200 * 1000);
 	}
-	if (fire && !w->done)
+	if (fire && !__atomic_load_n(&w->done, __ATOMIC_RELAXED))
 		svc_end(w->v);
 	return NULL;
 }
@@ -1540,7 +1540,7 @@ int host_headless(const char *id_opt, int no_mcast, int no_dht, int no_fwd,
 		return 1;
 	}
 	svc_serve(&v, hostkey, no_mcast, no_dht);
-	w.done = 1;
+	__atomic_store_n(&w.done, 1, __ATOMIC_RELAXED);
 	pthread_join(th, NULL);
 	spawner_destroy(v.sp);
 	mview_destroy(m);

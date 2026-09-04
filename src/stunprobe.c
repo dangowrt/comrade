@@ -37,6 +37,18 @@ void stun_probe_build(uint8_t out[STUN_PROBE_REQ_LEN],
  * in the transaction id (all but its per-server last byte, which numbers
  * whichever server answered). Returns the attribute block's length, or -1
  * if any of that does not hold. */
+/*
+ * The caller's wind-up flag, read the way one thread may read what another
+ * writes. It is set once and never cleared while a round is in flight, so
+ * relaxed is all the ordering this needs -- what the round produced is
+ * published by the join that follows, not by this flag. Plain reads of it are
+ * a data race all the same, and a race detector is right to say so.
+ */
+static int sb_flag(volatile int *f)
+{
+	return __atomic_load_n(f, __ATOMIC_RELAXED);
+}
+
 static int stun_reply_ok(const uint8_t *pkt, size_t len,
 			 const uint8_t seed[STUN_PROBE_TXID_LEN])
 {
@@ -297,7 +309,8 @@ void stun_probe_run(char *const *servers, int nservers, int total_ms,
 	}
 
 	t0 = os_mono_ms();
-	while (!(stop && *stop) && os_mono_ms() - t0 < (uint64_t)total_ms) {
+	while (!(stop && sb_flag(stop)) &&
+	       os_mono_ms() - t0 < (uint64_t)total_ms) {
 		struct pollfd pf;
 		uint64_t now = os_mono_ms();
 
@@ -395,7 +408,8 @@ void stun_probe_check(char *const *servers, int nservers, int family,
 
 	memset(have, 0, sizeof(have));
 	t0 = os_mono_ms();
-	while (!(stop && *stop) && os_mono_ms() - t0 < (uint64_t)total_ms) {
+	while (!(stop && sb_flag(stop)) &&
+	       os_mono_ms() - t0 < (uint64_t)total_ms) {
 		struct pollfd pf;
 		uint64_t now = os_mono_ms();
 

@@ -1927,7 +1927,7 @@ static void *stun_probe_thread(void *arg)
 static void stun_probe_halt(struct sess *s)
 {
 	if (s->probe_running)
-		s->probe_stop = 1;
+		__atomic_store_n(&s->probe_stop, 1, __ATOMIC_RELAXED);
 }
 
 static void stun_probe_reap(struct sess *s)
@@ -1950,10 +1950,10 @@ static int stun_probe_kick(struct sess *s)
 	if (s->cfg->stun_host || !s->cfg->stun_auto || s->stun_count < 1)
 		return 0;
 	if (s->probe_running) {
-		s->probe_stop = 1;
+		__atomic_store_n(&s->probe_stop, 1, __ATOMIC_RELAXED);
 		return 0;
 	}
-	s->probe_stop = 0;
+	__atomic_store_n(&s->probe_stop, 0, __ATOMIC_RELAXED);
 	if (pthread_create(&s->probe_th, NULL, stun_probe_thread, s))
 		return 0;
 	s->probe_running = 1;
@@ -1995,7 +1995,7 @@ static void *stun_probe6_thread(void *arg)
 static void stun_probe6_halt(struct sess *s)
 {
 	if (s->probe6_running)
-		s->probe6_stop = 1;
+		__atomic_store_n(&s->probe6_stop, 1, __ATOMIC_RELAXED);
 }
 
 static void stun_probe6_reap(struct sess *s)
@@ -2017,10 +2017,10 @@ static int stun_probe6_kick(struct sess *s)
 	if (s->cfg->stun_host || !s->cfg->stun_auto || s->stun_count < 1)
 		return 0;
 	if (s->probe6_running) {
-		s->probe6_stop = 1;
+		__atomic_store_n(&s->probe6_stop, 1, __ATOMIC_RELAXED);
 		return 0;
 	}
-	s->probe6_stop = 0;
+	__atomic_store_n(&s->probe6_stop, 0, __ATOMIC_RELAXED);
 	if (pthread_create(&s->probe6_th, NULL, stun_probe6_thread, s))
 		return 0;
 	s->probe6_running = 1;
