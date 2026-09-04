@@ -459,26 +459,22 @@ jobs:
     name: windows (x64${{ matrix.sanitize != 'none' && format(', {0}', matrix.sanitize) || '' }})
     runs-on: ${{ vars.RUNNER_WINDOWS && fromJSON(vars.RUNNER_WINDOWS) || 'windows-latest' }}
     timeout-minutes: 40
-    # The instrumented entry is not gating yet, but the archive question is
-    # settled: llvm-mingw 20260616 (ucrt-x86_64) does ship the runtimes this
-    # build needs for x86_64-w64-mingw32 --
-    # lib/clang/22/lib/windows/libclang_rt.asan_dynamic-x86_64.dll.a with its
-    # runtime thunk, libclang_rt.ubsan_standalone-x86_64.a, and the
-    # libclang_rt.asan_dynamic-x86_64.dll itself in the toolchain's bin
-    # directory. So the CMake's link probe will pass rather than refuse the
-    # configure, and ASan on Windows is dynamic-only: the DLL has to be
-    # findable when the tests and the smoke test run the binary, which is why
-    # those steps put the toolchain's bin on PATH. What is left before this
-    # gates is a green run -- the entry has never actually run, so nothing here
-    # has been observed rather than reasoned. ThreadSanitizer has no Windows
-    # support at all and is not attempted.
-    continue-on-error: ${{ matrix.sanitize != 'none' }}
+    # Windows builds uninstrumented. The archive does carry runtimes for
+    # x86_64-w64-mingw32 -- libclang_rt.asan_dynamic-x86_64.dll.a with its
+    # thunk, libclang_rt.ubsan_standalone-x86_64.a, and the asan DLL itself --
+    # which is why an instrumented entry looked reachable and was reasoned to
+    # work. Run, it does not: the CMake link probe for
+    # `-fsanitize=address,undefined -fno-sanitize-recover=all` fails on this
+    # toolchain, so the configure refuses rather than hand back a binary that
+    # was never instrumented. An entry that cannot link is worse than no entry,
+    # because a job permanently red is a job nobody reads; the sanitisers are
+    # covered on Linux and macOS, and this returns when the probe passes.
+    # ThreadSanitizer has no Windows support at all and is not attempted.
     strategy:
       fail-fast: false
       matrix:
         include:
           - sanitize: none
-          - sanitize: address
     steps:
       - uses: actions/checkout@v5
         with:
