@@ -360,7 +360,14 @@ struct conn {
 					 * not punch the same worker twice */
 	/* The claimant's ICE ufrag, carried for the worker's whole lifetime so the
 	 * host recognises the same client arriving over the other transport. */
+	/*
+	 * The claimant identity this connection serves. Written by the loop
+	 * when a claim is taken up and read by the transport receive thread on
+	 * every probe, so claim_lock covers both -- held only long enough to
+	 * copy the string, never across a call.
+	 */
 	char claim_ufrag[40];
+	pthread_mutex_t claim_lock;
 	volatile int ice_up;		/* the agent is connected, for readers
 					 * that may not touch the agent */
 	/*
@@ -464,6 +471,8 @@ struct conn {
 	/* Read-only grade (host): the ssh thread sets it once the client has
 	 * authenticated (which secret it used), the main loop reports it to the
 	 * dashboard once. Written from the ssh thread, so volatile like done. */
+	/* Set by the ssh server thread once it knows which credential
+	 * the peer used, read by the loop that reports the peer's row. */
 	volatile int read_only;
 	int ro_reported;		/* main-thread only: sent to the view yet */
 	volatile int peer_fresh;	/* the host said it is serving us from a
@@ -556,6 +565,9 @@ struct sess {
 
 	uint64_t next_gather_ms;	/* backoff after a gather found nothing */
 	uint64_t ice_attempt_start;
+	/* Which STUN server this attempt starts from. The loop advances it
+	 * while a probe thread is indexing with it, so both ends are atomic
+	 * and each thread takes one snapshot for the round it is running. */
 	int ice_attempt;
 	int expect4, expect6;		/* host has DHT reach on this family */
 	int tok_state[2];
@@ -586,6 +598,9 @@ struct sess {
 					 * invitation leads nowhere from now on */
 	uint64_t tomb_deadline;		/* host: how long the end of the session
 					 * is published for before we go */
+	/* Set from libjuice's gather thread as candidates arrive and cleared
+	 * by the loop on a regather, so every access is a relaxed atomic: the
+	 * reader wants the latest answer, not a synchronised one. */
 	volatile int have_priv4;	/* a private/CGNAT v4 host candidate (needs
 					 * STUN); set from the gather thread */
 	volatile int have_srflx4;	/* STUN gave us a public v4 (reflexive) */
@@ -1330,10 +1345,12 @@ static void report_candidates(struct sess *s, const char *sdp)
 
 				fam = strchr(addr, ':') ? 6 : 4;
 				if (fam == 4 && via == NET_VIA_STUN)
-					s->have_srflx4 = 1;
+					__atomic_store_n(&s->have_srflx4, 1,
+							 __ATOMIC_RELAXED);
 				else if (fam == 4 && via == NET_VIA_DIRECT &&
 					 scope != NET_SCOPE_GLOBAL)
-					s->have_priv4 = 1;
+					__atomic_store_n(&s->have_priv4, 1,
+							 __ATOMIC_RELAXED);
 				len = fam == 6 ? 16 : 4;
 				if (inet_pton(fam == 6 ? AF_INET6 : AF_INET,
 					      addr, raw) == 1)
@@ -1507,6 +1524,9 @@ static int fan_local_sdp(struct sess *s)
  */
 static void log_offer(const char *sdp, int served, int active);
 
+/* Defined below, beside the rest of the description handling. */
+static void canon_v6(const char *sdp, const char *src6, char *out, size_t n);
+
 /*
  * Whether the description libjuice produced is in hand, taking it out of the
  * staging buffer first if it is waiting there.
@@ -1519,17 +1539,21 @@ static void log_offer(const char *sdp, int served, int active);
  */
 static int sdp_ready(struct sess *s)
 {
+	char raw[NAT_SDP_MAX];
 	int staged;
 
 	pthread_mutex_lock(&s->trickle_lock);
 	staged = s->pending_sdp_set;
 	if (staged) {
-		memcpy(s->local_sdp, s->pending_sdp, sizeof(s->local_sdp));
+		memcpy(raw, s->pending_sdp, sizeof(raw));
 		s->pending_sdp_set = 0;
 	}
 	pthread_mutex_unlock(&s->trickle_lock);
-	if (staged)
+	if (staged) {
+		canon_v6(raw, netstate_src_text(&s->ns, 6), s->local_sdp,
+			 sizeof(s->local_sdp));
 		s->have_local_sdp = 1;
+	}
 	return s->have_local_sdp;
 }
 
@@ -1767,11 +1791,16 @@ static void canon_v6(const char *in, const char *src6, char *out, size_t cap)
 static void on_local_sdp(void *arg, const char *sdp)
 {
 	struct sess *s = ((struct ice_ctx *)arg)->c->sess;
-	char canon[NAT_SDP_MAX];
 
-	canon_v6(sdp, netstate_src_text(&s->ns, 6), canon, sizeof(canon));
+	/*
+	 * Staged exactly as libjuice gave it. Canonicalising here would mean
+	 * reading netstate from this thread, and a callback thread owns none
+	 * of the model -- the loop was writing the same source address
+	 * through netstate_on_src while this read it. The loop canonicalises
+	 * when it takes the description, where it owns both sides.
+	 */
 	pthread_mutex_lock(&s->trickle_lock);
-	memcpy(s->pending_sdp, canon, sizeof(canon));
+	snprintf(s->pending_sdp, sizeof(s->pending_sdp), "%s", sdp);
 	s->pending_sdp_set = 1;
 	pthread_mutex_unlock(&s->trickle_lock);
 }
@@ -1980,11 +2009,11 @@ static void *stun_probe6_thread(void *arg)
 	char *targets[STUN_PROBE_SERVERS];
 	uint8_t seed[STUN_PROBE_TXID_LEN];
 	uint32_t epoch = s->probe_epoch[1];
-	int n = 0, i;
+	int n = 0, i, attempt;
 
+	attempt = __atomic_load_n(&s->ice_attempt, __ATOMIC_RELAXED);
 	for (i = 0; i < s->stun_count && n < STUN_PROBE_SERVERS; i++)
-		targets[n++] = s->stun_servers[(s->ice_attempt + i) %
-					       s->stun_count];
+		targets[n++] = s->stun_servers[(attempt + i) % s->stun_count];
 	random_bytes(seed, sizeof(seed));
 	stun_probe_check(targets, n, AF_INET6, STUN_PROBE_MS, seed,
 			 &s->probe6_stop, probe6_hit, s);
@@ -2045,13 +2074,13 @@ static void on_ice_candidate(void *arg, const char *cand)
 		} else if (!strcmp(typ, "srflx")) {
 			uint8_t b[4];
 
-			s->have_srflx4 = 1;
+			__atomic_store_n(&s->have_srflx4, 1, __ATOMIC_RELAXED);
 			ns_post(s, NSF_ROUNDTRIP, 4, s->gather_epoch[0]);
 			if (inet_pton(AF_INET, addr, b) == 1)
 				pool_note(s, b);
 		} else if (!strcmp(typ, "host") &&
 			   addr_scope(addr) != NET_SCOPE_GLOBAL) {
-			s->have_priv4 = 1;
+			__atomic_store_n(&s->have_priv4, 1, __ATOMIC_RELAXED);
 		}
 	}
 	pthread_mutex_lock(&s->trickle_lock);
@@ -2330,12 +2359,20 @@ static int conn_probe_open(struct conn *c, struct path_probe *pr,
 	return pr->type == PROBE_FRESH ? 0 : -1;
 }
 
+/* The claimant identity, copied out under its lock. */
+static void conn_claim_take(struct conn *c, char *out, size_t n)
+{
+	pthread_mutex_lock(&c->claim_lock);
+	snprintf(out, n, "%s", c->claim_ufrag);
+	pthread_mutex_unlock(&c->claim_lock);
+}
+
 static size_t conn_probe_seal(struct conn *c, struct path_probe *pr,
 			      uint8_t *out)
 {
 	struct conn_keys k;
 
-	snprintf(pr->ufrag, sizeof(pr->ufrag), "%s", c->claim_ufrag);
+	conn_claim_take(c, pr->ufrag, sizeof(pr->ufrag));
 	pthread_mutex_lock(&c->probe_lock);
 	pr->seq = ++c->probe_seq;
 	pthread_mutex_unlock(&c->probe_lock);
@@ -2667,10 +2704,12 @@ static void probe_recv(struct conn *c, const uint8_t *data, size_t len,
 		       struct nat_agent *agent)
 {
 	struct path_probe pr;
+	char mine[40];
 
 	if (conn_probe_open(c, &pr, data, len))
 		return;
-	if (strcmp(pr.ufrag, c->claim_ufrag))
+	conn_claim_take(c, mine, sizeof(mine));
+	if (strcmp(pr.ufrag, mine))
 		return;			/* not the claimant this conn serves */
 	if (!conn_probe_fresh(c, &pr))
 		return;
@@ -2785,6 +2824,7 @@ static void probe_adopt(struct sess *s, const uint8_t *data, size_t len,
 			const struct sockaddr_in6 *src)
 {
 	struct path_probe pr;
+	char mine[40];
 	int i;
 
 	/*
@@ -2798,8 +2838,9 @@ static void probe_adopt(struct sess *s, const uint8_t *data, size_t len,
 
 		if (!c || conn_probe_open(c, &pr, data, len))
 			continue;
+		conn_claim_take(c, mine, sizeof(mine));
 		if (pr.type != PROBE_PING || !pr.ufrag[0] ||
-		    strcmp(c->claim_ufrag, pr.ufrag))
+		    strcmp(mine, pr.ufrag))
 			continue;
 		if (!conn_probe_fresh(c, &pr))
 			return;
@@ -3415,9 +3456,12 @@ static void conn_gen_ice(struct conn *c)
 	/* A client probes under its own identity; a host overwrites this with the
 	 * claimant it admitted (lan_drain, the turnstile at pickup, and the
 	 * single-connection state machine when it takes an answer up). */
-	if (c->sess && !c->sess->cfg->is_host)
+	if (c->sess && !c->sess->cfg->is_host) {
+		pthread_mutex_lock(&c->claim_lock);
 		snprintf(c->claim_ufrag, sizeof(c->claim_ufrag), "%s",
 			 c->ice_ufrag);
+		pthread_mutex_unlock(&c->claim_lock);
+	}
 	/* What a probe proved was proved for one claimant identity, so a fresh
 	 * one voids every measurement; the endpoints themselves stand. */
 	pthread_mutex_lock(&c->path_lock);
@@ -4278,14 +4322,23 @@ static int conn_run(struct conn *c, int drive_sig)
 	if (nosigpipe(cp[0])) {		/* see ctl_send */
 		/* best effort: without it a closed channel raises SIGPIPE */
 	}
-	c->stream = stream_create(s->keys.conv, on_stream_output, c);
-	if (!c->stream) {
+	/*
+	 * Built first and published under the lock the readers take: a
+	 * transport receive thread is already running by now and reaches
+	 * c->stream through deliver_stream_from, so assigning it in the open
+	 * was a race with every one of those reads.
+	 */
+	st = stream_create(s->keys.conv, on_stream_output, c);
+	if (!st) {
 		sock_close(sp[0]);
 		sock_close(sp[1]);
 		sock_close(cp[0]);
 		sock_close(cp[1]);
 		return -1;
 	}
+	pthread_mutex_lock(&c->stream_lock);
+	c->stream = st;
+	pthread_mutex_unlock(&c->stream_lock);
 	c->ssh_fd = sp[1];
 	c->ssh_ctl_fd = cp[1];
 	c->ctl_fd = cp[0];
@@ -4720,14 +4773,15 @@ static int stun_rotate_ok(const struct sess *s)
 {
 	if (s->cfg->stun_host || !s->cfg->stun_auto || s->stun_count < 2)
 		return 0;
-	if (!s->have_priv4)
+	if (!__atomic_load_n(&s->have_priv4, __ATOMIC_RELAXED))
 		return 0;
 	return s->stun_rotations < STUN_ROTATE_MAX;
 }
 
 static int stun_stall(struct sess *s)
 {
-	if (!stun_rotate_ok(s) || s->have_srflx4)
+	if (!stun_rotate_ok(s) ||
+	    __atomic_load_n(&s->have_srflx4, __ATOMIC_RELAXED))
 		return 0;
 	return now_ms() - s->stun_since_ms > STUN_ROTATE_MS;
 }
@@ -5120,10 +5174,13 @@ static void net_change_reset(struct sess *s)
 		uint8_t rb[2];
 
 		random_bytes(rb, 2);
-		s->ice_attempt = ((rb[0] << 8) | rb[1]) % s->stun_count;
+		__atomic_store_n(&s->ice_attempt,
+				 ((rb[0] << 8) | rb[1]) % s->stun_count,
+				 __ATOMIC_RELAXED);
 	}
-	s->have_priv4 = 0;		/* and fresh v4 facts to run it on */
-	s->have_srflx4 = 0;
+	__atomic_store_n(&s->have_priv4, 0, __ATOMIC_RELAXED);
+					/* and fresh v4 facts to run it on */
+	__atomic_store_n(&s->have_srflx4, 0, __ATOMIC_RELAXED);
 	s->pool_reported = 0;
 	s->pool_posted = 0;
 	s->mapping_reported = 0;
@@ -5532,6 +5589,7 @@ static struct conn *conn_alloc(struct sess *s)
 	pthread_mutex_init(&c->path_lock, NULL);
 	pthread_mutex_init(&c->key_lock, NULL);
 	pthread_mutex_init(&c->probe_lock, NULL);
+	pthread_mutex_init(&c->claim_lock, NULL);
 	path_table_init(&c->paths);
 	/*
 	 * Frames are counted from the clock, not from one. A host that reaps a
@@ -5564,6 +5622,7 @@ static void conn_free(struct conn *c)
 	pthread_mutex_destroy(&c->path_lock);
 	pthread_mutex_destroy(&c->key_lock);
 	pthread_mutex_destroy(&c->probe_lock);
+	pthread_mutex_destroy(&c->claim_lock);
 	free(c);
 }
 
@@ -5843,8 +5902,10 @@ static void lan_drain(struct sess *s, struct worker *ws, int *dash_seq)
 			conn_free(c);
 			break;
 		}
+		pthread_mutex_lock(&c->claim_lock);
 		snprintf(c->claim_ufrag, sizeof(c->claim_ufrag), "%s",
 			 s->lan_pending[p].ufrag);
+		pthread_mutex_unlock(&c->claim_lock);
 		if (c->claim_ufrag[0]) {
 			snprintf(s->last_served_ufrag,
 				 sizeof(s->last_served_ufrag), "%s",
@@ -6402,7 +6463,9 @@ static int host_turnstile(struct sess *s)
 			}
 			/* The ssh thread learns the grade a beat after the row
 			 * appears (it is decided at auth); mark it once known. */
-			if (o && o->peer_ro && ws[i].c->read_only &&
+			if (o && o->peer_ro &&
+			    __atomic_load_n(&ws[i].c->read_only,
+					    __ATOMIC_RELAXED) &&
 			    !ws[i].c->ro_reported) {
 				ws[i].c->ro_reported = 1;
 				o->peer_ro(o->arg, ws[i].c->dash_id);
@@ -6444,7 +6507,7 @@ static int host_turnstile(struct sess *s)
 				 "-- offering through the next (%d of %d)",
 				 s->ice_attempt % s->stun_count,
 				 s->stun_rotations + 1, STUN_ROTATE_MAX);
-			s->ice_attempt++;
+			__atomic_add_fetch(&s->ice_attempt, 1, __ATOMIC_RELAXED);
 			s->stun_rotations++;
 			conn_free(listen);
 			listen = NULL;
@@ -6532,7 +6595,7 @@ static int host_turnstile(struct sess *s)
 						 s->ice_attempt % s->stun_count,
 						 s->stun_rotations + 1,
 						 STUN_ROTATE_MAX);
-					s->ice_attempt++;
+					__atomic_add_fetch(&s->ice_attempt, 1, __ATOMIC_RELAXED);
 					s->stun_rotations++;
 					conn_free(listen);
 					listen = NULL;
@@ -6735,8 +6798,10 @@ static int host_turnstile(struct sess *s)
 				} else {
 					s->admitted_n++;
 				}
+				pthread_mutex_lock(&listen->claim_lock);
 				snprintf(listen->claim_ufrag,
 					 sizeof(listen->claim_ufrag), "%s", cu);
+				pthread_mutex_unlock(&listen->claim_lock);
 				punch_start[pslot] = now_ms();
 				punch_stuck[pslot] = stuck_left > 0;
 				if (stuck_left > 0)
@@ -6872,6 +6937,7 @@ int session_run(const struct session_cfg *cfg)
 	pthread_mutex_init(&s.c.path_lock, NULL);
 	pthread_mutex_init(&s.c.key_lock, NULL);
 	pthread_mutex_init(&s.c.probe_lock, NULL);
+	pthread_mutex_init(&s.c.claim_lock, NULL);
 	pthread_mutex_init(&s.pub_lock, NULL);
 	path_table_init(&s.c.paths);
 	pthread_mutex_init(&s.ns_lock, NULL);
@@ -6891,7 +6957,9 @@ int session_run(const struct session_cfg *cfg)
 		uint8_t rb[2];
 
 		random_bytes(rb, 2);
-		s.ice_attempt = ((rb[0] << 8) | rb[1]) % s.stun_count;
+		__atomic_store_n(&s.ice_attempt,
+				 ((rb[0] << 8) | rb[1]) % s.stun_count,
+				 __ATOMIC_RELAXED);
 	}
 	/* The probes are scheduled by the reachability model, which asks for the
 	 * first round on its first tick. */
@@ -7016,7 +7084,7 @@ int session_run(const struct session_cfg *cfg)
 		 * answer is in play the ICE retry path below owns rotation.
 		 */
 		if ((st == ST_GATHER || st == ST_SIGNAL) && stun_stall(&s)) {
-			s.ice_attempt++;
+			__atomic_add_fetch(&s.ice_attempt, 1, __ATOMIC_RELAXED);
 			s.stun_rotations++;
 			st = client_regather(&s) ? ST_FAIL : ST_GATHER;
 		}
@@ -7050,8 +7118,9 @@ int session_run(const struct session_cfg *cfg)
 				s.escalated = 1;
 			}
 			if (o->escalate && !s.stun_warned &&
-			    (cfg->sig_flags & SIG_DHT) && s.have_priv4 &&
-			    !s.have_srflx4 && s.stun_count > 0 &&
+			    (cfg->sig_flags & SIG_DHT) && __atomic_load_n(&s.have_priv4, __ATOMIC_RELAXED) &&
+			    !__atomic_load_n(&s.have_srflx4, __ATOMIC_RELAXED) &&
+			    s.stun_count > 0 &&
 			    now_ms() - s.start_ms > STUN_WARN_MS) {
 				o->escalate(o->arg, "no public IPv4 from STUN -- "
 					    "the server list may be stale; run "
@@ -7060,7 +7129,8 @@ int session_run(const struct session_cfg *cfg)
 			}
 			/* The fact the warning reported has stopped being true:
 			 * a reflexive v4 did arrive, just late. */
-			if (s.stun_warned && s.have_srflx4) {
+			if (s.stun_warned &&
+			    __atomic_load_n(&s.have_srflx4, __ATOMIC_RELAXED)) {
 				s.stun_warned = 0;
 				if (o->escalate_clear)
 					o->escalate_clear(o->arg);
@@ -7115,10 +7185,13 @@ int session_run(const struct session_cfg *cfg)
 				/* The claimant a single-connection host serves is
 				 * the identity in the answer it takes up, as
 				 * lan_drain and the turnstile record theirs. */
-				if (cfg->is_host)
+				if (cfg->is_host) {
+					pthread_mutex_lock(&s.c.claim_lock);
 					snprintf(s.c.claim_ufrag,
 						 sizeof(s.c.claim_ufrag), "%s",
 						 ufrag);
+					pthread_mutex_unlock(&s.c.claim_lock);
+				}
 				s.pool_posted = fan_local_sdp(&s);
 							/* members learnt since
 							 * the ST_GATHER post */
@@ -7198,7 +7271,7 @@ int session_run(const struct session_cfg *cfg)
 			}
 			if (nat_failed(s.c.nat) ||
 			    now_ms() - s.ice_attempt_start > ICE_ATTEMPT_MS) {
-				s.ice_attempt++;
+				__atomic_add_fetch(&s.ice_attempt, 1, __ATOMIC_RELAXED);
 				conn_drop_ice_path(&s.c);
 				conn_free_agent(&s.c, s.c.nat, s.c.nat_ctx);
 				s.c.nat = NULL;
@@ -7334,6 +7407,7 @@ done:
 	pthread_mutex_destroy(&s.trickle_lock);
 	pthread_mutex_destroy(&s.c.status_lock);
 	pthread_mutex_destroy(&s.c.probe_lock);
+	pthread_mutex_destroy(&s.c.claim_lock);
 	pthread_mutex_destroy(&s.c.hb_lock);
 	pthread_mutex_destroy(&s.c.peer_in_lock);
 	pthread_mutex_destroy(&s.c.stream_lock);

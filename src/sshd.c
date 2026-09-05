@@ -737,8 +737,9 @@ int sshd_serve_fd(sock_t fd, const struct sshd_opts *o)
 		dbg_logf("sshd: auth failed/aborted");
 		goto out;
 	}
+	/* Read by the loop that watches this worker, on another thread. */
 	if (o->ro_out)
-		*o->ro_out = read_only;
+		__atomic_store_n(o->ro_out, read_only, __ATOMIC_RELAXED);
 	dbg_logf("sshd: auth ok (read_only=%d), channel open", read_only);
 	chan = do_channel(s);
 	if (!chan) {
