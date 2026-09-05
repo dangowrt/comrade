@@ -1736,6 +1736,26 @@ static void sb_rule_ioctl(struct sb_prog *p, unsigned int deflt, int no_pty)
 		sb_eq_ret(p, TCGETS2, SB_RET_ALLOW);
 		sb_eq_ret(p, TCSETS2, SB_RET_ALLOW);
 #endif
+	} else {
+		/*
+		 * A sanitiser runtime asks isatty() about the descriptor it
+		 * reports through before it writes a word -- ioctl(TCGETS2) on
+		 * glibc, TCGETS on musl. Withholding the query kills the
+		 * process at the instant it tries to speak, which is how a
+		 * forwarding-only host under ThreadSanitizer died with SIGSYS
+		 * and left a report file of zero bytes behind. An instrumented
+		 * build grants the two read-only queries; the setters stay
+		 * withheld, because a role that drives no terminal still has no
+		 * business changing the state of one.
+		 */
+#ifdef SB_INSTRUMENTED
+#ifdef TCGETS
+		sb_eq_ret(p, TCGETS, SB_RET_ALLOW);
+#endif
+#ifdef TCGETS2
+		sb_eq_ret(p, TCGETS2, SB_RET_ALLOW);
+#endif
+#endif
 	}
 	sb_ret(p, deflt);
 	sb_land_jf(p, at);
