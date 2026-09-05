@@ -459,7 +459,7 @@ jobs:
           # self-confining binary, so leaving it unmeasured was a real hole.
           ctest --test-dir build -T memcheck --timeout 3600 \
             -R "_e2e|swarm_|^stop_test$" \
-            --overwrite MemoryCheckCommandOptions="--fair-sched=yes --trace-children=yes --trace-children-skip=*/sh,*/bash,*/sed,*/grep,*/awk,*/cat,*/rm,*/mktemp,*/sleep,*/kill,*/tail,*/head,*/tr,*/date,*/dirname,*/basename,*/wc,*/sort,*/uniq,*/cut,*/env,*/tmux,*/printf,*/expr,*/seq --leak-check=no --error-exitcode=1" \
+            --overwrite MemoryCheckCommandOptions="--fair-sched=yes --trace-children=yes --trace-children-skip=*/sh,*/bash,*/sed,*/grep,*/awk,*/cat,*/rm,*/mktemp,*/sleep,*/kill,*/tail,*/head,*/tr,*/date,*/dirname,*/basename,*/wc,*/sort,*/uniq,*/cut,*/env,*/tmux,*/printf,*/expr,*/seq,*/ps --leak-check=no --error-exitcode=1" \
             2>&1 | tee mce2e.out
           rc=${PIPESTATUS[0]}
           ctest --test-dir build -R swarm_down >/dev/null 2>&1 || true
