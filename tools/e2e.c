@@ -47,6 +47,18 @@ static volatile sig_atomic_t e2e_stop;
  */
 static int e2e_end_wfd = -1;
 
+/*
+ * And the same monitor is what bounds a run in time. The turnstile checks its
+ * deadline only where there is no end monitor -- a real host has one and must
+ * outlive any deadline, since its connect timeout is 60s and it serves for as
+ * long as its tmux lives -- so once this harness held a monitor of its own, a
+ * host here stopped being bounded by --timeout as well. A run that then failed
+ * to serve every client it was promised sat in the turnstile for ever and the
+ * script waiting on it hung until ctest killed the pair, with nothing printed
+ * to say why. So the alarm below signals this monitor at the same deadline the
+ * turnstile would have applied, which bounds the harness without touching what
+ * a real host does.
+ */
 static void on_term(int sig)
 {
 	(void)sig;
@@ -58,6 +70,14 @@ static void on_term(int sig)
 
 		(void)n;
 	}
+}
+
+/* Arm the deadline this run is allowed, per session_run, from the same value
+ * the turnstile computes its own deadline from. */
+static void e2e_bound_run(int secs)
+{
+	if (secs > 0)
+		alarm((unsigned int)secs);
 }
 
 static const char *state_name(int state)
@@ -148,6 +168,7 @@ int main(int argc, char **argv)
 	 * for: SIGTERM winds the hold up and the run finishes and reports as it
 	 * would have anyway, rather than being cut off mid-verdict. */
 	signal(SIGTERM, on_term);
+	signal(SIGALRM, on_term);
 
 	if (argc >= 3 && !strcmp(argv[1], "token"))
 		return inspect_token(argv[2]);
@@ -315,10 +336,14 @@ int main(int argc, char **argv)
 		for (n = 0; n < cfg.host_serve_max && !rc; n++) {
 			cfg.tok = host.tok;	/* carry the anchor forward, as
 						 * run_service does */
+			e2e_bound_run(cfg.connect_timeout_s);
 			rc = session_run(&cfg);
+			alarm(0);
 		}
 	} else {
+		e2e_bound_run(cfg.connect_timeout_s);
 		rc = session_run(&cfg);
+		alarm(0);
 	}
 	if (cfg.hostkey)
 		sshd_hostkey_free(cfg.hostkey);
