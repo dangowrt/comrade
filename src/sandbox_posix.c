@@ -1241,6 +1241,25 @@ static const int sb_nr_mem[] = {
 #ifdef __NR_madvise
 	__NR_madvise,		/* MADV_GUARD_INSTALL from glibc 2.42 */
 #endif
+	/*
+	 * libgcrypt locks its secure-memory pool so the secrets in it are
+	 * never written to swap -- one mlock of 32 KiB during
+	 * GCRYCTL_INIT_SECMEM, measured. The list was first taken against the
+	 * OpenSSL backend, which does not do this, so a gcrypt build was
+	 * killed by its own filter before it could publish a token. munlock
+	 * goes with it: gcry does not release the pool today, and a version
+	 * that starts to should not have its clean exit turned into a SIGSYS
+	 * for asking to undo something it was allowed to do. Neither grants
+	 * an attacker anything -- one refuses the kernel a page it may swap,
+	 * the other gives it back. mlockall is deliberately not here: nothing
+	 * asks for it and it is a way to pin all of memory at once.
+	 */
+#ifdef __NR_mlock
+	__NR_mlock,
+#endif
+#ifdef __NR_munlock
+	__NR_munlock,
+#endif
 	0
 };
 
