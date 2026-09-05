@@ -28,6 +28,7 @@
 #include <poll.h>
 #include <pthread.h>
 #ifdef __APPLE__
+#include <sys/sysctl.h>			/* KERN_PROC, for a process's state */
 #include <util.h>			/* forkpty lives here, not in pty.h */
 #else
 #include <pty.h>
@@ -268,6 +269,73 @@ static int valid_id(const char *id)
 
 
 /* The pid a file names, still alive; 0 if the file is absent or it is not. */
+/*
+ * Whether a pid is a process that has exited and not yet been collected.
+ *
+ * kill(pid, 0) cannot tell that from a running one: a process that has exited
+ * keeps its entry until whatever started it waits on it, and answers the
+ * signal probe throughout. That is not a corner case here -- a supervisor
+ * starts a headless host, reaps it only when it chooses to, and asks in
+ * between whether the session is still up -- so a service killed outright
+ * would read as running for as long as nobody collected it, and `stop` would
+ * report a session it had in fact already ended.
+ *
+ * Consulted only to demote a pid the signal probe already accepted, so a
+ * platform this cannot answer for, or a confined caller whose private root has
+ * no /proc, degrades to exactly the old test rather than to a wrong one.
+ */
+static int pid_exited(long pid)
+{
+#if defined(__linux__)
+	char p[64], buf[512], *e;
+	FILE *f;
+	size_t n;
+
+	snprintf(p, sizeof(p), "/proc/%ld/stat", pid);
+	f = fopen(p, "r");
+	if (!f)
+		return 0;
+	n = fread(buf, 1, sizeof(buf) - 1, f);
+	fclose(f);
+	buf[n] = '\0';
+	/*
+	 * The state is the third field, but the second is the command in
+	 * parentheses and may hold spaces and parentheses of its own, so it is
+	 * found from the last ')' rather than by counting separators.
+	 */
+	e = strrchr(buf, ')');
+	if (!e)
+		return 0;
+	for (e++; *e == ' '; e++)
+		;
+	return *e == 'Z';
+#elif defined(__APPLE__)
+	struct kinfo_proc kp;
+	size_t len = sizeof(kp);
+	int mib[4];
+
+	mib[0] = CTL_KERN;
+	mib[1] = KERN_PROC;
+	mib[2] = KERN_PROC_PID;
+	mib[3] = (int)pid;
+	if (sysctl(mib, 4, &kp, &len, NULL, 0) != 0 || len == 0)
+		return 0;
+	return kp.kp_proc.p_stat == SZOMB;
+#else
+	(void)pid;
+	return 0;
+#endif
+}
+
+/* A pid that names a process still running, rather than one merely still
+ * listed. Every liveness question in this file goes through here. */
+static int pid_running(long pid)
+{
+	if (pid <= 0 || kill((pid_t)pid, 0) != 0)
+		return 0;
+	return !pid_exited(pid);
+}
+
 static long pid_in(const char *pp)
 {
 	FILE *f;
@@ -279,7 +347,7 @@ static long pid_in(const char *pp)
 	if (fscanf(f, "%ld", &pid) != 1)
 		pid = 0;
 	fclose(f);
-	return (pid > 0 && kill((pid_t)pid, 0) == 0) ? pid : 0;
+	return pid_running(pid) ? pid : 0;
 }
 
 /* The service pid a session's pidfile names, alive; 0 if none or dead. */
@@ -1557,11 +1625,6 @@ int host_headless(const char *id_opt, int no_mcast, int no_dht, int no_fwd,
 		mview_error(m, "no_tmux");
 		return 3;
 	}
-	pf = fopen(pidp, "w");
-	if (pf) {
-		fprintf(pf, "%ld\n", os_getpid());
-		fclose(pf);
-	}
 	/* Fork the spawner and confine, while still single-threaded and before
 	 * the first socket -- the stop-watch thread and the serving come after. */
 	layers = svc_confine(&v);
@@ -1577,10 +1640,24 @@ int host_headless(const char *id_opt, int no_mcast, int no_dht, int no_fwd,
 	w.done = 0;
 	if (pthread_create(&th, NULL, stop_watch_thread, &w)) {
 		fprintf(stderr, "comrade: thread creation failed\n");
-		unlink(pidp);
 		mview_destroy(m);
 		spawner_destroy(v.sp);
 		return 1;
+	}
+	/*
+	 * Published last, because it is what tells a supervisor this session
+	 * can be stopped -- and until the handler is armed and the watch that
+	 * carries out its wind-down is running, it cannot be. Written any
+	 * earlier, the interval that confines the process and forks its
+	 * spawner sits between the promise and the ability to keep it, and a
+	 * supervisor that reads the file and signals at once lands in it: the
+	 * default action ends the process outright, so the tail that removes
+	 * this file never runs and the pidfile outlives the service it names.
+	 */
+	pf = fopen(pidp, "w");
+	if (pf) {
+		fprintf(pf, "%ld\n", os_getpid());
+		fclose(pf);
 	}
 	svc_serve(&v, hostkey, no_mcast, no_dht);
 	__atomic_store_n(&w.done, 1, __ATOMIC_RELAXED);
@@ -1606,9 +1683,9 @@ static int term_wait(long pid)
 	int i;
 
 	kill((pid_t)pid, SIGTERM);
-	for (i = 0; i < STOP_GRACE_TICKS && !kill((pid_t)pid, 0); i++)
+	for (i = 0; i < STOP_GRACE_TICKS && pid_running(pid); i++)
 		usleep(100 * 1000);
-	return kill((pid_t)pid, 0) == 0;
+	return pid_running(pid);
 }
 
 int host_stop(const char *id_opt)
@@ -1673,8 +1750,7 @@ int host_stop(const char *id_opt)
 	 * middle of removing.
 	 */
 	if (pid > 0)
-		for (i = 0; i < STOP_GONE_TICKS &&
-			    kill((pid_t)pid, 0) == 0; i++)
+		for (i = 0; i < STOP_GONE_TICKS && pid_running(pid); i++)
 			usleep(100 * 1000);
 	/*
 	 * Say so when it is still there. `stop` returning 0 means access has
@@ -1683,7 +1759,7 @@ int host_stop(const char *id_opt)
 	 * which is a worse answer than an error naming the process that is
 	 * still running.
 	 */
-	if (session_live(id) || (pid > 0 && kill((pid_t)pid, 0) == 0)) {
+	if (session_live(id) || pid_running(pid)) {
 		long now_pid = pid_of(id);
 
 		fprintf(stderr, "comrade: session '%s' is still running", id);

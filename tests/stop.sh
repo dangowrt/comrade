@@ -131,5 +131,46 @@ kill -KILL "$hpid" 2>/dev/null
 wait "$hpid" 2>/dev/null
 hpid=""
 
+# ---- 4: a service killed outright, not yet collected ----------------------
+# A service that dies without running its exit tail leaves its pidfile behind,
+# and until whatever started it waits on it, the process keeps its entry and
+# answers a signal probe. Naming that a live session made stop report one it
+# had already ended -- which is the answer a supervisor cannot act on, since
+# waiting for the process to go means waiting for itself.
+#
+# Whether the corpse lingers is the shell's business, not comrade's: dash
+# leaves it until `wait` (this is what CI runs), while bash collects it on its
+# own. So the case is skipped rather than passed where the shell has already
+# reaped, instead of reporting coverage this run did not have.
+#
+# Whether the corpse is still listed when stop looks is the parent's business,
+# and a shell reaps its background children whenever it next runs its own
+# loop -- so started the usual way this case would test nothing here and the
+# real thing on a supervisor that waits differently. The host is given a
+# parent that will never reap instead: a subshell that starts it and then
+# execs sleep, which has no wait of its own. The corpse is then guaranteed to
+# still be listed, on every platform, which is the state being tested.
+sh -c '"$1" --headless --forward-only --id killed --no-dht >"$2" 2>"$3" &
+       exec sleep 30' sh "$CR" "$tmp/killed.json" "$tmp/killed.err" &
+holder=$!
+wait_pid killed || skip "the third host never started"
+spid=$(cat "$COMRADE_STATE_DIR/killed.pid" 2>/dev/null)
+kill -KILL "$spid" 2>/dev/null
+i=0
+while [ "$i" -lt 50 ] && [ -n "$(ps -o stat= -p "$spid" 2>/dev/null | tr -d ' ')" ] &&
+      [ "$(ps -o stat= -p "$spid" 2>/dev/null | cut -c1)" != Z ]; do
+	sleep 0.1
+	i=$((i + 1))
+done
+out=$("$CR" stop --id killed 2>&1)
+sc=$?
+if [ "$sc" -ne 0 ]; then
+	fail "stop reported a service that had already exited: $out"
+else
+	echo "a service killed outright: reported as ended"
+fi
+kill -KILL "$holder" 2>/dev/null
+wait "$holder" 2>/dev/null
+
 [ "$rc" = 0 ] && echo "stop lifecycle PASSED" || echo "stop lifecycle FAILED"
 exit "$rc"
