@@ -346,7 +346,7 @@ jobs:
           LOGS="$PWD/build/san-logs"
           rm -rf "$LOGS"; mkdir -p "$LOGS"
           eval "$(sh tests/sanenv.sh '${{ matrix.sanitize }}' "$LOGS")"
-          ctest --test-dir build --output-on-failure --timeout 600 \
+          ${SAN_LAUNCH:-} ctest --test-dir build --output-on-failure --timeout 600 \
             -E "_e2e|swarm_" 2>&1 | tee unit.out
           rc=${PIPESTATUS[0]}
           sed -n 's/.*out of \([0-9][0-9]*\).*/\1/p' unit.out | tail -1 > "$LOGS/.ran"
@@ -409,7 +409,7 @@ jobs:
           LOGS="$PWD/build/san-logs-e2e"
           rm -rf "$LOGS"; mkdir -p "$LOGS"
           eval "$(sh tests/sanenv.sh '${{ matrix.sanitize }}' "$LOGS")"
-          ctest --test-dir build --output-on-failure --stop-on-failure \
+          ${SAN_LAUNCH:-} ctest --test-dir build --output-on-failure --stop-on-failure \
             -R "_e2e|swarm_" 2>&1 | tee e2e.out
           rc=${PIPESTATUS[0]}
           # The swarm outlives a run that stopped early, so take it down by
@@ -477,6 +477,21 @@ jobs:
 
       # The binary itself, not only the tests: main, the option parsing and the
       # dashboard's own code are reached by nothing in the suite.
+      # ThreadSanitizer places its shadow at fixed addresses and refuses to
+      # start if anything is already mapped there. Ubuntu 24.04 ships
+      # vm.mmap_rnd_bits=32, which spreads a PIE binary across exactly that
+      # range, so every instrumented binary dies with "unexpected memory
+      # mapping" before reaching main -- the whole suite, not one test.
+      # Lowering the sysctl would fix it for the entire machine, and these
+      # runners are shared, so randomisation is turned off for the test
+      # processes alone instead: per process, inherited by their children,
+      # and needing no privilege. Measured on a runner-identical guest
+      # (Ubuntu 24.04, mmap_rnd_bits=32): every binary exits 66 plain and 0
+      # under this.
+      - name: Give ThreadSanitizer an address space it can map
+        if: ${{ matrix.sanitize == 'thread' && runner.os == 'Linux' }}
+        run: echo "SAN_LAUNCH=setarch $(uname -m) -R" >> "$GITHUB_ENV"
+
       - name: Smoke test the binary
         if: ${{ !matrix.analyze }}
         run: |
@@ -484,9 +499,9 @@ jobs:
           LOGS="$PWD/build/san-logs-smoke"
           rm -rf "$LOGS"; mkdir -p "$LOGS"
           eval "$(sh tests/sanenv.sh '${{ matrix.sanitize }}' "$LOGS")"
-          ./build/comrade --help
-          ./build/comrade --version
-          ./build/comrade show || true   # exits 1 with no session, as designed
+          ${SAN_LAUNCH:-} ./build/comrade --help
+          ${SAN_LAUNCH:-} ./build/comrade --version
+          ${SAN_LAUNCH:-} ./build/comrade show || true   # exits 1 with no session, as designed
           echo 3 > "$LOGS/.ran"
           sh tests/sanreport.sh "$LOGS" 1
 
