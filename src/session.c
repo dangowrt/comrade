@@ -245,9 +245,27 @@ struct sess;			/* forward: a conn carries a back-pointer to it */
  * and libjuice reports no source address with a datagram, so without this each
  * one's traffic would be credited to whichever agent is current.
  */
+/*
+ * A callback's way back to the connection it serves. The loop re-points c
+ * when a punched agent is grafted onto another connection, while libjuice's
+ * threads are reading it, so it is touched atomically at both ends. A
+ * callback that loads the old value delivers one last frame to the previous
+ * owner -- the behaviour nat_rebind already documents, and which the punch
+ * shell being dissolved and the connection adopting it both tolerate. agent
+ * is set when the context is made and never changes, so a context names its
+ * agent for life.
+ */
 struct ice_ctx {
 	struct conn *c;
 	struct nat_agent *agent;
+	/*
+	 * The connection that lent this agent away and is waiting to be
+	 * released. A callback that loaded c before it was re-pointed is still
+	 * inside the old connection, so the lender cannot be freed on the spot
+	 * -- nat_destroy is the only moment at which nothing can be inside the
+	 * callbacks any more, and that is where it goes.
+	 */
+	struct conn *shell;
 };
 
 struct conn {
@@ -345,14 +363,32 @@ struct conn {
 	 * punch into the worker it already runs -- the SSH session, the
 	 * forwards and their carried TCP streams ride through on KCP
 	 * retransmission (rs_state: 0 idle, 1 gathering, 2 claimed). On the
-	 * host, the turnstile parks the punched agent in resume_agent for the
-	 * worker's own thread to adopt -- c->nat belongs to that thread -- and
-	 * resume_pending holds the reap off while the punch is in flight.
+	 * host, the turnstile hands the punched agent to the worker's own
+	 * thread, under the contract below.
+	 *
+	 * WHO OWNS AN AGENT. A connection's agent and its context (c->nat and
+	 * c->nat_ctx, which always move as a pair) belong to exactly one
+	 * thread: the worker running conn_run for this connection if there is
+	 * one, and the loop otherwise. The loop never writes them for a
+	 * connection that has a worker; it hands over instead.
+	 *
+	 * HOW A HANDOVER IS PUBLISHED. One pointer, once. A context is bound
+	 * for life to the agent it was created for (ice_ctx.agent), so naming
+	 * the context names the agent, and the slot below is the whole of the
+	 * handover -- publishing an agent and a context as two stores is how a
+	 * worker came to see one of them and not the other. The loop re-points
+	 * the context's connection and the agent's callback argument first and
+	 * publishes the slot last, with release; the worker takes it with
+	 * acquire, which is what makes those earlier stores visible to it.
+	 *
+	 * resume_pending holds the reap off while the punch is in flight. It
+	 * and the stamps below are written by the loop and read by the worker,
+	 * so they are atomic: each is advisory and one-way within a resume,
+	 * and a reader wants the latest answer rather than a synchronised one.
 	 */
 	int rs_state;
 	uint64_t rs_deadline;
-	struct nat_agent *volatile resume_agent;
-	struct ice_ctx *volatile resume_agent_ctx;
+	struct ice_ctx *resume_ctx;	/* the handover slot; see above */
 	volatile int resume_pending;
 	uint64_t resume_last_ms;	/* host: when a resume punch last began,
 					 * so a redelivered claim in the window
@@ -432,6 +468,10 @@ struct conn {
 					 * last proven on; older means we have
 					 * no evidence about it here */
 	uint64_t hb_last_pong;		/* when a pong last came back */
+	/* Touched atomically: every update is under hb_lock with the rest of
+	 * the heartbeat state, but conn_heard tests it on the receive path
+	 * before taking anything, so that this does not cost a lock on every
+	 * packet that arrives. */
 	uint64_t hb_last_heard;		/* when anything last arrived from the
 					 * peer (fed by the receive threads) */
 	int hb_rtt;			/* round trip from the last pong, ms */
@@ -687,6 +727,8 @@ struct sess {
 	pthread_mutex_t ns_lock;
 	struct nsfacts ns_facts;
 	/* The epoch each producer was started for, stamped before it starts. */
+	/* Stamped by the loop when a round is armed and read by that round's
+	 * probe thread as it reports, so both ends are atomic. */
 	volatile uint32_t probe_epoch[2];
 	volatile uint32_t gather_epoch[2];
 
@@ -900,6 +942,23 @@ static void conn_drop_ice_path(struct conn *c)
 
 /* Let one agent go, with the path that borrowed it and the context its
  * callbacks were handed. The table is unlocked before the agent call. */
+/*
+ * And the connection itself. Only ever after nat_destroy has returned for any
+ * agent whose callbacks could still name it -- see ice_ctx.shell.
+ */
+static void conn_release(struct conn *c)
+{
+	pthread_mutex_destroy(&c->hb_lock);
+	pthread_mutex_destroy(&c->peer_in_lock);
+	pthread_mutex_destroy(&c->status_lock);
+	pthread_mutex_destroy(&c->stream_lock);
+	pthread_mutex_destroy(&c->path_lock);
+	pthread_mutex_destroy(&c->key_lock);
+	pthread_mutex_destroy(&c->probe_lock);
+	pthread_mutex_destroy(&c->claim_lock);
+	free(c);
+}
+
 static void conn_free_agent(struct conn *c, struct nat_agent *agent,
 			    struct ice_ctx *ctx)
 {
@@ -909,6 +968,10 @@ static void conn_free_agent(struct conn *c, struct nat_agent *agent,
 		pthread_mutex_unlock(&c->path_lock);
 		nat_destroy(agent);
 	}
+	/* Past nat_destroy nothing can be inside this agent's callbacks, so a
+	 * connection that lent it away can finally be given back. */
+	if (ctx && ctx->shell)
+		conn_release(ctx->shell);
 	free(ctx);
 }
 
@@ -1024,7 +1087,7 @@ static int path_blackholed(const struct conn *c, int kind,
 {
 	struct path_ep ep;
 
-	if (c->bh_mute)
+	if (__atomic_load_n(&c->bh_mute, __ATOMIC_RELAXED))
 		return 1;
 	if (c->bh_kind < 0 || kind != c->bh_kind)
 		return 0;
@@ -1524,8 +1587,70 @@ static int fan_local_sdp(struct sess *s)
  */
 static void log_offer(const char *sdp, int served, int active);
 
-/* Defined below, beside the rest of the description handling. */
-static void canon_v6(const char *sdp, const char *src6, char *out, size_t n);
+/*
+ * "v6 direct": a host reaches its own global v6 at the address the kernel
+ * sources outbound from, which we learn without STUN via source_addr's connect
+ * trick. That is the privacy (temporary) address where RFC 4941 is enabled and
+ * the stable one otherwise -- either way, the address we effectively listen on.
+ * libjuice instead enumerates the interface's stable address, which need not be
+ * the source and is a tracking handle besides. So rewrite the one global v6
+ * candidate to our real source and drop the rest (any other global v6 host
+ * candidate, and the redundant v6 srflx), leaving v4 untouched. With no global
+ * v6 source, leave v6 as gathered.
+ */
+static void canon_v6(const char *in, const char *src6, char *out, size_t cap)
+{
+	const char *line = in;
+	size_t o = 0;
+	int kept6 = 0;
+
+	while (*line) {
+		const char *nl = strchr(line, '\n');
+		size_t len = nl ? (size_t)(nl - line + 1) : strlen(line);
+		char addr[64], typ[16];
+		int drop = 0, rewrite = 0, a0 = 0, a1 = 0;
+
+		if (src6[0] && !strncmp(line, "a=candidate:", 12) &&
+		    sscanf(line, "a=candidate:%*s %*d %*s %*u %63s %*d typ %15s",
+			   addr, typ) == 2 && strchr(addr, ':') &&
+		    addr_scope(addr) == NET_SCOPE_GLOBAL) {
+			if (strcmp(typ, "host"))
+				drop = 1;	/* global v6 srflx: source covers it */
+			else if (kept6)
+				drop = 1;	/* only one global v6 */
+			else
+				rewrite = 1;
+		}
+		if (drop) {
+			if (!nl)
+				break;
+			line = nl + 1;
+			continue;
+		}
+		if (rewrite)
+			sscanf(line, "a=candidate:%*s %*d %*s %*u %n%*s%n", &a0, &a1);
+		if (rewrite && a1 > a0 && a0 > 0 && (size_t)a1 <= len) {
+			size_t plen = strlen(src6);
+
+			if (o + (size_t)a0 + plen + (len - (size_t)a1) < cap) {
+				memcpy(out + o, line, (size_t)a0);
+				o += (size_t)a0;
+				memcpy(out + o, src6, plen);
+				o += plen;
+				memcpy(out + o, line + a1, len - (size_t)a1);
+				o += len - (size_t)a1;
+				kept6 = 1;
+			}
+		} else if (o + len < cap) {
+			memcpy(out + o, line, len);
+			o += len;
+		}
+		if (!nl)
+			break;
+		line = nl + 1;
+	}
+	out[o] = '\0';
+}
 
 /*
  * Whether the description libjuice produced is in hand, taking it out of the
@@ -1723,74 +1848,12 @@ static void client_direct_connect(struct sess *s)
 	}
 }
 
-/*
- * "v6 direct": a host reaches its own global v6 at the address the kernel
- * sources outbound from, which we learn without STUN via source_addr's connect
- * trick. That is the privacy (temporary) address where RFC 4941 is enabled and
- * the stable one otherwise -- either way, the address we effectively listen on.
- * libjuice instead enumerates the interface's stable address, which need not be
- * the source and is a tracking handle besides. So rewrite the one global v6
- * candidate to our real source and drop the rest (any other global v6 host
- * candidate, and the redundant v6 srflx), leaving v4 untouched. With no global
- * v6 source, leave v6 as gathered.
- */
-static void canon_v6(const char *in, const char *src6, char *out, size_t cap)
-{
-	const char *line = in;
-	size_t o = 0;
-	int kept6 = 0;
-
-	while (*line) {
-		const char *nl = strchr(line, '\n');
-		size_t len = nl ? (size_t)(nl - line + 1) : strlen(line);
-		char addr[64], typ[16];
-		int drop = 0, rewrite = 0, a0 = 0, a1 = 0;
-
-		if (src6[0] && !strncmp(line, "a=candidate:", 12) &&
-		    sscanf(line, "a=candidate:%*s %*d %*s %*u %63s %*d typ %15s",
-			   addr, typ) == 2 && strchr(addr, ':') &&
-		    addr_scope(addr) == NET_SCOPE_GLOBAL) {
-			if (strcmp(typ, "host"))
-				drop = 1;	/* global v6 srflx: source covers it */
-			else if (kept6)
-				drop = 1;	/* only one global v6 */
-			else
-				rewrite = 1;
-		}
-		if (drop) {
-			if (!nl)
-				break;
-			line = nl + 1;
-			continue;
-		}
-		if (rewrite)
-			sscanf(line, "a=candidate:%*s %*d %*s %*u %n%*s%n", &a0, &a1);
-		if (rewrite && a1 > a0 && a0 > 0 && (size_t)a1 <= len) {
-			size_t plen = strlen(src6);
-
-			if (o + (size_t)a0 + plen + (len - (size_t)a1) < cap) {
-				memcpy(out + o, line, (size_t)a0);
-				o += (size_t)a0;
-				memcpy(out + o, src6, plen);
-				o += plen;
-				memcpy(out + o, line + a1, len - (size_t)a1);
-				o += len - (size_t)a1;
-				kept6 = 1;
-			}
-		} else if (o + len < cap) {
-			memcpy(out + o, line, len);
-			o += len;
-		}
-		if (!nl)
-			break;
-		line = nl + 1;
-	}
-	out[o] = '\0';
-}
 
 static void on_local_sdp(void *arg, const char *sdp)
 {
-	struct sess *s = ((struct ice_ctx *)arg)->c->sess;
+	struct conn *cc = __atomic_load_n(&((struct ice_ctx *)arg)->c,
+					  __ATOMIC_ACQUIRE);
+	struct sess *s = cc->sess;
 
 	/*
 	 * Staged exactly as libjuice gave it. Canonicalising here would mean
@@ -1894,14 +1957,15 @@ static void probe_hit(void *arg, const uint8_t addr[4], uint16_t port)
 
 	pool_note(s, addr);
 	mapping_note(s, addr, port);
-	ns_post(s, NSF_ROUNDTRIP, 4, s->probe_epoch[0]);
+	ns_post(s, NSF_ROUNDTRIP, 4,
+		__atomic_load_n(&s->probe_epoch[0], __ATOMIC_RELAXED));
 }
 
 static void *stun_probe_thread(void *arg)
 {
 	struct sess *s = arg;
 	uint8_t seed[STUN_PROBE_TXID_LEN];
-	uint32_t epoch = s->probe_epoch[0];
+	uint32_t epoch = __atomic_load_n(&s->probe_epoch[0], __ATOMIC_RELAXED);
 
 	/* The whole list, every round. A NAT that maps per destination shows a
 	 * different public address to each server it is asked through, and how
@@ -1998,9 +2062,12 @@ static void probe6_hit(void *arg, const uint8_t addr[16], uint16_t port)
 	char ip[64];
 
 	(void)port;
-	ns_post(s, NSF_ROUNDTRIP, 6, s->probe_epoch[1]);
+	ns_post(s, NSF_ROUNDTRIP, 6,
+		__atomic_load_n(&s->probe_epoch[1], __ATOMIC_RELAXED));
 	if (inet_ntop(AF_INET6, addr, ip, sizeof(ip)))
-		ns_post_addr(s, 6, s->probe_epoch[1], addr, ip);
+		ns_post_addr(s, 6,
+			     __atomic_load_n(&s->probe_epoch[1],
+					     __ATOMIC_RELAXED), addr, ip);
 }
 
 static void *stun_probe6_thread(void *arg)
@@ -2008,7 +2075,7 @@ static void *stun_probe6_thread(void *arg)
 	struct sess *s = arg;
 	char *targets[STUN_PROBE_SERVERS];
 	uint8_t seed[STUN_PROBE_TXID_LEN];
-	uint32_t epoch = s->probe_epoch[1];
+	uint32_t epoch = __atomic_load_n(&s->probe_epoch[1], __ATOMIC_RELAXED);
 	int n = 0, i, attempt;
 
 	attempt = __atomic_load_n(&s->ice_attempt, __ATOMIC_RELAXED);
@@ -2061,7 +2128,9 @@ static int stun_probe6_kick(struct sess *s)
  * observer report, which not every caller wires up. */
 static void on_ice_candidate(void *arg, const char *cand)
 {
-	struct sess *s = ((struct ice_ctx *)arg)->c->sess;
+	struct conn *cc = __atomic_load_n(&((struct ice_ctx *)arg)->c,
+					  __ATOMIC_ACQUIRE);
+	struct sess *s = cc->sess;
 	size_t used, room, n = strlen(cand);
 	const char *p = strstr(cand, "candidate:");
 	char addr[64], typ[16];
@@ -2208,7 +2277,8 @@ static void ctl_dispatch(void *arg, int type, const uint8_t *pl, size_t plen)
 		c->hb_last_pong = now;
 		c->hb_rtt = (int)(now - ctl_get_u64(pl));
 		c->hb_pong_seen = 1;
-		c->sess->handshake_seen = 1;
+		__atomic_store_n(&c->sess->handshake_seen, 1,
+				 __ATOMIC_RELAXED);
 		/* Traffic arriving is the only thing that proves a path on the
 		 * network we are on now. */
 		c->live_gen = c->sess->netgen;
@@ -2666,10 +2736,10 @@ static void probe_apply(struct conn *c, const struct path_probe *pr,
  */
 static void conn_heard(struct conn *c, uint64_t now)
 {
-	if (now - c->hb_last_heard < 100)
+	if (now - __atomic_load_n(&c->hb_last_heard, __ATOMIC_RELAXED) < 100)
 		return;
 	pthread_mutex_lock(&c->hb_lock);
-	c->hb_last_heard = now;
+	__atomic_store_n(&c->hb_last_heard, now, __ATOMIC_RELAXED);
 	pthread_mutex_unlock(&c->hb_lock);
 }
 
@@ -2862,7 +2932,8 @@ static void deliver_stream_from(struct conn *c, const uint8_t *data, size_t len,
 	uint64_t now = now_ms();
 	int took = 0;
 
-	if (c->bh_mute)		/* a staged total outage swallows receives */
+	if (__atomic_load_n(&c->bh_mute, __ATOMIC_RELAXED))
+				/* a staged total outage swallows receives */
 		return;
 	if (path_probe_is(c->sess->keys.probe_magic, data, len)) {
 		probe_recv(c, data, len, kind, src, agent);
@@ -3107,8 +3178,9 @@ static void claim_watch(struct conn *c)
 static void on_transport_recv(void *arg, const uint8_t *data, size_t len)
 {
 	struct ice_ctx *x = arg;
+	struct conn *cc = __atomic_load_n(&x->c, __ATOMIC_ACQUIRE);
 
-	deliver_stream_from(x->c, data, len, PATH_ICE, NULL, x->agent);
+	deliver_stream_from(cc, data, len, PATH_ICE, NULL, x->agent);
 }
 
 /* Single-connection lanlink receive (client, or a single-connection host): its
@@ -3513,7 +3585,7 @@ static int nat_setup(struct conn *c)
 	ctx = calloc(1, sizeof(*ctx));
 	if (!ctx)
 		return -1;
-	ctx->c = c;
+	__atomic_store_n(&ctx->c, c, __ATOMIC_RELAXED);
 	cfg.arg = ctx;
 
 	s->remote_set = 0;
@@ -4376,7 +4448,7 @@ static int conn_run(struct conn *c, int drive_sig)
 	c->peer_fresh = 0;
 	pthread_mutex_lock(&c->hb_lock);
 	c->hb_last_pong = now_ms();
-	c->hb_last_heard = c->hb_last_pong;
+	__atomic_store_n(&c->hb_last_heard, c->hb_last_pong, __ATOMIC_RELAXED);
 	c->hb_pong_seen = 0;
 	c->lost_since_ms = 0;
 	pthread_mutex_unlock(&c->hb_lock);
@@ -4419,6 +4491,7 @@ static int conn_run(struct conn *c, int drive_sig)
 
 	while (!done) {
 		struct pollfd fds[9];
+		struct ice_ctx *got;
 		int timeout = 10, nfds = 0, lnf = 0, bidx, cidx;
 
 		/* A re-punched agent the turnstile grafted for us: adopt it
@@ -4426,22 +4499,24 @@ static int conn_run(struct conn *c, int drive_sig)
 		 * re-pointed at this connection before it was parked, so its
 		 * packets have been landing in the stream all along; this
 		 * makes it the sending agent too. */
-		if (c->resume_agent) {
+		got = __atomic_load_n(&c->resume_ctx, __ATOMIC_ACQUIRE);
+		if (got) {
 			struct nat_agent *old = c->nat;
 			struct ice_ctx *old_ctx = c->nat_ctx;
 
 			conn_drop_ice_path(c);
-			c->nat = c->resume_agent;
-			c->nat_ctx = c->resume_agent_ctx;
-			c->resume_agent = NULL;
-			c->resume_agent_ctx = NULL;
+			c->nat = got->agent;	/* bound to it for life */
+			c->nat_ctx = got;
+			__atomic_store_n(&c->resume_ctx, (struct ice_ctx *)0,
+					 __ATOMIC_RELAXED);
 			conn_add_ice_path(c);
 			conn_free_agent(c, old, old_ctx);
-			c->bh_mute = 0;
+			__atomic_store_n(&c->bh_mute, 0, __ATOMIC_RELAXED);
 			/* The resumed link earns a full liveness window; without
 			 * this it is judged by silence that predates it. */
 			pthread_mutex_lock(&c->hb_lock);
-			c->hb_last_heard = now_ms();
+			__atomic_store_n(&c->hb_last_heard, now_ms(),
+					 __ATOMIC_RELAXED);
 			pthread_mutex_unlock(&c->hb_lock);
 			dbg_logf("resume: adopted the re-punched agent");
 		}
@@ -4487,7 +4562,8 @@ static int conn_run(struct conn *c, int drive_sig)
 			struct path_pick pick;
 
 			if (s->cfg->test_blackhole_all) {
-				c->bh_mute = 1;
+				__atomic_store_n(&c->bh_mute, 1,
+						 __ATOMIC_RELAXED);
 				c->bh_done = 1;
 				dbg_logf("path blackholed: all");
 			} else if (!conn_pick(c, &pick)) {
@@ -4503,14 +4579,15 @@ static int conn_run(struct conn *c, int drive_sig)
 					 pick.label[0] ? pick.label : "ICE");
 			}
 		}
-		if ((c->bh_kind >= 0 || c->bh_mute) &&
+		if ((c->bh_kind >= 0 ||
+		     __atomic_load_n(&c->bh_mute, __ATOMIC_RELAXED)) &&
 		    s->cfg->test_blackhole_lift_ms > 0 &&
 		    now_ms() - conn_start >
 		    (uint64_t)s->cfg->test_blackhole_lift_ms) {
 			pthread_mutex_lock(&c->path_lock);
 			c->bh_kind = -1;
 			pthread_mutex_unlock(&c->path_lock);
-			c->bh_mute = 0;
+			__atomic_store_n(&c->bh_mute, 0, __ATOMIC_RELAXED);
 			dbg_logf("path blackhole lifted");
 		}
 
@@ -4595,8 +4672,10 @@ static int conn_run(struct conn *c, int drive_sig)
 
 			pthread_mutex_lock(&c->hb_lock);
 			lp = c->hb_last_pong;
-			if (c->hb_last_heard > lp)
-				lp = c->hb_last_heard;
+			if (__atomic_load_n(&c->hb_last_heard,
+					    __ATOMIC_RELAXED) > lp)
+				lp = __atomic_load_n(&c->hb_last_heard,
+						     __ATOMIC_RELAXED);
 			pong_seen = c->hb_pong_seen;
 			if (pong_seen) {
 				if (now - lp > hb_lost_ms(c->hb_rtt)) {
@@ -4643,8 +4722,12 @@ static int conn_run(struct conn *c, int drive_sig)
 
 				hr.conn_start_ms = conn_start;
 				hr.lost_since_ms = c->lost_since_ms;
-				hr.resume_last_ms = c->resume_last_ms;
-				hr.resume_pending = c->resume_pending;
+				hr.resume_last_ms =
+					__atomic_load_n(&c->resume_last_ms,
+							__ATOMIC_RELAXED);
+				hr.resume_pending =
+					__atomic_load_n(&c->resume_pending,
+							__ATOMIC_RELAXED);
 				hr.pong_seen = pong_seen;
 				verdict = host_reap_due(&hr, now);
 				if (verdict != HOST_REAP_KEEP)
@@ -4660,7 +4743,8 @@ static int conn_run(struct conn *c, int drive_sig)
 				 * at something that demonstrably works.
 				 */
 				if (verdict == HOST_REAP_NO_HANDSHAKE &&
-				    !s->handshake_seen &&
+				    !__atomic_load_n(&s->handshake_seen,
+						     __ATOMIC_RELAXED) &&
 				    s->cfg->obs && s->cfg->obs->escalate)
 					s->cfg->obs->escalate(
 						s->cfg->obs->arg,
@@ -5018,7 +5102,8 @@ static void net_apply(struct sess *s, const struct netstate_actions *a)
 		if (act & NSA_KICK_PROBE) {
 			int started;
 
-			s->probe_epoch[i] = a->epoch[i];
+			__atomic_store_n(&s->probe_epoch[i], a->epoch[i],
+					 __ATOMIC_RELAXED);
 			started = i ? stun_probe6_kick(s) : stun_probe_kick(s);
 			if (started)
 				netstate_on_probe_started(&s->ns, family,
@@ -5607,23 +5692,25 @@ static struct conn *conn_alloc(struct sess *s)
 	return c;
 }
 
-static void conn_free(struct conn *c)
+/*
+ * Give back everything a connection holds except the connection itself. Safe
+ * the moment it is dissolved: nothing here is reachable from a callback.
+ */
+static void conn_dissolve(struct conn *c)
 {
-	if (!c)
-		return;
 	conn_unregister(c->sess, c);
 	conn_reap_parked(c);
 	conn_drop_ice_path(c);
 	conn_free_agent(c, c->nat, c->nat_ctx);
-	pthread_mutex_destroy(&c->hb_lock);
-	pthread_mutex_destroy(&c->peer_in_lock);
-	pthread_mutex_destroy(&c->status_lock);
-	pthread_mutex_destroy(&c->stream_lock);
-	pthread_mutex_destroy(&c->path_lock);
-	pthread_mutex_destroy(&c->key_lock);
-	pthread_mutex_destroy(&c->probe_lock);
-	pthread_mutex_destroy(&c->claim_lock);
-	free(c);
+}
+
+
+static void conn_free(struct conn *c)
+{
+	if (!c)
+		return;
+	conn_dissolve(c);
+	conn_release(c);
 }
 
 #define HOST_IDLE_MS 3000		/* exit after this idle once we have served */
@@ -5843,7 +5930,8 @@ static void punch_retire(struct sess *s, struct conn **punching,
 			continue;
 		dbg_logf("host: claimant tried again -- retiring its punch");
 		if (punch_resume[i]) {
-			punch_resume[i]->resume_pending = 0;
+			__atomic_store_n(&punch_resume[i]->resume_pending, 0,
+					 __ATOMIC_RELAXED);
 			punch_resume[i] = NULL;
 		}
 		punching[i] = NULL;
@@ -5981,20 +6069,36 @@ static void punch_scan(struct sess *s, struct worker *ws, struct conn **punching
 
 				dbg_logf("host: punch connected -> resume "
 					 "worker");
-				if (c->nat_ctx)
-					c->nat_ctx->c = t;
-				nat_rebind(c->nat, c->nat_ctx);
-				t->resume_agent = c->nat;
-				t->resume_agent_ctx = c->nat_ctx;
+				if (c->nat_ctx) {
+					/* Re-pointed before it is published:
+					 * the release below is what makes both
+					 * of these visible to the worker. */
+					c->nat_ctx->shell = c;
+					__atomic_store_n(&c->nat_ctx->c, t,
+							 __ATOMIC_RELAXED);
+					nat_rebind(c->nat, c->nat_ctx);
+					__atomic_store_n(&t->resume_ctx,
+							 c->nat_ctx,
+							 __ATOMIC_RELEASE);
+				}
 				c->nat = NULL;
 				c->nat_ctx = NULL;
-				t->resume_pending = 0;
+				__atomic_store_n(&t->resume_pending, 0,
+						 __ATOMIC_RELAXED);
 				punching[i] = NULL;
 				punch_resume[i] = NULL;
 				s->punch_ufrag[i][0] = '\0';	/* grafted: the
 								 * worker holds
 								 * it now */
-				conn_free(c);
+				/*
+				 * Dissolved now, released when the agent it
+				 * lent is destroyed: a callback that loaded
+				 * this connection before the context was
+				 * re-pointed is still inside it, and freeing
+				 * it here tore the mutexes out from under
+				 * that callback.
+				 */
+				conn_dissolve(c);
 				continue;
 			}
 			addr[0] = '\0';
@@ -6060,7 +6164,8 @@ static void punch_scan(struct sess *s, struct worker *ws, struct conn **punching
 			dbg_logf("host: punch %s -> drop",
 				 punch_stuck[i] ? "wedged (test)" : "failed");
 			if (punch_resume[i]) {
-				punch_resume[i]->resume_pending = 0;
+				__atomic_store_n(&punch_resume[i]->resume_pending, 0,
+					 __ATOMIC_RELAXED);
 				punch_resume[i] = NULL;
 			} else if (s->admitted_n > 0) {
 				/* It was counted against the grant when it was
@@ -6329,7 +6434,8 @@ static int host_turnstile(struct sess *s)
 			if (cfg->test_roam_hard)
 				for (i = 0; i < HOST_MAX_WORKERS; i++)
 					if (ws[i].used)
-						ws[i].c->bh_mute = 1;
+						__atomic_store_n(&ws[i].c->bh_mute,
+								 1, __ATOMIC_RELAXED);
 			if (sig_rebuild(s, "on the new network"))
 				break;
 			net_change_reset(s);
@@ -6698,7 +6804,9 @@ static int host_turnstile(struct sess *s)
 						  !conn_is_proven(w)) &&
 					    (again ||
 					     !punch_in_flight(s, punching, cu)) &&
-					    now_ms() - w->resume_last_ms >
+					    now_ms() -
+					    __atomic_load_n(&w->resume_last_ms,
+							    __ATOMIC_RELAXED) >
 					    RESUME_ATTEMPT_MS) {
 						/* Its own newer attempt is the
 						 * one thing allowed to take the
@@ -6793,8 +6901,11 @@ static int host_turnstile(struct sess *s)
 				punching[pslot] = listen;
 				punch_resume[pslot] = resume;
 				if (resume) {
-					resume->resume_pending = 1;
-					resume->resume_last_ms = now_ms();
+					__atomic_store_n(&resume->resume_pending, 1,
+							 __ATOMIC_RELAXED);
+					__atomic_store_n(&resume->resume_last_ms,
+							 now_ms(),
+							 __ATOMIC_RELAXED);
 				} else {
 					s->admitted_n++;
 				}
@@ -6817,9 +6928,12 @@ static int host_turnstile(struct sess *s)
 
 		/*
 		 * The real host runs until its shared tmux ends (the end monitor
-		 * signals end_fd, as it does for each worker's sshd). The test
-		 * harness passes no end monitor, so there it is bounded by the
-		 * deadline, or exits once idle having served at least one client.
+		 * signals end_fd, as it does for each worker's sshd), and the
+		 * harness answers the same monitor from its own SIGTERM, so a
+		 * host under test stops when it is asked to rather than running
+		 * to its deadline. Without a monitor at all it is bounded by the
+		 * deadline, or exits once idle having served at least one
+		 * client.
 		 */
 		if (sock_isset(end_fd)) {
 			struct pollfd ef;
@@ -7379,6 +7493,17 @@ int session_run(const struct session_cfg *cfg)
 
 	if (s.session_over)
 		session_entomb(&s);
+	/*
+	 * A stop that was asked for is not a failure. The loop above leaves st
+	 * at whatever it had reached when the flag was seen, and only one of
+	 * those states is ST_DONE -- so a harness that signalled a client it
+	 * had already watched establish was told the run had failed. It is a
+	 * failure only if nothing was ever established, which is the same
+	 * question as before for a session that never got going.
+	 */
+	if (!ended && st != ST_DONE && cfg->test_stop && *cfg->test_stop &&
+	    s.established_fired)
+		st = ST_DONE;
 	rc = ended ? ended : ((st == ST_DONE) ? 0 : 1);
 done:
 	/* Cleared under the lock before it is freed, as run_ssh does: the ICE

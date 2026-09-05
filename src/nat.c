@@ -47,7 +47,8 @@ static void on_state_changed(juice_agent_t *agent, juice_state_t state, void *us
 	/* Announced outside the lock: it is the caller's code, and it may ask
 	 * this agent about itself while it runs. */
 	if (a->on_state)
-		a->on_state(a->arg, connected, failed);
+		a->on_state(__atomic_load_n(&a->arg, __ATOMIC_ACQUIRE),
+			   connected, failed);
 }
 
 static void on_candidate(juice_agent_t *agent, const char *sdp, void *user)
@@ -56,7 +57,8 @@ static void on_candidate(juice_agent_t *agent, const char *sdp, void *user)
 
 	(void)agent;
 	if (a->on_candidate && sdp)
-		a->on_candidate(a->arg, sdp);
+		a->on_candidate(__atomic_load_n(&a->arg, __ATOMIC_ACQUIRE),
+			   sdp);
 }
 
 static void on_gathering_done(juice_agent_t *agent, void *user)
@@ -70,7 +72,8 @@ static void on_gathering_done(juice_agent_t *agent, void *user)
 	pthread_mutex_unlock(&a->lock);
 	if (a->on_local_sdp &&
 	    juice_get_local_description(a->agent, sdp, sizeof(sdp)) >= 0)
-		a->on_local_sdp(a->arg, sdp);
+		a->on_local_sdp(__atomic_load_n(&a->arg, __ATOMIC_ACQUIRE),
+			   sdp);
 }
 
 static void on_recv(juice_agent_t *agent, const char *data, size_t size, void *user)
@@ -79,7 +82,8 @@ static void on_recv(juice_agent_t *agent, const char *data, size_t size, void *u
 
 	(void)agent;
 	if (a->on_recv)
-		a->on_recv(a->arg, (const uint8_t *)data, size);
+		a->on_recv(__atomic_load_n(&a->arg, __ATOMIC_ACQUIRE),
+			   (const uint8_t *)data, size);
 }
 
 struct nat_agent *nat_create(const struct nat_config *cfg)
@@ -135,7 +139,7 @@ struct nat_agent *nat_create(const struct nat_config *cfg)
  */
 void nat_rebind(struct nat_agent *a, void *arg)
 {
-	a->arg = arg;
+	__atomic_store_n(&a->arg, arg, __ATOMIC_RELEASE);
 }
 
 void nat_destroy(struct nat_agent *a)
