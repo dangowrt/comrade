@@ -335,6 +335,13 @@ jobs:
       - name: Test
         if: ${{ !matrix.memcheck && !matrix.analyze }}
         run: |
+          # A step's shell is 'bash -e {0}', and -uo pipefail does not clear
+          # the inherited -e: a failing ctest in a pipeline ends the step
+          # there and then, before PIPESTATUS is read, before the .ran
+          # marker is written and before sanreport runs -- so the report
+          # was lost exactly when there was something in it to lose, and
+          # the thread policy below never got the chance to apply.
+          set +e
           set -uo pipefail
           LOGS="$PWD/build/san-logs"
           rm -rf "$LOGS"; mkdir -p "$LOGS"
@@ -349,6 +356,13 @@ jobs:
       - name: Test (valgrind, unit)
         if: ${{ matrix.memcheck && !matrix.analyze }}
         run: |
+          # A step's shell is 'bash -e {0}', and -uo pipefail does not clear
+          # the inherited -e: a failing ctest in a pipeline ends the step
+          # there and then, before PIPESTATUS is read, before the .ran
+          # marker is written and before sanreport runs -- so the report
+          # was lost exactly when there was something in it to lose, and
+          # the thread policy below never got the chance to apply.
+          set +e
           set -uo pipefail
           # ctest keeps the previous run's MemoryChecker logs, and the numbers
           # in their names are test indices that move when the selection
@@ -357,11 +371,13 @@ jobs:
           rm -f build/Testing/Temporary/MemoryChecker.*.log
           ctest --test-dir build -T memcheck --timeout 1800 \
             -E "_e2e|swarm_" -LE harness 2>&1 | tee mc.out
+          rc=${PIPESTATUS[0]}
           LOGS="$PWD/build/vg-logs"
           rm -rf "$LOGS"; mkdir -p "$LOGS"
           cp build/Testing/Temporary/MemoryChecker.*.log "$LOGS/" 2>/dev/null || true
           sed -n 's/.*out of \([0-9][0-9]*\).*/\1/p' mc.out | tail -1 > "$LOGS/.ran"
-          sh tests/sanreport.sh "$LOGS" 40
+          sh tests/sanreport.sh "$LOGS" 40 || exit 1
+          exit $rc
 
       # The end-to-end tests, and only these, stop at the first failure. They
       # share one machine and one network, so when the environment cannot carry
@@ -372,6 +388,13 @@ jobs:
       - name: Test (end to end)
         if: ${{ !matrix.memcheck && !matrix.analyze }}
         run: |
+          # A step's shell is 'bash -e {0}', and -uo pipefail does not clear
+          # the inherited -e: a failing ctest in a pipeline ends the step
+          # there and then, before PIPESTATUS is read, before the .ran
+          # marker is written and before sanreport runs -- so the report
+          # was lost exactly when there was something in it to lose, and
+          # the thread policy below never got the chance to apply.
+          set +e
           set -uo pipefail
           LOGS="$PWD/build/san-logs-e2e"
           rm -rf "$LOGS"; mkdir -p "$LOGS"
@@ -404,6 +427,13 @@ jobs:
       - name: Test (valgrind, end to end)
         if: ${{ matrix.memcheck }}
         run: |
+          # A step's shell is 'bash -e {0}', and -uo pipefail does not clear
+          # the inherited -e: a failing ctest in a pipeline ends the step
+          # there and then, before PIPESTATUS is read, before the .ran
+          # marker is written and before sanreport runs -- so the report
+          # was lost exactly when there was something in it to lose, and
+          # the thread policy below never got the chance to apply.
+          set +e
           set -uo pipefail
           # The unit step ran in this same job and left its logs behind, under
           # different options: leak checking is on there and off here. Cleared
