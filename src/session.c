@@ -711,7 +711,12 @@ struct sess {
 	 */
 	struct stun_mapping map4;
 	unsigned netgen;		/* bumped by any move; a path proven on an
-					 * earlier one proves nothing here */
+					 * earlier one proves nothing here.
+					 * The loop bumps it and the workers
+					 * read it, so every access is atomic:
+					 * it is only ever compared for
+					 * equality, which needs no ordering
+					 * against anything else. */
 	int mapping_reported;		/* 0 not yet, 1 sent independent, 2 sent dependent */
 	struct session_mailbox mb_told;	/* the last mailbox state sent to the view */
 	int mb_told_any;
@@ -2370,7 +2375,8 @@ static void ctl_dispatch(void *arg, int type, const uint8_t *pl, size_t plen)
 				 __ATOMIC_RELAXED);
 		/* Traffic arriving is the only thing that proves a path on the
 		 * network we are on now. */
-		c->live_gen = c->sess->netgen;
+		c->live_gen = __atomic_load_n(&c->sess->netgen,
+					      __ATOMIC_RELAXED);
 		pthread_mutex_unlock(&c->hb_lock);
 	} else if (type == CTLM_RDV && plen >= CTL_RDV_PLEN) {
 		struct sockaddr_storage sa;
@@ -5383,7 +5389,8 @@ static void net_pump(struct sess *s, uint64_t now)
 		netstate_on_netmon(&s->ns, ch, fam_usable_addr(addrs, n, 4),
 				   fam_usable_addr(addrs, n, 6), now);
 		if (ch) {
-			s->netgen++;	/* every path is unproven again */
+			/* every path is unproven again */
+			__atomic_add_fetch(&s->netgen, 1, __ATOMIC_RELAXED);
 			dbg_logf("net: change v4=%d v6=%d iface=%d",
 				 !!(ch & NETMON_CH_V4), !!(ch & NETMON_CH_V6),
 				 !!(ch & NETMON_CH_IFACE));
@@ -5474,7 +5481,7 @@ static int conn_link_state(const struct sess *s, struct conn *c)
 		return c->ice_up ? CONN_PUNCHING : CONN_CONNECTING;
 	if (lost && now - last >= hb_lost_ms(c->hb_rtt))
 		return CONN_LOST;
-	if (gen != s->netgen)
+	if (gen != __atomic_load_n(&s->netgen, __ATOMIC_RELAXED))
 		return CONN_UNKNOWN;	/* proven, but somewhere else */
 	if (now - last >= LINK_LAG_MS)
 		return CONN_LAGGED;
