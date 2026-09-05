@@ -255,7 +255,6 @@ static int valid_id(const char *id)
 	return 1;
 }
 
-static int tmux_alive(const char *sock);
 
 /* The pid a file names, still alive; 0 if the file is absent or it is not. */
 static long pid_in(const char *pp)
@@ -281,6 +280,23 @@ static long pid_of(const char *id)
 	return pid_in(pp);
 }
 
+/* Run argv to completion; return its exit status, or -1 on spawn failure. */
+static int run_wait(char *const argv[])
+{
+	pid_t pid = fork();
+	int status;
+
+	if (pid < 0)
+		return -1;
+	if (pid == 0) {
+		execvp(argv[0], argv);
+		_exit(127);
+	}
+	if (waitpid(pid, &status, 0) < 0)
+		return -1;
+	return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
 /* Likewise for the interactive service; 0 for a session with none running. */
 static long svc_of(const char *id)
 {
@@ -288,6 +304,26 @@ static long svc_of(const char *id)
 
 	svc_path(pp, sizeof(pp), id);
 	return pid_in(pp);
+}
+
+static int tmux_alive(const char *sock)
+{
+	char *argv[] = { "tmux", "-S", (char *)sock, "has-session",
+			 "-t", "comrade", NULL };
+	int fd = open("/dev/null", O_WRONLY);
+	int saved = -1, rc;
+
+	if (fd >= 0) {			/* silence has-session's stderr */
+		saved = dup(STDERR_FILENO);
+		dup2(fd, STDERR_FILENO);
+		close(fd);
+	}
+	rc = run_wait(argv);
+	if (saved >= 0) {
+		dup2(saved, STDERR_FILENO);
+		close(saved);
+	}
+	return rc == 0;
 }
 
 /*
@@ -368,22 +404,6 @@ static int gen_id(char *out)
 	return 0;
 }
 
-/* Run argv to completion; return its exit status, or -1 on spawn failure. */
-static int run_wait(char *const argv[])
-{
-	pid_t pid = fork();
-	int status;
-
-	if (pid < 0)
-		return -1;
-	if (pid == 0) {
-		execvp(argv[0], argv);
-		_exit(127);
-	}
-	if (waitpid(pid, &status, 0) < 0)
-		return -1;
-	return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-}
 
 /*
  * Like run_wait, but capture the child's stderr into err (NUL-terminated, one
@@ -431,25 +451,6 @@ static int run_capture(char *const argv[], char *err, size_t cap)
 	return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
-static int tmux_alive(const char *sock)
-{
-	char *argv[] = { "tmux", "-S", (char *)sock, "has-session",
-			 "-t", "comrade", NULL };
-	int fd = open("/dev/null", O_WRONLY);
-	int saved = -1, rc;
-
-	if (fd >= 0) {			/* silence has-session's stderr */
-		saved = dup(STDERR_FILENO);
-		dup2(fd, STDERR_FILENO);
-		close(fd);
-	}
-	rc = run_wait(argv);
-	if (saved >= 0) {
-		dup2(saved, STDERR_FILENO);
-		close(saved);
-	}
-	return rc == 0;
-}
 
 /* Take the shared tmux, quietly: on the way out there may be no server left to
  * take, and tmux says so on stderr, over the operator's shell. */

@@ -220,7 +220,6 @@ static uint64_t now_ms(void)
 	return (uint64_t)ts.tv_sec * 1000 + (uint64_t)(ts.tv_nsec / 1000000);
 }
 
-static int sig_stage(struct sig *s);
 
 static char my_slot(const struct sig *s)
 {
@@ -371,6 +370,71 @@ uint64_t sig_offer_settle_until(int is_host, int stored_before,
 	if (!is_host || !stored_before || !only_candidates)
 		return 0;		/* due at once */
 	return now + SIG_OFFER_SETTLE_MS;
+}
+
+/*
+ * Build what goes in our slot from the packed description we hold, and stage
+ * it. The host prefixes the key claims are boxed to; a client boxes to that
+ * key and puts its ufrag in the clear beside it. A client that has not seen
+ * the host's slot yet cannot box anything, so it stages nothing and is called
+ * again when the slot arrives -- which is before it could have written, since
+ * a write is only decided against a container that has been read.
+ */
+static int sig_stage(struct sig *s)
+{
+	uint8_t val[SIG_MAX_VALUE];
+	uint8_t sealed[SIG_SEALED_MAX];
+	uint8_t mc[2 + SIG_MAX_VALUE];
+	char ms[2];
+	size_t ulen, n;
+	int slen;
+
+	if (!s->my_packed_len)
+		return -1;
+	if (s->is_host) {
+		if (32 + s->my_packed_len > sizeof(val))
+			return -1;
+		memcpy(val, s->claim_pk, 32);
+		memcpy(val + 32, s->my_packed, s->my_packed_len);
+		n = 32 + s->my_packed_len;
+	} else {
+		if (!s->have_peer_claim_pk)
+			return -1;
+		ulen = strlen(s->my_ufrag);
+		if (ulen > 255 ||
+		    1 + ulen + s->my_packed_len + BOX_OVERHEAD > sizeof(val))
+			return -1;
+		val[0] = (uint8_t)ulen;
+		memcpy(val + 1, s->my_ufrag, ulen);
+		slen = box_seal(val + 1 + ulen, sizeof(val) - 1 - ulen,
+				s->peer_claim_pk, s->my_packed,
+				s->my_packed_len);
+		if (slen < 0)
+			return -1;
+		n = 1 + ulen + (size_t)slen;
+	}
+	slen = msg_seal(sealed, sizeof(sealed), s->keys.sig_key, val, n);
+	if (slen < 0)
+		return -1;
+	mailbox_set_mine(&s->mb, sealed, (size_t)slen);
+
+	/*
+	 * The multicast announcement carries the same value with our
+	 * direct-transport port prepended, bound to the slot letter it goes out
+	 * under: that letter frames the value outside the seal and is what says
+	 * whether a description is an offer or an answer, so without binding it
+	 * a frame captured from one slot opens in the other.
+	 */
+	mc[0] = (uint8_t)(s->direct_port >> 8);
+	mc[1] = (uint8_t)s->direct_port;
+	memcpy(mc + 2, val, n);
+	ms[0] = my_slot(s);
+	ms[1] = '\0';
+	slen = msg_seal_ad(s->mcast_mine, sizeof(s->mcast_mine),
+			   s->keys.sig_key, (const uint8_t *)ms, 1, mc, n + 2);
+	if (slen > 0)
+		s->mcast_mine_len = (size_t)slen;
+	return 0;
 }
 
 /*
@@ -837,70 +901,6 @@ int sig_rdv_stage(struct sig *s, int family)
 	return s->rdv_stage;			/* 0 cold .. 3 get, engine-wide */
 }
 
-/*
- * Build what goes in our slot from the packed description we hold, and stage
- * it. The host prefixes the key claims are boxed to; a client boxes to that
- * key and puts its ufrag in the clear beside it. A client that has not seen
- * the host's slot yet cannot box anything, so it stages nothing and is called
- * again when the slot arrives -- which is before it could have written, since
- * a write is only decided against a container that has been read.
- */
-static int sig_stage(struct sig *s)
-{
-	uint8_t val[SIG_MAX_VALUE];
-	uint8_t sealed[SIG_SEALED_MAX];
-	uint8_t mc[2 + SIG_MAX_VALUE];
-	char ms[2];
-	size_t ulen, n;
-	int slen;
-
-	if (!s->my_packed_len)
-		return -1;
-	if (s->is_host) {
-		if (32 + s->my_packed_len > sizeof(val))
-			return -1;
-		memcpy(val, s->claim_pk, 32);
-		memcpy(val + 32, s->my_packed, s->my_packed_len);
-		n = 32 + s->my_packed_len;
-	} else {
-		if (!s->have_peer_claim_pk)
-			return -1;
-		ulen = strlen(s->my_ufrag);
-		if (ulen > 255 ||
-		    1 + ulen + s->my_packed_len + BOX_OVERHEAD > sizeof(val))
-			return -1;
-		val[0] = (uint8_t)ulen;
-		memcpy(val + 1, s->my_ufrag, ulen);
-		slen = box_seal(val + 1 + ulen, sizeof(val) - 1 - ulen,
-				s->peer_claim_pk, s->my_packed,
-				s->my_packed_len);
-		if (slen < 0)
-			return -1;
-		n = 1 + ulen + (size_t)slen;
-	}
-	slen = msg_seal(sealed, sizeof(sealed), s->keys.sig_key, val, n);
-	if (slen < 0)
-		return -1;
-	mailbox_set_mine(&s->mb, sealed, (size_t)slen);
-
-	/*
-	 * The multicast announcement carries the same value with our
-	 * direct-transport port prepended, bound to the slot letter it goes out
-	 * under: that letter frames the value outside the seal and is what says
-	 * whether a description is an offer or an answer, so without binding it
-	 * a frame captured from one slot opens in the other.
-	 */
-	mc[0] = (uint8_t)(s->direct_port >> 8);
-	mc[1] = (uint8_t)s->direct_port;
-	memcpy(mc + 2, val, n);
-	ms[0] = my_slot(s);
-	ms[1] = '\0';
-	slen = msg_seal_ad(s->mcast_mine, sizeof(s->mcast_mine),
-			   s->keys.sig_key, (const uint8_t *)ms, 1, mc, n + 2);
-	if (slen > 0)
-		s->mcast_mine_len = (size_t)slen;
-	return 0;
-}
 
 /*
  * The peer's slot value -> its packed description. A client reads the host's

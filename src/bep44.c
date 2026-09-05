@@ -858,7 +858,6 @@ static int put_send(struct b44_op *op, int node)
 	return 0;
 }
 
-static int node_addr_usable(const struct sockaddr *sa, socklen_t len);
 
 static int id_nonzero(const uint8_t id[20])
 {
@@ -962,6 +961,25 @@ static void op_retain_nodes(struct bep44_engine *e, struct b44_op *op)
 		else
 			kept4++;
 	}
+}
+
+/* A node address worth handing on as a rendezvous hint: real family, and
+ * neither the address nor the port all-zero (bogus compact entries appear). */
+static int node_addr_usable(const struct sockaddr *sa, socklen_t len)
+{
+	if (sa->sa_family == AF_INET && len >= (socklen_t)sizeof(struct sockaddr_in)) {
+		const struct sockaddr_in *s = (const struct sockaddr_in *)sa;
+
+		return s->sin_port != 0 && s->sin_addr.s_addr != 0;
+	}
+	if (sa->sa_family == AF_INET6 && len >= (socklen_t)sizeof(struct sockaddr_in6)) {
+		const struct sockaddr_in6 *s = (const struct sockaddr_in6 *)sa;
+		static const uint8_t zero[16] = { 0 };
+
+		return s->sin6_port != 0 &&
+		       memcmp(&s->sin6_addr, zero, 16) != 0;
+	}
+	return 0;
 }
 
 static void op_finish(struct b44_op *op)
@@ -1285,24 +1303,6 @@ static void op_step(struct b44_op *op)
 	op_finish(op);
 }
 
-/* A node address worth handing on as a rendezvous hint: real family, and
- * neither the address nor the port all-zero (bogus compact entries appear). */
-static int node_addr_usable(const struct sockaddr *sa, socklen_t len)
-{
-	if (sa->sa_family == AF_INET && len >= (socklen_t)sizeof(struct sockaddr_in)) {
-		const struct sockaddr_in *s = (const struct sockaddr_in *)sa;
-
-		return s->sin_port != 0 && s->sin_addr.s_addr != 0;
-	}
-	if (sa->sa_family == AF_INET6 && len >= (socklen_t)sizeof(struct sockaddr_in6)) {
-		const struct sockaddr_in6 *s = (const struct sockaddr_in6 *)sa;
-		static const uint8_t zero[16] = { 0 };
-
-		return s->sin6_port != 0 &&
-		       memcmp(&s->sin6_addr, zero, 16) != 0;
-	}
-	return 0;
-}
 
 /* Note a server of the winning value in its family's slot, first one wins:
  * a single shared slot would go to the quicker family on every round. */

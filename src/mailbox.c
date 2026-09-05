@@ -28,7 +28,63 @@ void mailbox_withdraw(struct mailbox *m)
 	m->need_write = 0;
 }
 
-static void recompute_need_write(struct mailbox *m);
+/* The claim under release: gone or replaced means the release is done. */
+static int releasing(const struct mailbox *m)
+{
+	return m->released_len && m->slot_a_len == m->released_len &&
+	       !memcmp(m->slot_a, m->released, m->released_len);
+}
+
+/*
+ * The claim in the slot is one that did not open. Unlike a release this is
+ * never completed by observing the slot empty: those bytes are held against
+ * for as long as they keep coming back, which is what a copy still serving
+ * them does. It ends when somebody writes something else, because whatever
+ * that is, it is not the claim nobody can open.
+ */
+static int refusing(const struct mailbox *m)
+{
+	return m->refused_len && m->slot_a_len == m->refused_len &&
+	       !memcmp(m->slot_a, m->refused, m->refused_len);
+}
+
+/* We must (re)write when our slot in the container does not match ours. */
+static void recompute_need_write(struct mailbox *m)
+{
+	const uint8_t *cur = m->is_host ? m->slot_o : m->slot_a;
+	size_t cur_len = m->is_host ? m->slot_o_len : m->slot_a_len;
+
+	if (m->ending)
+		/* Placed once the container is the tombstone and nothing but,
+		 * so a write that lost a race -- or a holder writing a claim
+		 * over it -- is followed by another. */
+		m->need_write = (m->slot_x_len != m->tomb_len ||
+				 memcmp(m->slot_x, m->tomb, m->tomb_len) ||
+				 m->slot_o_len || m->slot_a_len) ? 1 : 0;
+	else if (m->is_host && m->slot_x_len)
+		/*
+		 * A tombstone under a host that is still serving. Nobody who
+		 * can write this container has anything true to say about
+		 * whether the session behind it is over, so the one end that
+		 * does takes the slot back on its next write.
+		 */
+		m->need_write = 1;
+	else if (!m->have_mine)
+		m->need_write = 0;
+	else if (m->is_host && (releasing(m) || refusing(m)))
+		/*
+		 * The claim being let go is still in the container, so what is
+		 * stored is not what we would write, whatever our own slot
+		 * says. Without this a release armed without a fresh offer
+		 * beside it never reaches the DHT, and the answer slot -- the
+		 * turnstile mutex -- stays held by a claim nobody will serve.
+		 */
+		m->need_write = 1;
+	else
+		m->need_write = (cur_len != m->mine_len ||
+				 memcmp(cur, m->mine, m->mine_len)) ? 1 : 0;
+}
+
 
 void mailbox_arm_release(struct mailbox *m)
 {
@@ -76,25 +132,7 @@ void mailbox_note_own_answer(struct mailbox *m, int own)
 	m->slot_a_own = own;
 }
 
-/* The claim under release: gone or replaced means the release is done. */
-static int releasing(const struct mailbox *m)
-{
-	return m->released_len && m->slot_a_len == m->released_len &&
-	       !memcmp(m->slot_a, m->released, m->released_len);
-}
 
-/*
- * The claim in the slot is one that did not open. Unlike a release this is
- * never completed by observing the slot empty: those bytes are held against
- * for as long as they keep coming back, which is what a copy still serving
- * them does. It ends when somebody writes something else, because whatever
- * that is, it is not the claim nobody can open.
- */
-static int refusing(const struct mailbox *m)
-{
-	return m->refused_len && m->slot_a_len == m->refused_len &&
-	       !memcmp(m->slot_a, m->refused, m->refused_len);
-}
 
 /* Pull one slot's sealed string out of the container into dst. */
 static size_t slot_extract(const uint8_t *v, size_t v_len, const char *key,
@@ -123,42 +161,6 @@ static void parse_slots(struct mailbox *m, const uint8_t *v, size_t v_len)
 		m->released_len = 0;
 }
 
-/* We must (re)write when our slot in the container does not match ours. */
-static void recompute_need_write(struct mailbox *m)
-{
-	const uint8_t *cur = m->is_host ? m->slot_o : m->slot_a;
-	size_t cur_len = m->is_host ? m->slot_o_len : m->slot_a_len;
-
-	if (m->ending)
-		/* Placed once the container is the tombstone and nothing but,
-		 * so a write that lost a race -- or a holder writing a claim
-		 * over it -- is followed by another. */
-		m->need_write = (m->slot_x_len != m->tomb_len ||
-				 memcmp(m->slot_x, m->tomb, m->tomb_len) ||
-				 m->slot_o_len || m->slot_a_len) ? 1 : 0;
-	else if (m->is_host && m->slot_x_len)
-		/*
-		 * A tombstone under a host that is still serving. Nobody who
-		 * can write this container has anything true to say about
-		 * whether the session behind it is over, so the one end that
-		 * does takes the slot back on its next write.
-		 */
-		m->need_write = 1;
-	else if (!m->have_mine)
-		m->need_write = 0;
-	else if (m->is_host && (releasing(m) || refusing(m)))
-		/*
-		 * The claim being let go is still in the container, so what is
-		 * stored is not what we would write, whatever our own slot
-		 * says. Without this a release armed without a fresh offer
-		 * beside it never reaches the DHT, and the answer slot -- the
-		 * turnstile mutex -- stays held by a claim nobody will serve.
-		 */
-		m->need_write = 1;
-	else
-		m->need_write = (cur_len != m->mine_len ||
-				 memcmp(cur, m->mine, m->mine_len)) ? 1 : 0;
-}
 
 void mailbox_parse(struct mailbox *m, const uint8_t *v, size_t v_len)
 {

@@ -1061,9 +1061,6 @@ struct conn_keys {
 	int old_ok;
 };
 
-static void conn_key_bind(struct conn *c);
-static void conn_keys_take(struct conn *c, struct conn_keys *k);
-static void conn_key_saw_new(struct conn *c);
 
 struct path_pick {
 	int kind;			/* -1 when no path can carry one */
@@ -1585,7 +1582,6 @@ static int fan_local_sdp(struct sess *s)
  * (sig_post, not sig_rotate), so the turnstile's answer slot is untouched and
  * the credentials do not change.
  */
-static void log_offer(const char *sdp, int served, int active);
 
 /*
  * "v6 direct": a host reaches its own global v6 at the address the kernel
@@ -1650,6 +1646,47 @@ static void canon_v6(const char *in, const char *src6, char *out, size_t cap)
 		line = nl + 1;
 	}
 	out[o] = '\0';
+}
+
+/*
+ * What went into the offer a peer is about to read.
+ *
+ * An offer with nothing in it a peer could reach looks, from this end, exactly
+ * like one that works: the host publishes, the client claims, the punch is made
+ * and simply never connects. Behind a carrier NAT the difference is one
+ * candidate -- whether STUN answered before the offer went out -- and there was
+ * no way to tell the two apart from a log.
+ *
+ * Reflexive is counted rather than "reachable", because the two are not the
+ * same: a globally routable IPv6 host candidate needs no STUN and is reachable
+ * with none, so on a v6 network a count of zero here is the ordinary case and
+ * says nothing is wrong.
+ */
+static void log_offer(const char *sdp, int served, int active)
+{
+	const char *p;
+	int cands = 0, reflexive = 0;
+
+	for (p = sdp; (p = strstr(p, "a=candidate:")) != NULL; p += 12) {
+		const char *end = strchr(p, '\n');
+		const char *t = strstr(p, "typ ");
+
+		cands++;
+		if (!t || (end && t > end))
+			continue;
+		if (!strncmp(t, "typ srflx", 9) ||
+		    !strncmp(t, "typ prflx", 9) ||
+		    !strncmp(t, "typ relay", 9))
+			reflexive++;
+	}
+	if (served < 0)
+		dbg_logf("host: offer re-posted, fanned across %d egress "
+			 "address(es): %d candidate(s), %d reflexive",
+			 active, cands, reflexive);
+	else
+		dbg_logf("host: offer published (served=%d active=%d) "
+			 "%d candidate(s), %d reflexive",
+			 served, active, cands, reflexive);
 }
 
 /*
@@ -1868,6 +1905,22 @@ static void on_local_sdp(void *arg, const char *sdp)
 	pthread_mutex_unlock(&s->trickle_lock);
 }
 
+static void stun_probe_reap(struct sess *s)
+{
+	if (!s->probe_running)
+		return;
+	pthread_join(s->probe_th, NULL);
+	s->probe_running = 0;
+}
+
+static void stun_probe6_reap(struct sess *s)
+{
+	if (!s->probe6_running)
+		return;
+	pthread_join(s->probe6_th, NULL);
+	s->probe6_running = 0;
+}
+
 /* Leave a fact for the loop: called from threads that own none of the model,
  * sig or the view. */
 static void ns_post(struct sess *s, int kind, int family, uint32_t epoch)
@@ -1885,8 +1938,6 @@ static void ns_post_addr(struct sess *s, int family, uint32_t epoch,
 	pthread_mutex_unlock(&s->ns_lock);
 }
 
-static void stun_probe_reap(struct sess *s);
-static void stun_probe6_reap(struct sess *s);
 
 static void ns_drain(struct sess *s)
 {
@@ -2023,13 +2074,6 @@ static void stun_probe_halt(struct sess *s)
 		__atomic_store_n(&s->probe_stop, 1, __ATOMIC_RELAXED);
 }
 
-static void stun_probe_reap(struct sess *s)
-{
-	if (!s->probe_running)
-		return;
-	pthread_join(s->probe_th, NULL);
-	s->probe_running = 0;
-}
 
 /*
  * Start a pool probe; an operator-pinned server is theirs alone to talk to.
@@ -2094,13 +2138,6 @@ static void stun_probe6_halt(struct sess *s)
 		__atomic_store_n(&s->probe6_stop, 1, __ATOMIC_RELAXED);
 }
 
-static void stun_probe6_reap(struct sess *s)
-{
-	if (!s->probe6_running)
-		return;
-	pthread_join(s->probe6_th, NULL);
-	s->probe6_running = 0;
-}
 
 /* v6's own connectivity proof: the same pool of servers, tried over a v6
  * socket, independent of whether ICE ever bothers to gather a v6 srflx
@@ -2165,6 +2202,25 @@ static void on_ice_candidate(void *arg, const char *cand)
 }
 
 
+/*
+ * What this connection may seal with, and what it may open. Sealing moves to
+ * the connection key only once the peer has said it can open one; opening
+ * accepts the session key until the first frame arrives under the connection
+ * key, at which point the invitation's key is done here.
+ */
+static void conn_keys_take(struct conn *c, struct conn_keys *k)
+{
+	pthread_mutex_lock(&c->key_lock);
+	memcpy(k->rx, c->conn_key, sizeof(k->rx));
+	k->have_rx = c->key_ready;
+	k->old_ok = c->key_old_ok;
+	if (c->key_tx)
+		memcpy(k->tx, c->conn_key, sizeof(k->tx));
+	else
+		memcpy(k->tx, c->sess->keys.sig_key, sizeof(k->tx));
+	pthread_mutex_unlock(&c->key_lock);
+}
+
 /* Send over whichever transport carries the stream right now, under a counter
  * and a tag that say this end sent it. */
 static int transport_send(struct conn *c, const uint8_t *data, size_t len)
@@ -2186,6 +2242,18 @@ static int transport_send(struct conn *c, const uint8_t *data, size_t len)
 	if (pick.kind == PATH_ICE)
 		return pick.agent ? nat_send(pick.agent, buf, n) : -1;
 	return s->lan ? lanlink_send(s->lan, &pick.remote, buf, n) : -1;
+}
+
+/* A frame opened under the connection key: the session key is spent here. */
+static void conn_key_saw_new(struct conn *c)
+{
+	pthread_mutex_lock(&c->key_lock);
+	if (c->key_old_ok) {
+		c->key_old_ok = 0;
+		dbg_logf("path: the invitation's key is done on this "
+			 "connection");
+	}
+	pthread_mutex_unlock(&c->key_lock);
 }
 
 /*
@@ -2255,6 +2323,27 @@ static void ctl_send(struct conn *c, int type, const uint8_t *payload,
 		return;
 	w = send(c->ctl_fd, (const char *)buf, (int)n, MSG_NOSIGNAL);
 	(void)w;
+}
+
+/*
+ * Both halves are in: this connection's probes leave the session key behind.
+ * Runs on the loop thread, which is the only writer.
+ */
+static void conn_key_bind(struct conn *c)
+{
+	if (c->key_ready || !c->key_half_sent || !c->key_half_seen)
+		return;
+	pthread_mutex_lock(&c->key_lock);
+	keys_conn_key(c->conn_key, c->sess->keys.sig_key,
+		      c->key_half_out, c->key_half_in);
+	c->key_ready = 1;
+	pthread_mutex_unlock(&c->key_lock);
+	/*
+	 * We can open under it now; the far end may not be able to yet, and it
+	 * is the one that decides when we may seal with it.
+	 */
+	ctl_send(c, CTLM_KEYOK, NULL, 0);
+	dbg_logf("path: keyed to this connection, telling the peer");
 }
 
 /* Act on one decoded control message (a ctl_reframer callback): answer a ping,
@@ -2370,36 +2459,7 @@ static void ctl_readable(struct conn *c)
 
 /* Seal one probe for this connection into out (>= PROBE_MAX); 0 on failure.
  * The claimant ufrag is this connection's, whoever filled the rest in. */
-/*
- * What this connection may seal with, and what it may open. Sealing moves to
- * the connection key only once the peer has said it can open one; opening
- * accepts the session key until the first frame arrives under the connection
- * key, at which point the invitation's key is done here.
- */
-static void conn_keys_take(struct conn *c, struct conn_keys *k)
-{
-	pthread_mutex_lock(&c->key_lock);
-	memcpy(k->rx, c->conn_key, sizeof(k->rx));
-	k->have_rx = c->key_ready;
-	k->old_ok = c->key_old_ok;
-	if (c->key_tx)
-		memcpy(k->tx, c->conn_key, sizeof(k->tx));
-	else
-		memcpy(k->tx, c->sess->keys.sig_key, sizeof(k->tx));
-	pthread_mutex_unlock(&c->key_lock);
-}
 
-/* A frame opened under the connection key: the session key is spent here. */
-static void conn_key_saw_new(struct conn *c)
-{
-	pthread_mutex_lock(&c->key_lock);
-	if (c->key_old_ok) {
-		c->key_old_ok = 0;
-		dbg_logf("path: the invitation's key is done on this "
-			 "connection");
-	}
-	pthread_mutex_unlock(&c->key_lock);
-}
 
 /* Open a probe addressed to this connection, under the key in force or, while
  * the far end may not have bound yet, the one it replaced. */
@@ -2451,26 +2511,6 @@ static size_t conn_probe_seal(struct conn *c, struct path_probe *pr,
 				k.tx, pr);
 }
 
-/*
- * Both halves are in: this connection's probes leave the session key behind.
- * Runs on the loop thread, which is the only writer.
- */
-static void conn_key_bind(struct conn *c)
-{
-	if (c->key_ready || !c->key_half_sent || !c->key_half_seen)
-		return;
-	pthread_mutex_lock(&c->key_lock);
-	keys_conn_key(c->conn_key, c->sess->keys.sig_key,
-		      c->key_half_out, c->key_half_in);
-	c->key_ready = 1;
-	pthread_mutex_unlock(&c->key_lock);
-	/*
-	 * We can open under it now; the far end may not be able to yet, and it
-	 * is the one that decides when we may seal with it.
-	 */
-	ctl_send(c, CTLM_KEYOK, NULL, 0);
-	dbg_logf("path: keyed to this connection, telling the peer");
-}
 
 /*
  * The path a frame arrived on: the agent for ICE, which reports no source, and
@@ -3313,8 +3353,16 @@ static void sdp_pwd(const char *sdp, char *out)
 
 /* Is this claimant already admitted over the direct path -- served by a LAN
  * worker, or queued for one? (host main thread only) */
-static int conn_is_lost(struct conn *c);
-static int conn_is_proven(struct conn *c);
+
+static int conn_is_lost(struct conn *c)
+{
+	int lost;
+
+	pthread_mutex_lock(&c->hb_lock);
+	lost = c->lost_since_ms != 0;
+	pthread_mutex_unlock(&c->hb_lock);
+	return lost;
+}
 
 /*
  * A claimant already served over lanlink is refused a second admission -- once
@@ -3608,7 +3656,6 @@ static int nat_setup(struct conn *c)
 	return 0;
 }
 
-static void session_entomb_start(struct sess *s);
 
 static void pump_once(struct sess *s, int timeout_cap_ms)
 {
@@ -4224,10 +4271,6 @@ static void peer_in_drain(struct sess *s)
 		}
 }
 
-static int net_changed(struct sess *s);
-static int sig_rebuild(struct sess *s, const char *why);
-static void net_settle(struct sess *s);
-static void ns_take_acks(struct sess *s, uint64_t now);
 
 /*
  * A fresh ICE password under the same ufrag: the identity naming this
@@ -4246,6 +4289,108 @@ static void conn_fresh_pwd(struct conn *c)
 		c->ice_pwd[j * 2 + 1] = hx[rb[j] & 0xf];
 	}
 	c->ice_pwd[32] = '\0';
+}
+
+static int host_is_multiuser(const struct session_cfg *cfg)
+{
+	return cfg->is_host && (cfg->sig_flags & (SIG_DHT | SIG_MCAST)) &&
+	       !cfg->test_single_conn;
+}
+
+/*
+ * Create the signalling and arm it: subscribe the callbacks, advertise the
+ * direct transport's port and seed the rendezvous. The lanlink socket itself is
+ * not touched here -- it belongs to the session rather than to sig, and worker
+ * threads send on it without a lock. Returns 0 on success.
+ */
+static int sig_arm(struct sess *s)
+{
+	const struct session_cfg *cfg = s->cfg;
+
+	s->sig = sig_create(cfg->tok.rdv, cfg->sig_flags, cfg->is_host);
+	if (!s->sig)
+		return -1;
+	/*
+	 * BEFORE ANYTHING IS PUBLISHED. A claimant boxes its claim to the key
+	 * it read in the offer, and this is a REBUILD as often as it is a
+	 * first arming -- every move makes one. A fresh key would strand the
+	 * claim in flight: the host cannot open it, calls the slot unreadable
+	 * and RELEASES it, erasing a claim that was perfectly good, and the
+	 * claimant answers the new offer instead. So the key belongs to the
+	 * session, which the rebuild does not replace.
+	 */
+	if (s->have_claim_sk)
+		sig_use_claim_key(s->sig, s->claim_sk);
+	else if (!sig_claim_key(s->sig, s->claim_sk))
+		s->have_claim_sk = 1;
+	s->dht_since_ms = now_ms();	/* a rebuild is a fresh attempt, and a
+					 * fresh grace, on the new network */
+	sig_subscribe(s->sig, on_peer_offer, s);
+	/* A fresh signaller knows nothing, and what it drives its convergence
+	 * eagerness from is only ever published when it changes -- so a family
+	 * that came through the move still proven would sit in the slow tier
+	 * for the rest of the session, and never find its rendezvous. */
+	sig_set_family_up(s->sig, 4, netstate_conn(&s->ns, 4) == NET_CONN_UP);
+	sig_set_family_up(s->sig, 6, netstate_conn(&s->ns, 6) == NET_CONN_UP);
+	if (s->lan) {
+		sig_set_direct_port(s->sig, lanlink_port(s->lan));
+		if (host_is_multiuser(cfg)) {
+			sig_subscribe_direct(s->sig, on_direct_claim, s);
+			sig_set_mcast_claims(s->sig, 1);
+		} else {
+			sig_subscribe_direct(s->sig, on_direct_peer, &s->c);
+		}
+	}
+	seed_rendezvous(s);
+	/* A peer's request that we rendezvous for it stands until it has a
+	 * node; a fresh signaller starts knowing nothing of it. */
+	if (s->relay_fam[0])
+		sig_relay(s->sig, 4, 1);
+	if (s->relay_fam[1])
+		sig_relay(s->sig, 6, 1);
+	return 0;
+}
+
+/* Re-run on a rebuild: a cable going in adds one that was not there at
+ * startup. */
+static void report_links(struct sess *s)
+{
+	const struct session_obs *o = s->cfg->obs;
+	struct sig_mcast_if ifs[16];
+	int ni, k;
+
+	if (!s->lan || !s->sig || !o || !o->link)
+		return;
+	ni = sig_link_ifaces(s->sig, ifs, 16);
+	if (o->link_reset)
+		o->link_reset(o->arg);
+	for (k = 0; k < ni; k++)
+		o->link(o->arg, ifs[k].name, ifs[k].has4, ifs[k].has6);
+}
+
+/*
+ * net_pump has already noticed and told the model which family moved; this is
+ * the loop collecting the part only it can do, and clearing the debt.
+ */
+static int net_changed(struct sess *s)
+{
+	unsigned ch = s->net_ch;
+
+	s->net_ch = 0;
+	return ch != 0;
+}
+
+static int sig_rebuild(struct sess *s, const char *why)
+{
+	sig_discard(s->sig);
+	s->sig = NULL;
+	if (sig_arm(s)) {
+		dbg_logf("sig: rebuild failed -- giving up the session");
+		return -1;
+	}
+	report_links(s);
+	dbg_logf("sig: rebuilt %s", why);
+	return 0;
 }
 
 /*
@@ -4358,6 +4503,214 @@ static void resume_tick(struct conn *c)
 			c->rs_state = 0;
 		return;
 	}
+}
+
+/*
+ * Longest the operator's shell is held while the end of the session is
+ * published. The usual cost is a round trip to the rendezvous node the token
+ * already names, so this is the ceiling on a bad network, not the price of a
+ * quit. Waiting at all is the point: a comrade that returned the prompt and
+ * finished the publish behind the operator's back would be the background
+ * process this whole path exists to avoid.
+ */
+#define SESSION_TOMB_MS 4000
+
+/*
+ * The shared session is over: leave that where the invitation points.
+ *
+ * Everything a client holds says where to meet a host that is still there, and
+ * nothing in it can say the opposite -- so a token outliving its session sends
+ * every holder into a wait with no end. The tombstone is the missing answer,
+ * and it has to be placed from here, while this session's rendezvous node is
+ * still warm and pinned: a process that has already torn its signalling down
+ * would have to converge on the DHT from cold to say a single word.
+ *
+ * The DHT is the only place there is to leave it, so a link-local session has
+ * nothing to do here and returns at once -- see sig_end.
+ *
+ * Started as early as the end is known and finished last, because the operator
+ * is waiting on it: the deadline runs from the start, so whatever winding down
+ * happens in between -- workers lingering to land their end-of-session signal
+ * on clients that are slow to ack -- is time the store has been using rather
+ * than time added to it.
+ */
+static void session_entomb_start(struct sess *s)
+{
+	if (!s->sig || s->tomb_deadline)
+		return;
+	s->tomb_deadline = now_ms() + SESSION_TOMB_MS;
+	sig_end(s->sig);
+}
+
+/* A validated get proves the family, and says whether the rendezvous we hold
+ * is the one still answering. */
+static void ns_take_acks(struct sess *s, uint64_t now)
+{
+	static const int famv[2] = { 4, 6 };
+	int i;
+
+	if (!s->sig)
+		return;
+	for (i = 0; i < 2; i++) {
+		struct sockaddr_storage sa;
+		socklen_t sl = sizeof(sa);
+
+		/* Taken first and separately: a get answered by the node we
+		 * hold and then by another holder would otherwise be read as
+		 * ours having gone quiet, which is how a live rendezvous used
+		 * to be given up seconds after being chosen. */
+		if (sig_take_anchor_seen(s->sig, famv[i]))
+			netstate_on_anchor_seen(&s->ns, famv[i], now);
+		/*
+		 * Rendezvousing for the peer on this family is precisely being
+		 * allowed to choose one, so the ordinary trial runs and the
+		 * node that wins it becomes this end's anchor by the rules
+		 * every other node goes through. The peer must not be able to
+		 * tell one found this way from one we found for ourselves.
+		 */
+		netstate_set_picking(&s->ns, famv[i],
+				     s->cfg->is_host || s->relay_fam[i]);
+		memset(&sa, 0, sizeof(sa));
+		if (!sig_take_ack(s->sig, famv[i], (struct sockaddr *)&sa, &sl))
+			continue;
+		netstate_on_dht_ack(&s->ns, famv[i],
+				    netstate_epoch(&s->ns, famv[i]),
+				    (const uint8_t *)&sa, (int)sl, now);
+	}
+}
+
+static void net_sample_src(struct sess *s, int family, uint32_t epoch)
+{
+	int af = family == 6 ? AF_INET6 : AF_INET;
+	uint8_t raw[16];
+	char text[64];
+	int len = 0;
+
+	if (net_source_addr(af, text, sizeof(text), raw, &len))
+		len = 0;
+	netstate_on_src(&s->ns, family, epoch, len ? raw : NULL, len,
+			len ? addr_scope(text) : 0, len ? text : NULL,
+			now_ms());
+}
+
+/*
+ * Tell the view each family's rendezvous: the node the model holds, and
+ * whether it has qualified to go into a token.
+ *
+ * The same fact token_pump mints from, so the panel cannot name a node while
+ * the invite line is still saying it is looking for one -- a contradiction the
+ * operator sees for as long as qualifying takes, and which then resolves as a
+ * token changing under a shared invite for no visible reason.
+ */
+static void report_rendezvous(struct sess *s)
+{
+	static const int famv[2] = { 4, 6 };
+	const struct session_obs *o = s->cfg->obs;
+	int i;
+
+	if (!o || !o->rendezvous)
+		return;
+	for (i = 0; i < 2; i++) {
+		uint8_t node[NETSTATE_SA_MAX], nlen = 0;
+		int proven = 0, vouched = 0, row;
+		char b[80];
+
+		if (netstate_anchor(&s->ns, famv[i], node, &nlen, NULL) &&
+		    nlen) {
+			netstate_anchor_state(&s->ns, famv[i], &proven,
+					      &vouched, NULL);
+			row = proven ? RDV_ROW_PROVEN :
+			      vouched ? RDV_ROW_VOUCHED : RDV_ROW_CHECKING;
+			addr_str((const struct sockaddr *)node, b, sizeof(b));
+			o->rendezvous(o->arg, famv[i], b, row);
+		} else if (s->cfg->is_host &&
+			   (famv[i] == 4 ? s->expect4 : s->expect6)) {
+			o->rendezvous(o->arg, famv[i], "", RDV_ROW_CHECKING);
+		}
+	}
+}
+
+static void net_apply(struct sess *s, const struct netstate_actions *a)
+{
+	static const int famv[2] = { 4, 6 };
+	const struct session_obs *o = s->cfg->obs;
+	int i;
+
+	for (i = 0; i < 2; i++) {
+		unsigned act = a->f[i];
+		int family = famv[i];
+
+		if (act & NSA_SAMPLE_SRC)
+			net_sample_src(s, family, a->epoch[i]);
+		if (act & NSA_KICK_PROBE) {
+			int started;
+
+			__atomic_store_n(&s->probe_epoch[i], a->epoch[i],
+					 __ATOMIC_RELAXED);
+			started = i ? stun_probe6_kick(s) : stun_probe_kick(s);
+			if (started)
+				netstate_on_probe_started(&s->ns, family,
+							  a->epoch[i], now_ms());
+		}
+		if (act & NSA_EMIT_ROWS && o && o->net_reset && o->net) {
+			const struct netstate_row *rows;
+			int n = netstate_rows(&s->ns, family, &rows), k;
+
+			/* Rebuilt, not added to: a row shown before the source
+			 * was known has to be able to go away again. */
+			o->net_reset(o->arg, family);
+			for (k = 0; k < n; k++)
+				if (rows[k].shown)
+					o->net(o->arg, family, rows[k].scope,
+					       netstate_row_via(&s->ns, family,
+								&rows[k]),
+					       rows[k].text);
+		}
+		if (act & NSA_EMIT_CONN) {
+			int conn = netstate_conn(&s->ns, family);
+
+			if (s->sig)
+				sig_set_family_up(s->sig, family,
+						  conn == NET_CONN_UP);
+			if (o && o->net_conn)
+				o->net_conn(o->arg, family, conn);
+		}
+		if (act & NSA_RDV_PIN) {
+			uint8_t node[NETSTATE_SA_MAX];
+			uint8_t nlen = 0;
+
+			if (s->sig && netstate_anchor(&s->ns, family, node,
+						      &nlen, NULL))
+				sig_reinforce(s->sig, family,
+					      (const struct sockaddr *)node,
+					      (socklen_t)nlen);
+		}
+		if (act & NSA_RDV_RELOCATE) {
+			if (s->sig)
+				sig_search_again(s->sig, family);
+		}
+		if (act & NSA_RDV_DROP) {
+			if (s->sig)
+				sig_forget(s->sig, family);
+		}
+		if (act & NSA_EMIT_RDV)
+			report_rendezvous(s);
+		/* NSA_EMIT_TOKEN is advisory: token_pump recomputes on its own
+		 * cadence, which is what stops a token churning through the
+		 * transient states a move passes through. */
+	}
+}
+
+
+/* Drain what the model has decided and carry it out. Every path that feeds the
+ * model ends here, including the ones that run while a session is up and
+ * nothing is watching the interfaces. */
+static void net_settle(struct sess *s)
+{
+	struct netstate_actions a;
+
+	if (netstate_take_actions(&s->ns, &a))
+		net_apply(s, &a);
 }
 
 /*
@@ -4884,15 +5237,6 @@ static int deadline_room(uint64_t deadline, uint64_t now, uint64_t need)
 	return !deadline || now + need < deadline;
 }
 
-/*
- * Longest the operator's shell is held while the end of the session is
- * published. The usual cost is a round trip to the rendezvous node the token
- * already names, so this is the ceiling on a bad network, not the price of a
- * quit. Waiting at all is the point: a comrade that returned the prompt and
- * finished the publish behind the operator's back would be the background
- * process this whole path exists to avoid.
- */
-#define SESSION_TOMB_MS 4000
 
 /*
  * And the longest a worker is given to wind down while that goes on. Sized
@@ -4904,32 +5248,6 @@ static int deadline_room(uint64_t deadline, uint64_t now, uint64_t need)
  */
 #define SESSION_WIND_MS (LINGER_HOST_MS + 1000)
 
-/*
- * The shared session is over: leave that where the invitation points.
- *
- * Everything a client holds says where to meet a host that is still there, and
- * nothing in it can say the opposite -- so a token outliving its session sends
- * every holder into a wait with no end. The tombstone is the missing answer,
- * and it has to be placed from here, while this session's rendezvous node is
- * still warm and pinned: a process that has already torn its signalling down
- * would have to converge on the DHT from cold to say a single word.
- *
- * The DHT is the only place there is to leave it, so a link-local session has
- * nothing to do here and returns at once -- see sig_end.
- *
- * Started as early as the end is known and finished last, because the operator
- * is waiting on it: the deadline runs from the start, so whatever winding down
- * happens in between -- workers lingering to land their end-of-session signal
- * on clients that are slow to ack -- is time the store has been using rather
- * than time added to it.
- */
-static void session_entomb_start(struct sess *s)
-{
-	if (!s->sig || s->tomb_deadline)
-		return;
-	s->tomb_deadline = now_ms() + SESSION_TOMB_MS;
-	sig_end(s->sig);
-}
 
 static void session_entomb(struct sess *s)
 {
@@ -5034,140 +5352,10 @@ static void gather_facts(struct sess *s, int family, struct tokgen_facts *f)
 	netstate_facts(&s->ns, family, f);
 }
 
-static void net_sample_src(struct sess *s, int family, uint32_t epoch)
-{
-	int af = family == 6 ? AF_INET6 : AF_INET;
-	uint8_t raw[16];
-	char text[64];
-	int len = 0;
 
-	if (net_source_addr(af, text, sizeof(text), raw, &len))
-		len = 0;
-	netstate_on_src(&s->ns, family, epoch, len ? raw : NULL, len,
-			len ? addr_scope(text) : 0, len ? text : NULL,
-			now_ms());
-}
 
-/* A validated get proves the family, and says whether the rendezvous we hold
- * is the one still answering. */
-static void ns_take_acks(struct sess *s, uint64_t now)
-{
-	static const int famv[2] = { 4, 6 };
-	int i;
 
-	if (!s->sig)
-		return;
-	for (i = 0; i < 2; i++) {
-		struct sockaddr_storage sa;
-		socklen_t sl = sizeof(sa);
 
-		/* Taken first and separately: a get answered by the node we
-		 * hold and then by another holder would otherwise be read as
-		 * ours having gone quiet, which is how a live rendezvous used
-		 * to be given up seconds after being chosen. */
-		if (sig_take_anchor_seen(s->sig, famv[i]))
-			netstate_on_anchor_seen(&s->ns, famv[i], now);
-		/*
-		 * Rendezvousing for the peer on this family is precisely being
-		 * allowed to choose one, so the ordinary trial runs and the
-		 * node that wins it becomes this end's anchor by the rules
-		 * every other node goes through. The peer must not be able to
-		 * tell one found this way from one we found for ourselves.
-		 */
-		netstate_set_picking(&s->ns, famv[i],
-				     s->cfg->is_host || s->relay_fam[i]);
-		memset(&sa, 0, sizeof(sa));
-		if (!sig_take_ack(s->sig, famv[i], (struct sockaddr *)&sa, &sl))
-			continue;
-		netstate_on_dht_ack(&s->ns, famv[i],
-				    netstate_epoch(&s->ns, famv[i]),
-				    (const uint8_t *)&sa, (int)sl, now);
-	}
-}
-
-static void report_rendezvous(struct sess *s);
-
-static void net_apply(struct sess *s, const struct netstate_actions *a)
-{
-	static const int famv[2] = { 4, 6 };
-	const struct session_obs *o = s->cfg->obs;
-	int i;
-
-	for (i = 0; i < 2; i++) {
-		unsigned act = a->f[i];
-		int family = famv[i];
-
-		if (act & NSA_SAMPLE_SRC)
-			net_sample_src(s, family, a->epoch[i]);
-		if (act & NSA_KICK_PROBE) {
-			int started;
-
-			__atomic_store_n(&s->probe_epoch[i], a->epoch[i],
-					 __ATOMIC_RELAXED);
-			started = i ? stun_probe6_kick(s) : stun_probe_kick(s);
-			if (started)
-				netstate_on_probe_started(&s->ns, family,
-							  a->epoch[i], now_ms());
-		}
-		if (act & NSA_EMIT_ROWS && o && o->net_reset && o->net) {
-			const struct netstate_row *rows;
-			int n = netstate_rows(&s->ns, family, &rows), k;
-
-			/* Rebuilt, not added to: a row shown before the source
-			 * was known has to be able to go away again. */
-			o->net_reset(o->arg, family);
-			for (k = 0; k < n; k++)
-				if (rows[k].shown)
-					o->net(o->arg, family, rows[k].scope,
-					       netstate_row_via(&s->ns, family,
-								&rows[k]),
-					       rows[k].text);
-		}
-		if (act & NSA_EMIT_CONN) {
-			int conn = netstate_conn(&s->ns, family);
-
-			if (s->sig)
-				sig_set_family_up(s->sig, family,
-						  conn == NET_CONN_UP);
-			if (o && o->net_conn)
-				o->net_conn(o->arg, family, conn);
-		}
-		if (act & NSA_RDV_PIN) {
-			uint8_t node[NETSTATE_SA_MAX];
-			uint8_t nlen = 0;
-
-			if (s->sig && netstate_anchor(&s->ns, family, node,
-						      &nlen, NULL))
-				sig_reinforce(s->sig, family,
-					      (const struct sockaddr *)node,
-					      (socklen_t)nlen);
-		}
-		if (act & NSA_RDV_RELOCATE) {
-			if (s->sig)
-				sig_search_again(s->sig, family);
-		}
-		if (act & NSA_RDV_DROP) {
-			if (s->sig)
-				sig_forget(s->sig, family);
-		}
-		if (act & NSA_EMIT_RDV)
-			report_rendezvous(s);
-		/* NSA_EMIT_TOKEN is advisory: token_pump recomputes on its own
-		 * cadence, which is what stops a token churning through the
-		 * transient states a move passes through. */
-	}
-}
-
-/* Drain what the model has decided and carry it out. Every path that feeds the
- * model ends here, including the ones that run while a session is up and
- * nothing is watching the interfaces. */
-static void net_settle(struct sess *s)
-{
-	struct netstate_actions a;
-
-	if (netstate_take_actions(&s->ns, &a))
-		net_apply(s, &a);
-}
 
 /* The one place a network change is noticed and acted on, at the top of both
  * loops. What is left for each is taken from net_changed. */
@@ -5208,22 +5396,6 @@ static void net_pump(struct sess *s, uint64_t now)
 	net_settle(s);
 }
 
-/* Re-run on a rebuild: a cable going in adds one that was not there at
- * startup. */
-static void report_links(struct sess *s)
-{
-	const struct session_obs *o = s->cfg->obs;
-	struct sig_mcast_if ifs[16];
-	int ni, k;
-
-	if (!s->lan || !s->sig || !o || !o->link)
-		return;
-	ni = sig_link_ifaces(s->sig, ifs, 16);
-	if (o->link_reset)
-		o->link_reset(o->arg);
-	for (k = 0; k < ni; k++)
-		o->link(o->arg, ifs[k].name, ifs[k].has4, ifs[k].has6);
-}
 
 /* The half of a move that is the same wherever it is noticed. What differs --
  * which agent to tear down, which state to return to -- stays with each loop. */
@@ -5398,42 +5570,6 @@ static void maybe_announce_rendezvous(struct sess *s)
 	report_rendezvous(s);		/* also for a family still expected */
 }
 
-/*
- * Tell the view each family's rendezvous: the node the model holds, and
- * whether it has qualified to go into a token.
- *
- * The same fact token_pump mints from, so the panel cannot name a node while
- * the invite line is still saying it is looking for one -- a contradiction the
- * operator sees for as long as qualifying takes, and which then resolves as a
- * token changing under a shared invite for no visible reason.
- */
-static void report_rendezvous(struct sess *s)
-{
-	static const int famv[2] = { 4, 6 };
-	const struct session_obs *o = s->cfg->obs;
-	int i;
-
-	if (!o || !o->rendezvous)
-		return;
-	for (i = 0; i < 2; i++) {
-		uint8_t node[NETSTATE_SA_MAX], nlen = 0;
-		int proven = 0, vouched = 0, row;
-		char b[80];
-
-		if (netstate_anchor(&s->ns, famv[i], node, &nlen, NULL) &&
-		    nlen) {
-			netstate_anchor_state(&s->ns, famv[i], &proven,
-					      &vouched, NULL);
-			row = proven ? RDV_ROW_PROVEN :
-			      vouched ? RDV_ROW_VOUCHED : RDV_ROW_CHECKING;
-			addr_str((const struct sockaddr *)node, b, sizeof(b));
-			o->rendezvous(o->arg, famv[i], b, row);
-		} else if (s->cfg->is_host &&
-			   (famv[i] == 4 ? s->expect4 : s->expect6)) {
-			o->rendezvous(o->arg, famv[i], "", RDV_ROW_CHECKING);
-		}
-	}
-}
 
 /*
  * The token's view of a sockaddr: the bare address bytes, and the port in host
@@ -5828,15 +5964,6 @@ static struct conn *worker_by_ufrag(struct worker *ws, const char *ufrag)
 	return NULL;
 }
 
-static int conn_is_lost(struct conn *c)
-{
-	int lost;
-
-	pthread_mutex_lock(&c->hb_lock);
-	lost = c->lost_since_ms != 0;
-	pthread_mutex_unlock(&c->hb_lock);
-	return lost;
-}
 
 /*
  * Has anything ever come back over this connection? A punch connecting proves
@@ -6198,46 +6325,6 @@ static void punch_scan(struct sess *s, struct worker *ws, struct conn **punching
  * capped at one client. Only the test-only single-connection flag forces the
  * sequential re-serve state machine instead.
  */
-/*
- * What went into the offer a peer is about to read.
- *
- * An offer with nothing in it a peer could reach looks, from this end, exactly
- * like one that works: the host publishes, the client claims, the punch is made
- * and simply never connects. Behind a carrier NAT the difference is one
- * candidate -- whether STUN answered before the offer went out -- and there was
- * no way to tell the two apart from a log.
- *
- * Reflexive is counted rather than "reachable", because the two are not the
- * same: a globally routable IPv6 host candidate needs no STUN and is reachable
- * with none, so on a v6 network a count of zero here is the ordinary case and
- * says nothing is wrong.
- */
-static void log_offer(const char *sdp, int served, int active)
-{
-	const char *p;
-	int cands = 0, reflexive = 0;
-
-	for (p = sdp; (p = strstr(p, "a=candidate:")) != NULL; p += 12) {
-		const char *end = strchr(p, '\n');
-		const char *t = strstr(p, "typ ");
-
-		cands++;
-		if (!t || (end && t > end))
-			continue;
-		if (!strncmp(t, "typ srflx", 9) ||
-		    !strncmp(t, "typ prflx", 9) ||
-		    !strncmp(t, "typ relay", 9))
-			reflexive++;
-	}
-	if (served < 0)
-		dbg_logf("host: offer re-posted, fanned across %d egress "
-			 "address(es): %d candidate(s), %d reflexive",
-			 active, cands, reflexive);
-	else
-		dbg_logf("host: offer published (served=%d active=%d) "
-			 "%d candidate(s), %d reflexive",
-			 served, active, cands, reflexive);
-}
 
 /* Whether an offer has anything in it at all for a peer to aim at. */
 static int sdp_has_candidate(const char *sdp)
@@ -6245,77 +6332,8 @@ static int sdp_has_candidate(const char *sdp)
 	return strstr(sdp, "a=candidate:") != NULL;
 }
 
-static int host_is_multiuser(const struct session_cfg *cfg)
-{
-	return cfg->is_host && (cfg->sig_flags & (SIG_DHT | SIG_MCAST)) &&
-	       !cfg->test_single_conn;
-}
 
-/*
- * net_pump has already noticed and told the model which family moved; this is
- * the loop collecting the part only it can do, and clearing the debt.
- */
-static int net_changed(struct sess *s)
-{
-	unsigned ch = s->net_ch;
 
-	s->net_ch = 0;
-	return ch != 0;
-}
-
-/*
- * Create the signalling and arm it: subscribe the callbacks, advertise the
- * direct transport's port and seed the rendezvous. The lanlink socket itself is
- * not touched here -- it belongs to the session rather than to sig, and worker
- * threads send on it without a lock. Returns 0 on success.
- */
-static int sig_arm(struct sess *s)
-{
-	const struct session_cfg *cfg = s->cfg;
-
-	s->sig = sig_create(cfg->tok.rdv, cfg->sig_flags, cfg->is_host);
-	if (!s->sig)
-		return -1;
-	/*
-	 * BEFORE ANYTHING IS PUBLISHED. A claimant boxes its claim to the key
-	 * it read in the offer, and this is a REBUILD as often as it is a
-	 * first arming -- every move makes one. A fresh key would strand the
-	 * claim in flight: the host cannot open it, calls the slot unreadable
-	 * and RELEASES it, erasing a claim that was perfectly good, and the
-	 * claimant answers the new offer instead. So the key belongs to the
-	 * session, which the rebuild does not replace.
-	 */
-	if (s->have_claim_sk)
-		sig_use_claim_key(s->sig, s->claim_sk);
-	else if (!sig_claim_key(s->sig, s->claim_sk))
-		s->have_claim_sk = 1;
-	s->dht_since_ms = now_ms();	/* a rebuild is a fresh attempt, and a
-					 * fresh grace, on the new network */
-	sig_subscribe(s->sig, on_peer_offer, s);
-	/* A fresh signaller knows nothing, and what it drives its convergence
-	 * eagerness from is only ever published when it changes -- so a family
-	 * that came through the move still proven would sit in the slow tier
-	 * for the rest of the session, and never find its rendezvous. */
-	sig_set_family_up(s->sig, 4, netstate_conn(&s->ns, 4) == NET_CONN_UP);
-	sig_set_family_up(s->sig, 6, netstate_conn(&s->ns, 6) == NET_CONN_UP);
-	if (s->lan) {
-		sig_set_direct_port(s->sig, lanlink_port(s->lan));
-		if (host_is_multiuser(cfg)) {
-			sig_subscribe_direct(s->sig, on_direct_claim, s);
-			sig_set_mcast_claims(s->sig, 1);
-		} else {
-			sig_subscribe_direct(s->sig, on_direct_peer, &s->c);
-		}
-	}
-	seed_rendezvous(s);
-	/* A peer's request that we rendezvous for it stands until it has a
-	 * node; a fresh signaller starts knowing nothing of it. */
-	if (s->relay_fam[0])
-		sig_relay(s->sig, 4, 1);
-	if (s->relay_fam[1])
-		sig_relay(s->sig, 6, 1);
-	return 0;
-}
 
 /*
  * Rebuild the signalling on a move. A fresh sig binds a new DHT socket and
@@ -6354,18 +6372,6 @@ static int sig_idle_s(struct sig *sig)
 	return (int)((now_ms() - sm.last_get_ms) / 1000);
 }
 
-static int sig_rebuild(struct sess *s, const char *why)
-{
-	sig_discard(s->sig);
-	s->sig = NULL;
-	if (sig_arm(s)) {
-		dbg_logf("sig: rebuild failed -- giving up the session");
-		return -1;
-	}
-	report_links(s);
-	dbg_logf("sig: rebuilt %s", why);
-	return 0;
-}
 
 /*
  * Host turnstile: advertise one offer at a time (a fresh ICE identity per
