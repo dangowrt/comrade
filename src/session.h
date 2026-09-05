@@ -280,9 +280,7 @@ struct session_cfg {
 					 * never connect (a wedged punch), so the
 					 * release-on-pickup turnstile can be shown
 					 * not to head-of-line-block (L1-stuck) */
-	int test_roam_ms;
-	int test_roam_on_serve;	/* arm test_roam_ms when a client is
-				 * first served, not at session start */		/* report a network change this often, as
+	int test_roam_ms;		/* report a network change this often, as
 					 * if netmon had seen the interfaces move
 					 * (0 = never), so the rebuild on a roam
 					 * runs without one. A period, not a

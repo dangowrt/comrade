@@ -5931,10 +5931,10 @@ static int worker_spawn(struct worker *ws, struct conn *c)
 				return -1;
 			ws[i].done = 0;
 			ws[i].used = 1;
-			/* Where a client is actually being served, over
-			 * whatever transport brought it. */
-			if (c->sess->cfg->test_roam_on_serve &&
-			    c->sess->cfg->test_roam_ms > 0 &&
+			/* The DHT host's clock starts here, where a client is
+			 * actually being served. Anything else armed at the
+			 * start and has a deadline already. */
+			if (c->sess->cfg->test_roam_ms > 0 &&
 			    !c->sess->next_roam_ms)
 				c->sess->next_roam_ms = now_ms() +
 					(uint64_t)c->sess->cfg->test_roam_ms;
@@ -7072,15 +7072,17 @@ int session_run(const struct session_cfg *cfg)
 	netmon_init(&s.netmon);
 	netstate_init(&s.ns, cfg->is_host, now_ms());
 	/*
-	 * Armed here unless the caller asked for it to wait for a client. A
-	 * test that means "roam in the middle of a live session" cannot start
-	 * the clock at session start and hope: the client's arrival is gated
-	 * on a rendezvous lookup and has no bound, so the margin is only a
-	 * margin for as long as the lookup stays quick. A test that means
-	 * "make the roam seam fire" wants it now and may have no client at
-	 * all, which is why this is asked for rather than assumed.
+	 * When the synthetic change is armed follows the path the session
+	 * meets over, and nothing else. A host whose rendezvous is the DHT
+	 * waits for the first client it serves: the arrival it has to be
+	 * disturbing is gated on a lookup with no bound, so a clock started
+	 * here is a race the margin only hides for as long as the lookup
+	 * stays quick. Every other session arms now, because there is nothing
+	 * unbounded to wait for -- a client roams from its own start, and a
+	 * host on a LAN segment is reachable the moment it is up, so it can
+	 * be moved before anyone has arrived.
 	 */
-	s.next_roam_ms = cfg->test_roam_on_serve
+	s.next_roam_ms = (cfg->is_host && (cfg->sig_flags & SIG_DHT))
 		? 0 : now_ms() + (uint64_t)cfg->test_roam_ms;
 	if (keys_derive(&s.keys, cfg->tok.rdv))
 		return 1;
