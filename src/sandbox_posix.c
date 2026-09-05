@@ -2350,6 +2350,23 @@ static const char *const sb_lib_dirs[] = {
  * file it writes directly in /tmp, which is also where /var, and with it
  * every session token, lives. For these the resolver's file is staged and
  * the directory around it is not.
+ *
+ * A bind holds an inode, so it does not follow a rewrite that replaces the
+ * file -- measured: rename or unlink-and-recreate over a bound path leaves
+ * the bind reading what was there before, and dnsmasq rewrites by removing
+ * and recreating. That lands where it costs least, which is why this is a
+ * file and not the directory. The file bound here is the one dnsmasq writes
+ * when it is the box's own resolver, and it names 127.0.0.1 and ::1 -- the
+ * addresses do not move when dnsmasq restarts, so the content a confined
+ * process keeps reading is the content it would be given again. The case
+ * where the servers really do change is the DHCP-learned upstream list in
+ * /tmp/resolv.conf.d/resolv.conf.auto, and that directory is not shared, so
+ * it is staged whole and every rewrite in it is seen.
+ *
+ * What remains unseen is a reconfiguration that changes the search domain or
+ * adds a server to dnsmasq's own list while a confined process is running.
+ * That is a restart of the session away from being picked up, and worth less
+ * than handing the sandbox every session token in /tmp.
  */
 static const char *const sb_shared_dirs[] = {
 	"/tmp", "/var", "/var/tmp", "/run", "/var/run", "/dev/shm"
