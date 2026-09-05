@@ -182,15 +182,40 @@ jobs:
             if [ -x "$d/brew" ]; then echo "$d" >> "$GITHUB_PATH"; fi
           done
 
+      # Best-effort because a locked container can install nothing and is
+      # expected to carry these already. What it must not do is give up on a
+      # lock: unattended-upgrades holds the dpkg frontend for a while after a
+      # worker boots, and a job starting in that window installed nothing and
+      # then died four steps later on "cmake: command not found" -- a message
+      # about the dependency build, from a runner that was merely busy. So the
+      # lock is waited out, and what the later steps need is checked here,
+      # where the failure can say which tool is missing and that installing it
+      # was tried.
       - name: Install base packages (best-effort)
         run: |
           if [ "$RUNNER_OS" = Linux ]; then
             SUDO=; [ "$(id -u)" = 0 ] || SUDO="sudo -n"
-            $SUDO apt-get update && $SUDO apt-get install -y --no-install-recommends \
-              cmake ninja-build pkg-config build-essential git curl ca-certificates \
-              libssh-dev tmux libgcrypt20-dev libsodium-dev \
-              ${{ matrix.memcheck && 'valgrind' || '' }} \
-              || echo "note: could not apt-get; relying on the runner's provisioned packages"
+            n=0
+            until $SUDO apt-get update && $SUDO apt-get install -y --no-install-recommends \
+                cmake ninja-build pkg-config build-essential git curl ca-certificates \
+                libssh-dev tmux libgcrypt20-dev libsodium-dev \
+                ${{ matrix.memcheck && 'valgrind' || '' }}; do
+              n=$((n + 1))
+              if [ "$n" -ge 6 ]; then
+                echo "note: could not apt-get; relying on the runner's provisioned packages"
+                break
+              fi
+              echo "apt-get unavailable (attempt $n); retrying in $((n * 15))s"
+              sleep $((n * 15))
+            done
+            missing=
+            for t in cmake git curl; do
+              command -v "$t" >/dev/null 2>&1 || missing="$missing $t"
+            done
+            if [ -n "$missing" ]; then
+              echo "::error::runner has no$missing and installing it did not succeed"
+              exit 1
+            fi
           else
             brew install cmake ninja pkg-config libssh tmux libgcrypt \
               || echo "note: brew install failed; relying on the runner's provisioned packages"
