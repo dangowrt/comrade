@@ -16,12 +16,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <unistd.h>
 
 #include "keys.h"
 #include "session.h"
 #include "sig.h"
 #include "sig_mcast.h"
 #include "sshd.h"
+#include "wsock.h"
 #include "token.h"
 
 #define SSH_NONCE 4096
@@ -34,10 +36,28 @@ static struct {
  * allows to be touched from one. */
 static volatile sig_atomic_t e2e_stop;
 
+/*
+ * The write end of the end monitor, for the one state e2e_stop cannot reach.
+ * A host serving over the DHT runs host_turnstile, which is bounded by its
+ * deadline and by an end monitor and reads no stop flag -- so SIGTERM left it
+ * running, the script that sent it moved on, and the host outlived the test
+ * that started it. The real binary signals the same monitor from its stop
+ * path (src/host.c), so answering it here is what the shipped program does
+ * rather than a mechanism of the harness's own.
+ */
+static int e2e_end_wfd = -1;
+
 static void on_term(int sig)
 {
 	(void)sig;
 	e2e_stop = 1;
+	if (e2e_end_wfd >= 0) {
+		/* write(2) is async-signal-safe; the turnstile is polling the
+		 * other end for exactly this. */
+		ssize_t n = write(e2e_end_wfd, "x", 1);
+
+		(void)n;
+	}
 }
 
 static const char *state_name(int state)
@@ -114,6 +134,7 @@ int main(int argc, char **argv)
 	uint8_t tx[SSH_NONCE], rx[SSH_NONCE];
 	size_t rx_got = 0, k;
 	const char *stun_arg = NULL;
+	sock_t e2e_end[2];
 	int is_host, i, rc, flood = 0;
 
 	/* A peer closing first must not kill the harness outright, the same way
@@ -166,6 +187,15 @@ int main(int argc, char **argv)
 	cfg.connect_timeout_s = 120;
 	cfg.sig_flags = SIG_DHT;
 	cfg.test_stop = &e2e_stop;
+	/*
+	 * The end monitor the turnstile polls. Built for every role: a client
+	 * ignores it, and a host that never reaches the turnstile is no worse
+	 * off for holding one.
+	 */
+	if (!sock_pair(e2e_end)) {
+		cfg.ssh_end_fd = e2e_end[0];
+		e2e_end_wfd = e2e_end[1];
+	}
 
 	if (argc >= 2 && !strcmp(argv[1], "host")) {
 		is_host = 1;
