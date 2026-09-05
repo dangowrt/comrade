@@ -32,3 +32,23 @@
    fun:CRYPTO_THREAD_set_local_ex
    ...
 }
+
+# mount() ignores its filesystemtype argument for a bind, a remount and a
+# propagation change, and NULL is the idiomatic value there -- util-linux
+# passes it too. Valgrind 3.22, which is what Ubuntu 24.04 and so the CI
+# runners carry, checks the argument unconditionally and calls the NULL
+# unaddressable; newer valgrind does not report it. Every mount() in comrade
+# that passes no type is one of those three operations, so there is no call
+# here for which the kernel would read the pointer.
+#
+# It is not a cosmetic complaint: MEMORYCHECK_COMMAND_OPTIONS carries
+# --error-exitcode=1, so the finding made the confined child exit 1, the test
+# read that as its RC_FAIL, and sandbox_test aborted on the assertion --
+# a false positive presenting as a failed confinement.
+{
+   mount-ignores-its-type-for-bind-remount-and-propagation
+   Memcheck:Param
+   mount(type)
+   fun:mount
+   ...
+}
