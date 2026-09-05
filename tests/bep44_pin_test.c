@@ -7,6 +7,11 @@
  * cycled far past its capacity (which evicts ordinary seeds). A loopback
  * "victim" socket stands in for the rendezvous node; the test asserts the
  * engine actually sends it a query.
+ *
+ * And the other half of that guarantee, now that a pin can be displaced: a
+ * pin is only ever given up once it has stopped answering, so a table full of
+ * pins that are all still live refuses a new one rather than dropping a
+ * working rendezvous to make room.
  */
 
 #include <assert.h>
@@ -87,6 +92,27 @@ int main(void)
 		junk.sin_port = htons((uint16_t)(1000 + i));
 		bep44_seed_add(e, NULL, (struct sockaddr *)&junk, sizeof(junk));
 	}
+
+	/*
+	 * Fill the table with pins that have only just been added, and so are
+	 * inside their grace window. Every one of them is live as far as the
+	 * engine knows, so the table is full and the next add is refused --
+	 * a working pin is never displaced to make room.
+	 */
+	for (i = 0; i < 16; i++) {
+		int want;
+
+		memset(&junk, 0, sizeof(junk));
+		junk.sin_family = AF_INET;
+		junk.sin_addr.s_addr = htonl(0x0b000000u | (unsigned)i);
+		junk.sin_port = htons((uint16_t)(2000 + i));
+		/* One slot is already the victim, so the eighth add is the
+		 * last that fits and everything after it is refused. */
+		want = (i < 7) ? 0 : -1;
+		assert(bep44_pin_add(e, NULL, (struct sockaddr *)&junk,
+				     sizeof(junk)) == want);
+	}
+	/* The victim is still pinned through all of that. */
 
 	/* Start a query and confirm the pinned node is actually contacted. */
 	bep44_get(e, pk, "offer", on_get, NULL);

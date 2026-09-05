@@ -57,6 +57,17 @@ static int debug_on(void)
 #define B44_MSG_MAX 1400
 #define B44_SEEDS_MAX 16
 #define B44_PINNED_MAX 8
+/*
+ * How long a pinned node may go without answering before a new pin may take
+ * its slot. Pins used to be permanent, which is right for one that works and
+ * wrong for one that has died: a rendezvous adopted and then lost held its
+ * place for the life of the session, at XOR distance zero, at the head of the
+ * first round of every lookup -- and after eight of those nothing could be
+ * pinned at all. Long enough that a working rendezvous is never displaced by
+ * a moment's silence, short enough that a dead one does not outlast the
+ * session.
+ */
+#define B44_PIN_STALE_MS (2 * 60 * 1000)
 #define B44_RETAINED_MAX 8
 
 /*
@@ -291,6 +302,9 @@ struct b44_seed {
 	uint8_t has_id;
 	uint64_t tat_ms;		/* leaky bucket: when the queries asked of
 					 * it so far will have drained away */
+	uint64_t last_ok_ms;		/* when this last answered; a pin is
+					 * only ever displaced after it has
+					 * stopped doing so */
 };
 
 struct bep44_engine {
@@ -1401,11 +1415,13 @@ static void pin_learn_id(struct bep44_engine *e, const struct sockaddr *from,
 	for (i = 0; i < e->npinned; i++) {
 		struct b44_seed *p = &e->pinned[i];
 
-		if (p->has_id || p->sslen != fromlen ||
-		    memcmp(&p->ss, from, fromlen))
+		if (p->sslen != fromlen || memcmp(&p->ss, from, fromlen))
 			continue;
-		memcpy(p->id, id, 20);
-		p->has_id = 1;
+		p->last_ok_ms = now_ms();	/* it is still there */
+		if (!p->has_id) {
+			memcpy(p->id, id, 20);
+			p->has_id = 1;
+		}
 	}
 }
 
@@ -2623,10 +2639,34 @@ int bep44_pin_add(struct bep44_engine *e, const uint8_t id[20],
 		if (p->sslen == salen && !memcmp(&p->ss, sa, salen))
 			return 0;		/* already pinned */
 	}
-	if (e->npinned >= B44_PINNED_MAX)
-		return -1;			/* never evict an existing pin */
-	p = &e->pinned[e->npinned++];
+	if (e->npinned >= B44_PINNED_MAX) {
+		uint64_t now = now_ms(), oldest = 0;
+		int stalest = -1;
+
+		/*
+		 * Full: a pin that has answered inside the window keeps its
+		 * place, and the longest-silent one past it gives way. Refusing
+		 * outright is what left a session unable to pin a live
+		 * rendezvous because eight dead ones held every slot.
+		 */
+		for (i = 0; i < e->npinned; i++) {
+			uint64_t quiet = now - e->pinned[i].last_ok_ms;
+
+			if (quiet <= B44_PIN_STALE_MS)
+				continue;
+			if (stalest < 0 || quiet > oldest) {
+				oldest = quiet;
+				stalest = i;
+			}
+		}
+		if (stalest < 0)
+			return -1;		/* every pin is still answering */
+		p = &e->pinned[stalest];
+	} else {
+		p = &e->pinned[e->npinned++];
+	}
 	memset(p, 0, sizeof(*p));
+	p->last_ok_ms = now_ms();	/* a grace window before it can give way */
 	if (id) {
 		memcpy(p->id, id, 20);
 		p->has_id = 1;
