@@ -107,6 +107,14 @@
  * before ending the process. That is the only way to see what happened on a
  * stock OpenWrt kernel, where CONFIG_AUDIT is off and a kill leaves no record
  * at all.
+ *
+ * COMRADE_SANDBOX=log goes further and confines nothing: a syscall the list
+ * omits is recorded and then allowed, so one run names every one of them
+ * rather than one per restart. It needs a kernel that offers the action --
+ * /proc/sys/kernel/seccomp/actions_avail says -- and falls back to warn where
+ * there is none. On a router the action is accepted and the record still goes
+ * nowhere, because that is the same CONFIG_AUDIT; warn is the mode that works
+ * there.
  */
 
 /* Which process is being confined; see the block comment above. */

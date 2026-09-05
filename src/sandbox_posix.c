@@ -1860,6 +1860,50 @@ static int sb_warn_mode(void)
 	return e && !strcmp(e, "warn");
 }
 
+#ifndef SECCOMP_RET_LOG
+#define SECCOMP_RET_LOG 0x7ffc0000U
+#endif
+
+/*
+ * COMRADE_SANDBOX=log: every syscall the list omits is recorded and then
+ * allowed, so a whole run's worth of them can be collected in one pass
+ * instead of one per restart. It is the right tool for finding what a new
+ * libc or a new backend reaches for -- the gcrypt build that died on mlock
+ * would have named itself and carried on -- and it confines nothing while it
+ * is on, which is why it is asked for by name.
+ *
+ * The kernel has to offer the action, and it says so in
+ * /proc/sys/kernel/seccomp/actions_avail. Where it does not, or where the
+ * file cannot be read, this falls back to warn: a trap that names the syscall
+ * and ends the process is a worse tool than logging but a far better one than
+ * a silent kill. Worth knowing on a router: RET_LOG writes through the audit
+ * subsystem, and a stock OpenWrt kernel has CONFIG_AUDIT off, so the action is
+ * accepted and the record goes nowhere. warn is the mode that works there.
+ */
+static int sb_log_available(void)
+{
+	char buf[256];
+	ssize_t n;
+	int fd = open("/proc/sys/kernel/seccomp/actions_avail",
+		      O_RDONLY | O_CLOEXEC);
+
+	if (fd < 0)
+		return 0;
+	n = read(fd, buf, sizeof(buf) - 1);
+	close(fd);
+	if (n <= 0)
+		return 0;
+	buf[n] = '\0';
+	return strstr(buf, "log") != NULL;
+}
+
+static int sb_log_mode(void)
+{
+	const char *e = getenv("COMRADE_SANDBOX");
+
+	return e && !strcmp(e, "log");
+}
+
 /*
  * Read by the SIGSYS handler, so neither is a plain int. Both are set before
  * the filter that can raise it goes on -- the descriptor especially, since a
@@ -1984,7 +2028,11 @@ static int seccomp_allowlist(int role, int no_pty)
 	struct sb_prog p;
 	unsigned int deflt = SECCOMP_RET_KILL_PROCESS;
 
-	if (sb_warn_mode()) {
+	if (sb_log_mode() && sb_log_available()) {
+		deflt = SECCOMP_RET_LOG;
+	} else if (sb_warn_mode() || sb_log_mode()) {
+		/* Asked for log on a kernel that has none: warn still says
+		 * which syscall it was, which is the point of asking. */
 		sb_warn_arm(role);
 		deflt = SECCOMP_RET_TRAP;
 	}
