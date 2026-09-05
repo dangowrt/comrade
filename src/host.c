@@ -105,8 +105,19 @@ struct svc {
 	char svcfile[512];		/* this service's pid, while it runs */
 	int no_fwd;			/* decline all client port forwarding */
 	int forward_only;		/* serve no shell/tmux, forwarding only */
-	volatile int stop;		/* forward-only: end the serve loop */
-	sock_t stop_wfd;		/* shut to release the turnstile promptly */
+	volatile int stop;		/* forward-only: end the serve loop.
+					 * Written by the stop watcher thread,
+					 * read by the serve loop, so both ends
+					 * go through relaxed atomics. */
+	sock_t stop_wfd;		/* shut to release the turnstile promptly.
+					 * The serve loop opens and closes it
+					 * while the stop watcher thread may be
+					 * shutting it down, so stop_lock covers
+					 * every access: without it the watcher
+					 * can hold a descriptor the loop has
+					 * already closed, and shut down whatever
+					 * has since been given the number. */
+	pthread_mutex_t stop_lock;
 	int obs_fd;			/* the operator's end of the event pipe;
 					 * its closing is the operator leaving */
 	struct session_obs obs;		/* view-event emitter to the foreground */
@@ -831,9 +842,11 @@ static void on_token_state(void *arg, int family, int state,
 static void svc_end(struct svc *v)
 {
 	if (v->forward_only) {
-		v->stop = 1;
+		__atomic_store_n(&v->stop, 1, __ATOMIC_RELAXED);
+		pthread_mutex_lock(&v->stop_lock);
 		if (sock_isset(v->stop_wfd))
 			sock_shutdown(v->stop_wfd, SHUT_RDWR);
+		pthread_mutex_unlock(&v->stop_lock);
 	} else if (v->sp) {
 		spawner_kill_server(v->sp);
 	} else {
@@ -931,7 +944,9 @@ static void svc_serve(struct svc *v, void *hostkey, int no_mcast, int no_dht)
 
 		if (!sock_pair(sp)) {
 			end_fd = sp[0];
+			pthread_mutex_lock(&v->stop_lock);
 			v->stop_wfd = sp[1];
+			pthread_mutex_unlock(&v->stop_lock);
 		}
 	} else {
 		snprintf(cmd, sizeof(cmd), "tmux -S %s attach -t comrade",
@@ -975,7 +990,9 @@ static void svc_serve(struct svc *v, void *hostkey, int no_mcast, int no_dht)
 	 * tmux, so it runs until stopped (v->stop, set by the supervisor's
 	 * signal watcher or the operator) or the bounded grant is spent.
 	 */
-	while (v->forward_only ? !v->stop : svc_alive(v)) {
+	while (v->forward_only
+	       ? !__atomic_load_n(&v->stop, __ATOMIC_RELAXED)
+	       : svc_alive(v)) {
 		cfg.tok = v->tok;	/* carry the located anchor forward, so the
 					 * next idle attempt reinforces it rather
 					 * than locating (and churning) a new one */
@@ -991,10 +1008,12 @@ static void svc_serve(struct svc *v, void *hostkey, int no_mcast, int no_dht)
 		spawner_close(v->sp, end_handle);
 	if (sock_isset(end_fd))
 		sock_close(end_fd);
+	pthread_mutex_lock(&v->stop_lock);
 	if (sock_isset(v->stop_wfd)) {
 		sock_close(v->stop_wfd);
 		v->stop_wfd = INVALID_SOCK;
 	}
+	pthread_mutex_unlock(&v->stop_lock);
 	if (end_pid > 0) {
 		kill(end_pid, SIGTERM);
 		waitpid(end_pid, NULL, 0);
@@ -1170,6 +1189,7 @@ static int start_new(int ui_mode, int no_mcast, int no_dht, int no_fwd)
 	int pfd[2], enter, entered = 0, rc = 0;
 
 	memset(&v, 0, sizeof(v));
+	pthread_mutex_init(&v.stop_lock, NULL);
 	v.no_fwd = no_fwd;
 	if (gen_id(id)) {
 		fprintf(stderr, "comrade: random generation failed\n");
@@ -1399,6 +1419,15 @@ static int resolve_id(const char *id_opt, char *id, size_t n)
 	return count ? 0 : 1;
 }
 
+/*
+ * Set by the SIGTERM/SIGINT handler, read by the stop watcher thread and the
+ * loop. sig_atomic_t is the only type the standard lets a handler touch, and
+ * it stays that; the accesses are atomic so that a race detector can tell the
+ * handler's write from an unsynchronised one. Relaxed is the whole of the
+ * ordering needed -- the flag is set once and never cleared, so a reader sees
+ * it on this pass or the next -- and a relaxed store on a lock-free type is
+ * still async-signal-safe, which taking a lock here would not be.
+ */
 static volatile sig_atomic_t g_stop;
 
 /*
@@ -1411,12 +1440,12 @@ static volatile sig_atomic_t g_stop;
  */
 static void on_stop_sig(int sig)
 {
-	if (g_stop) {
+	if (__atomic_load_n(&g_stop, __ATOMIC_RELAXED)) {
 		signal(sig, SIG_DFL);
 		raise(sig);
 		return;
 	}
-	g_stop = 1;
+	__atomic_store_n(&g_stop, 1, __ATOMIC_RELAXED);
 }
 
 /*
@@ -1440,7 +1469,8 @@ static void *stop_watch_thread(void *arg)
 	int fire = 0;
 
 	while (!__atomic_load_n(&w->done, __ATOMIC_RELAXED)) {
-		if (g_stop || (w->deadline && mono_ms() >= w->deadline)) {
+		if (__atomic_load_n(&g_stop, __ATOMIC_RELAXED) ||
+		    (w->deadline && mono_ms() >= w->deadline)) {
 			fire = 1;
 			break;
 		}
@@ -1464,6 +1494,7 @@ int host_headless(const char *id_opt, int no_mcast, int no_dht, int no_fwd,
 	int layers;
 
 	memset(&v, 0, sizeof(v));
+	pthread_mutex_init(&v.stop_lock, NULL);
 	v.no_fwd = no_fwd;
 	v.forward_only = forward_only;
 	v.serve_max = max_clients;
