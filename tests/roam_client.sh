@@ -22,7 +22,8 @@
 # so the count is proof the handler ran rather than that the flag was read.
 #
 # DHT only, deliberately: it is the transport a roam exists for, and the one the
-# rebuild re-seeds. SKIPPED (77) unless COMRADE_E2E_NET=1.
+# rebuild re-seeds. It meets over the private swarm this script starts;
+# COMRADE_E2E_NET=1 points it at the real mainline DHT instead.
 #
 # Usage: roam_client.sh <path-to-comrade-e2e>
 set -u

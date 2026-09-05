@@ -884,10 +884,10 @@ if(BUILD_TESTING)
 		# Self-sandboxing: a child applies a profile and is then refused
 		# the thing that profile forbids (exec for the client, INET
 		# sockets for the foreground). Skips where the kernel offers no
-		# seccomp, and cannot be run under valgrind at all -- the
-		# profile's W^X denies valgrind its own executable mappings, so
-		# the child dies as valgrind rather than as a confined comrade
-		# (the memcheck job excludes it by name).
+		# seccomp. It does run under valgrind: the write-xor-execute
+		# layer that used to deny memcheck its own executable mappings
+		# is compiled in for a release only, and the memcheck jobs build
+		# Debug, so the tool and every other layer coexist.
 		add_executable(sandbox_test tests/sandbox_test.c)
 		target_link_libraries(sandbox_test comrade_sandbox)
 		add_test(NAME sandbox_test COMMAND sandbox_test)
@@ -1141,7 +1141,8 @@ if(BUILD_TESTING)
 		add_executable(sshctl_test tests/sshctl_test.c)
 		target_link_libraries(sshctl_test comrade_ssh comrade_bridge comrade_stream comrade_token Threads::Threads)
 		add_test(NAME sshctl_test COMMAND sshctl_test)
-		set_tests_properties(sshkcp_test PROPERTIES TIMEOUT 30)
+		set_tests_properties(sshkcp_test sshctl_test
+			PROPERTIES TIMEOUT 30)
 	endif()
 
 	# What the e2e scripts print when they fail goes through a filter first
@@ -1193,10 +1194,12 @@ if(COMRADE_BUILD_TOOLS)
 		target_link_options(comrade-e2e PRIVATE -static)
 	endif()
 
-	# Concurrent multi-user e2e: one host, N clients racing the turnstile over
-	# the live DHT. Skipped unless COMRADE_E2E_NET=1 (see tests/multiuser.sh),
-	# so the offline suite is unaffected; the turnstile's race-freedom is
-	# proven deterministically by mailbox_test.
+	# Concurrent multi-user e2e: one host, N clients racing the turnstile
+	# over a DHT. It runs on every build against the private swarm the
+	# fixture starts; COMRADE_E2E_NET=1 points it at the real mainline DHT
+	# instead, which is a question worth asking deliberately. The
+	# turnstile's race-freedom is proven deterministically by mailbox_test
+	# either way.
 	if(BUILD_TESTING AND UNIX)
 		# One swarm for the whole run rather than eight nodes per test:
 		# building them answers the same question every time, and the few
@@ -1255,8 +1258,8 @@ if(COMRADE_BUILD_TOOLS)
 			SKIP_RETURN_CODE 77 TIMEOUT 120)
 
 		# Mixed lanlink + DHT/ICE peers in one session: a
-		# lanlink worker and an ICE worker must coexist live. Needs the live
-		# DHT, so SKIPs (77) unless COMRADE_E2E_NET=1.
+		# lanlink worker and an ICE worker must coexist live. Meets over
+		# the private swarm; COMRADE_E2E_NET=1 asks for the real DHT.
 		add_test(NAME lan_mixed_e2e
 			COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/lan_mixed.sh
 				$<TARGET_FILE:comrade-e2e>
@@ -1300,7 +1303,8 @@ if(COMRADE_BUILD_TOOLS)
 
 		# The client half of the same handler: a client that rebuilds
 		# while still looking must still join over what it rebuilt. Its
-		# rendezvous is the DHT, so SKIPs (77) unless COMRADE_E2E_NET=1.
+		# rendezvous is the private swarm; COMRADE_E2E_NET=1 asks for the
+		# real DHT.
 		add_test(NAME roam_client_e2e
 			COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/roam_client.sh
 				$<TARGET_FILE:comrade-e2e>
@@ -1323,7 +1327,7 @@ if(COMRADE_BUILD_TOOLS)
 
 		# A total outage mid-session resumes in place: same worker,
 		# same SSH session, the punch grafted. Its rendezvous is the
-		# DHT, so SKIPs (77) unless COMRADE_E2E_NET=1.
+		# private swarm; COMRADE_E2E_NET=1 asks for the real DHT.
 		add_test(NAME resume_e2e
 			COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/resume.sh
 				$<TARGET_FILE:comrade-e2e>

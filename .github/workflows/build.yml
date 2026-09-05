@@ -350,7 +350,12 @@ jobs:
             -E "_e2e|swarm_" 2>&1 | tee unit.out
           rc=${PIPESTATUS[0]}
           sed -n 's/.*out of \([0-9][0-9]*\).*/\1/p' unit.out | tail -1 > "$LOGS/.ran"
-          sh tests/sanreport.sh "$LOGS" 40 || exit 1
+          sh tests/sanreport.sh "$LOGS" 40; sr=$?
+          # 1 is a finding, 2 is a run that checked nothing. They mean
+          # opposite things -- one says the tool saw a bug, the other that
+          # it saw nothing at all -- so they are not collapsed together.
+          [ "$sr" != 2 ] || echo "::error::sanreport: this run checked nothing"
+          [ "$sr" = 0 ] || exit "$sr"
           [ '${{ matrix.sanitize }}' = thread ] || exit $rc
 
       - name: Test (valgrind, unit)
@@ -376,7 +381,12 @@ jobs:
           rm -rf "$LOGS"; mkdir -p "$LOGS"
           cp build/Testing/Temporary/MemoryChecker.*.log "$LOGS/" 2>/dev/null || true
           sed -n 's/.*out of \([0-9][0-9]*\).*/\1/p' mc.out | tail -1 > "$LOGS/.ran"
-          sh tests/sanreport.sh "$LOGS" 40 || exit 1
+          sh tests/sanreport.sh "$LOGS" 40; sr=$?
+          # 1 is a finding, 2 is a run that checked nothing. They mean
+          # opposite things -- one says the tool saw a bug, the other that
+          # it saw nothing at all -- so they are not collapsed together.
+          [ "$sr" != 2 ] || echo "::error::sanreport: this run checked nothing"
+          [ "$sr" = 0 ] || exit "$sr"
           exit $rc
 
       # The end-to-end tests, and only these, stop at the first failure. They
@@ -406,7 +416,9 @@ jobs:
           # hand before the next job on this worker builds its own.
           ctest --test-dir build -R swarm_down >/dev/null 2>&1 || true
           sed -n 's/.*out of \([0-9][0-9]*\).*/\1/p' e2e.out | tail -1 > "$LOGS/.ran"
-          sh tests/sanreport.sh "$LOGS" 1 || exit 1
+          sh tests/sanreport.sh "$LOGS" 1; sr=$?
+          [ "$sr" != 2 ] || echo "::error::sanreport: this run checked nothing"
+          [ "$sr" = 0 ] || exit "$sr"
           [ '${{ matrix.sanitize }}' = thread ] || exit $rc
 
       # Valgrind has to follow the harness into comrade to see anything: the
@@ -439,7 +451,14 @@ jobs:
           # different options: leak checking is on there and off here. Cleared
           # so this step's report is its own.
           rm -f build/Testing/Temporary/MemoryChecker.*.log
-          ctest --test-dir build -T memcheck --timeout 3600 -R "_e2e|swarm_" \
+          # stop_test rides with the end-to-end selection rather than the
+          # unit one: it drives the real binary through a shell script, and
+          # only this step skips the shells (below), so under the unit
+          # selection valgrind would measure bash's own allocations instead
+          # of comrade's. It is the one harness test that exercises the
+          # self-confining binary, so leaving it unmeasured was a real hole.
+          ctest --test-dir build -T memcheck --timeout 3600 \
+            -R "_e2e|swarm_|^stop_test$" \
             --overwrite MemoryCheckCommandOptions="--fair-sched=yes --trace-children=yes --trace-children-skip=*/sh,*/bash,*/sed,*/grep,*/awk,*/cat,*/rm,*/mktemp,*/sleep,*/kill,*/tail,*/head,*/tr,*/date,*/dirname,*/basename,*/wc,*/sort,*/uniq,*/cut,*/env,*/tmux,*/printf,*/expr,*/seq --leak-check=no --error-exitcode=1" \
             2>&1 | tee mce2e.out
           rc=${PIPESTATUS[0]}
@@ -451,7 +470,9 @@ jobs:
           # Both questions, as everywhere else: what the tool said, and whether
           # the tests passed. A run whose sessions never connected reports no
           # memory errors and has checked nothing, so its verdicts count too.
-          sh tests/sanreport.sh "$LOGS" 1 || exit 1
+          sh tests/sanreport.sh "$LOGS" 1; sr=$?
+          [ "$sr" != 2 ] || echo "::error::sanreport: this run checked nothing"
+          [ "$sr" = 0 ] || exit "$sr"
           exit $rc
 
       # The binary itself, not only the tests: main, the option parsing and the
