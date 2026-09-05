@@ -22,8 +22,19 @@ include(GNUInstallDirs)
 find_program(COMRADE_VALGRIND valgrind)
 if(COMRADE_VALGRIND)
 	set(MEMORYCHECK_COMMAND "${COMRADE_VALGRIND}" CACHE FILEPATH "" FORCE)
+	# --child-silent-after-fork, because a fork is not a leak. A child of
+	# fork() inherits every block the parent had -- ssh sessions, the
+	# crypto library's per-thread state -- and must not free any of it:
+	# the parent owns that memory and frees it itself. The child then
+	# execs or _exits, and valgrind, which follows a fork, reported
+	# everything it inherited as definitely lost. Measured: with one log
+	# per process, the parent is clean and the findings are all in the
+	# children, which is why they came and went with the timing of a fork
+	# rather than with anything comrade did. An exec'd child is still
+	# traced and still reported where --trace-children asks for it, so
+	# this silences the copies and nothing else.
 	set(MEMORYCHECK_COMMAND_OPTIONS
-		"--fair-sched=yes --leak-check=full --show-leak-kinds=definite,indirect --errors-for-leak-kinds=definite --track-origins=yes --error-exitcode=1"
+		"--fair-sched=yes --child-silent-after-fork=yes --leak-check=full --show-leak-kinds=definite,indirect --errors-for-leak-kinds=definite --track-origins=yes --error-exitcode=1"
 		CACHE STRING "" FORCE)
 	set(MEMORYCHECK_SUPPRESSIONS_FILE
 		"${CMAKE_CURRENT_SOURCE_DIR}/tests/valgrind.supp"

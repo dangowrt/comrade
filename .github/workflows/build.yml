@@ -394,10 +394,15 @@ jobs:
           # the thread policy below never got the chance to apply.
           set +e
           set -uo pipefail
-          # ctest keeps the previous run's MemoryChecker logs, and the numbers
-          # in their names are test indices that move when the selection
-          # changes. On a runner that reuses its workspace the leftovers would
-          # be read as this run's findings.
+          # ctest names its MemoryChecker logs by test index, and those
+          # indices move when the selection changes, so a leftover log is
+          # read as this run's finding. Nothing survives between runs here --
+          # every job gets a fresh VM from a snapshot -- and this is the
+          # first memcheck step in the job, so today this clears nothing.
+          # It is kept because the step after it needs exactly the same line
+          # for a reason that is real (it follows this one), and because a
+          # memcheck step added ahead of this one would otherwise be read as
+          # part of it.
           rm -f build/Testing/Temporary/MemoryChecker.*.log
           ctest --test-dir build -T memcheck --timeout 1800 \
             -E "_e2e|swarm_" -LE harness 2>&1 | tee mc.out
@@ -484,7 +489,7 @@ jobs:
           # self-confining binary, so leaving it unmeasured was a real hole.
           ctest --test-dir build -T memcheck --timeout 3600 \
             -R "_e2e|swarm_|^stop_test$" \
-            --overwrite MemoryCheckCommandOptions="--fair-sched=yes --trace-children=yes --trace-children-skip=*/sh,*/bash,*/sed,*/grep,*/awk,*/cat,*/rm,*/mktemp,*/sleep,*/kill,*/tail,*/head,*/tr,*/date,*/dirname,*/basename,*/wc,*/sort,*/uniq,*/cut,*/env,*/tmux,*/printf,*/expr,*/seq,*/ps --leak-check=no --error-exitcode=1" \
+            --overwrite MemoryCheckCommandOptions="--fair-sched=yes --child-silent-after-fork=yes --trace-children=yes --trace-children-skip=*/sh,*/bash,*/sed,*/grep,*/awk,*/cat,*/rm,*/mktemp,*/sleep,*/kill,*/tail,*/head,*/tr,*/date,*/dirname,*/basename,*/wc,*/sort,*/uniq,*/cut,*/env,*/tmux,*/printf,*/expr,*/seq,*/ps --leak-check=no --error-exitcode=1" \
             2>&1 | tee mce2e.out
           rc=${PIPESTATUS[0]}
           ctest --test-dir build -R swarm_down >/dev/null 2>&1 || true
