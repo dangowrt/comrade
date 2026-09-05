@@ -1652,17 +1652,33 @@ int host_stop(const char *id_opt)
 	for (i = 0; i < 10 && session_live(id); i++)
 		usleep(100 * 1000);
 	/*
+	 * And wait on the process itself where there was one. session_live
+	 * asks the pid file, which the service unlinks early in its exit tail
+	 * and then goes on working -- so between that unlink and the process
+	 * actually going, a session reads as ended while it is still there.
+	 * The pid was taken before anything was signalled, so it is the one
+	 * thing here that does not depend on a file the subject is in the
+	 * middle of removing.
+	 */
+	if (pid > 0)
+		for (i = 0; i < STOP_GRACE_TICKS &&
+			    kill((pid_t)pid, 0) == 0; i++)
+			usleep(100 * 1000);
+	/*
 	 * Say so when it is still there. `stop` returning 0 means access has
 	 * ended, and a supervisor that sends SIGTERM and waits on that promise
 	 * waits for ever if this reports a session it did not actually end --
 	 * which is a worse answer than an error naming the process that is
 	 * still running.
 	 */
-	if (session_live(id)) {
+	if (session_live(id) || (pid > 0 && kill((pid_t)pid, 0) == 0)) {
+		long now_pid = pid_of(id);
+
 		fprintf(stderr, "comrade: session '%s' is still running", id);
-		pid = pid_of(id);
-		if (pid > 0)
-			fprintf(stderr, " (pid %ld)", pid);
+		if (now_pid <= 0)
+			now_pid = pid;
+		if (now_pid > 0)
+			fprintf(stderr, " (pid %ld)", now_pid);
 		fprintf(stderr, "\n");
 		return 3;
 	}
