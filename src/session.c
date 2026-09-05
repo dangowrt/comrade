@@ -5177,7 +5177,7 @@ static void net_pump(struct sess *s, uint64_t now)
 	unsigned ch = 0;
 	int synth = 0;
 
-	if (cfg->test_roam_ms > 0 && now >= s->next_roam_ms &&
+	if (cfg->test_roam_ms > 0 && s->next_roam_ms && now >= s->next_roam_ms &&
 	    (cfg->test_roam_max <= 0 || s->roams < cfg->test_roam_max)) {
 		s->next_roam_ms = now + (uint64_t)cfg->test_roam_ms;
 		s->roams++;
@@ -5795,6 +5795,13 @@ static int worker_spawn(struct worker *ws, struct conn *c)
 				return -1;
 			ws[i].done = 0;
 			ws[i].used = 1;
+			/* Where a client is actually being served, over
+			 * whatever transport brought it. */
+			if (c->sess->cfg->test_roam_on_serve &&
+			    c->sess->cfg->test_roam_ms > 0 &&
+			    !c->sess->next_roam_ms)
+				c->sess->next_roam_ms = now_ms() +
+					(uint64_t)c->sess->cfg->test_roam_ms;
 			if (pthread_create(&ws[i].th, NULL, worker_thread,
 					   &ws[i])) {
 				pthread_mutex_destroy(&ws[i].done_lock);
@@ -7058,7 +7065,17 @@ int session_run(const struct session_cfg *cfg)
 	nsfacts_init(&s.ns_facts);
 	netmon_init(&s.netmon);
 	netstate_init(&s.ns, cfg->is_host, now_ms());
-	s.next_roam_ms = now_ms() + (uint64_t)cfg->test_roam_ms;
+	/*
+	 * Armed here unless the caller asked for it to wait for a client. A
+	 * test that means "roam in the middle of a live session" cannot start
+	 * the clock at session start and hope: the client's arrival is gated
+	 * on a rendezvous lookup and has no bound, so the margin is only a
+	 * margin for as long as the lookup stays quick. A test that means
+	 * "make the roam seam fire" wants it now and may have no client at
+	 * all, which is why this is asked for rather than assumed.
+	 */
+	s.next_roam_ms = cfg->test_roam_on_serve
+		? 0 : now_ms() + (uint64_t)cfg->test_roam_ms;
 	if (keys_derive(&s.keys, cfg->tok.rdv))
 		return 1;
 	if (cfg->stun_auto)
