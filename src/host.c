@@ -93,6 +93,17 @@
 /* How long `stop` gives a signalled service to go, in 100 ms ticks, before it
  * signals again and then reports the session as still running. */
 #define STOP_GRACE_TICKS 30
+/*
+ * And how long it then waits for the process to actually be gone before
+ * reporting it as still running. Longer than the grace above, deliberately:
+ * by then the service has been asked twice and is on its way out, and the
+ * question is no longer whether it heard but whether it has finished. A
+ * loaded machine takes longer over that than an idle one -- a CI runner
+ * reported a service still running that was merely slow -- and an exit that
+ * is slow must not be called one that is stuck. Nothing waits this long in
+ * the ordinary case, where the process is gone within a tick or two.
+ */
+#define STOP_GONE_TICKS 100
 
 struct svc {
 	int serve_max;			/* bounded grant: sessions to serve */
@@ -1662,7 +1673,7 @@ int host_stop(const char *id_opt)
 	 * middle of removing.
 	 */
 	if (pid > 0)
-		for (i = 0; i < STOP_GRACE_TICKS &&
+		for (i = 0; i < STOP_GONE_TICKS &&
 			    kill((pid_t)pid, 0) == 0; i++)
 			usleep(100 * 1000);
 	/*
