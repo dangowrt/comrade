@@ -1744,6 +1744,17 @@ int host_stop(const char *id_opt)
 	for (i = 0; i < 10 && session_live(id); i++)
 		usleep(100 * 1000);
 	/*
+	 * A pid that was not there to read at the top: a service still inside
+	 * its confinement, which publishes the file only once it can be
+	 * stopped. It has since been asked, by its tmux going, and is
+	 * signalled and waited on like any other.
+	 */
+	if (pid <= 0) {
+		pid = pid_of(id);
+		if (pid > 0 && term_wait(pid, STOP_GRACE_TICKS))
+			term_wait(pid, STOP_KILL_TICKS);
+	}
+	/*
 	 * And wait on the process itself where there was one. session_live
 	 * asks the pid file, which the service unlinks early in its exit tail
 	 * and then goes on working -- so between that unlink and the process
