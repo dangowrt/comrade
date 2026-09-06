@@ -277,16 +277,103 @@ static int sp_run(char *const argv[])
 	return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
 }
 
-/* Spawn `tmux wait-for`; return the readable end of its stdout (EOF when the
- * session ends) and the child pid. */
+static volatile sig_atomic_t endmon_sub_pid;
+
+static void endmon_term(int sig)
+{
+	(void)sig;
+	if (endmon_sub_pid > 0)
+		kill((pid_t)endmon_sub_pid, SIGTERM);
+	_exit(0);
+}
+
+/* Run one tmux command in the monitor child; its output goes to `nul`, never
+ * the pipe. Returns the exit status, or -1 if it could not be run. */
+static int endmon_tmux(const char *sock, int nul, const char *a1,
+		       const char *a2, const char *a3)
+{
+	int n = 0, status;
+	char *argv[8];
+	pid_t c;
+
+	argv[n++] = "tmux";
+	argv[n++] = "-S";
+	argv[n++] = (char *)sock;
+	if (a1)
+		argv[n++] = (char *)a1;
+	if (a2)
+		argv[n++] = (char *)a2;
+	if (a3)
+		argv[n++] = (char *)a3;
+	argv[n] = NULL;
+	c = fork();
+	if (c < 0)
+		return -1;
+	if (c == 0) {
+		dup2(nul, STDIN_FILENO);
+		dup2(nul, STDOUT_FILENO);
+		dup2(nul, STDERR_FILENO);
+		execvp("tmux", argv);
+		_exit(127);
+	}
+	endmon_sub_pid = (sig_atomic_t)c;
+	if (waitpid(c, &status, 0) < 0) {
+		endmon_sub_pid = 0;
+		return -1;
+	}
+	endmon_sub_pid = 0;
+	return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+/* Whether the server still holds the comrade session, asked a few times so a
+ * momentary blip (a resume) is not read as the session having ended. */
+static int endmon_alive(const char *sock, int nul)
+{
+	int i;
+
+	for (i = 0; i < 3; i++) {
+		if (endmon_tmux(sock, nul, "has-session", "-t", "comrade") == 0)
+			return 1;
+		poll(NULL, 0, 250);
+	}
+	return 0;
+}
+
+/* A wait-for client can die on its own, a suspend and resume knocks it over,
+ * while the server lives on: its return is re-checked before the pipe is let
+ * close, or a host waking from sleep would drop every client. Never returns. */
+void endmon_run(const char *sock, int wfd)
+{
+	int nul = open("/dev/null", O_RDWR);
+
+	if (nul < 0)
+		_exit(127);
+	/* wfd must not survive into a tmux child: the EOF would wait on it. */
+	dup2(nul, STDIN_FILENO);
+	dup2(nul, STDOUT_FILENO);
+	dup2(nul, STDERR_FILENO);
+	fcntl(wfd, F_SETFD, FD_CLOEXEC);
+	fcntl(nul, F_SETFD, FD_CLOEXEC);
+	signal(SIGCHLD, SIG_DFL);	/* so waitpid sees the tmux children */
+	signal(SIGTERM, endmon_term);
+
+	for (;;) {
+		endmon_tmux(sock, nul, "wait-for", "comrade-session", NULL);
+		if (!endmon_alive(sock, nul))
+			_exit(0);		/* really over: EOF */
+		/* A wait-for that returned without blocking (it could not reach
+		 * the server, which then came back) must not spin. */
+		poll(NULL, 0, 200);
+	}
+}
+
+/* Spawn the end-of-session monitor; return the readable end of its pipe (EOF
+ * only when the session has really ended, see endmon_run) and the child pid. */
 static int sp_endmon(struct sp_state *s, pid_t *pid)
 {
-	char *argv[] = { "tmux", "-S", (char *)0, "wait-for",
-			 "comrade-session", (char *)0 };
 	int p[2];
 	pid_t c;
 
-	argv[2] = (char *)s->sock;
 	if (pipe(p))
 		return -1;
 	c = fork();
@@ -296,18 +383,8 @@ static int sp_endmon(struct sp_state *s, pid_t *pid)
 		return -1;
 	}
 	if (c == 0) {
-		int nul = open("/dev/null", O_RDWR);
-
-		if (nul >= 0) {
-			dup2(nul, STDIN_FILENO);
-			dup2(nul, STDERR_FILENO);
-			if (nul > STDERR_FILENO)
-				close(nul);
-		}
-		dup2(p[1], STDOUT_FILENO);
 		close(p[0]);
-		close(p[1]);
-		execvp("tmux", argv);
+		endmon_run(s->sock, p[1]);	/* never returns */
 		_exit(127);
 	}
 	close(p[1]);

@@ -553,16 +553,9 @@ static void kill_tmux(const char *sock)
 	}
 }
 
-/*
- * Spawn a light end-of-session monitor. `tmux wait-for <channel>` connects to
- * the server and blocks until that channel is signalled -- which we never do --
- * so it simply blocks until the server dies, i.e. until the shared session
- * ends. It attaches no client and emits no output, so the only event on its
- * stdout pipe is EOF when it exits with the session. The readable end of that
- * pipe is the event-driven end-of-session signal handed to sshd; it releases a
- * connected client at once instead of after a poll interval. Returns the
- * readable fd (and the pid to reap), or -1 on failure.
- */
+/* Spawn the end-of-session monitor (endmon_run); the readable end of its pipe,
+ * EOF once the shared session has ended, is the event-driven signal handed to
+ * sshd. Returns that fd (and the pid to reap), or -1 on failure. */
 static int spawn_end_monitor(const char *sock, pid_t *pid)
 {
 	int p[2];
@@ -577,20 +570,8 @@ static int spawn_end_monitor(const char *sock, pid_t *pid)
 		return -1;
 	}
 	if (c == 0) {
-		char *argv[] = { "tmux", "-S", (char *)sock, "wait-for",
-				 "comrade-session", NULL };
-		int nul = open("/dev/null", O_RDWR);
-
-		if (nul >= 0) {
-			dup2(nul, STDIN_FILENO);
-			dup2(nul, STDERR_FILENO);
-			if (nul > STDERR_FILENO)
-				close(nul);
-		}
-		dup2(p[1], STDOUT_FILENO);
 		close(p[0]);
-		close(p[1]);
-		execvp("tmux", argv);
+		endmon_run(sock, p[1]);		/* never returns */
 		_exit(127);
 	}
 	close(p[1]);

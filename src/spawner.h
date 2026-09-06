@@ -65,6 +65,11 @@ void spawner_kill_server(struct spawner *sp);
  */
 sock_t spawner_endmon(struct spawner *sp, int *handle);
 
+/* The end-of-session monitor, forked with only wfd (the write end of the pipe
+ * the host reads) open: exits, so the pipe reads EOF, only once the tmux
+ * session has really ended. Never returns. */
+void endmon_run(const char *sock, int wfd);
+
 /*
  * Run a `tmux attach` (read-only when ro) on a pseudo-terminal `rows` x `cols`
  * with TERM set to `term`; use_pty == 0 runs it on plain pipes. On success
