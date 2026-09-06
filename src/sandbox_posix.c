@@ -3532,10 +3532,16 @@ static int sbp_unlisted_prctl(void)
 	return SB_PROBE_FAIL;
 }
 
+/* Which profile must refuse a probe: the one that drives a terminal, the
+ * one that does not (a forwarding-only host), or both. */
+#define SB_REFUSED_PTY		1
+#define SB_REFUSED_NOPTY	2
+#define SB_REFUSED_BOTH		(SB_REFUSED_PTY | SB_REFUSED_NOPTY)
+
 struct sb_probe {
 	const char *name;
 	int (*fn)(void);
-	int must_be_refused;
+	int refused;
 };
 
 static const struct sb_probe sb_probes[] = {
@@ -3549,13 +3555,13 @@ static const struct sb_probe sb_probes[] = {
 	{ "signals", sbp_signals, 0 },
 	{ "prctl", sbp_prctl, 0 },
 	{ "ioctl(TIOCGWINSZ)", sbp_winsize_query, 0 },
-	{ "terminal ioctls", sbp_termios, 0 },
+	{ "terminal ioctls", sbp_termios, SB_REFUSED_NOPTY },
 	{ "carve-outs", sbp_carveouts, 0 },
-	{ "execve", sbp_exec, 1 },
-	{ "fork", sbp_fork, 1 },
-	{ "socket(AF_PACKET)", sbp_packet_socket, 1 },
-	{ "ioctl(TIOCSTI)", sbp_tiocsti, 1 },
-	{ "prctl(PR_SET_DUMPABLE)", sbp_unlisted_prctl, 1 }
+	{ "execve", sbp_exec, SB_REFUSED_BOTH },
+	{ "fork", sbp_fork, SB_REFUSED_BOTH },
+	{ "socket(AF_PACKET)", sbp_packet_socket, SB_REFUSED_BOTH },
+	{ "ioctl(TIOCSTI)", sbp_tiocsti, SB_REFUSED_BOTH },
+	{ "prctl(PR_SET_DUMPABLE)", sbp_unlisted_prctl, SB_REFUSED_BOTH }
 };
 
 static uint64_t sb_now_ms(void)
@@ -3570,12 +3576,13 @@ static uint64_t sb_now_ms(void)
  * Run one probe behind the real filter. The child installs it itself, so the
  * parent stays unconfined and can report on however many probes die.
  */
-static int sb_run_probe(const struct sb_probe *pr)
+static int sb_run_probe(const struct sb_probe *pr, int no_pty)
 {
-	int st = 0, refused;
+	int st = 0, refused, must;
 	uint64_t deadline;
 	pid_t pid, got;
 
+	must = pr->refused & (no_pty ? SB_REFUSED_NOPTY : SB_REFUSED_PTY);
 	/* Whatever is still sitting in the buffer would be inherited and, on
 	 * the paths where the child's exit does flush, printed a second time
 	 * per probe. Empty it before there are two of us. */
@@ -3587,7 +3594,7 @@ static int sb_run_probe(const struct sb_probe *pr)
 		prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
 #if defined(SYS_seccomp) && defined(SB_AUDIT_ARCH)
 		sb_mode_prepare(SANDBOX_CLIENT);
-		if (!(seccomp_allowlist(0) & SANDBOX_L_SECCOMP))
+		if (!(seccomp_allowlist(no_pty) & SANDBOX_L_SECCOMP))
 			_exit(SB_PROBE_SKIP);
 #else
 		_exit(SB_PROBE_SKIP);
@@ -3616,12 +3623,12 @@ static int sb_run_probe(const struct sb_probe *pr)
 	refused = (WIFSIGNALED(st) && WTERMSIG(st) == SIGSYS) ||
 		  (WIFEXITED(st) && WEXITSTATUS(st) == SB_PROBE_TRAPPED);
 	if (refused)
-		return pr->must_be_refused ? SB_PROBE_OK : SB_PROBE_FAIL;
+		return must ? SB_PROBE_OK : SB_PROBE_FAIL;
 	if (WIFSIGNALED(st))
 		return SB_PROBE_FAIL;
 	if (WEXITSTATUS(st) == SB_PROBE_SKIP)
 		return SB_PROBE_SKIP;
-	if (pr->must_be_refused)
+	if (must)
 		return SB_PROBE_FAIL;	/* it came back: nothing stopped it */
 	return WEXITSTATUS(st) == 0 ? SB_PROBE_OK : SB_PROBE_FAIL;
 }
@@ -3634,8 +3641,8 @@ static int sb_run_probe(const struct sb_probe *pr)
  */
 static int selftest_linux(void)
 {
-	unsigned i;
-	int bad = 0, skipped = 0;
+	unsigned i, n = sizeof(sb_probes) / sizeof(sb_probes[0]);
+	int bad = 0, skipped = 0, no_pty, r;
 
 #ifdef SB_INSTRUMENTED
 	printf("sandbox selftest: skipped, this build is instrumented\n");
@@ -3648,19 +3655,22 @@ static int selftest_linux(void)
 	printf("sandbox selftest: this build names no audit arch\n");
 	return SB_PROBE_SKIP;
 #endif
-	for (i = 0; i < sizeof(sb_probes) / sizeof(sb_probes[0]); i++) {
-		int r = sb_run_probe(&sb_probes[i]);
-
-		printf("  %-24s %s\n", sb_probes[i].name,
-		       r == SB_PROBE_OK ? "ok" :
-		       r == SB_PROBE_SKIP ? "skipped" :
-		       r == SB_PROBE_TIMEOUT ? "timed out" : "FAILED");
-		if (r == SB_PROBE_FAIL || r == SB_PROBE_TIMEOUT)
-			bad++;
-		else if (r == SB_PROBE_SKIP)
-			skipped++;
+	for (no_pty = 0; no_pty < 2; no_pty++) {
+		printf("sandbox selftest: the profile %s a terminal\n",
+		       no_pty ? "without" : "with");
+		for (i = 0; i < n; i++) {
+			r = sb_run_probe(&sb_probes[i], no_pty);
+			printf("  %-24s %s\n", sb_probes[i].name,
+			       r == SB_PROBE_OK ? "ok" :
+			       r == SB_PROBE_SKIP ? "skipped" :
+			       r == SB_PROBE_TIMEOUT ? "timed out" : "FAILED");
+			if (r == SB_PROBE_FAIL || r == SB_PROBE_TIMEOUT)
+				bad++;
+			else if (r == SB_PROBE_SKIP)
+				skipped++;
+		}
 	}
-	if (skipped == (int)(sizeof(sb_probes) / sizeof(sb_probes[0]))) {
+	if (skipped == (int)(2 * n)) {
 		printf("sandbox selftest: no seccomp on this kernel\n");
 		return SB_PROBE_SKIP;
 	}
