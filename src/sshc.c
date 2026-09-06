@@ -294,7 +294,7 @@ static int run_test(ssh_session s, ssh_channel chan, const struct sshc_opts *o)
 
 		while (mono_ms() < end && ssh_channel_is_open(chan) &&
 		       !ssh_channel_is_eof(chan) &&
-		       !(o->stop && *o->stop)) {
+		       !(o->stop && __atomic_load_n(o->stop, __ATOMIC_RELAXED))) {
 			char sink[4096];
 
 			if (rejoin_now(o)) {

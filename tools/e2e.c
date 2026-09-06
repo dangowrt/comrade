@@ -62,7 +62,9 @@ static int e2e_end_wfd = -1;
 static void on_term(int sig)
 {
 	(void)sig;
-	e2e_stop = 1;
+	/* Read on the worker thread that holds the session; a relaxed store on
+	 * a lock-free type is still async-signal-safe. */
+	__atomic_store_n(&e2e_stop, 1, __ATOMIC_RELAXED);
 	if (e2e_end_wfd >= 0) {
 		/* write(2) is async-signal-safe; the turnstile is polling the
 		 * other end for exactly this. */
@@ -164,12 +166,6 @@ int main(int argc, char **argv)
 #ifdef SIGPIPE
 	signal(SIGPIPE, SIG_IGN);
 #endif
-	/* A held session ends when the harness has seen what it was holding it
-	 * for: SIGTERM winds the hold up and the run finishes and reports as it
-	 * would have anyway, rather than being cut off mid-verdict. */
-	signal(SIGTERM, on_term);
-	signal(SIGALRM, on_term);
-
 	if (argc >= 3 && !strcmp(argv[1], "token"))
 		return inspect_token(argv[2]);
 
@@ -217,6 +213,10 @@ int main(int argc, char **argv)
 		cfg.ssh_end_fd = e2e_end[0];
 		e2e_end_wfd = e2e_end[1];
 	}
+	/* SIGTERM winds a held session up so the run reports as it would have
+	 * anyway. Armed once the monitor's end the handler writes is in place. */
+	signal(SIGTERM, on_term);
+	signal(SIGALRM, on_term);
 
 	if (argc >= 2 && !strcmp(argv[1], "host")) {
 		is_host = 1;

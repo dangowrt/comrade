@@ -7160,7 +7160,8 @@ int session_run(const struct session_cfg *cfg)
 	}
 
 	while (st != ST_DONE && st != ST_FAIL && !ended &&
-	       !(cfg->test_stop && *cfg->test_stop) &&
+	       !(cfg->test_stop &&
+		 __atomic_load_n(cfg->test_stop, __ATOMIC_RELAXED)) &&
 	       !deadline_passed(deadline, now_ms())) {
 		char filtered[NAT_SDP_MAX];
 		const struct session_obs *o = cfg->obs;
@@ -7549,7 +7550,8 @@ int session_run(const struct session_cfg *cfg)
 	 * failure only if nothing was ever established, which is the same
 	 * question as before for a session that never got going.
 	 */
-	if (!ended && st != ST_DONE && cfg->test_stop && *cfg->test_stop &&
+	if (!ended && st != ST_DONE && cfg->test_stop &&
+	    __atomic_load_n(cfg->test_stop, __ATOMIC_RELAXED) &&
 	    s.established_fired)
 		st = ST_DONE;
 	rc = ended ? ended : ((st == ST_DONE) ? 0 : 1);
