@@ -2905,6 +2905,7 @@ static int fs_confine_landlock(const struct sandbox_cfg *cfg)
 {
 	uint64_t handled, ro, rwx, rw, net, scoped;
 	struct sb_ruleset_attr attr;
+	char target[PATH_MAX];
 	char resolv[PATH_MAX];
 	char sandir[PATH_MAX];
 	const char *dbg, *san;
@@ -3010,9 +3011,11 @@ static int fs_confine_landlock(const struct sandbox_cfg *cfg)
 
 	for (i = 0; i < sizeof(sb_lib_dirs) / sizeof(sb_lib_dirs[0]); i++)
 		ll_allow(rs, sb_lib_dirs[i], rwx);
-	/* Grant the resolver's directory, not its file, so a roam's rename is
-	 * followed; /etc whole only where resolv.conf is a plain /etc file. */
-	have_resolv = (resolv_dir(resolv, sizeof(resolv), (char *)0, 0) == 0);
+	/* The resolver's directory, so a roam's rename is followed, or its file
+	 * alone where that directory is a shared root (see sb_shared_dirs);
+	 * /etc whole only where resolv.conf is a plain /etc file. */
+	have_resolv = (resolv_dir(resolv, sizeof(resolv), target,
+				  sizeof(target)) == 0);
 	if (have_resolv && strcmp(resolv, "/etc") == 0) {
 		ll_allow(rs, "/etc", ro);
 	} else {
@@ -3020,7 +3023,8 @@ static int fs_confine_landlock(const struct sandbox_cfg *cfg)
 		     i++)
 			ll_allow(rs, sb_etc_files[i], ro);
 		if (have_resolv)
-			ll_allow(rs, resolv, ro);
+			ll_allow(rs, dir_is_shared(resolv) ? target : resolv,
+				 ro);
 	}
 	ll_allow(rs, "/dev/urandom", SB_FS_READ_FILE & handled);
 	ll_allow(rs, "/dev/null", (SB_FS_READ_FILE | SB_FS_WRITE_FILE) & handled);
