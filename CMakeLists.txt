@@ -1512,5 +1512,9 @@ if(BUILD_TESTING AND COMRADE_TEST_TIMEOUT_SCALE GREATER 1)
 			set_tests_properties(${t} PROPERTIES
 				TIMEOUT ${comrade_t_limit})
 		endif()
+		# The e2e harness and the comrade-e2e run read this to stretch
+		# their own deadlines by the same factor as the ctest timeout.
+		set_property(TEST ${t} APPEND PROPERTY ENVIRONMENT
+			"COMRADE_E2E_TIMEOUT_SCALE=${COMRADE_TEST_TIMEOUT_SCALE}")
 	endforeach()
 endif()

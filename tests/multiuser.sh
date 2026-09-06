@@ -39,7 +39,7 @@ hpid=$!
 # convergence rather than starting from the bootstrap (~15 s either way).
 tok=""
 i=0
-while [ "$i" -lt 120 ]; do
+while [ "$i" -lt "$(e2e_loops 120)" ]; do
 	cand=$(sed -n 's/^COMRADE TOKEN: //p' "$tmp/host.out" 2>/dev/null | tail -1)
 	if [ -n "$cand" ] && "$E2E" token "$cand" 2>/dev/null |
 	   grep -q 'state[46]=RENDEZVOUS'; then

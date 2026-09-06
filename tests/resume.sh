@@ -29,7 +29,7 @@ hostpid=$!
 
 tok=""
 i=0
-while [ "$i" -lt 120 ]; do
+while [ "$i" -lt "$(e2e_loops 120)" ]; do
 	c=$(sed -n 's/^COMRADE TOKEN: //p' "$tmp/host.out" 2>/dev/null | tail -1)
 	if [ -n "$c" ] && "$E2E" token "$c" 2>/dev/null |
 	    grep -qE "ep4_rdv=1|ep6_rdv=1"; then
@@ -55,7 +55,7 @@ COMRADE_DEBUG="$tmp/client.dbg" "$E2E" client "$tok" \
 	--hold-ms 90000 --timeout 120 > "$tmp/client.out" 2>&1 &
 clientpid=$!
 i=0
-while [ "$i" -lt 90 ]; do
+while [ "$i" -lt "$(e2e_loops 90)" ]; do
 	grep -q "resume: link back" "$tmp/client.dbg" 2>/dev/null &&
 		grep -q "punch connected -> resume worker" "$tmp/host.dbg" 2>/dev/null &&
 		break

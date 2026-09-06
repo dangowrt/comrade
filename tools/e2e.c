@@ -152,12 +152,13 @@ static void mcast_probe_cb(void *arg, const char *salt, const uint8_t *data,
 
 int main(int argc, char **argv)
 {
-	struct session_cfg cfg;
+	int is_host, i, rc, flood = 0, scale = 1;
 	uint8_t tx[SSH_NONCE], rx[SSH_NONCE];
-	size_t rx_got = 0, k;
 	const char *stun_arg = NULL;
+	const char *scale_s = NULL;
+	struct session_cfg cfg;
+	size_t rx_got = 0, k;
 	sock_t e2e_end[2];
-	int is_host, i, rc, flood = 0;
 
 	/* A peer closing first must not kill the harness outright, the same way
 	 * the product binary arranges for itself (main.c). Without this a client
@@ -293,6 +294,16 @@ int main(int argc, char **argv)
 			return 2;
 		}
 	}
+	/* An instrumented or heavily loaded lane runs many times slower, so the
+	 * deadlines the run gives itself scale with it, matching the ctest one. */
+	scale_s = getenv("COMRADE_E2E_TIMEOUT_SCALE");
+	scale = scale_s ? atoi(scale_s) : 1;
+	if (scale > 1) {
+		cfg.connect_timeout_s *= scale;
+		if (cfg.test_hold_ms > 0)
+			cfg.test_hold_ms *= scale;
+	}
+
 	if (!stun_arg)
 		cfg.stun_auto = 1;
 	else if (strcmp(stun_arg, "none"))
