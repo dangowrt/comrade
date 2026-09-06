@@ -179,9 +179,10 @@ static int win_privileges(void)
  */
 static int win_job(void)
 {
-	HANDLE job;
 	JOBOBJECT_EXTENDED_LIMIT_INFORMATION eli;
 	JOBOBJECT_BASIC_UI_RESTRICTIONS ui;
+	int whole = 1;
+	HANDLE job;
 
 	job = CreateJobObjectW(NULL, NULL);
 	if (!job)
@@ -189,9 +190,11 @@ static int win_job(void)
 	memset(&ui, 0, sizeof(ui));
 	ui.UIRestrictionsClass = JOB_OBJECT_UILIMIT_ALL;
 	if (!SetInformationJobObject(job, JobObjectBasicUIRestrictions, &ui,
-				     sizeof(ui)))
+				     sizeof(ui))) {
 		dbg_logf("sandbox: job UI restrictions refused (%lu)",
 			 (unsigned long)GetLastError());
+		whole = 0;
+	}
 	memset(&eli, 0, sizeof(eli));
 	eli.BasicLimitInformation.LimitFlags =
 		JOB_OBJECT_LIMIT_ACTIVE_PROCESS |
@@ -206,7 +209,7 @@ static int win_job(void)
 		return 0;
 	}
 	CloseHandle(job);
-	return SANDBOX_L_JOB;
+	return whole ? SANDBOX_L_JOB : 0;
 }
 
 /*
