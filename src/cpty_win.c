@@ -363,15 +363,17 @@ sock_t cpty_out(const struct cpty *p)
 	return p ? p->app_out : INVALID_SOCK;
 }
 
-void cpty_resize(struct cpty *p, int rows, int cols)
+int cpty_resize(struct cpty *p, int rows, int cols)
 {
 	COORD sz;
 
-	if (!p || !p->pc || rows <= 0 || cols <= 0)
-		return;
+	if (!p || !p->pc)
+		return 0;
+	if (rows <= 0 || cols <= 0)
+		return -1;
 	sz.X = (SHORT)cols;
 	sz.Y = (SHORT)rows;
-	pc_resize(p->pc, sz);
+	return pc_resize(p->pc, sz) == S_OK ? 0 : -1;
 }
 
 int cpty_exited(struct cpty *p)

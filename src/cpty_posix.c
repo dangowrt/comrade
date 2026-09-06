@@ -172,16 +172,18 @@ sock_t cpty_out(const struct cpty *p)
 	return p ? p->out : INVALID_SOCK;
 }
 
-void cpty_resize(struct cpty *p, int rows, int cols)
+int cpty_resize(struct cpty *p, int rows, int cols)
 {
 	struct winsize ws;
 
-	if (!p || !p->pty || rows <= 0 || cols <= 0)
-		return;
+	if (!p || !p->pty)
+		return 0;
+	if (rows <= 0 || cols <= 0)
+		return -1;
 	memset(&ws, 0, sizeof(ws));
 	ws.ws_row = (unsigned short)rows;
 	ws.ws_col = (unsigned short)cols;
-	ioctl(p->in, TIOCSWINSZ, &ws);
+	return ioctl(p->in, TIOCSWINSZ, &ws);
 }
 
 int cpty_exited(struct cpty *p)

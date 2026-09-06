@@ -174,7 +174,8 @@ static void apply_winch(struct cpty *child, ssh_message m)
 	int rows = ssh_message_channel_request_pty_height(m);
 
 	dbg_logf("sshd window-change -> pty %dx%d", rows, cols);
-	cpty_resize(child, rows, cols);
+	if (cpty_resize(child, rows, cols))
+		dbg_logf("sshd window-change: the terminal refused it");
 }
 
 /*

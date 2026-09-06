@@ -66,8 +66,10 @@ struct cpty *cpty_spawn_sp(struct spawner *sp, int ro, int use_pty, int rows,
 sock_t cpty_in(const struct cpty *p);
 sock_t cpty_out(const struct cpty *p);
 
-/* Terminal resize (SSH window-change): TIOCSWINSZ / ResizePseudoConsole. */
-void cpty_resize(struct cpty *p, int rows, int cols);
+/* Terminal resize (SSH window-change): TIOCSWINSZ / ResizePseudoConsole.
+ * 0 once applied, or where there is no terminal to size; -1 where the
+ * platform refused it or the size is not one. */
+int cpty_resize(struct cpty *p, int rows, int cols);
 
 /* Has the child exited? Non-blocking: waitpid(WNOHANG) /
  * WaitForSingleObject(0). This is the SIGCHLD the port does not have.
