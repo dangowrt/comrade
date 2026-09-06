@@ -10,6 +10,7 @@
 
 #ifndef _WIN32
 
+#include <limits.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -81,6 +82,7 @@ static const char *san_log_dir(char *dir, size_t dn)
 		"TSAN_OPTIONS", "ASAN_OPTIONS", "LSAN_OPTIONS", "UBSAN_OPTIONS"
 	};
 	const char *v, *p, *end;
+	char real[PATH_MAX];
 	char *slash;
 	size_t i, len;
 
@@ -102,6 +104,8 @@ static const char *san_log_dir(char *dir, size_t dn)
 		if (!slash || slash == dir)
 			continue;
 		*slash = '\0';
+		if (realpath(dir, real) && strlen(real) < dn)
+			memcpy(dir, real, strlen(real) + 1);
 		return dir;
 	}
 #else
