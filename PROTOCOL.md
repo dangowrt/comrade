@@ -25,9 +25,9 @@ lands.
 changes the probe frame (a sequence number, §9), what a datagram opens with
 (both tags derived from the token rather than fixed, §2), the stream datagram
 (a counter and tag, §9), the mailbox slots (a key in the offer, a box in the
-answer, §4), the multicast announcement (the slot letter bound into the seal,
-§6) and the control channel (two new message types and a larger frame bound,
-§10). Two peers must be built from the same revision; there is no version
+answer, §4), the packed candidates (a version and a network generation, §7),
+the multicast announcement (the slot letter bound into the seal, §6) and the
+control channel (two new message types and a larger frame bound, §10). Two peers must be built from the same revision; there is no version
 negotiation and none is planned before the format settles.
 
 ---
@@ -536,12 +536,16 @@ Policy defaults (`cand_policy_default`): keep private v4; **drop** ULA
 separately in `session.c:addr_scope`, which also treats `fe80::/10`,
 `fec0::/10` site-local and `fc00::/7` as LAN.)
 
-candpack binary layout (`candpack.c`, `CANDPACK_VERSION = 1`):
+candpack binary layout (`candpack.c`, `CANDPACK_VERSION = 2`):
 
 ```
-  version(1)=1 | ufrag_len(1) | ufrag | pwd_len(1) | pwd | ncand(1)
+  version(1)=2 | gen(4,BE) | ufrag_len(1) | ufrag | pwd_len(1) | pwd | ncand(1)
   ncand *   [ type(1) | family(1) | prio(4,BE) | port(2,BE) | addr(4 or 16) ]
 ```
+
+`gen` is the offerer's network generation (`session.c: netgen`, 0 where none),
+which bumps on every move; a client tells a moved offer, whose candidates are
+new, from one that only rotated credentials, and re-claims at once on a move.
 
 `type`: `0 host, 1 srflx, 2 prflx, 3 relay`. `family`: `4` or `6`. Only
 `component 1`, `UDP` candidates are packed. Decode rebuilds
