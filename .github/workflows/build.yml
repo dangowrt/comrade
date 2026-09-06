@@ -404,12 +404,30 @@ jobs:
           # part of it.
           rm -f build/Testing/Temporary/MemoryChecker.*.log
           ctest --test-dir build -T memcheck --timeout 1800 \
-            -E "_e2e|swarm_" -LE harness 2>&1 | tee mc.out
+            -E "_e2e|swarm_" -LE "harness|forkchild" 2>&1 | tee mc.out
           rc=${PIPESTATUS[0]}
           LOGS="$PWD/build/vg-logs"
           rm -rf "$LOGS"; mkdir -p "$LOGS"
           cp build/Testing/Temporary/MemoryChecker.*.log "$LOGS/" 2>/dev/null || true
-          sed -n 's/.*out of \([0-9][0-9]*\).*/\1/p' mc.out | tail -1 > "$LOGS/.ran"
+          # The tests whose forked children never exec, measured with the
+          # children's output kept: silenced, a finding in one of them shows
+          # only as the child's exit code, which the test reads as its own
+          # failure. The leak check is off for them, since a forked copy
+          # that ends without an exec reports everything it inherited as
+          # lost. ctest numbers its logs by test index, so the first set was
+          # copied aside above before this one can reuse a number.
+          rm -f build/Testing/Temporary/MemoryChecker.*.log
+          ctest --test-dir build -T memcheck --timeout 1800 -L forkchild \
+            --overwrite MemoryCheckCommandOptions="--fair-sched=yes --child-silent-after-fork=no --leak-check=no --error-exitcode=1" \
+            2>&1 | tee mc2.out
+          rc2=${PIPESTATUS[0]}
+          [ "$rc" != 0 ] || rc=$rc2
+          for f in build/Testing/Temporary/MemoryChecker.*.log; do
+            [ -e "$f" ] && cp "$f" "$LOGS/forkchild-$(basename "$f")"
+          done
+          n1=$(sed -n 's/.*out of \([0-9][0-9]*\).*/\1/p' mc.out | tail -1)
+          n2=$(sed -n 's/.*out of \([0-9][0-9]*\).*/\1/p' mc2.out | tail -1)
+          echo $(( ${n1:-0} + ${n2:-0} )) > "$LOGS/.ran"
           sh tests/sanreport.sh "$LOGS" 40; sr=$?
           # 1 is a finding, 2 is a run that checked nothing. They mean
           # opposite things -- one says the tool saw a bug, the other that

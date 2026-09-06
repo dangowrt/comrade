@@ -924,10 +924,16 @@ if(BUILD_TESTING)
 		# layer that used to deny memcheck its own executable mappings
 		# is left out with COMRADE_MDWE=OFF, which the memcheck jobs
 		# pass, so the tool and every other layer coexist.
+		# Labelled forkchild: its confined children never exec, so a
+		# memory checker that silences forked copies would have a finding
+		# in one of them show only as that child's exit code, which the
+		# test reads as its own failure. The memcheck job runs the label
+		# apart, with the children's output kept.
 		add_executable(sandbox_test tests/sandbox_test.c)
 		target_link_libraries(sandbox_test comrade_sandbox)
 		add_test(NAME sandbox_test COMMAND sandbox_test)
-		set_tests_properties(sandbox_test PROPERTIES SKIP_RETURN_CODE 77)
+		set_tests_properties(sandbox_test PROPERTIES SKIP_RETURN_CODE 77
+			LABELS forkchild)
 
 		# The same probe battery through the shipped binary, which is the
 		# only thing that also exercises the command line reaching it.
@@ -942,11 +948,13 @@ if(BUILD_TESTING)
 		# The tmux spawner under concurrent load: many threads spawning
 		# and closing while another queries liveness, proving the one
 		# control channel never crosses a reply to the wrong caller.
+		# forkchild as well: the broker is a forked child that never
+		# execs and runs for the whole test.
 		add_executable(spawner_test tests/spawner_test.c)
 		target_link_libraries(spawner_test comrade_cpty)
 		add_test(NAME spawner_test COMMAND spawner_test)
 		set_tests_properties(spawner_test PROPERTIES
-			SKIP_RETURN_CODE 77 TIMEOUT 60)
+			SKIP_RETURN_CODE 77 TIMEOUT 60 LABELS forkchild)
 	endif()
 
 	# The Windows self-sandbox, which has no fork to confine a child in:
