@@ -167,10 +167,11 @@ static int clipboard_read_refused(void)
 }
 
 /*
- * The confined client. grant is the directory it is given, denied a sibling it
- * is not.
+ * The confined client. grant is the data directory it is given to read, cache
+ * the directory beneath it that it may write, denied a sibling it is not.
  */
-static int child_client(const char *grant, const char *denied)
+static int child_client(const char *grant, const char *denied,
+			const char *cache)
 {
 	struct sandbox_cfg sb;
 	int layers, priv, bad = 0;
@@ -178,6 +179,7 @@ static int child_client(const char *grant, const char *denied)
 	memset(&sb, 0, sizeof(sb));
 	sb.role = SANDBOX_CLIENT;
 	sb.data_dir = grant;
+	sb.cache_dir = cache;
 	layers = sandbox_apply(&sb);
 	printf("client: layers=0x%04x\n", layers);
 	if (sandbox_off())
@@ -205,29 +207,39 @@ static int child_client(const char *grant, const char *denied)
 		printf("client: FAIL a UDP socket would not open\n");
 		bad = 1;
 	}
-	if (!can_write_in(grant)) {
-		printf("client: FAIL its own data directory is not writable\n");
+	if (!can_write_in(cache)) {
+		printf("client: FAIL its own cache directory is not writable\n");
 		bad = 1;
 	}
 
 	/*
-	 * Reaching outside the grant is the integrity level's boundary, not the
+	 * Reaching outside the cache is the integrity level's boundary, not the
 	 * job's or a policy's, so without that layer there is nothing to assert
 	 * -- Windows leaves a medium-integrity process the run of the user's
 	 * own files, and it is meant to. What there is to assert without it is
-	 * that the directory carries no low label a refused drop left behind.
+	 * that the cache carries no low label a refused drop left behind. With
+	 * it, the data directory around the cache, where the STUN list lives,
+	 * is as closed as everything else.
 	 */
 	if (!(layers & SANDBOX_L_INTEGRITY)) {
 		printf("client: (still at its old integrity level -- the "
 		       "outside write is not asserted)\n");
-		if (has_low_label(grant) != 0) {
-			printf("client: FAIL the data directory is labelled "
+		if (has_low_label(cache) != 0) {
+			printf("client: FAIL the cache directory is labelled "
 			       "low with no drop to show for it\n");
 			bad = 1;
 		}
-	} else if (can_write_in(denied)) {
-		printf("client: FAIL wrote outside the granted directory\n");
-		bad = 1;
+	} else {
+		if (can_write_in(denied)) {
+			printf("client: FAIL wrote outside the granted "
+			       "directory\n");
+			bad = 1;
+		}
+		if (can_write_in(grant)) {
+			printf("client: FAIL wrote beside the cache, where the "
+			       "STUN list lives\n");
+			bad = 1;
+		}
 	}
 
 	/*
@@ -332,15 +344,15 @@ static int child_service(const char *grant)
 
 /* Re-run this binary with a marker and return its exit code, or -1. */
 static int rerun(const char *self, const char *marker, const char *grant,
-		 const char *denied)
+		 const char *denied, const char *cache)
 {
 	STARTUPINFOA si;
 	PROCESS_INFORMATION pi;
 	char cmd[2048];
 	DWORD code = (DWORD)-1;
 
-	if ((size_t)snprintf(cmd, sizeof(cmd), "\"%s\" %s \"%s\" \"%s\"", self,
-			     marker, grant, denied) >= sizeof(cmd))
+	if ((size_t)snprintf(cmd, sizeof(cmd), "\"%s\" %s \"%s\" \"%s\" \"%s\"",
+			     self, marker, grant, denied, cache) >= sizeof(cmd))
 		return -1;
 	memset(&si, 0, sizeof(si));
 	si.cb = sizeof(si);
@@ -371,14 +383,14 @@ static void sweep(const char *dir)
 
 int main(int argc, char **argv)
 {
-	char root[PATHBUF], grant[PATHBUF], denied[PATHBUF];
+	char root[PATHBUF], grant[PATHBUF], denied[PATHBUF], cache[PATHBUF];
+	int rc, bad = 0, skipped = 0;
 	char self[MAX_PATH];
 	char tmp[MAX_PATH];
-	int rc, bad = 0, skipped = 0;
 
 	setvbuf(stdout, NULL, _IONBF, 0);
-	if (argc >= 4 && !strcmp(argv[1], "client"))
-		return child_client(argv[2], argv[3]);
+	if (argc >= 5 && !strcmp(argv[1], "client"))
+		return child_client(argv[2], argv[3], argv[4]);
 	if (argc >= 4 && !strcmp(argv[1], "service"))
 		return child_service(argv[2]);
 	if (argc >= 2 && !strcmp(argv[1], "foreground"))
@@ -397,6 +409,8 @@ int main(int argc, char **argv)
 		    sizeof(root) ||
 	    (size_t)snprintf(grant, sizeof(grant), "%s\\data", root) >=
 		    sizeof(grant) ||
+	    (size_t)snprintf(cache, sizeof(cache), "%s\\dht", grant) >=
+		    sizeof(cache) ||
 	    (size_t)snprintf(denied, sizeof(denied), "%s\\elsewhere", root) >=
 		    sizeof(denied)) {
 		fprintf(stderr, "temporary path too long\n");
@@ -404,33 +418,35 @@ int main(int argc, char **argv)
 	}
 	if (!CreateDirectoryA(root, NULL) ||
 	    !CreateDirectoryA(grant, NULL) ||
+	    !CreateDirectoryA(cache, NULL) ||
 	    !CreateDirectoryA(denied, NULL)) {
 		fprintf(stderr, "cannot lay out %s (%lu)\n", root,
 			(unsigned long)GetLastError());
 		return RC_FAIL;
 	}
 
-	rc = rerun(self, "client", grant, denied);
+	rc = rerun(self, "client", grant, denied, cache);
 	printf("client child: %d\n", rc);
 	if (rc == RC_SKIP)
 		skipped++;
 	else if (rc != RC_OK)
 		bad = 1;
 
-	rc = rerun(self, "service", grant, denied);
+	rc = rerun(self, "service", grant, denied, cache);
 	printf("service child: %d\n", rc);
 	if (rc == RC_SKIP)
 		skipped++;
 	else if (rc != RC_OK)
 		bad = 1;
 
-	rc = rerun(self, "foreground", grant, denied);
+	rc = rerun(self, "foreground", grant, denied, cache);
 	printf("foreground child: %d\n", rc);
 	if (rc == RC_SKIP)
 		skipped++;
 	else if (rc != RC_OK)
 		bad = 1;
 
+	sweep(cache);
 	sweep(grant);
 	sweep(denied);
 	RemoveDirectoryA(root);

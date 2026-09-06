@@ -47,10 +47,13 @@
 
 #include "sandbox.h"
 
-/* Set up by main() before forking: a writable data directory the confinement
- * child is granted, and a readable marker file just outside it that the child
- * must NOT be able to reach. */
+/* Set up by main() before forking: a data directory the confinement child is
+ * granted to read, holding a STUN list it must not be able to write and a
+ * cache directory it must, and a readable marker file just outside it that
+ * the child must NOT be able to reach. */
 static char g_datadir[PATH_MAX];
+static char g_cachedir[PATH_MAX];
+static char g_stunlist[PATH_MAX];
 static char g_marker[PATH_MAX];
 
 /* Exit codes carried back from the forked children. */
@@ -126,6 +129,7 @@ static int child_client_layers(void)
 	memset(&sb, 0, sizeof(sb));
 	sb.role = SANDBOX_CLIENT;
 	sb.data_dir = g_datadir;
+	sb.cache_dir = g_cachedir;
 	layers = sandbox_apply(&sb);
 	if (!layers)
 		return RC_SKIP;		/* COMRADE_SANDBOX=0 */
@@ -193,10 +197,26 @@ static int child_foreground(void)
 static int confined_checks(void)
 {
 	struct addrinfo hints, *ai = NULL;
+	char probe[PATH_MAX];
 	int rc, fd;
 
 	if (access(g_datadir, F_OK) != 0)
 		return RC_FAIL;		/* the kept data dir must survive */
+	/* The cache is the one writable part of it; the STUN list beside the
+	 * cache is stun-update's alone. */
+	if ((size_t)snprintf(probe, sizeof(probe), "%s/probe", g_cachedir) >=
+	    sizeof(probe))
+		return RC_FAIL;
+	fd = open(probe, O_WRONLY | O_CREAT, 0600);
+	if (fd < 0)
+		return RC_FAIL;
+	close(fd);
+	unlink(probe);
+	fd = open(g_stunlist, O_WRONLY);
+	if (fd >= 0) {
+		close(fd);
+		return RC_FAIL;
+	}
 
 	memset(&hints, 0, sizeof(hints));
 	hints.ai_family = AF_UNSPEC;
@@ -227,6 +247,7 @@ static int child_confined_ns(void)
 	memset(&sb, 0, sizeof(sb));
 	sb.role = SANDBOX_CLIENT;
 	sb.data_dir = g_datadir;
+	sb.cache_dir = g_cachedir;
 	layers = sandbox_apply(&sb);
 	if (!(layers & SANDBOX_L_MOUNTNS))
 		return RC_SKIP;
@@ -249,6 +270,7 @@ static int child_confined_landlock(void)
 	memset(&sb, 0, sizeof(sb));
 	sb.role = SANDBOX_CLIENT;
 	sb.data_dir = g_datadir;
+	sb.cache_dir = g_cachedir;
 	layers = sandbox_apply(&sb);
 	if (!(layers & SANDBOX_L_LANDLOCK))
 		return RC_SKIP;
@@ -301,6 +323,7 @@ static int child_ifaddrs_survive(void)
 	memset(&sb, 0, sizeof(sb));
 	sb.role = SANDBOX_CLIENT;
 	sb.data_dir = g_datadir;
+	sb.cache_dir = g_cachedir;
 	/* Only a layer that could take an address away makes this a check:
 	 * the core limit alone engages on every Linux. */
 	if (!(sandbox_apply(&sb) & (SANDBOX_L_MOUNTNS | SANDBOX_L_LANDLOCK |
@@ -374,6 +397,7 @@ static int child_forwards_nothing(void)
 	memset(&sb, 0, sizeof(sb));
 	sb.role = SANDBOX_CLIENT;
 	sb.data_dir = g_datadir;
+	sb.cache_dir = g_cachedir;
 	layers = sandbox_apply(&sb);
 	if (!layers || !(layers & SANDBOX_L_LANDLOCK) || abi < 4)
 		return RC_SKIP;
@@ -392,6 +416,7 @@ static int child_forward_only_host(void)
 	memset(&sb, 0, sizeof(sb));
 	sb.role = SANDBOX_SERVICE;
 	sb.data_dir = g_datadir;
+	sb.cache_dir = g_cachedir;
 	sb.state_dir = g_datadir;
 	sb.no_exec = 1;
 	sb.no_pty = 1;
@@ -599,23 +624,10 @@ static int the_tcp_grant_follows_the_forwards(void)
 	return RC_OK;
 }
 
-/* Create the granted data dir and the ungranted marker, both under one temp
- * base; returns 0 on success. */
-static int make_fixture(char *base)
+static int write_file(const char *path)
 {
-	int fd;
+	int fd = open(path, O_WRONLY | O_CREAT, 0644);
 
-	if (!mkdtemp(base))
-		return -1;
-	if ((size_t)snprintf(g_datadir, sizeof(g_datadir), "%s/data", base) >=
-	    sizeof(g_datadir))
-		return -1;
-	if ((size_t)snprintf(g_marker, sizeof(g_marker), "%s/secret", base) >=
-	    sizeof(g_marker))
-		return -1;
-	if (mkdir(g_datadir, 0700) != 0)
-		return -1;
-	fd = open(g_marker, O_WRONLY | O_CREAT, 0644);
 	if (fd < 0)
 		return -1;
 	if (write(fd, "x\n", 2) != 2) {
@@ -626,8 +638,37 @@ static int make_fixture(char *base)
 	return 0;
 }
 
+/* Create the granted data dir, with the STUN list and the cache directory the
+ * real one holds, and the ungranted marker, all under one temp base; returns
+ * 0 on success. */
+static int make_fixture(char *base)
+{
+	if (!mkdtemp(base))
+		return -1;
+	if ((size_t)snprintf(g_datadir, sizeof(g_datadir), "%s/data", base) >=
+	    sizeof(g_datadir))
+		return -1;
+	if ((size_t)snprintf(g_cachedir, sizeof(g_cachedir), "%s/dht",
+			     g_datadir) >= sizeof(g_cachedir))
+		return -1;
+	if ((size_t)snprintf(g_stunlist, sizeof(g_stunlist),
+			     "%s/stun_servers.txt", g_datadir) >=
+	    sizeof(g_stunlist))
+		return -1;
+	if ((size_t)snprintf(g_marker, sizeof(g_marker), "%s/secret", base) >=
+	    sizeof(g_marker))
+		return -1;
+	if (mkdir(g_datadir, 0700) != 0 || mkdir(g_cachedir, 0700) != 0)
+		return -1;
+	if (write_file(g_stunlist) != 0 || write_file(g_marker) != 0)
+		return -1;
+	return 0;
+}
+
 static void drop_fixture(const char *base)
 {
+	unlink(g_stunlist);
+	rmdir(g_cachedir);
 	rmdir(g_datadir);	/* the .ns mount, if any, is long gone */
 	unlink(g_marker);
 	rmdir(base);
