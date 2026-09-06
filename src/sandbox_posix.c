@@ -3442,7 +3442,13 @@ static int sbp_carveouts(void)
 /* The negative probes. Each must not come back. */
 static int sbp_exec(void)
 {
-	execl("/bin/sh", "sh", "-c", "exit 0", (char *)0);
+	char *argv[2];
+
+	/* A path that does not exist: a permitted execve returns ENOENT, where
+	 * a real image would have died under the same filter a moment later. */
+	argv[0] = "/nonexistent/comrade-sbx";
+	argv[1] = (char *)0;
+	execve(argv[0], argv, argv + 1);
 	return SB_PROBE_FAIL;
 }
 
