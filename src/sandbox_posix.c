@@ -3674,8 +3674,11 @@ static int selftest_linux(void)
 		printf("sandbox selftest: no seccomp on this kernel\n");
 		return SB_PROBE_SKIP;
 	}
-	printf("sandbox selftest: %s\n", bad ? "FAILED" : "ok");
-	return bad ? 1 : 0;
+	if (skipped)
+		printf("sandbox selftest: %d probe(s) could not be measured\n",
+		       skipped);
+	printf("sandbox selftest: %s\n", bad || skipped ? "FAILED" : "ok");
+	return bad || skipped ? 1 : 0;
 }
 
 #else /* a Unix that is neither macOS nor Linux */
