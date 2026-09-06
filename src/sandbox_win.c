@@ -241,20 +241,20 @@ static int label_low(const char *dir)
 	return 1;
 }
 
-/*
- * Drop to low integrity, but only once the one directory this process writes
- * will accept a low writer -- a client that cannot save its node cache is a
- * client that re-bootstraps the DHT on every join, so a label that will not
- * take means no drop rather than a broken client. A token's level can be
- * lowered and never raised, and lowering it costs the process the right to
- * lower it again, so this runs last of everything here.
- *
- * The debug log is the other thing the process writes, and its home is the
- * temporary directory, which nothing can label low without labelling every
- * other program's scratch space with it. So a run asked for diagnostics keeps
- * its integrity level and says so, rather than logging nothing and looking
- * like a clean run.
- */
+/* The label off again: a SACL holding no label ACE is how one is removed. */
+static void label_clear(const char *dir)
+{
+	ACL empty;
+
+	if (InitializeAcl(&empty, sizeof(empty), ACL_REVISION))
+		SetNamedSecurityInfoA((char *)dir, SE_FILE_OBJECT,
+				      LABEL_SECURITY_INFORMATION, NULL, NULL,
+				      NULL, &empty);
+}
+
+/* Last: a lowered token can be neither raised nor lowered again. Skipped where
+ * the data directory will not take a low writer, or where a debug log in the
+ * shared temporary directory would become unwritable. */
 static int win_low_integrity(const char *data_dir)
 {
 	TOKEN_MANDATORY_LABEL ml;
@@ -269,24 +269,30 @@ static int win_low_integrity(const char *data_dir)
 			 "this log unwritable");
 		return 0;
 	}
-	if (!data_dir || !*data_dir || !label_low(data_dir))
+	if (!data_dir || !*data_dir)
 		return 0;
-	if (!ConvertStringSidToSidA("S-1-16-4096", &low))
+	if (!OpenProcessToken(GetCurrentProcess(),
+			      TOKEN_ADJUST_DEFAULT | TOKEN_QUERY, &tok))
 		return 0;
-	if (OpenProcessToken(GetCurrentProcess(),
-			     TOKEN_ADJUST_DEFAULT | TOKEN_QUERY, &tok)) {
+	if (!ConvertStringSidToSidA("S-1-16-4096", &low)) {
+		CloseHandle(tok);
+		return 0;
+	}
+	if (label_low(data_dir)) {
 		memset(&ml, 0, sizeof(ml));
 		ml.Label.Attributes = SE_GROUP_INTEGRITY;
 		ml.Label.Sid = low;
 		ok = SetTokenInformation(tok, TokenIntegrityLevel, &ml,
 					 (DWORD)(sizeof(ml) +
 						 GetLengthSid(low))) ? 1 : 0;
-		if (!ok)
+		if (!ok) {
 			dbg_logf("sandbox: integrity drop refused (%lu)",
 				 (unsigned long)GetLastError());
-		CloseHandle(tok);
+			label_clear(data_dir);
+		}
 	}
 	LocalFree(low);
+	CloseHandle(tok);
 	return ok ? SANDBOX_L_INTEGRITY : 0;
 }
 
