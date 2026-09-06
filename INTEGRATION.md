@@ -93,9 +93,11 @@ sweeps it.
 Ends any session, interactive or headless, completely: the tmux server
 is killed first, which closes every attached client's channel through
 the end monitor, and `stop` then waits for the service to finish going
--- a headless one on SIGTERM (~3 s, then a second SIGTERM the service
-takes at its word, so ~6 s at worst), an interactive one on its own,
-watched by its token file disappearing (~6 s). When `stop` returns 0,
+-- a headless one on SIGTERM (up to ~10 s for its own wind-down, then a
+second SIGTERM the service takes at its word and a wait for the process
+to go, so ~23 s at worst for one that answers neither), an interactive
+one on its own, watched by its token file disappearing (~6 s). When
+`stop` returns 0,
 access has ended, the service is gone and the state file with it. A
 client still holding the token is told so rather than left waiting: the
 service replaces the mailbox offer with a tombstone on its way out

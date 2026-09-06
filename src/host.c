@@ -91,9 +91,12 @@
 #define ID_LEN 12			/* hex chars of a generated session id */
 #define ID_MAX 32			/* longest id, generated or named */
 
-/* How long `stop` gives a signalled service to go, in 100 ms ticks, before it
- * signals again and then reports the session as still running. */
-#define STOP_GRACE_TICKS 30
+/* How long `stop` gives a signalled service to wind down, in 100 ms ticks:
+ * what the session gives itself for its end-of-session signal and the
+ * tombstone (SESSION_WIND_MS, SESSION_TOMB_MS), as TEARDOWN_WAIT_MS does. */
+#define STOP_GRACE_TICKS 100
+/* And the second signal, which the service ends itself on: a moment. */
+#define STOP_KILL_TICKS 20
 /*
  * And how long it then waits for the process to actually be gone before
  * reporting it as still running. Longer than the grace above, deliberately:
@@ -1678,12 +1681,12 @@ int host_headless(const char *id_opt, int no_mcast, int no_dht, int no_fwd,
 
 /* Signal a service and wait out the grace period; non-zero if it is still
  * there when that runs out. */
-static int term_wait(long pid)
+static int term_wait(long pid, int ticks)
 {
 	int i;
 
 	kill((pid_t)pid, SIGTERM);
-	for (i = 0; i < STOP_GRACE_TICKS && pid_running(pid); i++)
+	for (i = 0; i < ticks && pid_running(pid); i++)
 		usleep(100 * 1000);
 	return pid_running(pid);
 }
@@ -1715,8 +1718,8 @@ int host_stop(const char *id_opt)
 		 * its own exit still answers this rather than needing a kill
 		 * from outside.
 		 */
-		if (term_wait(pid))
-			term_wait(pid);
+		if (term_wait(pid, STOP_GRACE_TICKS))
+			term_wait(pid, STOP_KILL_TICKS);
 	} else {
 		/*
 		 * An interactive session's service records no pid -- its
