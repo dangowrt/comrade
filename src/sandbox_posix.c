@@ -3141,8 +3141,10 @@ static int apply_linux(const struct sandbox_cfg *cfg)
 
 #define SB_PROBE_OK	0
 #define SB_PROBE_FAIL	1
+#define SB_PROBE_TIMEOUT 2
 #define SB_PROBE_SKIP	77
 #define SB_PROBE_TRAPPED 159	/* what the warn-mode handler exits with */
+#define SB_PROBE_MS	10000	/* longest one probe may take */
 
 static int sbp_basics(void)
 {
@@ -3344,9 +3346,9 @@ static int sbp_resolver(void)
 	memset(&hints, 0, sizeof(hints));
 	hints.ai_family = AF_UNSPEC;
 	hints.ai_socktype = SOCK_STREAM;
-	if (getaddrinfo("localhost", (const char *)0, &hints, &ai) != 0)
-		return SB_PROBE_FAIL;
-	freeaddrinfo(ai);
+	/* Any answer is the resolver running; only a kill is the allowlist. */
+	if (getaddrinfo("localhost", (const char *)0, &hints, &ai) == 0)
+		freeaddrinfo(ai);
 	if (if_nametoindex("lo") == 0)
 		return SB_PROBE_FAIL;	/* SIOCGIFINDEX through the ioctl rule */
 	nl = socket(AF_NETLINK, SOCK_RAW, 0);
@@ -3514,14 +3516,23 @@ static const struct sb_probe sb_probes[] = {
 	{ "prctl(PR_SET_DUMPABLE)", sbp_unlisted_prctl, 1 }
 };
 
+static uint64_t sb_now_ms(void)
+{
+	struct timespec t;
+
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return (uint64_t)t.tv_sec * 1000 + (uint64_t)(t.tv_nsec / 1000000);
+}
+
 /*
  * Run one probe behind the real filter. The child installs it itself, so the
  * parent stays unconfined and can report on however many probes die.
  */
 static int sb_run_probe(const struct sb_probe *pr)
 {
-	pid_t pid;
 	int st = 0, refused;
+	uint64_t deadline;
+	pid_t pid, got;
 
 	/* Whatever is still sitting in the buffer would be inherited and, on
 	 * the paths where the child's exit does flush, printed a second time
@@ -3541,8 +3552,20 @@ static int sb_run_probe(const struct sb_probe *pr)
 #endif
 		_exit(pr->fn());
 	}
-	if (waitpid(pid, &st, 0) != pid)
-		return SB_PROBE_FAIL;
+	deadline = sb_now_ms() + SB_PROBE_MS;
+	for (;;) {
+		got = waitpid(pid, &st, WNOHANG);
+		if (got == pid)
+			break;
+		if (got < 0 && errno != EINTR)
+			return SB_PROBE_FAIL;
+		if (sb_now_ms() >= deadline) {
+			kill(pid, SIGKILL);
+			waitpid(pid, &st, 0);
+			return SB_PROBE_TIMEOUT;
+		}
+		usleep(10 * 1000);
+	}
 	/*
 	 * Refused means killed by the default action -- or, under
 	 * COMRADE_SANDBOX=warn, trapped and reported by the handler, which is
@@ -3588,8 +3611,9 @@ static int selftest_linux(void)
 
 		printf("  %-24s %s\n", sb_probes[i].name,
 		       r == SB_PROBE_OK ? "ok" :
-		       r == SB_PROBE_SKIP ? "skipped" : "FAILED");
-		if (r == SB_PROBE_FAIL)
+		       r == SB_PROBE_SKIP ? "skipped" :
+		       r == SB_PROBE_TIMEOUT ? "timed out" : "FAILED");
+		if (r == SB_PROBE_FAIL || r == SB_PROBE_TIMEOUT)
 			bad++;
 		else if (r == SB_PROBE_SKIP)
 			skipped++;
