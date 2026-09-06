@@ -634,6 +634,7 @@ static int no_new_privs(void)
 #  define SB_COMPAT_AUDIT_ARCH AUDIT_ARCH_I386
 #  define SB_COMPAT_NR_SOCKET 359
 #  define SB_COMPAT_NR_SOCKETCALL 102
+#  define SB_COMPAT_NR_IO_URING_SETUP 425
 # endif
 #elif defined(__i386__)
 # define SB_AUDIT_ARCH AUDIT_ARCH_I386
@@ -646,6 +647,7 @@ static int no_new_privs(void)
 # define SB_COMPAT_AUDIT_ARCH AUDIT_ARCH_ARM
 # define SB_COMPAT_NR_SOCKET 281
 # define SB_COMPAT_NR_SOCKETCALL 102
+# define SB_COMPAT_NR_IO_URING_SETUP 425
 #elif defined(__arm__)
 /* Never AUDIT_ARCH_ARMEB: see the block comment. */
 # define SB_AUDIT_ARCH AUDIT_ARCH_ARM
@@ -674,7 +676,9 @@ static int no_new_privs(void)
 /* o32 and n32 respectively; the n32 table has no socketcall at all. */
 #  define SB_COMPAT_NR_SOCKET 4183
 #  define SB_COMPAT_NR_SOCKETCALL 4102
+#  define SB_COMPAT_NR_IO_URING_SETUP 4425
 #  define SB_COMPAT2_NR_SOCKET 6040
+#  define SB_COMPAT2_NR_IO_URING_SETUP 6425
 # elif _MIPS_SIM == _ABIN32
 #  ifdef __MIPSEL__
 #   define SB_AUDIT_ARCH AUDIT_ARCH_MIPSEL64N32
@@ -687,6 +691,7 @@ static int no_new_privs(void)
 #  endif
 #  define SB_COMPAT_NR_SOCKET 4183
 #  define SB_COMPAT_NR_SOCKETCALL 4102
+#  define SB_COMPAT_NR_IO_URING_SETUP 4425
 # endif
 #elif defined(__powerpc64__)
 # if defined(__LITTLE_ENDIAN__)
@@ -700,6 +705,7 @@ static int no_new_privs(void)
 # define SB_COMPAT_AUDIT_ARCH AUDIT_ARCH_PPC
 # define SB_COMPAT_NR_SOCKET 326
 # define SB_COMPAT_NR_SOCKETCALL 102
+# define SB_COMPAT_NR_IO_URING_SETUP 425
 #elif defined(__powerpc__)
 # define SB_AUDIT_ARCH AUDIT_ARCH_PPC
 # define SB_ARCH_NAME "AUDIT_ARCH_PPC"
@@ -2113,12 +2119,14 @@ static int seccomp_nonet(void)
 #ifdef SB_COMPAT_NR_SOCKETCALL
 	sb_eq_ret(&p, SB_COMPAT_NR_SOCKETCALL, SB_RET_ERRNO(EPERM));
 #endif
+	sb_eq_ret(&p, SB_COMPAT_NR_IO_URING_SETUP, SB_RET_ERRNO(EPERM));
 	sb_nonet_body(&p, SB_COMPAT_NR_SOCKET);
 	sb_land_jf(&p, skip);
 #endif
 #ifdef SB_COMPAT2_AUDIT_ARCH
 	skip = sb_test(&p, SB_COMPAT2_AUDIT_ARCH);
 	sb_ld_nr(&p);
+	sb_eq_ret(&p, SB_COMPAT2_NR_IO_URING_SETUP, SB_RET_ERRNO(EPERM));
 	sb_nonet_body(&p, SB_COMPAT2_NR_SOCKET);
 	sb_land_jf(&p, skip);
 #endif
