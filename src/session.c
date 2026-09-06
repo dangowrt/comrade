@@ -391,6 +391,8 @@ struct conn {
 	 */
 	int rs_state;
 	uint64_t rs_deadline;
+	uint64_t rs_gathered_ms;	/* when this set was gathered, to hold it a
+					 * punch window before gathering afresh */
 	uint32_t rs_backoff;		/* the answer-wait between re-claims, from
 					 * RESUME_FIRST_MS up to RESUME_ATTEMPT_MS */
 	struct ice_ctx *resume_ctx;	/* the handover slot; see above */
@@ -4425,6 +4427,10 @@ static int sig_rebuild(struct sess *s, const char *why)
  * host's own cadence so a peer that is simply gone is not hammered. */
 #define RESUME_FIRST_MS 2000
 
+/* How long a gathered set is held for the host to punch before it is replaced:
+ * a whole host punch window, so a set that only needs time is not churned. */
+#define RESUME_HOLD_MS HOST_PUNCH_MS
+
 static uint32_t resume_backoff(struct conn *c)
 {
 	if (!c->rs_backoff)
@@ -4509,6 +4515,7 @@ static void resume_tick(struct conn *c)
 		pthread_mutex_unlock(&s->trickle_lock);
 		if (nat_setup(c))
 			return;
+		c->rs_gathered_ms = now;
 		c->rs_state = 1;
 		c->rs_deadline = now + RESUME_ATTEMPT_MS;
 		dbg_logf("resume: re-claiming under the session identity");
@@ -4548,17 +4555,28 @@ static void resume_tick(struct conn *c)
 				dbg_logf("resume: primed offer %s", ufrag);
 			}
 		}
-		/* The offer rotated past the one we primed, so this punch is
-		 * against dead credentials: re-gather at once, not at the
-		 * backoff, whether the host moved or picked someone else up. */
+		/* A higher generation is the host having moved, its candidates
+		 * gone: re-gather. A same-generation rotation is pickup churn,
+		 * and chasing it aborts a punch still in flight. */
 		if (s->remote_set && c->remote_ufrag[0] &&
 		    s->cur_offer_ufrag[0] &&
-		    strcmp(s->cur_offer_ufrag, c->remote_ufrag)) {
+		    strcmp(s->cur_offer_ufrag, c->remote_ufrag) &&
+		    sig_peer_gen(s->sig) > c->remote_gen) {
 			c->rs_state = 0;
 			return;
 		}
-		if (now >= c->rs_deadline)
-			c->rs_state = 0;
+		if (now >= c->rs_deadline) {
+			/* Hold the set the host is punching rather than gather a
+			 * fresh one under it each backoff; redelivery rides the
+			 * mailbox, not a store, for the shared node's rate cap. */
+			if (!s->remote_set || s->net_ch ||
+			    now - c->rs_gathered_ms >= RESUME_HOLD_MS) {
+				c->rs_state = 0;
+				return;
+			}
+			sig_redeliver(s->sig);
+			c->rs_deadline = now + resume_backoff(c);
+		}
 		return;
 	}
 }
