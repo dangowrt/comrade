@@ -406,6 +406,7 @@ struct conn {
 	pthread_mutex_t claim_lock;
 	volatile int ice_up;		/* the agent is connected, for readers
 					 * that may not touch the agent */
+	volatile uint32_t carry_epoch;	/* ++ on a qualified carry switch (roam) */
 	/*
 	 * Each probe carries the next of these, and a receiver drops one whose
 	 * sequence it has already seen. Both the connection's own loop and the
@@ -1186,9 +1187,13 @@ static int conn_pick(struct conn *c, struct path_pick *out)
 		}
 	}
 	pthread_mutex_unlock(&c->path_lock);
-	if (to[0])
+	if (to[0]) {
 		dbg_logf("path: carrying %s (was %s)", to,
 			 from[0] ? from : "none");
+		if (out->qualified)
+			__atomic_add_fetch(&c->carry_epoch, 1,
+					   __ATOMIC_RELAXED);
+	}
 	return out->kind < 0 ? -1 : 0;
 }
 
@@ -2769,9 +2774,14 @@ static void probe_apply(struct conn *c, const struct path_probe *pr,
 		}
 	}
 	pthread_mutex_unlock(&c->path_lock);
-	if (rtt >= 0)
+	if (rtt >= 0) {
 		dbg_logf("path qualified: %s rtt~%dms",
 			 label[0] ? label : "ICE", rtt);
+		/* A path becoming usable is the moment to retransmit the stream's
+		 * backlog, whether the carry switched to it before it qualified
+		 * (its srtt still zero then) or it is the one already carrying. */
+		__atomic_add_fetch(&c->carry_epoch, 1, __ATOMIC_RELAXED);
+	}
 }
 
 /*
@@ -4738,13 +4748,14 @@ static void net_settle(struct sess *s)
  */
 static int conn_run(struct conn *c, int drive_sig)
 {
+	uint64_t next_hb, conn_start;
+	int done = 0, link_lost = 0;
 	struct sess *s = c->sess;
+	uint32_t carry_seen = 0;
 	struct sshbridge *br;
+	sock_t sp[2], cp[2];
 	struct stream *st;
 	pthread_t th;
-	sock_t sp[2], cp[2];
-	int done = 0, link_lost = 0;
-	uint64_t next_hb, conn_start;
 
 	/* Both pairs must be sockets, not pipes: they are polled in the same
 	 * set as the transport, and WSAPoll takes nothing else (see wsock.h). */
@@ -4915,6 +4926,12 @@ static int conn_run(struct conn *c, int drive_sig)
 		 * one carrying it, so a switch is an immediate reordering rather
 		 * than a rediscovery. */
 		path_tick(c, now_ms());
+		if (__atomic_load_n(&c->carry_epoch, __ATOMIC_RELAXED) !=
+		    carry_seen) {
+			carry_seen = __atomic_load_n(&c->carry_epoch,
+						    __ATOMIC_RELAXED);
+			stream_kick(st);
+		}
 		cand_tell(c, now_ms());
 		rdv_tell(c, now_ms());
 		reach_tell(c, now_ms());

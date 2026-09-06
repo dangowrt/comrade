@@ -357,6 +357,22 @@ uint32_t stream_update(struct stream *s, uint32_t now_ms)
 	return next;
 }
 
+void stream_kick(struct stream *s)
+{
+	struct IKCPSEG *seg;
+	ikcpcb *kcp;
+
+	pthread_mutex_lock(&s->lock);
+	kcp = s->kcp;
+	kcp->rx_rto = kcp->rx_minrto;
+	iqueue_foreach(seg, &kcp->snd_buf, struct IKCPSEG, node) {
+		seg->rto = (IUINT32)kcp->rx_minrto;
+		seg->resendts = kcp->current;
+	}
+	ikcp_flush(kcp);
+	pthread_mutex_unlock(&s->lock);
+}
+
 int stream_waitsnd(struct stream *s)
 {
 	int rc;

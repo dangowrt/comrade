@@ -45,4 +45,8 @@ int stream_rtt(struct stream *s);
  */
 int stream_tx_room(struct stream *s);
 
+/* Retransmit the unacked backlog now, resetting the per-segment RTO an outage
+ * backed off; called when a path recovers so a green link does not sit idle. */
+void stream_kick(struct stream *s);
+
 #endif
