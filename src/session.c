@@ -5841,10 +5841,18 @@ static struct conn *conn_alloc(struct sess *s)
  */
 static void conn_dissolve(struct conn *c)
 {
+	struct ice_ctx *got;
+
 	conn_unregister(c->sess, c);
 	conn_reap_parked(c);
 	conn_drop_ice_path(c);
 	conn_free_agent(c, c->nat, c->nat_ctx);
+	/* A re-punch grafted for a worker that left its loop before adopting
+	 * it: nobody else will. */
+	got = __atomic_exchange_n(&c->resume_ctx, (struct ice_ctx *)0,
+				  __ATOMIC_ACQUIRE);
+	if (got)
+		conn_free_agent(c, got->agent, got);
 }
 
 
