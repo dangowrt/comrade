@@ -2003,6 +2003,24 @@ static void sb_warn_arm(int role)
 	sigaction(SIGSYS, &sa, (struct sigaction *)0);
 }
 
+/* Settled before the filesystem is confined: actions_avail is under /proc,
+ * and the warn log has to be opened while its path can still be reached. */
+static unsigned int sb_deflt = SECCOMP_RET_KILL_PROCESS;
+
+static void sb_mode_prepare(int role)
+{
+	if (sb_log_mode() && sb_log_available()) {
+		sb_deflt = SECCOMP_RET_LOG;
+		return;
+	}
+	if (sb_warn_mode() || sb_log_mode()) {
+		/* Asked for log on a kernel that has none: warn still says
+		 * which syscall it was, which is the point of asking. */
+		sb_warn_arm(role);
+		sb_deflt = SECCOMP_RET_TRAP;
+	}
+}
+
 /*
  * The filter for the client and the host service: a default-deny allowlist.
  * execve, execveat, fork, ptrace and everything else unnamed above are refused
@@ -2027,20 +2045,12 @@ static void sb_warn_arm(int role)
 			    SB_N(sb_nr_enosys) + SB_N(sb_nr_eperm) + \
 			    SB_ARM_PRIVATE_N) + 128)
 
-static int seccomp_allowlist(int role, int no_pty)
+static int seccomp_allowlist(int no_pty)
 {
 	static struct sock_filter filt[SB_MAX_FILTER];
+	unsigned int deflt = sb_deflt;
 	struct sb_prog p;
-	unsigned int deflt = SECCOMP_RET_KILL_PROCESS;
 
-	if (sb_log_mode() && sb_log_available()) {
-		deflt = SECCOMP_RET_LOG;
-	} else if (sb_warn_mode() || sb_log_mode()) {
-		/* Asked for log on a kernel that has none: warn still says
-		 * which syscall it was, which is the point of asking. */
-		sb_warn_arm(role);
-		deflt = SECCOMP_RET_TRAP;
-	}
 	p.f = filt;
 	p.n = 0;
 	p.max = SB_MAX_FILTER;
@@ -2053,7 +2063,8 @@ static int seccomp_allowlist(int role, int no_pty)
 	}
 	dbg_logf("sandbox: allowlist %u instructions, arch %s%s",
 		 (unsigned)p.n, SB_ARCH_NAME,
-		 deflt == SECCOMP_RET_TRAP ? ", warn mode" : "");
+		 deflt == SECCOMP_RET_TRAP ? ", warn mode" :
+		 deflt == SECCOMP_RET_LOG ? ", log mode" : "");
 	return install_filter(filt, p.n);
 }
 
@@ -2162,6 +2173,16 @@ static int seccomp_available(void)
 #endif
 }
 
+static void seccomp_prepare(const struct sandbox_cfg *cfg)
+{
+#if defined(SYS_seccomp) && defined(SB_AUDIT_ARCH)
+	if (cfg->role != SANDBOX_FOREGROUND)
+		sb_mode_prepare(cfg->role);
+#else
+	(void)cfg;
+#endif
+}
+
 static int seccomp_apply(const struct sandbox_cfg *cfg, int confine)
 {
 #if defined(SYS_seccomp) && defined(SB_AUDIT_ARCH)
@@ -2170,7 +2191,7 @@ static int seccomp_apply(const struct sandbox_cfg *cfg, int confine)
 	if (cfg->role == SANDBOX_FOREGROUND)
 		return seccomp_nonet();
 	if (confine)
-		return seccomp_allowlist(cfg->role, cfg->no_pty);
+		return seccomp_allowlist(cfg->no_pty);
 	return 0;
 #else
 	(void)cfg;
@@ -3079,6 +3100,7 @@ static int apply_linux(const struct sandbox_cfg *cfg)
 #endif
 	}
 	layers |= mdwe();
+	seccomp_prepare(cfg);
 	if (confine)
 		layers |= fs_confine(cfg);
 	layers |= no_dumpable();
@@ -3495,7 +3517,8 @@ static int sb_run_probe(const struct sb_probe *pr)
 	if (pid == 0) {
 		prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
 #if defined(SYS_seccomp) && defined(SB_AUDIT_ARCH)
-		if (!(seccomp_allowlist(SANDBOX_CLIENT, 0) & SANDBOX_L_SECCOMP))
+		sb_mode_prepare(SANDBOX_CLIENT);
+		if (!(seccomp_allowlist(0) & SANDBOX_L_SECCOMP))
 			_exit(SB_PROBE_SKIP);
 #else
 		_exit(SB_PROBE_SKIP);
