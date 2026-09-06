@@ -3203,17 +3203,18 @@ static int sbp_memory(void)
 
 static int sbp_files(void)
 {
-	char path[64], other[68];
+	char path[] = "/tmp/comrade-sbx-XXXXXX";
 	struct stat st;
+	char other[32];
 	char buf[16];
+	int fd, rc;
 	DIR *d;
-	int fd, rc = SB_PROBE_FAIL;
 
-	snprintf(path, sizeof(path), "/tmp/comrade-sbx-%ld", (long)getpid());
-	snprintf(other, sizeof(other), "%s.2", path);
-	fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+	rc = SB_PROBE_FAIL;
+	fd = mkstemp(path);
 	if (fd < 0)
-		return SB_PROBE_FAIL;
+		return rc;
+	snprintf(other, sizeof(other), "%s.2", path);
 	do {
 		if (write(fd, "hello\n", 6) != 6)
 			break;
