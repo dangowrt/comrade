@@ -48,9 +48,10 @@ done
 [ -n "$tok" ] || { echo "no rendezvous token after ${i}s"; exit 1; }
 
 # Held open until the thing it is here to see has happened, not for a span
-# chosen to be longer than it: the roam is staged 30s in, and what follows is
-# the client resuming onto the host's new network. The hold is only an upper
-# bound for a run where that never comes.
+# chosen to be longer than it: the roam is staged 5s after the host first
+# serves a client (--roam-ms counts from there on a DHT host), and what follows
+# is the client resuming onto the host's new network. The hold is only an
+# upper bound for a run where that never comes.
 COMRADE_DEBUG="$tmp/client.dbg" "$E2E" client "$tok" \
 	--hold-ms 120000 --timeout 160 > "$tmp/client.out" 2>&1 &
 clientpid=$!
