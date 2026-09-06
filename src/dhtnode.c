@@ -360,8 +360,10 @@ static void seed_from_dht(struct dhtnode *n)
 
 /*
  * On-disk DHT node cache: good nodes from a previous run, kept per family in
- * separate files next to the STUN list. They seed the table AND the bep44
- * engine on start, IN ADDITION to the curated bootstrap routers -- so warming
+ * separate files in a directory of their own beside the STUN list, the one
+ * part of the data directory a confined process may write (see sandbox.h).
+ * They seed the table AND the bep44 engine on start, IN ADDITION to the
+ * curated bootstrap routers -- so warming
  * (especially the sparse v6 side) has a head start, while the always-on routers
  * remain the safety net for a client that has been idle for months and whose
  * cached nodes have all gone. Records are compact: 6 bytes for v4 (address then
@@ -378,7 +380,7 @@ static int cache_flushed;		/* the run's teardown write is done */
 
 static void cache_path(int af, char *out, size_t n)
 {
-	snprintf(out, n, "%s/dht_nodes_v%d", appdir_data(), af == AF_INET6 ? 6 : 4);
+	snprintf(out, n, "%s/nodes_v%d", appdir_cache(), af == AF_INET6 ? 6 : 4);
 }
 
 /* Load one family's cache; returns how many nodes it seeded. */

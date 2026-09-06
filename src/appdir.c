@@ -17,8 +17,10 @@
 
 #ifdef _WIN32
 #define appdir_mkdir(p) _mkdir(p)
+#define APPDIR_SEP "\\"
 #else
 #define appdir_mkdir(p) mkdir((p), 0700)
+#define APPDIR_SEP "/"
 #endif
 
 /* mkdir every component of path (best effort, mode 0700 where that exists). */
@@ -68,5 +70,26 @@ const char *appdir_data(void)
 			 (unsigned)getuid());
 #endif
 	mkdir_p(dir);
+	return dir;
+}
+
+const char *appdir_cache(void)
+{
+	const char *base = appdir_data();
+	static char dir[560];
+	char from[600];
+	char to[600];
+	int af;
+
+	snprintf(dir, sizeof(dir), "%s%sdht", base, APPDIR_SEP);
+	appdir_mkdir(dir);
+	/* A cache an earlier layout left beside the directory moves in; from
+	 * a confined process the rename is refused, and the cache is cold. */
+	for (af = 4; af <= 6; af += 2) {
+		snprintf(from, sizeof(from), "%s%sdht_nodes_v%d", base,
+			 APPDIR_SEP, af);
+		snprintf(to, sizeof(to), "%s%snodes_v%d", dir, APPDIR_SEP, af);
+		rename(from, to);
+	}
 	return dir;
 }

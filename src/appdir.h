@@ -11,4 +11,8 @@
  */
 const char *appdir_data(void);
 
+/* The DHT node cache's own directory beneath it, created if absent: the one
+ * part of the data directory a confined process may write (sandbox.h). */
+const char *appdir_cache(void);
+
 #endif
