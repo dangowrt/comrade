@@ -4457,7 +4457,10 @@ static void resume_tick(struct conn *c)
 			c->parked_until_ms = 0;
 			conn_free_agent(c, spare, spare_ctx);
 			dbg_logf("resume: carried by the agent set aside");
-		} else if (c->parked && now >= c->parked_until_ms) {
+		} else if (c->parked) {
+			/* A non-parked path carries, so free the set-aside
+			 * agent now, not at its deadline: a second punch would
+			 * else ride along on its own port for the whole span. */
 			conn_reap_parked(c);
 			dbg_logf("resume: the agent set aside answered "
 				 "nothing");
