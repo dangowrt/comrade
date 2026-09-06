@@ -7105,7 +7105,7 @@ int session_run(const struct session_cfg *cfg)
 	 * host on a LAN segment is reachable the moment it is up, so it can
 	 * be moved before anyone has arrived.
 	 */
-	s.next_roam_ms = (cfg->is_host && (cfg->sig_flags & SIG_DHT))
+	s.next_roam_ms = (host_is_multiuser(cfg) && (cfg->sig_flags & SIG_DHT))
 		? 0 : now_ms() + (uint64_t)cfg->test_roam_ms;
 	if (keys_derive(&s.keys, cfg->tok.rdv))
 		return 1;
