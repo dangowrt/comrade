@@ -3728,6 +3728,11 @@ int sandbox_selftest(void)
 		return 77;
 	}
 #if defined(__linux__)
+	if (sb_log_mode()) {
+		printf("sandbox selftest: COMRADE_SANDBOX=log confines "
+		       "nothing\n");
+		return 77;
+	}
 	return selftest_linux();
 #else
 	printf("sandbox selftest: no syscall filter on this platform\n");
