@@ -524,10 +524,10 @@ static int the_namespace_confines_the_filesystem(void)
  */
 static int the_debug_log_does_not_widen_the_grant(void)
 {
-	char log[sizeof("/tmp/comrade-sbtest-dbg-4294967295.log")];
+	char log[sizeof("/tmp//comrade-sbtest-dbg-4294967295.log")];
 	const char *prev = getenv("COMRADE_DEBUG");
 	char keep[PATH_MAX];
-	int r;
+	int r, r2;
 
 	keep[0] = '\0';
 	if (prev)
@@ -536,14 +536,22 @@ static int the_debug_log_does_not_widen_the_grant(void)
 		 (unsigned)getpid());
 	setenv("COMRADE_DEBUG", log, 1);
 	r = run_child(child_confined_ns);
+	unlink(log);
+	/* The same log named the way a TMPDIR with a trailing slash names it:
+	 * the directory it is judged by is what the doubled slash hides. */
+	snprintf(log, sizeof(log), "/tmp//comrade-sbtest-dbg-%u.log",
+		 (unsigned)getpid());
+	setenv("COMRADE_DEBUG", log, 1);
+	r2 = run_child(child_confined_ns);
+	unlink(log);
 	if (keep[0])
 		setenv("COMRADE_DEBUG", keep, 1);
 	else
 		unsetenv("COMRADE_DEBUG");
-	unlink(log);
 	if (r == RC_SKIP)
 		return RC_SKIP;
 	assert(r == RC_OK);
+	assert(r2 == RC_OK);
 	return RC_OK;
 }
 
