@@ -123,10 +123,10 @@ void netstate_on_netmon(struct netstate *ns, unsigned changed, int have4,
 		f->src_tries = 0;
 		f->src_next_ms = now;
 
-		f->anchor_confirmed = 0;
+		/* A move bears on our reachability, not on the node: both
+		 * proofs stay, and the quiet detector, counting only once the
+		 * family is up again, may unseat it. Acks were per epoch. */
 		f->anchor_acks = 0;
-		/* anchor_vouched is deliberately kept: our own proof was about
-		 * the network we have left, a peer's is about the node. */
 		/* A candidate gets its full run on the network it is now to
 		 * prove itself on, rather than inheriting a clock from the one
 		 * we have left. What has qualified stays not-a-candidate: it
@@ -702,8 +702,8 @@ void netstate_reach(const struct netstate *ns, int family, int *conn,
  * A VOUCH IS A STAND-IN FOR A PROOF THIS END COULD NOT MAKE, so it holds only
  * while that is still so. On a network where the family is up the round trip
  * is available again and it is ours to make: the node goes back to being
- * checked until it answers here, rather than resting for the rest of the
- * session on a proof made elsewhere, on a network we have since left.
+ * checked until it answers here. Our own proof is about the node and survives
+ * a move; the quiet detector, never the move, is what retires it.
  *
  * The token slot is a separate question and keeps the node either way (see
  * netstate_facts): what the peer proved is that the node holds this key, which

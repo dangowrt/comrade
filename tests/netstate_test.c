@@ -104,9 +104,10 @@ static void v6_change_leaves_v4_alone(void)
 	assert(a.f[1] != 0);		/* and everything for v6 */
 }
 
-/* B10/B5: the anchor survives a move so the token keeps naming it, but it is a
- * memory of the last network, not evidence about this one. */
-static void preserved_anchor_is_not_proof(void)
+/* B10/B5: a confirmed anchor survives a move and stays proven: the node did
+ * not move, we did. Only the family's reachability drops, until it answers
+ * here too. */
+static void a_confirmed_anchor_survives_a_move(void)
 {
 	struct netstate ns;
 	struct tokgen_facts fx;
@@ -126,13 +127,16 @@ static void preserved_anchor_is_not_proof(void)
 
 	assert(netstate_anchor(&ns, 6, got, &glen, &confirmed));
 	assert(!memcmp(got, node, 16));	/* still ours */
-	assert(!confirmed);		/* but nothing has spoken to it here */
+	assert(confirmed);		/* still proven: we moved, not it */
+	/* Reachability is a different fact from the anchor's proof, and it does
+	 * drop: nothing has answered us on this network yet. */
 	assert(netstate_conn(&ns, 6) != NET_CONN_UP);
 	netstate_facts(&ns, 6, &fx);
 	assert(!fx.dht_acked);
 	assert(drain(&ns).f[1] & NSA_RDV_PIN);
 
-	/* and it earns its way back */
+	/* It re-validates when it answers here, which brings reachability back;
+	 * the proof it never lost is unchanged. */
 	qualify(&ns, 6, node);
 	assert(netstate_anchor(&ns, 6, got, &glen, &confirmed) && confirmed);
 	assert(netstate_conn(&ns, 6) == NET_CONN_UP);
@@ -544,11 +548,12 @@ static void only_another_answer_condemns(void)
 	assert(netstate_anchor(&ns, 6, got, &glen, &confirmed) && confirmed);
 	assert(!memcmp(got, a, 16));
 
-	/* and a move keeps it, unconfirmed until it answers here too */
+	/* and a move keeps it, proof and all: only another node answering
+	 * counts against a node, never a move. */
 	netstate_on_netmon(&ns, NETMON_CH_V6, 1, 1, t);
 	assert(netstate_anchor(&ns, 6, got, &glen, &confirmed));
 	assert(!memcmp(got, a, 16));
-	assert(!confirmed);
+	assert(confirmed);
 }
 
 /*
@@ -1370,7 +1375,7 @@ static void laws_hold_under_churn(void)
 int main(void)
 {
 	v6_change_leaves_v4_alone();
-	preserved_anchor_is_not_proof();
+	a_confirmed_anchor_survives_a_move();
 	stale_roundtrip_never_marks_up();
 	src_survives_the_roam_window();
 	an_address_that_never_comes_stops_being_hurried();
