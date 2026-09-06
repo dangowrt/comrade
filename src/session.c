@@ -945,10 +945,8 @@ static void conn_drop_ice_path(struct conn *c)
 	pthread_mutex_unlock(&c->path_lock);
 }
 
-/* Let one agent go, with the path that borrowed it and the context its
- * callbacks were handed. The table is unlocked before the agent call. */
 /*
- * And the connection itself. Only ever after nat_destroy has returned for any
+ * The connection itself. Only ever after nat_destroy has returned for any
  * agent whose callbacks could still name it -- see ice_ctx.shell.
  */
 static void conn_release(struct conn *c)
@@ -964,6 +962,8 @@ static void conn_release(struct conn *c)
 	free(c);
 }
 
+/* Let one agent go, with the path that borrowed it and the context its
+ * callbacks were handed. The table is unlocked before the agent call. */
 static void conn_free_agent(struct conn *c, struct nat_agent *agent,
 			    struct ice_ctx *ctx)
 {
@@ -3362,9 +3362,6 @@ static void sdp_pwd(const char *sdp, char *out)
 	if (p)
 		sscanf(p, "ice-pwd:%39s", out);
 }
-
-/* Is this claimant already admitted over the direct path -- served by a LAN
- * worker, or queued for one? (host main thread only) */
 
 static int conn_is_lost(struct conn *c)
 {
