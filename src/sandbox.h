@@ -74,12 +74,15 @@
  * and lower its own integrity level. The client takes all four. A service that
  * still runs tmux itself -- which on Windows is every service, since
  * sandbox_needs_spawner() is 0 there -- and the operator's foreground take the
- * first two only: a job object's limits apply to every process in the job and
- * children inherit membership, so the rest would land on tmux and on every
- * guest's shell. The child-process ban goes with them too, since it also blocks
- * CreatePseudoConsole. The client takes it, because it spawns nothing and
- * renders into the console it was started in rather than making one, and so
- * does a forwarding-only host, which serves no shell at all.
+ * first two only. What they launch is the tmux client that attaches to the
+ * shared server, and CreateProcess hands it a copy of the launcher's token, so
+ * the privilege removal reaches it; a job's limits would reach it too, and the
+ * child-process ban would stop the launch itself, which also needs
+ * CreatePseudoConsole. The server, and every shell in it, was started by the
+ * foreground before any of this and keeps the caller's whole token. The client
+ * takes the ban, because it spawns nothing and renders into the console it was
+ * started in rather than making one, and so does a forwarding-only host, which
+ * serves no shell at all.
  *
  * Low integrity is a write-and-reach boundary, not a read boundary. It stops a
  * compromised client writing anywhere the mandatory policy does not label low,

@@ -32,11 +32,14 @@
  * does write stays writable.
  *
  * The connection service that serves shells, and the operator's foreground,
- * both keep launching tmux and the per-client shells. A job object's limits
- * apply to every process in the job and children inherit membership, so neither
- * takes the job or the child-process ban -- those would land on tmux and on
- * every guest's shell. They take the privilege removal and the mitigation
- * policies, which are per-process and inherited by nothing.
+ * both keep launching the tmux client that attaches to the shared server. A
+ * job object's limits apply to every process in the job and children inherit
+ * membership, so neither takes the job or the child-process ban, which would
+ * stop that launch. They take the privilege removal and the mitigation
+ * policies; CreateProcess copies the launcher's token, so the removal reaches
+ * the attaching client, and no further. The server, with every shell in it,
+ * was started by the foreground before any of this and keeps the caller's
+ * whole token.
  */
 
 /* Every policy is best-effort: a Windows that refuses one leaves the rest. */
