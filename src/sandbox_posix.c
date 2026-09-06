@@ -3434,7 +3434,8 @@ static int sbp_carveouts(void)
 	    errno != EPERM)
 		return SB_PROBE_FAIL;
 	errno = 0;
-	if (mount("none", "/", "tmpfs", 0, (void *)0) != -1 || errno != EPERM)
+	if (mount("none", "/nonexistent/comrade-sbx", "tmpfs", 0,
+		  (void *)0) != -1 || errno != EPERM)
 		return SB_PROBE_FAIL;
 	return SB_PROBE_OK;
 }
