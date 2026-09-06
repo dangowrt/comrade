@@ -2,6 +2,7 @@
 /* Copyright (C) 2026 Daniel Golle <daniel@makrotopia.org> */
 
 #include <pthread.h>
+#include <stddef.h>
 #include <stdlib.h>
 
 #include <ikcp.h>
@@ -359,13 +360,16 @@ uint32_t stream_update(struct stream *s, uint32_t now_ms)
 
 void stream_kick(struct stream *s)
 {
+	struct IQUEUEHEAD *p;
 	struct IKCPSEG *seg;
 	ikcpcb *kcp;
 
 	pthread_mutex_lock(&s->lock);
 	kcp = s->kcp;
 	kcp->rx_rto = kcp->rx_minrto;
-	iqueue_foreach(seg, &kcp->snd_buf, struct IKCPSEG, node) {
+	for (p = kcp->snd_buf.next; p != &kcp->snd_buf; p = p->next) {
+		seg = (struct IKCPSEG *)((char *)p -
+				offsetof(struct IKCPSEG, node));
 		seg->rto = (IUINT32)kcp->rx_minrto;
 		seg->resendts = kcp->current;
 	}
