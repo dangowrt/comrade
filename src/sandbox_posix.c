@@ -2856,8 +2856,6 @@ struct sb_path_beneath {
 #define SB_FS_FILE (SB_FS_EXECUTE | SB_FS_WRITE_FILE | SB_FS_READ_FILE | \
 		    SB_FS_TRUNCATE)
 
-/* Grant `access` beneath `path`; a path that is not present is skipped, and a
- * file keeps only the file-applicable rights so the rule is not rejected. */
 /* One TCP port the process may bind or connect to. */
 static void ll_allow_port(int rs, uint16_t port, uint64_t access)
 {
@@ -2872,6 +2870,8 @@ static void ll_allow_port(int rs, uint16_t port, uint64_t access)
 			 (unsigned)port, errno);
 }
 
+/* Grant `access` beneath `path`; a path that is not present is skipped, and a
+ * file keeps only the file-applicable rights so the rule is not rejected. */
 static void ll_allow(int rs, const char *path, uint64_t access)
 {
 	struct sb_path_beneath pb;
