@@ -270,8 +270,6 @@ static int valid_id(const char *id)
 	return 1;
 }
 
-
-/* The pid a file names, still alive; 0 if the file is absent or it is not. */
 /*
  * Whether a pid is a process that has exited and not yet been collected.
  *
@@ -339,6 +337,7 @@ static int pid_running(long pid)
 	return !pid_exited(pid);
 }
 
+/* The pid a file names, still alive; 0 if the file is absent or it is not. */
 static long pid_in(const char *pp)
 {
 	FILE *f;
@@ -1756,12 +1755,12 @@ int host_stop(const char *id_opt)
 	}
 	/*
 	 * And wait on the process itself where there was one. session_live
-	 * asks the pid file, which the service unlinks early in its exit tail
-	 * and then goes on working -- so between that unlink and the process
-	 * actually going, a session reads as ended while it is still there.
-	 * The pid was taken before anything was signalled, so it is the one
-	 * thing here that does not depend on a file the subject is in the
-	 * middle of removing.
+	 * asks the pid file, which host_headless() unlinks as the last thing
+	 * it does; what remains after that is the return to main() and the
+	 * process exit, and in that window a session reads as ended while the
+	 * process is still there. The pid was taken before anything was
+	 * signalled, so it is the one thing here that does not depend on a
+	 * file the subject removes on its way out.
 	 */
 	if (pid > 0)
 		for (i = 0; i < STOP_GONE_TICKS && pid_running(pid); i++)
