@@ -265,7 +265,7 @@ does not encode:
 An operator may also decline the DHT outright with `--no-dht` (§13), which
 settles both families to `NONE` as soon as the local addresses are known.
 
-**`DIRECT` requires proof** *(PLANNED, 0.2.0)*. The slot is specified and its
+**`DIRECT` requires proof** *(PLANNED, 0.3.0)*. The slot is specified and its
 encoding fixed, but nothing in 0.1.x may mint it: a host cannot tell whether one
 of its own ports is reachable from a stranger's address without an external
 prober, and a UPnP/NAT-PMP/PCP mapping reporting success is not that proof,
