@@ -16,6 +16,7 @@
  */
 
 #include <assert.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -43,6 +44,25 @@
 
 /* And what an open one must beat, well under what `yes` can produce. */
 #define OPEN_MIN 262144
+
+/* More input than a raw terminal holds before a write to it blocks (the 4 KiB
+ * line discipline buffer and the 64 KiB flip buffer behind it on Linux) plus
+ * the slice the host keeps aside for it. */
+#define FEED_BYTES 98304
+
+static void feed_input(ssh_channel chan, size_t n)
+{
+	char buf[1024];
+	size_t off = 0;
+	int w;
+
+	memset(buf, 'k', sizeof(buf));
+	while (off < n) {
+		w = ssh_channel_write(chan, buf, (uint32_t)sizeof(buf));
+		assert(w > 0);
+		off += (size_t)w;
+	}
+}
 
 /* What tx_room answers. It crosses the thread that sets it and the server
  * thread that asks, so it is not a plain int. */
@@ -81,7 +101,9 @@ static void *srv_thread(void *p)
 	memset(&o, 0, sizeof(o));
 	o.hostkey = a->hostkey;
 	memcpy(o.auth, a->auth, sizeof(o.auth));
-	o.command = "yes";		/* more than any window can hold */
+	/* More than any window can hold, on a raw terminal as tmux keeps its
+	 * own, so input nobody reads backs up in it instead of being dropped. */
+	o.command = "stty raw; exec yes";
 	o.use_pty = 1;
 	o.tx_room = room_cb;
 	sshd_serve_fd(a->fd, &o);
@@ -144,6 +166,10 @@ int main(void)
 				sizeof(password)) > 0);
 
 	assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0);
+	/* Or the served command inherits the client's end and its close is
+	 * never an EOF. */
+	assert(fcntl(sp[0], F_SETFD, FD_CLOEXEC) == 0);
+	assert(fcntl(sp[1], F_SETFD, FD_CLOEXEC) == 0);
 	memset(&sa, 0, sizeof(sa));
 	sa.fd = sp[1];
 	sa.hostkey = hostkey;
@@ -190,6 +216,17 @@ int main(void)
 	gated = drain_for(chan, PHASE_MS);
 	printf("gated again: %zu bytes in %dms\n", gated, PHASE_MS);
 	assert(gated <= GATED_MAX);
+
+	/* Input pushed into a command that never reads it while its output
+	 * is held back: a pump that parks in that write never comes back to
+	 * close the session, and the join below hangs. */
+	feed_input(chan, FEED_BYTES);
+	gated = drain_for(chan, PHASE_MS / 3);
+	assert(gated <= GATED_MAX);
+	set_room(1);
+	open_got = drain_for(chan, PHASE_MS / 3);
+	printf("open again: %zu bytes\n", open_got);
+	assert(open_got >= OPEN_MIN / 3);
 
 	ssh_channel_send_eof(chan);
 	ssh_channel_close(chan);

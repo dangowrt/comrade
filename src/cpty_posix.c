@@ -42,6 +42,16 @@ struct cpty {
 	int exit_fd;			/* readable (1 byte) when it exits */
 };
 
+/* The pump polls both ends and must never park in a write the child has
+ * stopped draining, or in a read the poll did not announce. */
+static void nonblock(int fd)
+{
+	int fl = fcntl(fd, F_GETFL);
+
+	if (fl >= 0)
+		fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+}
+
 struct cpty *cpty_spawn(const char *command, int use_pty, int rows, int cols,
 			const char *term)
 {
@@ -87,6 +97,7 @@ struct cpty *cpty_spawn(const char *command, int use_pty, int rows, int cols,
 			execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
 			_exit(127);
 		}
+		nonblock(master);
 		p->pid = c;
 		p->in = p->out = master;
 		p->pty = 1;
@@ -122,6 +133,8 @@ struct cpty *cpty_spawn(const char *command, int use_pty, int rows, int cols,
 		}
 		close(in[0]);
 		close(out[1]);
+		nonblock(in[1]);
+		nonblock(out[0]);
 		p->pid = c;
 		p->in = in[1];
 		p->out = out[0];
@@ -132,9 +145,9 @@ struct cpty *cpty_spawn(const char *command, int use_pty, int rows, int cols,
 struct cpty *cpty_spawn_sp(struct spawner *sp, int ro, int use_pty, int rows,
 			   int cols, const char *term)
 {
-	struct cpty *p;
 	sock_t in = INVALID_SOCK, out = INVALID_SOCK, ex = INVALID_SOCK;
-	int h = -1, fl;
+	struct cpty *p;
+	int h = -1;
 
 	if (!sp)
 		return NULL;
@@ -149,10 +162,10 @@ struct cpty *cpty_spawn_sp(struct spawner *sp, int ro, int use_pty, int rows,
 		free(p);
 		return NULL;
 	}
-	/* cpty_exited polls the exit fd without blocking. */
-	fl = fcntl(ex, F_GETFL);
-	if (fl >= 0)
-		fcntl(ex, F_SETFL, fl | O_NONBLOCK);
+	nonblock(in);
+	if (out != in)
+		nonblock(out);
+	nonblock(ex);			/* cpty_exited polls it */
 	p->sp = sp;
 	p->handle = h;
 	p->in = in;

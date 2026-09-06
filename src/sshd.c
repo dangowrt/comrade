@@ -325,8 +325,7 @@ static int term_flush(struct pump_ctx *c)
 /*
  * One slice of terminal -> channel, when the poll said there is one. The read
  * is capped by the window because writing past it would block the session, and
- * taken once per pass because a pty master is a blocking descriptor: the poll
- * is the whole of what says a read will return.
+ * taken once per pass so the input side gets its turn between slices.
  */
 static void term_pump(struct pump_ctx *c)
 {
