@@ -751,6 +751,23 @@ target_link_libraries(comrade_session PUBLIC
 	comrade_stunprobe comrade_conn comrade_path comrade_ctlproto comrade_dbg
 	comrade_netstate comrade_netroute comrade_nsfacts comrade_hostreap
 	comrade_claimlog comrade_hbeat comrade_replay comrade_dataauth)
+# session.c reads and writes two 64-bit stamps with the __atomic builtins. A
+# target whose widest lock-free atomic is 4 bytes (32-bit MIPS, ARMv5) lowers
+# those to calls into libatomic, so the probe links one and the library is
+# added where the probe fails.
+check_c_source_compiles("
+#include <stdint.h>
+int main(void) { uint64_t v = 0; __atomic_store_n(&v, 1, __ATOMIC_RELAXED);
+	return (int)__atomic_load_n(&v, __ATOMIC_RELAXED) - 1; }"
+	COMRADE_ATOMIC64_LOCK_FREE)
+if(NOT COMRADE_ATOMIC64_LOCK_FREE)
+	find_library(COMRADE_LIBATOMIC atomic)
+	if(NOT COMRADE_LIBATOMIC)
+		message(FATAL_ERROR
+			"64-bit atomics need libatomic on this target and none was found")
+	endif()
+	target_link_libraries(comrade_session PUBLIC ${COMRADE_LIBATOMIC})
+endif()
 
 # The view: the only module that draws to the terminal (MVC).
 # Token QR codes for the dashboard. qrcodegen.c is vendored from Project
