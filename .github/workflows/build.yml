@@ -338,6 +338,34 @@ jobs:
       - name: Build
         run: cmake --build build
 
+      # ThreadSanitizer places its shadow at fixed addresses and refuses to
+      # start if anything is already mapped there. Ubuntu 24.04 ships
+      # vm.mmap_rnd_bits=32, which spreads a PIE binary across exactly that
+      # range, so every instrumented binary dies with "unexpected memory
+      # mapping" before reaching main -- the whole suite, not one test.
+      # Lowering the sysctl would fix it for the entire machine, and these
+      # runners are shared, so randomisation is turned off for the test
+      # processes alone instead: per process, inherited by their children,
+      # and needing no privilege. Measured on a runner-identical guest
+      # (Ubuntu 24.04, mmap_rnd_bits=32): every binary exits 66 plain and 0
+      # under this. A value written to GITHUB_ENV reaches later steps only,
+      # so this sits ahead of every step that runs a binary.
+      - name: Give ThreadSanitizer an address space it can map
+        if: ${{ matrix.sanitize == 'thread' && runner.os == 'Linux' }}
+        run: echo "SAN_LAUNCH=setarch $(uname -m) -R" >> "$GITHUB_ENV"
+
+      # An instrumented runtime that cannot start dies before main and
+      # writes no report, and the thread lanes let the test outcome go, so
+      # that run would pass on an empty report directory. Ask once, here,
+      # where the answer is a failed step in words.
+      - name: Check the instrumented binary starts
+        if: ${{ matrix.sanitize != 'none' && !matrix.analyze }}
+        run: |
+          if ! ${SAN_LAUNCH:-} ./build/comrade --version; then
+            echo "::error::the instrumented binary cannot start; nothing below would be checked"
+            exit 2
+          fi
+
       # --output-on-failure so a flake arrives with its output attached rather
       # than as a bare red cross; --timeout 120 so a hung test fails fast with
       # diagnostics instead of stalling the worker (the e2e tests carry their
@@ -524,21 +552,6 @@ jobs:
 
       # The binary itself, not only the tests: main, the option parsing and the
       # dashboard's own code are reached by nothing in the suite.
-      # ThreadSanitizer places its shadow at fixed addresses and refuses to
-      # start if anything is already mapped there. Ubuntu 24.04 ships
-      # vm.mmap_rnd_bits=32, which spreads a PIE binary across exactly that
-      # range, so every instrumented binary dies with "unexpected memory
-      # mapping" before reaching main -- the whole suite, not one test.
-      # Lowering the sysctl would fix it for the entire machine, and these
-      # runners are shared, so randomisation is turned off for the test
-      # processes alone instead: per process, inherited by their children,
-      # and needing no privilege. Measured on a runner-identical guest
-      # (Ubuntu 24.04, mmap_rnd_bits=32): every binary exits 66 plain and 0
-      # under this.
-      - name: Give ThreadSanitizer an address space it can map
-        if: ${{ matrix.sanitize == 'thread' && runner.os == 'Linux' }}
-        run: echo "SAN_LAUNCH=setarch $(uname -m) -R" >> "$GITHUB_ENV"
-
       - name: Smoke test the binary
         if: ${{ !matrix.analyze }}
         run: |
