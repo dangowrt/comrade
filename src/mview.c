@@ -50,7 +50,7 @@ struct mview {
  */
 static const char *const mv_sb_name[] = {
 	"userns", "mountns", "landlock", "seccomp", "caps", "nonewprivs",
-	"mdwe", "rlimit", "nodump", "job", "mitigation"
+	"mdwe", "rlimit", "nodump", "job", "mitigation", "integrity"
 };
 
 /*

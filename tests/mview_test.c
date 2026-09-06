@@ -86,6 +86,10 @@ int main(void)
 	mview_sandbox(m, SANDBOX_L_RLIMIT, 0);
 	assert(slurp(path, buf, sizeof(buf)));
 	assert(strstr(buf, "\"sandbox\":{\"mask\":128,\"layers\":[\"rlimit\"]}"));
+	/* The highest bit sandbox.h defines has a name too. */
+	mview_sandbox(m, SANDBOX_L_INTEGRITY, 0);
+	assert(slurp(path, buf, sizeof(buf)));
+	assert(strstr(buf, "\"sandbox\":{\"mask\":2048,\"layers\":[\"integrity\"]}"));
 	mview_sandbox(m, 0, 0);
 	assert(slurp(path, buf, sizeof(buf)));
 	assert(strstr(buf, "\"sandbox\":{\"mask\":0,\"layers\":[]}"));

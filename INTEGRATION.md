@@ -212,7 +212,8 @@ server left standing by a service that was killed outright.
   process. `mask` is the layer bitmask (`src/sandbox.h`), `layers` the
   same set by stable name -- `userns`, `mountns`, `landlock`, `seccomp`,
   `caps`, `nonewprivs`, `mdwe`, `rlimit`, `nodump`, `job`, `mitigation`,
-  in that bit order, with a bit this comrade has no name for appearing as
+  `integrity`, in that bit order, with a bit this comrade has no name for
+  appearing as
   `bitN` -- and `filter_insns` the length of the syscall filter that
   installed, in BPF instructions, present only where the platform compiles
   one and the kernel took it. `"mask": 0` with an empty `layers` is the
