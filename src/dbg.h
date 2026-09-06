@@ -4,16 +4,19 @@
 #ifndef COMRADE_DBG_H
 #define COMRADE_DBG_H
 
-/*
- * Opt-in diagnostics. Does nothing unless COMRADE_DEBUG is set in the
- * environment; then each call appends one timestamped line to that file
- * (COMRADE_DEBUG="1" means /tmp/comrade-debug.log). Used to trace terminal
- * sizing across the host and client without disturbing the display.
- */
+#include <stddef.h>
+
+/* Opt-in diagnostics: with COMRADE_DEBUG set, each call appends one
+ * timestamped line to that file ("1" means comrade-debug.log in the
+ * temporary directory). */
 void dbg_logf(const char *fmt, ...)
 #if defined(__GNUC__)
 	__attribute__((format(printf, 1, 2)))
 #endif
 	;
+
+/* The file the log goes to, with the "1" shorthand resolved into buf; NULL
+ * where no log is asked for. */
+const char *dbg_path(char *buf, size_t n);
 
 #endif

@@ -1988,14 +1988,13 @@ static void sb_sigsys(int sig, siginfo_t *si, void *uctx)
 static void sb_warn_arm(int role)
 {
 	struct sigaction sa;
-	const char *path = getenv("COMRADE_DEBUG");
+	char buf[PATH_MAX];
+	const char *path;
 
 	sb_warn_role = role;
-	if (path && path[0]) {
-		if (!strcmp(path, "1"))
-			path = "/tmp/comrade-debug.log";
+	path = dbg_path(buf, sizeof(buf));
+	if (path)
 		sb_warn_fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0600);
-	}
 	memset(&sa, 0, sizeof(sa));
 	sa.sa_sigaction = sb_sigsys;
 	sa.sa_flags = SA_SIGINFO;
@@ -2618,11 +2617,13 @@ static int bind_dev(const char *root, const char *node, int ro)
  * file has to exist before it can be bound, and creating it is what the first
  * log line would do anyway. NULL where there is nothing to grant.
  */
-static const char *dbg_grant(char *dir, size_t dn, const char *dbg)
+static const char *dbg_grant(char *dir, size_t dn, char *path, size_t pn)
 {
+	const char *dbg;
 	char *slash;
 	int fd;
 
+	dbg = dbg_path(path, pn);
 	if (!dbg || dbg[0] != '/')
 		return NULL;
 	if ((size_t)snprintf(dir, dn, "%s", dbg) >= dn)
@@ -2645,9 +2646,10 @@ static const char *dbg_grant(char *dir, size_t dn, const char *dbg)
  * debug log's directory. Shared by the namespace builder below. */
 static int bind_writable(const char *root, const struct sandbox_cfg *cfg)
 {
-	char dir[PATH_MAX];
-	char sandir[PATH_MAX];
 	const char *dbg, *san;
+	char sandir[PATH_MAX];
+	char dbgp[PATH_MAX];
+	char dir[PATH_MAX];
 	int fail = 0;
 
 	if (bind_at(root, cfg->data_dir, cfg->data_dir, 0, 0) < 0)
@@ -2657,7 +2659,7 @@ static int bind_writable(const char *root, const struct sandbox_cfg *cfg)
 		fail = 1;
 	/* The debug log is convenient, not essential -- its bind failing
 	 * (bind_at logs it) does not fail the confinement. */
-	dbg = dbg_grant(dir, sizeof(dir), getenv("COMRADE_DEBUG"));
+	dbg = dbg_grant(dir, sizeof(dir), dbgp, sizeof(dbgp));
 	if (dbg)
 		bind_at(root, dbg, dbg, 0, 0);
 	san = san_log_dir(sandir, sizeof(sandir));
@@ -2898,16 +2900,17 @@ static void ll_allow(int rs, const char *path, uint64_t access)
 
 static int fs_confine_landlock(const struct sandbox_cfg *cfg)
 {
+	uint64_t handled, ro, rwx, rw, net, scoped;
 	struct sb_ruleset_attr attr;
 	char resolv[PATH_MAX];
-	char dir[PATH_MAX];
 	char sandir[PATH_MAX];
 	const char *dbg, *san;
-	uint64_t handled, ro, rwx, rw, net, scoped;
-	long abi;
-	int rs;
+	char dbgp[PATH_MAX];
+	char dir[PATH_MAX];
 	int have_resolv;
 	size_t i;
+	long abi;
+	int rs;
 
 	abi = syscall(__NR_landlock_create_ruleset, (void *)0, (size_t)0,
 		      SB_LANDLOCK_VERSION_QUERY);
@@ -3021,7 +3024,7 @@ static int fs_confine_landlock(const struct sandbox_cfg *cfg)
 	ll_allow(rs, cfg->data_dir, rw);
 	if (cfg->state_dir && cfg->state_dir[0])
 		ll_allow(rs, cfg->state_dir, rw);
-	dbg = dbg_grant(dir, sizeof(dir), getenv("COMRADE_DEBUG"));
+	dbg = dbg_grant(dir, sizeof(dir), dbgp, sizeof(dbgp));
 	if (dbg)
 		ll_allow(rs, dbg, rw);
 	san = san_log_dir(sandir, sizeof(sandir));

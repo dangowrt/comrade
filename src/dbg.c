@@ -10,20 +10,29 @@
 #include "dbg.h"
 #include "oscompat.h"
 
-void dbg_logf(const char *fmt, ...)
+const char *dbg_path(char *buf, size_t n)
 {
 	const char *path = getenv("COMRADE_DEBUG");
-	char dflt[512];
-	struct timespec ts;
-	FILE *f;
-	va_list ap;
 
 	if (!path || !path[0])
+		return NULL;
+	if (strcmp(path, "1"))
+		return path;
+	snprintf(buf, n, "%s/comrade-debug.log", os_tmpdir());
+	return buf;
+}
+
+void dbg_logf(const char *fmt, ...)
+{
+	struct timespec ts;
+	const char *path;
+	char dflt[512];
+	va_list ap;
+	FILE *f;
+
+	path = dbg_path(dflt, sizeof(dflt));
+	if (!path)
 		return;
-	if (!strcmp(path, "1")) {
-		snprintf(dflt, sizeof(dflt), "%s/comrade-debug.log", os_tmpdir());
-		path = dflt;
-	}
 	f = fopen(path, "a");
 	if (!f)
 		return;
