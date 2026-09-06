@@ -79,15 +79,15 @@ include(CheckCSourceCompiles)
 # What the tool reports and whether the tests pass are separate questions, and
 # on e2e under thread they give different answers -- the instrumented binaries
 # are slow enough to miss the timing the tests assert, while reporting nothing
-# wrong. So the report is collected on its own (see COMRADE_SAN_LOG_DIR below)
-# and a job may watch that while letting the outcome go.
+# wrong. So the report is collected on its own, in the directory tests/sanenv.sh
+# points the runtimes at and tests/sanreport.sh reads, and a job may watch that
+# while letting the outcome go.
 #
 set(COMRADE_SANITIZE "none" CACHE STRING
 	"Instrument the build: none, address (+undefined, +leak), or thread")
 set_property(CACHE COMRADE_SANITIZE PROPERTY STRINGS none address thread)
 
 set(COMRADE_SAN_FLAGS "")
-set(COMRADE_SAN_ENV "")
 if(NOT COMRADE_SANITIZE STREQUAL "none")
 	if(COMRADE_SANITIZE STREQUAL "address")
 		set(COMRADE_SAN_FLAGS -fsanitize=address,undefined
@@ -1186,14 +1186,15 @@ if(BUILD_TESTING)
 	# shell and no network, so it runs in every build rather than with the
 	# e2e tests it serves.
 	#
-	# The "harness" label marks a test whose command is a shell script. Under
-	# a memory checker such a test measures the shell: valgrind instruments
-	# the interpreter it was pointed at and does not follow the children the
+	# The "harness" label marks a test valgrind cannot usefully instrument
+	# as a unit test: one whose command is a shell script, where valgrind
+	# measures the interpreter it was pointed at and not the children the
 	# script spawns, so what it reports is the shell's own allocation
-	# behaviour and none of comrade's. The unit memcheck job excludes the
-	# label rather than suppressing a particular shell's internals. The e2e
-	# memcheck job is the other way round: it selects those tests by name
-	# and follows the harness into comrade with --trace-children.
+	# behaviour and none of comrade's; and sandbox_selftest, which forks a
+	# child per probe for the kernel to kill. The unit memcheck job excludes
+	# the label rather than suppressing a particular shell's internals. The
+	# e2e memcheck job is the other way round: it selects those tests by
+	# name and follows the harness into comrade with --trace-children.
 	#
 	if(UNIX)
 		add_test(NAME redact_test
