@@ -4543,6 +4543,15 @@ static void resume_tick(struct conn *c)
 				dbg_logf("resume: primed offer %s", ufrag);
 			}
 		}
+		/* The offer rotated past the one we primed, so this punch is
+		 * against dead credentials: re-gather at once, not at the
+		 * backoff, whether the host moved or picked someone else up. */
+		if (s->remote_set && c->remote_ufrag[0] &&
+		    s->cur_offer_ufrag[0] &&
+		    strcmp(s->cur_offer_ufrag, c->remote_ufrag)) {
+			c->rs_state = 0;
+			return;
+		}
 		if (now >= c->rs_deadline)
 			c->rs_state = 0;
 		return;
