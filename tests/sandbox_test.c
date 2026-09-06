@@ -301,7 +301,10 @@ static int child_ifaddrs_survive(void)
 	memset(&sb, 0, sizeof(sb));
 	sb.role = SANDBOX_CLIENT;
 	sb.data_dir = g_datadir;
-	if (!sandbox_apply(&sb))
+	/* Only a layer that could take an address away makes this a check:
+	 * the core limit alone engages on every Linux. */
+	if (!(sandbox_apply(&sb) & (SANDBOX_L_MOUNTNS | SANDBOX_L_LANDLOCK |
+				    SANDBOX_L_SECCOMP)))
 		return RC_SKIP;
 	after = count_ifaddrs();
 	return after >= before ? RC_OK : RC_FAIL;
