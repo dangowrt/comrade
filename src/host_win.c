@@ -10,11 +10,12 @@
 
 #ifdef _WIN32
 
+#include "cpty.h"			/* wsock.h sets _WIN32_WINNT before libssh */
+
 #include <libssh/libssh.h>
 #include <pthread.h>
 
 #include "conn.h"
-#include "cpty.h"
 #include "dbg.h"
 #include "keys.h"
 #include "oscompat.h"
