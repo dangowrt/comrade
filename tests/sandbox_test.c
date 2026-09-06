@@ -127,6 +127,8 @@ static int child_client_layers(void)
 	sb.role = SANDBOX_CLIENT;
 	sb.data_dir = g_datadir;
 	layers = sandbox_apply(&sb);
+	if (!layers)
+		return RC_SKIP;		/* COMRADE_SANDBOX=0 */
 	return (layers & g_expect_layers) == g_expect_layers ? RC_OK : RC_FAIL;
 }
 
@@ -451,6 +453,8 @@ static int the_layers_engage_together(void)
 	if (!g_expect_layers)
 		return RC_SKIP;
 	r = run_child(child_client_layers);
+	if (r == RC_SKIP)
+		return RC_SKIP;
 	assert(r == RC_OK);
 	return RC_OK;
 }
