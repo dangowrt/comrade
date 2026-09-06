@@ -822,8 +822,9 @@ static int no_new_privs(void)
  * same reason. The terminal pair is per-libc (glibc TCGETS2, musl TCGETS) so
  * either will do; the rest have no alternative spelling.
  */
-#if !defined(FIONBIO) || !defined(FIONREAD) || !defined(TIOCGWINSZ)
-#error "seccomp allowlist: <sys/ioctl.h> named none of FIONBIO/FIONREAD/TIOCGWINSZ"
+#if !defined(FIONBIO) || !defined(FIONREAD) || !defined(TIOCGWINSZ) || \
+    !defined(TIOCSWINSZ)
+#error "seccomp allowlist: <sys/ioctl.h> named none of FIONBIO/FIONREAD/TIOC[GS]WINSZ"
 #endif
 #if !defined(SIOCGIFINDEX) || !defined(SIOCGIFNAME)
 #error "seccomp allowlist: no SIOCGIFINDEX/SIOCGIFNAME; if_nametoindex needs them"
@@ -1728,6 +1729,7 @@ static void sb_rule_ioctl(struct sb_prog *p, unsigned int deflt, int no_pty)
 	sb_eq_ret(p, SIOCGIFNAME, SB_RET_ALLOW);
 	sb_eq_ret(p, TIOCGWINSZ, SB_RET_ALLOW);
 	if (!no_pty) {
+		sb_eq_ret(p, TIOCSWINSZ, SB_RET_ALLOW);
 #ifdef TCGETS
 		sb_eq_ret(p, TCGETS, SB_RET_ALLOW);
 		sb_eq_ret(p, TCSETS, SB_RET_ALLOW);
