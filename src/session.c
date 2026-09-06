@@ -1420,7 +1420,9 @@ static void report_candidates(struct sess *s, const char *sdp)
 				if (inet_pton(fam == 6 ? AF_INET6 : AF_INET,
 					      addr, raw) == 1)
 					netstate_on_candidate(&s->ns, fam,
-							      s->gather_epoch[fam_idx(fam)],
+							      __atomic_load_n(
+							      &s->gather_epoch[fam_idx(fam)],
+							      __ATOMIC_RELAXED),
 							      scope, via, raw,
 							      len, addr);
 			}
@@ -2181,12 +2183,16 @@ static void on_ice_candidate(void *arg, const char *cand)
 			addr, typ) == 2) {
 		if (strchr(addr, ':')) {
 			if (!strcmp(typ, "srflx"))	/* a real v6 STUN reply */
-				ns_post(s, NSF_ROUNDTRIP, 6, s->gather_epoch[1]);
+				ns_post(s, NSF_ROUNDTRIP, 6,
+					__atomic_load_n(&s->gather_epoch[1],
+							__ATOMIC_RELAXED));
 		} else if (!strcmp(typ, "srflx")) {
 			uint8_t b[4];
 
 			__atomic_store_n(&s->have_srflx4, 1, __ATOMIC_RELAXED);
-			ns_post(s, NSF_ROUNDTRIP, 4, s->gather_epoch[0]);
+			ns_post(s, NSF_ROUNDTRIP, 4,
+				__atomic_load_n(&s->gather_epoch[0],
+						__ATOMIC_RELAXED));
 			if (inet_pton(AF_INET, addr, b) == 1)
 				pool_note(s, b);
 		} else if (!strcmp(typ, "host") &&
@@ -3645,8 +3651,10 @@ static int nat_setup(struct conn *c)
 	s->remote_set = 0;
 	/* Stamp before the gather thread can report from it. One agent gathers
 	 * both families, but they move apart, so each gets its own. */
-	s->gather_epoch[0] = netstate_epoch(&s->ns, 4);
-	s->gather_epoch[1] = netstate_epoch(&s->ns, 6);
+	__atomic_store_n(&s->gather_epoch[0], netstate_epoch(&s->ns, 4),
+			 __ATOMIC_RELAXED);
+	__atomic_store_n(&s->gather_epoch[1], netstate_epoch(&s->ns, 6),
+			 __ATOMIC_RELAXED);
 	c->nat = nat_create(&cfg);
 	ctx->agent = c->nat;
 	c->nat_ctx = ctx;
