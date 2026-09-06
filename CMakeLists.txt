@@ -434,6 +434,14 @@ target_include_directories(comrade_sandbox PUBLIC src)
 # The selftest's probe battery creates threads, because the clone3 -> ENOSYS
 # -> clone(CLONE_THREAD) fallback is one of the things it has to prove.
 target_link_libraries(comrade_sandbox PUBLIC comrade_dbg Threads::Threads)
+# Memory write-xor-execute (Linux PR_SET_MDWE). Off only for a build that will
+# run under valgrind, which maps its own shadow memory executable and cannot
+# start under the layer; nothing about a build type says that, so it is asked
+# for by name.
+option(COMRADE_MDWE "Refuse memory that turns executable after being writable (off for a memcheck build)" ON)
+if(COMRADE_MDWE)
+	target_compile_definitions(comrade_sandbox PRIVATE COMRADE_MDWE=1)
+endif()
 
 #
 # A command running on its own terminal: forkpty plus /bin/sh, or a
@@ -897,8 +905,8 @@ if(BUILD_TESTING)
 		# sockets for the foreground). Skips where the kernel offers no
 		# seccomp. It does run under valgrind: the write-xor-execute
 		# layer that used to deny memcheck its own executable mappings
-		# is compiled in for a release only, and the memcheck jobs build
-		# Debug, so the tool and every other layer coexist.
+		# is left out with COMRADE_MDWE=OFF, which the memcheck jobs
+		# pass, so the tool and every other layer coexist.
 		add_executable(sandbox_test tests/sandbox_test.c)
 		target_link_libraries(sandbox_test comrade_sandbox)
 		add_test(NAME sandbox_test COMMAND sandbox_test)

@@ -321,11 +321,10 @@ jobs:
               p=$(brew --prefix "$keg" 2>/dev/null) && [ -n "$p" ] && PP="$PP;$p"
             done
           fi
-          # The memcheck entries build Debug on purpose: the write-xor-execute
-          # layer is compiled in only for a release, because memcheck maps its
-          # own shadow memory executable and cannot run under it. A debug build
-          # therefore keeps every other layer while valgrind watches, instead
-          # of the whole confinement having to be switched off.
+          # The memcheck entries build Debug for the symbols valgrind names
+          # its findings by, and turn the write-xor-execute layer off by
+          # name: memcheck maps its own shadow memory executable and cannot
+          # run under it, and every other layer stays on while it watches.
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=${{ matrix.memcheck && 'Debug' || 'Release' }} \
             -DCMAKE_PREFIX_PATH="$PP" \
@@ -333,7 +332,7 @@ jobs:
             -DCOMRADE_CRYPTO=${{ matrix.crypto }} \
             -DCOMRADE_SANITIZE=${{ matrix.sanitize }} \
             ${{ matrix.analyze && '-DCOMRADE_ANALYZE=ON' || '' }} \
-            ${{ matrix.memcheck && '-DCOMRADE_TEST_TIMEOUT_SCALE=10' || '' }} \
+            ${{ matrix.memcheck && '-DCOMRADE_TEST_TIMEOUT_SCALE=10 -DCOMRADE_MDWE=OFF' || '' }} \
             -DCOMRADE_WERROR=ON
 
       - name: Build
@@ -462,8 +461,8 @@ jobs:
       # mapping valgrind needs after comrade confines itself used to kill
       # valgrind outright, "out of memory: Permission denied", no report and no
       # comrade, with forward_e2e never reaching the point of publishing a
-      # token. That layer is compiled in for a release build only, and these
-      # jobs build Debug, so the tool and every other layer coexist: the
+      # token. That layer is left out with COMRADE_MDWE=OFF, which these
+      # jobs configure with, so the tool and every other layer coexist: the
       # namespaces, the filesystem confinement, the capability drop and the
       # syscall filter are all in force under the reads this step is for.
       - name: Test (valgrind, end to end)
