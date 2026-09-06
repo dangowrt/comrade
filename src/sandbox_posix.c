@@ -1618,6 +1618,9 @@ static const int sb_nr_enosys[] = {
 #ifdef __NR_io_uring_register
 	__NR_io_uring_register,
 #endif
+#ifdef __NR_socketcall
+	__NR_socketcall,	/* arguments in userspace, out of BPF's sight */
+#endif
 	0
 };
 
@@ -3369,6 +3372,19 @@ static int sbp_prctl(void)
 	return SB_PROBE_OK;
 }
 
+#ifdef __NR_socketcall
+static int sbp_socketcall_refused(void)
+{
+	long a[3];
+
+	a[0] = AF_INET;
+	a[1] = SOCK_DGRAM;
+	a[2] = 0;
+	errno = 0;
+	return syscall(__NR_socketcall, 1L, a) == -1 && errno == ENOSYS;
+}
+#endif
+
 /* Denied with an errno, not a death: the probe-and-fall-back carve-outs. */
 static int sbp_carveouts(void)
 {
@@ -3376,6 +3392,10 @@ static int sbp_carveouts(void)
 	errno = 0;
 	if (syscall(__NR_clone3, (void *)0, (size_t)0) != -1 ||
 	    errno != ENOSYS)
+		return SB_PROBE_FAIL;
+#endif
+#ifdef __NR_socketcall
+	if (!sbp_socketcall_refused())
 		return SB_PROBE_FAIL;
 #endif
 	errno = 0;
