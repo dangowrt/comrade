@@ -388,6 +388,8 @@ struct conn {
 	 */
 	int rs_state;
 	uint64_t rs_deadline;
+	uint32_t rs_backoff;		/* the answer-wait between re-claims, from
+					 * RESUME_FIRST_MS up to RESUME_ATTEMPT_MS */
 	struct ice_ctx *resume_ctx;	/* the handover slot; see above */
 	volatile int resume_pending;
 	uint64_t resume_last_ms;	/* host: when a resume punch last began,
@@ -4414,6 +4416,22 @@ static int sig_rebuild(struct sess *s, const char *why)
 	return 0;
 }
 
+/* The answer-wait between re-claims: short at first, so a claim that lost the
+ * race with the host's regather is re-posted in seconds, backing off to the
+ * host's own cadence so a peer that is simply gone is not hammered. */
+#define RESUME_FIRST_MS 2000
+
+static uint32_t resume_backoff(struct conn *c)
+{
+	if (!c->rs_backoff)
+		c->rs_backoff = RESUME_FIRST_MS;
+	else if (c->rs_backoff < RESUME_ATTEMPT_MS)
+		c->rs_backoff *= 2;
+	if (c->rs_backoff > RESUME_ATTEMPT_MS)
+		c->rs_backoff = RESUME_ATTEMPT_MS;
+	return c->rs_backoff;
+}
+
 /*
  * Client-side in-place resume: while the link is lost, run the claim half of
  * the join machinery from inside the live connection -- gather a fresh agent
@@ -4438,6 +4456,7 @@ static void resume_tick(struct conn *c)
 	if (!lost) {
 		if (c->rs_state) {
 			c->rs_state = 0;
+			c->rs_backoff = 0;
 			sig_withdraw(s->sig);
 			dbg_logf("resume: link back");
 		}
@@ -4504,6 +4523,7 @@ static void resume_tick(struct conn *c)
 			sig_redeliver(s->sig);
 			dbg_logf("resume: claim posted");
 			c->rs_state = 2;
+			c->rs_deadline = now + resume_backoff(c);
 		} else if (now >= c->rs_deadline) {
 			c->rs_state = 0;
 		}
