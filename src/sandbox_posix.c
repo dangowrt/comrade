@@ -256,7 +256,8 @@ static const char sb_profile_confine[] =
  * permissions is the same as when it was written in place.
  */
 static const char sb_profile_tty[] =
-"(allow file-ioctl (literal \"/dev/tty\") (regex #\"^/dev/ttys[0-9]+$\"))\n";
+"(allow file-ioctl (literal \"/dev/tty\") (literal \"/dev/ptmx\")\n"
+"  (regex #\"^/dev/ttys[0-9]+$\"))\n";
 
 /*
  * Appended for a role that forwards ports, and left off every other one. A
