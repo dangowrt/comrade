@@ -13,12 +13,14 @@
 # killed whatever pids the file named by then, which were the second run's.
 # A test that passed alone failed in company for that reason and no other.
 #
-# So the swarm is shared and counted rather than owned. `up` joins a swarm that
-# is already running and only builds one when there is none; `down` decrements
-# and only tears down when the last user has gone. mkdir is the lock, because
-# it is atomic everywhere and flock is not on macOS. A count left behind by a
-# run that was killed is not trusted on its own: the recorded pids have to
-# still be alive, or the swarm is rebuilt.
+# So the swarm is shared and its users are recorded rather than counted. `up`
+# joins a swarm that is running and in use and only builds one when there is
+# none; `down` withdraws its user and tears down when no live user is left. A
+# user is the ctest that asked, named by its pid, and is live while that
+# process is: a run that was killed leaves no user behind that counts, so
+# the nodes it started come down with the next `down` and a later `up`
+# rebuilds them from the binary it was given. mkdir is the lock, because it
+# is atomic everywhere and flock is not on macOS.
 #
 # Usage: swarmfix.sh <path-to-comrade-dhtseed> up|down
 set -u
@@ -28,43 +30,77 @@ MODE="${2:?up or down}"
 FILE="${COMRADE_SWARM_FILE:?COMRADE_SWARM_FILE must name where to write the list}"
 PIDF="$FILE.pids"
 DIRF="$FILE.dir"
-NF="$FILE.n"
+USERS="$FILE.users"
 LOCK="$FILE.lock"
+SEEDNAME=$(basename "$SEED")
 
-# Held only across the bookkeeping, never across starting the nodes.
+# Held across the bookkeeping and, on the run that builds the swarm, across
+# starting it. The holder's pid is in the lock, and a lock is stale only when
+# that holder is gone: a wait on a live one is bounded by its work, not a clock.
 swarm_lock() {
 	_i=0
 	while ! mkdir "$LOCK" 2>/dev/null; do
-		# A lock older than a minute belonged to a run that died in it.
-		if [ -d "$LOCK" ] && [ -z "$(find "$LOCK" -maxdepth 0 -mmin -1 2>/dev/null)" ]; then
-			rmdir "$LOCK" 2>/dev/null
+		_h=$(cat "$LOCK/pid" 2>/dev/null)
+		if [ -n "$_h" ] && ! kill -0 "$_h" 2>/dev/null; then
+			rm -rf "$LOCK"
 			continue
 		fi
 		_i=$((_i + 1))
-		[ "$_i" -gt 600 ] && return 1
+		[ "$_i" -gt 3000 ] && return 1
 		sleep 0.1
 	done
+	echo "$$" > "$LOCK/pid"
 	return 0
 }
 
-swarm_unlock() { rmdir "$LOCK" 2>/dev/null || true; }
+swarm_unlock() { rm -rf "$LOCK"; }
 
-# Whether the nodes the pid file names are still there. A count without live
-# nodes is a leftover, not a swarm.
+# A pid that is still one of our nodes, not a number the system has reused.
+seed_pid() {
+	case "$(ps -o comm= -p "$1" 2>/dev/null)" in
+	*"$SEEDNAME"*) return 0 ;;
+	esac
+	return 1
+}
+
+# Whether the nodes the pid file names are still there.
 swarm_live() {
 	[ -s "$PIDF" ] || return 1
 	for _p in $(cat "$PIDF"); do
-		kill -0 "$_p" 2>/dev/null && return 0
+		seed_pid "$_p" && return 0
 	done
 	return 1
 }
 
+# Whether any user recorded is still a running process; the dead are dropped.
+users_live() {
+	_live=1
+	for _u in "$USERS"/*; do
+		[ -e "$_u" ] || continue
+		if kill -0 "$(basename "$_u")" 2>/dev/null; then
+			_live=0
+		else
+			rm -f "$_u"
+		fi
+	done
+	return $_live
+}
+
+swarm_teardown() {
+	for _p in $(cat "$PIDF" 2>/dev/null); do
+		seed_pid "$_p" && kill "$_p" 2>/dev/null
+	done
+	[ -s "$DIRF" ] && rm -rf "$(cat "$DIRF")"
+	rm -rf "$FILE" "$PIDF" "$DIRF" "$USERS"
+}
+
+if [ "${COMRADE_E2E_NET:-0}" = 1 ]; then
+	echo "COMRADE_E2E_NET=1: the real DHT, no swarm to build or take down"
+	exit 0
+fi
+
 case "$MODE" in
 up)
-	if [ "${COMRADE_E2E_NET:-0}" = 1 ]; then
-		echo "COMRADE_E2E_NET=1: the real DHT, no swarm to build"
-		exit 0
-	fi
 	# Detached, so they outlive the process that starts them. setsid is
 	# util-linux's and macOS has none, where nohup does the same for this
 	# purpose; a machine with neither still gets nodes, just ones a stray
@@ -78,27 +114,28 @@ up)
 	fi
 	export SWARM_SPAWN
 	swarm_lock || { echo "swarm up: could not take the lock" >&2; exit 1; }
-	if swarm_live; then
-		_n=$(cat "$NF" 2>/dev/null || echo 0)
-		case "$_n" in ''|*[!0-9]*) _n=0 ;; esac
-		echo $((_n + 1)) > "$NF"
+	mkdir -p "$USERS"
+	if swarm_live && users_live; then
+		touch "$USERS/$PPID"
 		swarm_unlock
 		echo "swarm up: joined the swarm already running"
 		exit 0
 	fi
-	# Nothing alive: any count and any directory left here are a dead run's.
-	[ -s "$DIRF" ] && rm -rf "$(cat "$DIRF")"
-	rm -f "$FILE" "$PIDF" "$DIRF" "$NF"
+	# Nothing alive, or nobody left using what is: a dead run's, or an
+	# older binary's, and either is rebuilt.
+	swarm_teardown
 	. "$(dirname "$0")/swarm.sh"
-	if ! swarm_start "$SEED"; then
-		_rc=$?
+	swarm_start "$SEED"
+	_rc=$?
+	if [ "$_rc" -ne 0 ]; then
 		swarm_unlock
 		exit "$_rc"
 	fi
 	printf '%s' "$COMRADE_DHT_BOOTSTRAP" > "$FILE"
 	printf '%s' "$SWARM_PIDS" > "$PIDF"
 	printf '%s' "$SWARM_DIR" > "$DIRF"
-	echo 1 > "$NF"
+	mkdir -p "$USERS"
+	touch "$USERS/$PPID"
 	swarm_unlock
 	# The count, not the list: this line lands in a workflow log, and the
 	# addresses in it are the runner's own.
@@ -107,19 +144,13 @@ up)
 	;;
 down)
 	swarm_lock || { echo "swarm down: could not take the lock" >&2; exit 0; }
-	_n=$(cat "$NF" 2>/dev/null || echo 0)
-	case "$_n" in ''|*[!0-9]*) _n=0 ;; esac
-	_n=$((_n - 1))
-	if [ "$_n" -gt 0 ]; then
-		echo "$_n" > "$NF"
+	rm -f "$USERS/$PPID"
+	if users_live; then
 		swarm_unlock
-		echo "swarm down: $_n run(s) still using it"
+		echo "swarm down: still in use"
 		exit 0
 	fi
-	# shellcheck disable=SC2046
-	[ -s "$PIDF" ] && kill $(cat "$PIDF") 2>/dev/null
-	[ -s "$DIRF" ] && rm -rf "$(cat "$DIRF")"
-	rm -f "$FILE" "$PIDF" "$DIRF" "$NF"
+	swarm_teardown
 	swarm_unlock
 	echo "swarm down"
 	;;
