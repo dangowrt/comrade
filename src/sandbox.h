@@ -210,12 +210,9 @@ struct sandbox_cfg {
 	int tcp_any;
 };
 
-/*
- * Whether the host should fork a spawner before sandboxing its service: true
- * where the service profile will actually deny exec (Linux with seccomp
- * available; macOS), false where it will not (a seccompless kernel; Windows).
- * Lets the host skip the broker where it would add nothing.
- */
+/* Whether the host should fork a spawner before sandboxing its service: true
+ * where the confinement that follows is one tmux must not inherit (Linux,
+ * macOS), false where nothing would follow (Windows). */
 int sandbox_needs_spawner(void);
 
 /*

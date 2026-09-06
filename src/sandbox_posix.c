@@ -2154,15 +2154,9 @@ static int seccomp_nonet(void)
 #endif /* SB_AUDIT_ARCH */
 #endif /* SYS_seccomp */
 
-/*
- * Whether a filter can actually be installed here: the syscall exists, this
- * build names an audit arch for the architecture it is running on, and the
- * kernel has seccomp compiled in. All three are needed, and the second is the
- * one that is easy to forget -- a kernel can have seccomp while this file has
- * no constant for the architecture, which is most of what OpenWrt ships. The
- * exec denial is what buys the host its spawner, so the same question decides
- * both, and adding an architecture below turns the spawner on there by itself.
- */
+/* Whether a filter can install here: the syscall exists, this build names an
+ * audit arch for the architecture it runs on, and the kernel has seccomp. A
+ * kernel can have seccomp while this file has no constant for the arch. */
 static int seccomp_available(void)
 {
 #if defined(SYS_seccomp) && defined(SB_AUDIT_ARCH)
@@ -3657,10 +3651,8 @@ int sandbox_needs_spawner(void)
 {
 	if (sandbox_disabled())
 		return 0;
-#if defined(__APPLE__)
-	return 1;			/* the Seatbelt profile denies exec */
-#elif defined(__linux__)
-	return seccomp_available();
+#if defined(__APPLE__) || defined(__linux__)
+	return 1;
 #else
 	return 0;
 #endif
