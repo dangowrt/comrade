@@ -102,9 +102,9 @@ access has ended, the service is gone and the state file with it. A
 client still holding the token is told so rather than left waiting: the
 service replaces the mailbox offer with a tombstone on its way out
 (PROTOCOL.md §4.1), so a join attempt fails with an error in a few
-seconds. Idempotent: exit 0 when nothing was running. Without `--id` it
-acts on the single live session and refuses (exit 1) when there are
-several.
+seconds. Idempotent: exit 0, and nothing printed, when nothing was
+running. Without `--id` it acts on the single live session and refuses
+(exit 1) when there are several.
 
 A service that does not go is reported rather than assumed: `stop`
 checks, and exits **3** with a line on stderr naming the session and the

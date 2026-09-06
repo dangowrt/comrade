@@ -22,12 +22,17 @@ redact_output
 
 tmp=$(mktemp -d)
 hpid=""
+holder=""
 
 cleanup() {
 	[ -n "$hpid" ] && {
 		kill -CONT "$hpid" 2>/dev/null
 		kill -KILL "$hpid" 2>/dev/null
 		wait "$hpid" 2>/dev/null
+	}
+	[ -n "$holder" ] && {
+		kill -KILL "$holder" 2>/dev/null
+		wait "$holder" 2>/dev/null
 	}
 	rm -rf "$tmp"
 }
@@ -78,13 +83,19 @@ wait_pid() {
 }
 
 # start <id> -- a headless host with no DHT, so the run stays on this machine
-# and needs no swarm; forwarding-only, so it needs no tmux either.
+# and needs no swarm; forwarding-only, so it needs no tmux either. A host that
+# published its pidfile and then died is a failure with its reason, not a
+# system that cannot run the case.
 start() {
 	_id=$1
 	"$CR" --headless --forward-only --id "$_id" --no-dht \
 		>"$tmp/$_id.json" 2>"$tmp/$_id.err" &
 	hpid=$!
-	wait_pid "$_id"
+	wait_pid "$_id" || return 1
+	sleep 0.2
+	kill -0 "$hpid" 2>/dev/null && return 0
+	fail "the host died after starting"
+	return 1
 }
 
 # ---- 1: nothing was ever published ----------------------------------------
@@ -97,6 +108,9 @@ else
 fi
 
 # ---- 2: a live session ----------------------------------------------------
+# Ended through its own tail, not killed: a service the second signal took at
+# its word exits by that signal, and one that wound down exits 0 and removes
+# its pidfile last.
 start live || skip "the host never started"
 if ! out=$("$CR" stop --id live 2>&1); then
 	fail "stopping a live session reported failure: $out"
@@ -106,7 +120,10 @@ else
 	echo "a live session: ended, and reported as ended"
 fi
 wait "$hpid" 2>/dev/null
+st=$?
 hpid=""
+[ "$st" = 0 ] || fail "the service did not exit through its own tail (status $st)"
+[ ! -e "$COMRADE_STATE_DIR/live.pid" ] || fail "the pidfile outlived the service"
 # And it is gone from the machine interface as well.
 "$CR" show --json | grep -q '"sessions":\[\]' ||
 	fail "show --json still lists a session after stop"
@@ -120,10 +137,13 @@ kill -STOP "$hpid" 2>/dev/null || skip "this system cannot SIGSTOP a process"
 out=$("$CR" stop --id wedged 2>&1)
 sc=$?
 kill -CONT "$hpid" 2>/dev/null
+# INTEGRATION.md promises exit 3 and a line naming the session and the pid.
 if [ "$sc" -eq 0 ]; then
 	fail "stop claimed success against a service it did not end"
-elif ! echo "$out" | grep -q "still running"; then
-	fail "stop failed without saying why: $out"
+elif [ "$sc" -ne 3 ]; then
+	fail "stop exited $sc against a service it did not end, not 3: $out"
+elif ! echo "$out" | grep -q "'wedged' is still running (pid $hpid)"; then
+	fail "stop did not name the session and the pid still running: $out"
 else
 	echo "a service that cannot answer: reported, not claimed as stopped"
 fi
@@ -138,23 +158,21 @@ hpid=""
 # had already ended -- which is the answer a supervisor cannot act on, since
 # waiting for the process to go means waiting for itself.
 #
-# Whether the corpse lingers is the shell's business, not comrade's: dash
-# leaves it until `wait` (this is what CI runs), while bash collects it on its
-# own. So the case is skipped rather than passed where the shell has already
-# reaped, instead of reporting coverage this run did not have.
-#
 # Whether the corpse is still listed when stop looks is the parent's business,
 # and a shell reaps its background children whenever it next runs its own
 # loop -- so started the usual way this case would test nothing here and the
 # real thing on a supervisor that waits differently. The host is given a
 # parent that will never reap instead: a subshell that starts it and then
 # execs sleep, which has no wait of its own. The corpse is then guaranteed to
-# still be listed, on every platform, which is the state being tested.
+# still be listed, on every platform, which is the state being tested -- and
+# it is checked to be, since a corpse that had gone by the time stop looked
+# would make this case pass having tested nothing.
 sh -c '"$1" --headless --forward-only --id killed --no-dht >"$2" 2>"$3" &
        exec sleep 30' sh "$CR" "$tmp/killed.json" "$tmp/killed.err" &
 holder=$!
 wait_pid killed || skip "the third host never started"
 spid=$(cat "$COMRADE_STATE_DIR/killed.pid" 2>/dev/null)
+hpid=$spid
 kill -KILL "$spid" 2>/dev/null
 i=0
 while [ "$i" -lt 50 ] && [ -n "$(ps -o stat= -p "$spid" 2>/dev/null | tr -d ' ')" ] &&
@@ -162,15 +180,24 @@ while [ "$i" -lt 50 ] && [ -n "$(ps -o stat= -p "$spid" 2>/dev/null | tr -d ' ')
 	sleep 0.1
 	i=$((i + 1))
 done
-out=$("$CR" stop --id killed 2>&1)
-sc=$?
-if [ "$sc" -ne 0 ]; then
-	fail "stop reported a service that had already exited: $out"
+state=$(ps -o stat= -p "$spid" 2>/dev/null | cut -c1)
+if [ -z "$state" ]; then
+	skip "the corpse was collected before stop could look at it"
+elif [ "$state" != Z ]; then
+	fail "the killed service is still in state $state after 5s"
 else
-	echo "a service killed outright: reported as ended"
+	out=$("$CR" stop --id killed 2>&1)
+	sc=$?
+	if [ "$sc" -ne 0 ]; then
+		fail "stop reported a service that had already exited: $out"
+	else
+		echo "a service killed outright: reported as ended"
+	fi
 fi
+hpid=""
 kill -KILL "$holder" 2>/dev/null
 wait "$holder" 2>/dev/null
+holder=""
 
 [ "$rc" = 0 ] && echo "stop lifecycle PASSED" || echo "stop lifecycle FAILED"
 exit "$rc"
