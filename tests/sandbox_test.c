@@ -348,15 +348,31 @@ static int probe_udp_and_tcp(void)
 	return RC_TCP_OPEN;
 }
 
-/* A client that was asked for no forwards: it should have lost TCP. */
+/* The Landlock ABI this kernel offers, asked before the filter is on: network
+ * rules arrive with version 4. Seatbelt needs no version and reports 1. */
+static long fs_rules_abi(void)
+{
+#ifdef __linux__
+	return syscall(444, (void *)0, (size_t)0, 1U);
+#else
+	return 4;
+#endif
+}
+
+/* A client that was asked for no forwards: it should have lost TCP, wherever
+ * the platform could refuse it: a Landlock ruleset on a kernel with network
+ * rules, or a Seatbelt profile, which reports the same bit. */
 static int child_forwards_nothing(void)
 {
+	long abi = fs_rules_abi();
 	struct sandbox_cfg sb;
+	int layers;
 
 	memset(&sb, 0, sizeof(sb));
 	sb.role = SANDBOX_CLIENT;
 	sb.data_dir = g_datadir;
-	if (!sandbox_apply(&sb))
+	layers = sandbox_apply(&sb);
+	if (!layers || !(layers & SANDBOX_L_LANDLOCK) || abi < 4)
 		return RC_SKIP;
 	return probe_udp_and_tcp();
 }
@@ -553,12 +569,11 @@ static int the_confinement_keeps_every_local_address(void)
 
 /*
  * TCP follows the forwarding, and it follows it the right way round. The two
- * roles are run against each other rather than against a fixed expectation, so
- * a platform with no TCP restriction at all skips instead of passing
- * vacuously -- but a forwarding role that lost its TCP fails on every
- * platform, because that is the mistake worth catching: it is the pairing
- * whose intuition points the wrong way, and getting it backwards breaks the
- * one service built to forward while the suite otherwise stays green.
+ * roles are run against each other: a forwarding role that lost its TCP fails
+ * on every platform, since that breaks the one service built to forward while
+ * the suite otherwise stays green, and a client with no forwards that kept it
+ * fails wherever the platform could have refused it, which is the property
+ * named. Only a kernel that cannot restrict TCP at all skips.
  */
 static int the_tcp_grant_follows_the_forwards(void)
 {
@@ -569,8 +584,6 @@ static int the_tcp_grant_follows_the_forwards(void)
 		return RC_SKIP;
 	assert(denied != RC_FAIL && granted != RC_FAIL);
 	assert(granted == RC_TCP_OPEN);
-	if (denied == RC_TCP_OPEN)
-		return RC_SKIP;		/* this platform restricts no TCP */
 	assert(denied == RC_TCP_BLOCKED);
 	return RC_OK;
 }
