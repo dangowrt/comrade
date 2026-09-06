@@ -13,11 +13,16 @@
 # alone sees none of it and passes, having checked nothing. Point the runtimes
 # at a directory instead (log_path=DIR/prefix) and the reports survive.
 #
-# Usage: sanreport.sh <log-dir> [expected-minimum-runs]
+# Usage: sanreport.sh <log-dir> [expected-minimum-runs] [valgrind]
+#
+# The word valgrind says the run was a memcheck run, and then the number of
+# verdicts is held to the minimum from zero up: no valgrind, a wrong path or a
+# build without symbols all collapse it to nothing, and nothing is not clean.
 set -u
 
-dir="${1:?usage: sanreport.sh <log-dir> [min-runs]}"
+dir="${1:?usage: sanreport.sh <log-dir> [min-runs] [valgrind]}"
 minruns="${2:-1}"
+mode="${3:-}"
 
 if [ ! -d "$dir" ]; then
 	echo "sanreport: $dir does not exist -- the run did not happen, or the"
@@ -84,6 +89,12 @@ for f in $all; do
 			fi
 		else
 			vgcut="$vgcut $f"
+			# Each finding is written as it happens and the summary
+			# only at exit, so a log cut off after one holds it.
+			if grep -q -E "Invalid |uninitialised|Mismatched |Syscall param|definitely lost" \
+			   "$f" 2>/dev/null; then
+				vgbad="$vgbad $f"
+			fi
 		fi
 	else
 		logs="$logs $f"
@@ -116,11 +127,11 @@ fi
 if [ -z "$logs" ] && [ -z "$vgbad" ]; then
 	# The hole is allowed to be small and not to be everything. Whole-run
 	# failures -- no valgrind, a wrong path, a build without symbols --
-	# collapse the number of verdicts, and that is refused for the same
-	# reason too few runs is. Asked only of a run with nothing else to
-	# report, so a finding is never answered with a complaint about
-	# coverage.
-	if [ "$vgn" -gt 0 ] && [ "$vgn" -lt "$minruns" ]; then
+	# collapse the number of verdicts to nothing, and a memcheck run that
+	# says so is refused for the same reason too few runs is. Asked only
+	# of a run with nothing else to report, so a finding is never answered
+	# with a complaint about coverage.
+	if [ "$mode" = valgrind ] && [ "$vgn" -lt "$minruns" ]; then
 		echo "sanreport: only $vgn of $runs test(s) reached a valgrind verdict,"
 		echo "sanreport: expected at least $minruns. Not a pass."
 		exit 2
@@ -140,8 +151,9 @@ fi
 if [ -n "$vgbad" ]; then
 	echo "sanreport: valgrind reported errors in:"
 	for f in $vgbad; do
-		echo "  $f: $(grep -h -E "ERROR SUMMARY: [1-9][0-9]* errors" "$f" |
-			head -1)"
+		summary=$(grep -h -E "ERROR SUMMARY: [1-9][0-9]* errors" "$f" |
+			head -1)
+		echo "  $f: ${summary:-a finding, and no summary: cut off}"
 	done
 fi
 

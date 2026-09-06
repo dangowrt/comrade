@@ -456,7 +456,7 @@ jobs:
           n1=$(sed -n 's/.*out of \([0-9][0-9]*\).*/\1/p' mc.out | tail -1)
           n2=$(sed -n 's/.*out of \([0-9][0-9]*\).*/\1/p' mc2.out | tail -1)
           echo $(( ${n1:-0} + ${n2:-0} )) > "$LOGS/.ran"
-          sh tests/sanreport.sh "$LOGS" 40; sr=$?
+          sh tests/sanreport.sh "$LOGS" 40 valgrind; sr=$?
           # 1 is a finding, 2 is a run that checked nothing. They mean
           # opposite things -- one says the tool saw a bug, the other that
           # it saw nothing at all -- so they are not collapsed together.
@@ -545,7 +545,7 @@ jobs:
           # Both questions, as everywhere else: what the tool said, and whether
           # the tests passed. A run whose sessions never connected reports no
           # memory errors and has checked nothing, so its verdicts count too.
-          sh tests/sanreport.sh "$LOGS" 1; sr=$?
+          sh tests/sanreport.sh "$LOGS" 1 valgrind; sr=$?
           [ "$sr" != 2 ] || echo "::error::sanreport: this run checked nothing"
           [ "$sr" = 0 ] || exit "$sr"
           exit $rc
