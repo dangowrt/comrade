@@ -320,7 +320,7 @@ int sandbox_apply(const struct sandbox_cfg *cfg)
 		layers |= win_job();
 		/* Last: the drop costs this process the right to adjust its own
 		 * token again, so nothing above may follow it. */
-		layers |= win_low_integrity(cfg->data_dir);
+		layers |= win_low_integrity(cfg->cache_dir);
 	}
 	dbg_logf("sandbox: role=%d layers=0x%x", cfg->role, layers);
 	return layers;

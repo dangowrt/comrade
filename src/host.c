@@ -978,6 +978,7 @@ static int svc_confine(struct svc *v)
 	memset(&sb, 0, sizeof(sb));
 	sb.role = SANDBOX_SERVICE;
 	sb.data_dir = appdir_data();
+	sb.cache_dir = appdir_cache();
 	sb.state_dir = state_dir();
 	sb.no_exec = (v->sp != NULL) || v->forward_only;
 	/* Forwarding-only serves no shell (see sshd.c), so it reaches no pty. */

@@ -168,8 +168,10 @@
 
 struct sandbox_cfg {
 	int role;			/* one of SANDBOX_* above */
-	const char *data_dir;		/* appdir_data(), made writable; may be
-					 * NULL to grant no data directory */
+	const char *data_dir;		/* appdir_data(), readable; may be NULL
+					 * to grant no data directory */
+	const char *cache_dir;		/* appdir_cache(), the one part of it
+					 * made writable; NULL grants none */
 	const char *state_dir;		/* host state dir, writable; NULL unless
 					 * role == SANDBOX_SERVICE */
 	/*

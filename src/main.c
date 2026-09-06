@@ -166,6 +166,7 @@ static int session_connect(const char *arg, int ui_mode, int no_mcast,
 	memset(&sb, 0, sizeof(sb));
 	sb.role = SANDBOX_CLIENT;
 	sb.data_dir = appdir_data();
+	sb.cache_dir = appdir_cache();
 	sb.tcp_bind = tcp_bind;
 	sb.n_tcp_bind = ntcp_bind;
 	sb.tcp_connect = tcp_connect;

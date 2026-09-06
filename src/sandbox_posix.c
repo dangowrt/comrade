@@ -218,8 +218,9 @@ static const char sb_profile_confine[] =
 "  (literal \"/dev/null\")\n"
 "  (literal \"/dev/random\") (literal \"/dev/urandom\"))\n"
 "(allow file-write-data (literal \"/dev/null\"))\n"
+"(allow file-read* (subpath (param \"DATA_DIR\")))\n"
 "(allow file-read* file-write*\n"
-"  (subpath (param \"DATA_DIR\")) (subpath (param \"STATE_DIR\"))\n"
+"  (subpath (param \"CACHE_DIR\")) (subpath (param \"STATE_DIR\"))\n"
 "  (subpath (param \"SAN_DIR\")))\n"
 "(allow signal (target self))\n"
 "(allow sysctl-read\n"
@@ -279,6 +280,9 @@ static const char sb_profile_tcp[] =
 "(allow network-inbound (local tcp \"*:*\"))\n"
 "(allow network-outbound (remote tcp \"*:*\"))\n";
 
+#define SB_PROFILE_MAX (sizeof(sb_profile_confine) + sizeof(sb_profile_tty) + \
+			sizeof(sb_profile_tcp))
+
 /*
  * The foreground profile: it runs the operator's local tmux, so it keeps
  * everything a program normally does -- exec, files, a pty, local (unix)
@@ -333,14 +337,14 @@ static int wants_tcp(const struct sandbox_cfg *cfg)
 
 static int apply_macos(const struct sandbox_cfg *cfg)
 {
-	int layers = 0;
+	char prof[SB_PROFILE_MAX];
+	const char *params[9];
+	char sanbuf[PATH_MAX];
 	char dd[PATH_MAX];
 	char sd[PATH_MAX];
-	char prof[sizeof(sb_profile_confine) + sizeof(sb_profile_tty) +
-		  sizeof(sb_profile_tcp)];
-	const char *params[7];
-	char sanbuf[PATH_MAX];
+	char cd[PATH_MAX];
 	struct rlimit rl;
+	int layers = 0;
 	int confine;
 
 	layers |= limit_core();
@@ -375,20 +379,24 @@ static int apply_macos(const struct sandbox_cfg *cfg)
 
 	if (!cfg->data_dir || !realpath(cfg->data_dir, dd))
 		snprintf(dd, sizeof(dd), "/nonexistent");
+	if (!cfg->cache_dir || !realpath(cfg->cache_dir, cd))
+		snprintf(cd, sizeof(cd), "/nonexistent");
 	if (!cfg->state_dir || !realpath(cfg->state_dir, sd))
-		snprintf(sd, sizeof(sd), "%s", dd);
+		snprintf(sd, sizeof(sd), "%s", cd);
 	params[0] = "DATA_DIR";
 	params[1] = dd;
-	params[2] = "STATE_DIR";
-	params[3] = sd;
-	/* A sanitiser's report destination, and the data directory again where
-	 * there is none: every parameter the profile names has to be given a
-	 * value, and granting that directory twice grants nothing new. */
-	params[4] = "SAN_DIR";
-	params[5] = san_log_dir(sanbuf, sizeof(sanbuf));
-	if (!params[5])
-		params[5] = dd;
-	params[6] = (const char *)0;
+	params[2] = "CACHE_DIR";
+	params[3] = cd;
+	params[4] = "STATE_DIR";
+	params[5] = sd;
+	/* A sanitiser's report destination, and the cache again where there
+	 * is none: every parameter the profile names has to be given a value,
+	 * and granting that directory twice grants nothing new. */
+	params[6] = "SAN_DIR";
+	params[7] = san_log_dir(sanbuf, sizeof(sanbuf));
+	if (!params[7])
+		params[7] = cd;
+	params[8] = (const char *)0;
 	snprintf(prof, sizeof(prof), "%s%s%s", sb_profile_confine,
 		 cfg->no_pty ? "" : sb_profile_tty,
 		 wants_tcp(cfg) ? sb_profile_tcp : "");
@@ -2655,7 +2663,12 @@ static int bind_writable(const char *root, const struct sandbox_cfg *cfg)
 	char dir[PATH_MAX];
 	int fail = 0;
 
-	if (bind_at(root, cfg->data_dir, cfg->data_dir, 0, 0) < 0)
+	/* The data directory read-only, its cache writably over it: the STUN
+	 * list is written by stun-update alone, unconfined. */
+	if (bind_at(root, cfg->data_dir, cfg->data_dir, 0, 1) < 0)
+		fail = 1;
+	if (cfg->cache_dir && cfg->cache_dir[0] &&
+	    bind_at(root, cfg->cache_dir, cfg->cache_dir, 0, 0) < 0)
 		fail = 1;		/* without it the program cannot persist */
 	if (cfg->state_dir && cfg->state_dir[0] &&
 	    bind_at(root, cfg->state_dir, cfg->state_dir, 0, 0) < 0)
@@ -3028,7 +3041,11 @@ static int fs_confine_landlock(const struct sandbox_cfg *cfg)
 	}
 	ll_allow(rs, "/dev/urandom", SB_FS_READ_FILE & handled);
 	ll_allow(rs, "/dev/null", (SB_FS_READ_FILE | SB_FS_WRITE_FILE) & handled);
-	ll_allow(rs, cfg->data_dir, rw);
+	/* The data directory read-only and its cache writably: the STUN list
+	 * is written by stun-update alone, unconfined. */
+	ll_allow(rs, cfg->data_dir, ro);
+	if (cfg->cache_dir && cfg->cache_dir[0])
+		ll_allow(rs, cfg->cache_dir, rw);
 	if (cfg->state_dir && cfg->state_dir[0])
 		ll_allow(rs, cfg->state_dir, rw);
 	dbg = dbg_grant(dir, sizeof(dir), dbgp, sizeof(dbgp));
