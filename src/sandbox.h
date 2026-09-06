@@ -203,8 +203,9 @@ struct sandbox_cfg {
 	 * per-port restriction is skipped: a host learns which port to listen
 	 * on when a client asks it to, long after it is confined. A client does
 	 * know, from its own -L and -R arguments, so it gets the exact ports and
-	 * nothing else. With none of the three set, a role gets no TCP
-	 * whatsoever.
+	 * nothing else. With none of the three set, a role gets no TCP but the
+	 * one exception every port-restricted role keeps: outbound to port 53,
+	 * the resolver's fallback for an answer too big for a datagram.
 	 */
 	const uint16_t *tcp_bind;	/* ports it will listen on */
 	int n_tcp_bind;
