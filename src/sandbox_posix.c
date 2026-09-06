@@ -354,11 +354,12 @@ static int apply_macos(const struct sandbox_cfg *cfg)
 	}
 
 	/*
-	 * The same gate apply_linux() uses, and for the same reason: the fork
-	 * and exec denials below are only correct for a service whose spawning
-	 * is already done elsewhere. A service without a broker runs tmux
-	 * itself, and denying it both would leave every client attach failing
-	 * with nothing to explain it.
+	 * The fork and exec denials below are only correct for a service whose
+	 * spawning is already done elsewhere. A service without a broker runs
+	 * tmux itself, and denying it both would leave every client attach
+	 * failing with nothing to explain it; it keeps what is above, the core
+	 * limit and the ptrace denial, which is all a process without a
+	 * Seatbelt profile can take here.
 	 */
 	confine = cfg->role == SANDBOX_CLIENT ||
 		  (cfg->role == SANDBOX_SERVICE && cfg->no_exec);
@@ -3050,13 +3051,13 @@ static int fs_confine_landlock(const struct sandbox_cfg *cfg)
 
 /*
  * Confine the visible filesystem with both boundaries, because they fail in
- * different places. The mount namespace decides what exists, and it has to
- * bind in whichever directory resolv.conf lives in -- which is /etc on a host
- * with a static one and the whole of /tmp on OpenWrt, where /etc/resolv.conf
- * points into it. Landlock decides what may be reached, so it takes back what
- * the namespace was obliged to make visible; and unlike a read-only bind it
- * covers connecting to a unix socket, which is how the interesting things in
- * those directories are spoken to.
+ * different places. The mount namespace decides what exists: it binds in the
+ * directory resolv.conf lives in, /etc on a host with a static one, and only
+ * the resolver's file where that directory is a shared root such as /tmp on
+ * OpenWrt, where /etc/resolv.conf points into it. Landlock decides what may
+ * be reached, from the same two lists, and unlike a read-only bind it covers
+ * connecting to a unix socket, which is how the interesting things in those
+ * directories are spoken to.
  *
  * Either may be absent and the other still applies. COMRADE_SANDBOX_NO_USERNS
  * forces the Landlock path alone -- for exercising it, and for a host where a
