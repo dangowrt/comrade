@@ -138,6 +138,23 @@ static size_t drain_for(ssh_channel chan, int ms)
 	return got;
 }
 
+/* Consume what was in flight when the gate shut: the slice the pump held and
+ * the window the client had not read. Reads until quiet_ms pass with nothing,
+ * bounded by max_ms. */
+static void drain_quiet(ssh_channel chan, int quiet_ms, int max_ms)
+{
+	uint64_t last = mono_ms(), end = last + (uint64_t)max_ms;
+	char buf[16384];
+	int n;
+
+	while (mono_ms() < end && mono_ms() - last < (uint64_t)quiet_ms) {
+		n = ssh_channel_read_timeout(chan, buf, sizeof(buf), 0, 50);
+		assert(n != SSH_ERROR);
+		if (n > 0)
+			last = mono_ms();
+	}
+}
+
 int main(void)
 {
 	char password[64];
@@ -213,6 +230,7 @@ int main(void)
 
 	/* And it shuts again, on a session that has been carrying bulk. */
 	set_room(0);
+	drain_quiet(chan, 250, 3000);
 	gated = drain_for(chan, PHASE_MS);
 	printf("gated again: %zu bytes in %dms\n", gated, PHASE_MS);
 	assert(gated <= GATED_MAX);
