@@ -320,9 +320,9 @@ struct bep44_engine {
 	/*
 	 * Pinned nodes (rendezvous hints from a token). Unlike seeds, which are
 	 * a cycling ring the routing-table cache overwrites, pinned nodes are
-	 * never overwritten and never aged: they are injected into the initial
-	 * node set of EVERY op, so a token-supplied node is tried on every
-	 * query for the life of the engine, with the global DHT as fallback.
+	 * injected into the initial node set of EVERY op, so a token-supplied
+	 * node is tried on every query, with the global DHT as fallback. One
+	 * silent for longer than B44_PIN_STALE_MS gives way to a new pin.
 	 */
 	struct b44_seed pinned[B44_PINNED_MAX];
 	int npinned;

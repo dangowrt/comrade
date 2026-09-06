@@ -37,15 +37,16 @@ int bep44_bootstrap_add(struct bep44_engine *e, const struct sockaddr *sa,
 int bep44_seed_add(struct bep44_engine *e, const uint8_t id[20],
 		   const struct sockaddr *sa, socklen_t salen);
 /*
- * Pin a node (a token rendezvous hint) permanently: unlike a seed it is never
- * overwritten and never aged, and it is injected into the initial node set of
- * EVERY subsequent op, so it is tried on every query for the life of the
- * engine (with the global DHT as fallback). id may be NULL (address only,
- * which is all a token carries).
+ * Pin a node (a token rendezvous hint): unlike a seed it is not overwritten by
+ * the routing-table cache, and it is injected into the initial node set of
+ * EVERY subsequent op, so it is tried on every query (with the global DHT as
+ * fallback). A pin that has answered recently keeps its slot; once the table
+ * is full, the one silent longest past bep44.c's B44_PIN_STALE_MS gives way
+ * to a new pin. id may be NULL (address only, which is all a token carries).
  */
 int bep44_pin_add(struct bep44_engine *e, const uint8_t id[20],
 		  const struct sockaddr *sa, socklen_t salen);
-/* Unpin a node given up on, freeing its never-aged slot for a replacement. */
+/* Unpin a node given up on, freeing its slot for a replacement. */
 void bep44_pin_del(struct bep44_engine *e, const struct sockaddr *sa,
 		   socklen_t salen);
 int bep44_input(struct bep44_engine *e, const uint8_t *buf, size_t len,
