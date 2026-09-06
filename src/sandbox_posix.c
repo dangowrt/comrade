@@ -3405,6 +3405,46 @@ static int sbp_prctl(void)
 	return SB_PROBE_OK;
 }
 
+/* The terminal ioctls by number, so both libcs' spellings are covered, aimed
+ * at a socketpair end: the kernel answers ENOTTY, and seccomp has judged the
+ * number before it gets to. */
+static int sbp_winsize_query(void)
+{
+	struct winsize ws;
+	int sp[2];
+
+	if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) != 0)
+		return SB_PROBE_FAIL;
+	(void)ioctl(sp[0], TIOCGWINSZ, &ws);
+	close(sp[0]);
+	close(sp[1]);
+	return SB_PROBE_OK;
+}
+
+static int sbp_termios(void)
+{
+	struct termios kt;
+	struct winsize ws;
+	int sp[2];
+
+	if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) != 0)
+		return SB_PROBE_FAIL;
+	memset(&kt, 0, sizeof(kt));
+	memset(&ws, 0, sizeof(ws));
+#ifdef TCGETS
+	(void)ioctl(sp[0], TCGETS, &kt);
+	(void)ioctl(sp[0], TCSETS, &kt);
+#endif
+#ifdef TCGETS2
+	(void)ioctl(sp[0], TCGETS2, &kt);
+	(void)ioctl(sp[0], TCSETS2, &kt);
+#endif
+	(void)ioctl(sp[0], TIOCSWINSZ, &ws);
+	close(sp[0]);
+	close(sp[1]);
+	return SB_PROBE_OK;
+}
+
 #ifdef __NR_socketcall
 static int sbp_socketcall_refused(void)
 {
@@ -3508,6 +3548,8 @@ static const struct sb_probe sb_probes[] = {
 	{ "resolver", sbp_resolver, 0 },
 	{ "signals", sbp_signals, 0 },
 	{ "prctl", sbp_prctl, 0 },
+	{ "ioctl(TIOCGWINSZ)", sbp_winsize_query, 0 },
+	{ "terminal ioctls", sbp_termios, 0 },
 	{ "carve-outs", sbp_carveouts, 0 },
 	{ "execve", sbp_exec, 1 },
 	{ "fork", sbp_fork, 1 },
