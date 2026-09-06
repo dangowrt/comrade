@@ -383,6 +383,23 @@ static void cache_path(int af, char *out, size_t n)
 	snprintf(out, n, "%s/nodes_v%d", appdir_cache(), af == AF_INET6 ? 6 : 4);
 }
 
+/* A record a node could be reached at: a port, and neither an unspecified,
+ * a loopback nor a multicast address. The cache is written by a process a
+ * compromise may reach, so a record is evidence of nothing beyond that. */
+static int cache_rec_ok(int af, const uint8_t *rec)
+{
+	static const uint8_t zero[15];
+
+	if (af == AF_INET6) {
+		if ((rec[16] | rec[17]) == 0 || rec[0] == 0xff)
+			return 0;
+		return memcmp(rec, zero, sizeof(zero)) != 0 || rec[15] > 1;
+	}
+	if ((rec[4] | rec[5]) == 0)
+		return 0;
+	return rec[0] != 0 && rec[0] != 127 && rec[0] < 224;
+}
+
 /* Load one family's cache; returns how many nodes it seeded. */
 static int cache_load_family(struct dhtnode *n, int af)
 {
@@ -396,10 +413,12 @@ static int cache_load_family(struct dhtnode *n, int af)
 	f = fopen(path, "rb");
 	if (!f)
 		return 0;
-	while (fread(rec, 1, rl, f) == rl) {
+	while (loaded < DHTNODE_CACHE_MAX && fread(rec, 1, rl, f) == rl) {
 		struct sockaddr_storage ss;
 		socklen_t sl;
 
+		if (!cache_rec_ok(af, rec))
+			continue;
 		memset(&ss, 0, sizeof(ss));
 		if (af == AF_INET6) {
 			struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)&ss;
