@@ -2619,6 +2619,7 @@ static int bind_dev(const char *root, const char *node, int ro)
  */
 static const char *dbg_grant(char *dir, size_t dn, char *path, size_t pn)
 {
+	char real[PATH_MAX];
 	const char *dbg;
 	char *slash;
 	int fd;
@@ -2632,7 +2633,9 @@ static const char *dbg_grant(char *dir, size_t dn, char *path, size_t pn)
 	if (!slash || slash == dir)
 		return NULL;
 	*slash = '\0';
-	if (!dir_is_shared(dir))
+	if (!realpath(dir, real))
+		return NULL;
+	if (!dir_is_shared(real))
 		return dir;
 	fd = open(dbg, O_WRONLY | O_CREAT | O_APPEND, 0600);
 	if (fd < 0)
