@@ -460,14 +460,15 @@ static void sp_escalate(struct sp_state *s)
  * -Wanalyzer-fd-leak cannot follow a descriptor into fds[] and back out
  * through the loop at the end that closes every entry: the count is dynamic,
  * so the checker gives up and calls the last one parked there leaked. Every
- * descriptor this function opens or is handed goes into that array, and the
- * array is drained before it returns. Scoped to this one function rather than
- * the file, because the checker has found real leaks in the rest of it. GCC 13
- * reports it and later versions do not, so the build has to carry this whoever
- * compiles it.
+ * descriptor this function opens or is handed goes into that array and is
+ * closed from it, but one: the exit pipe's write end is parked in the handle
+ * table and closed by sp_reap(), which the checker cannot see either. Scoped
+ * to this one function rather than the file, because the checker has found
+ * real leaks in the rest of it. GCC 13 reports it and later versions do not;
+ * older ones do not know the option and would diagnose the pragma itself.
  */
 #pragma GCC diagnostic push
-#if defined(__GNUC__) && !defined(__clang__)
+#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 13
 #pragma GCC diagnostic ignored "-Wanalyzer-fd-leak"
 #endif
 static void sp_handle(struct sp_state *s, const struct sp_req *req)
