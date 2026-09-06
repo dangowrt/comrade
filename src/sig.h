@@ -231,6 +231,12 @@ int sig_locate(struct sig *s);
  * how hard to keep trying.
  */
 void sig_set_family_up(struct sig *s, int family, int up);
+
+/* The network generation stamped into our own posted slot, and the one read
+ * back from the peer's. A host bumps its own on every move so a peer can tell a
+ * fresh offer that only rotated credentials from one that changed networks. */
+void sig_set_gen(struct sig *s, uint32_t gen);
+uint32_t sig_peer_gen(const struct sig *s);
 /* Host: adopt an already-known rendezvous node (from a persisted token) as the
  * located anchor and keep it warm with the direct store, instead of locating a
  * fresh one -- so the token stays stable across idle re-attempts. */

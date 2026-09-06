@@ -35,10 +35,10 @@ static void for_dht_check(void)
 	char out[2048];
 	int n, r;
 
-	n = candpack_encode(sdp, 1, buf, sizeof(buf));
+	n = candpack_encode(sdp, 1, 0, buf, sizeof(buf));
 	assert(n > 0);
 
-	r = candpack_decode(buf, (size_t)n, out, sizeof(out));
+	r = candpack_decode(buf, (size_t)n, NULL, out, sizeof(out));
 	assert(r > 0);
 
 	/* ufrag/pwd preserved (libjuice rejects a description lacking them). */
@@ -68,9 +68,9 @@ static void full_set_check(void)
 
 	/* Permissive keeps every on-link address, including private v4 and the
 	 * link-local v6 that same-segment peers use. All five survive. */
-	n = candpack_encode(sdp, 0, buf, sizeof(buf));
+	n = candpack_encode(sdp, 0, 0, buf, sizeof(buf));
 	assert(n > 0);
-	r = candpack_decode(buf, (size_t)n, out, sizeof(out));
+	r = candpack_decode(buf, (size_t)n, NULL, out, sizeof(out));
 	assert(r > 0);
 	assert(strstr(out, "192.168.0.2"));
 	assert(strstr(out, "10.1.2.3"));
@@ -85,8 +85,27 @@ static void no_creds_check(void)
 
 	/* Nothing packable without credentials. */
 	n = candpack_encode("a=candidate:1 1 UDP 100 203.0.113.5 9 typ host\n", 1,
-			    buf, sizeof(buf));
+			    0, buf, sizeof(buf));
 	assert(n == 0);
+}
+
+/* The offer's network generation rides the packed slot and comes back whole. */
+static void gen_check(void)
+{
+	uint8_t buf[512];
+	char out[2048];
+	uint32_t g = 0;
+	int n, r;
+
+	n = candpack_encode(sdp, 1, 0xdeadbeef, buf, sizeof(buf));
+	assert(n > 0);
+	r = candpack_decode(buf, (size_t)n, &g, out, sizeof(out));
+	assert(r > 0);
+	assert(g == 0xdeadbeef);
+	n = candpack_encode(sdp, 1, 0, buf, sizeof(buf));
+	assert(n > 0);
+	r = candpack_decode(buf, (size_t)n, &g, out, sizeof(out));
+	assert(r > 0 && g == 0);
 }
 
 int main(void)
@@ -94,6 +113,7 @@ int main(void)
 	for_dht_check();
 	full_set_check();
 	no_creds_check();
+	gen_check();
 	printf("candpack_test: all checks passed\n");
 	return 0;
 }

@@ -9,7 +9,7 @@
 #include "candpack.h"
 #include "candpolicy.h"
 
-#define CANDPACK_VERSION 1
+#define CANDPACK_VERSION 2
 
 #define CT_HOST 0
 #define CT_SRFLX 1
@@ -75,7 +75,8 @@ static int cred_value(const char *line, const char *key, char *out, size_t max)
 	return 1;
 }
 
-int candpack_encode(const char *sdp, int for_dht, uint8_t *out, size_t max)
+int candpack_encode(const char *sdp, int for_dht, uint32_t gen, uint8_t *out,
+		    size_t max)
 {
 	struct cand_policy pol;
 	char ufrag[257], pwd[257];
@@ -121,9 +122,13 @@ int candpack_encode(const char *sdp, int for_dht, uint8_t *out, size_t max)
 
 	ul = (int)strlen(ufrag);
 	pl = (int)strlen(pwd);
-	if (max < (size_t)(1 + 1 + ul + 1 + pl + 1))
+	if (max < (size_t)(1 + 4 + 1 + ul + 1 + pl + 1))
 		return -1;
 	out[o++] = CANDPACK_VERSION;
+	out[o++] = (uint8_t)(gen >> 24);
+	out[o++] = (uint8_t)(gen >> 16);
+	out[o++] = (uint8_t)(gen >> 8);
+	out[o++] = (uint8_t)gen;
 	out[o++] = (uint8_t)ul;
 	memcpy(out + o, ufrag, (size_t)ul);
 	o += (size_t)ul;
@@ -184,7 +189,8 @@ int candpack_encode(const char *sdp, int for_dht, uint8_t *out, size_t max)
 	return (int)o;
 }
 
-int candpack_decode(const uint8_t *in, size_t in_len, char *out, size_t max)
+int candpack_decode(const uint8_t *in, size_t in_len, uint32_t *gen, char *out,
+		    size_t max)
 {
 	size_t i = 0;
 	int o = 0, r;
@@ -193,6 +199,12 @@ int candpack_decode(const uint8_t *in, size_t in_len, char *out, size_t max)
 
 	if (in_len < 1 || in[i++] != CANDPACK_VERSION)
 		return -1;
+	if (i + 4 > in_len)
+		return -1;
+	if (gen)
+		*gen = ((uint32_t)in[i] << 24) | ((uint32_t)in[i + 1] << 16) |
+		       ((uint32_t)in[i + 2] << 8) | (uint32_t)in[i + 3];
+	i += 4;
 	if (i >= in_len)
 		return -1;
 	ul = in[i++];

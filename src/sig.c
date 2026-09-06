@@ -168,6 +168,10 @@ struct sig {
 	char my_ufrag[64];		/* our claim's ICE ufrag: recognises our
 					 * own (possibly superseded) answer in
 					 * the slot, see mailbox_note_own_answer */
+	uint32_t my_gen;		/* our offer's network generation, stamped
+					 * into the packed slot; the peer's, read
+					 * back off its slot, is peer_gen */
+	uint32_t peer_gen;
 
 	int locate;
 	int put_inflight;		/* a convergent host store is running */
@@ -482,7 +486,7 @@ int sig_post(struct sig *s, const uint8_t *data, size_t len)
 	memcpy(sdp, data, len);
 	sdp[len] = '\0';
 	sdp_ufrag_of(sdp, s->my_ufrag, sizeof(s->my_ufrag));
-	plen = candpack_encode(sdp, 1, packed, sizeof(packed));
+	plen = candpack_encode(sdp, 1, s->my_gen, packed, sizeof(packed));
 	if (plen <= 0)
 		return -1;
 	/*
@@ -674,6 +678,16 @@ void sig_set_family_up(struct sig *s, int family, int up)
 		s->up6 = up;
 	else
 		s->up4 = up;
+}
+
+void sig_set_gen(struct sig *s, uint32_t gen)
+{
+	s->my_gen = gen;
+}
+
+uint32_t sig_peer_gen(const struct sig *s)
+{
+	return s->peer_gen;
 }
 
 int sig_locate(struct sig *s)
@@ -989,7 +1003,7 @@ static void deliver_peer(struct sig *s, const uint8_t *sealed, size_t len)
 		refuse_slot(s, sealed, len);
 		return;
 	}
-	slen = candpack_decode(packed, (size_t)n, sdp, sizeof(sdp));
+	slen = candpack_decode(packed, (size_t)n, &s->peer_gen, sdp, sizeof(sdp));
 	if (slen < 0)
 		return;
 	if (s->cb)
@@ -1224,7 +1238,7 @@ static void deliver_peer_mcast(struct sig *s, const uint8_t *sealed, size_t len,
 			NULL, 0);
 	if (n < 0)
 		return;
-	slen = candpack_decode(packed, (size_t)n, sdp, sizeof(sdp));
+	slen = candpack_decode(packed, (size_t)n, &s->peer_gen, sdp, sizeof(sdp));
 	if (slen >= 0 && s->cb && !(s->is_host && s->mcast_claims))
 		s->cb(s->arg, (const uint8_t *)sdp, (size_t)slen);
 

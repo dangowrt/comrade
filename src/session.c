@@ -282,6 +282,9 @@ struct conn {
 	char remote_ufrag[40];
 	char remote_pwd[40];		/* which attempt of that peer, so a later
 					 * one can take this punch's place */
+	uint32_t remote_gen;		/* the offer's network generation when it
+					 * primed us: a higher one now is a move,
+					 * not a mere pickup rotation */
 
 	/*
 	 * What this connection's probes are sealed under. Until both ends have
@@ -3192,6 +3195,10 @@ static int offer_moved_on(struct conn *c)
 		return 0;
 	if (!strcmp(s->cur_offer_ufrag, c->remote_ufrag))
 		return 0;
+	/* A higher generation than primed us is a move, not a pickup rotation:
+	 * the offer's candidates are new, so re-claim at once with no floor. */
+	if (sig_peer_gen(s->sig) > c->remote_gen)
+		return strcmp(s->cur_offer_ufrag, s->regathered_for) != 0;
 	/* The long floor is only for a client being punched, whose claim was
 	 * taken up; one never picked up, never in the slot or queued over by a
 	 * rival, re-claims on the short floor, not a punch window it is not in. */
@@ -4348,6 +4355,10 @@ static int sig_arm(struct sess *s)
 	 * for the rest of the session, and never find its rendezvous. */
 	sig_set_family_up(s->sig, 4, netstate_conn(&s->ns, 4) == NET_CONN_UP);
 	sig_set_family_up(s->sig, 6, netstate_conn(&s->ns, 6) == NET_CONN_UP);
+	/* Our offer carries the generation of the network it was gathered on, so
+	 * a peer tells a move from a mere credential rotation. A rebuild follows
+	 * a move, so the current netgen is what this fresh signaller stamps. */
+	sig_set_gen(s->sig, __atomic_load_n(&s->netgen, __ATOMIC_RELAXED));
 	if (s->lan) {
 		sig_set_direct_port(s->sig, lanlink_port(s->lan));
 		if (host_is_multiuser(cfg)) {
@@ -4532,6 +4543,7 @@ static void resume_tick(struct conn *c)
 				cand_sdp_ufrag(s->peer_sdp, ufrag, sizeof(ufrag));
 				snprintf(c->remote_ufrag,
 					 sizeof(c->remote_ufrag), "%s", ufrag);
+				c->remote_gen = sig_peer_gen(s->sig);
 				s->remote_set = 1;
 				dbg_logf("resume: primed offer %s", ufrag);
 			}
@@ -7384,6 +7396,7 @@ int session_run(const struct session_cfg *cfg)
 				cand_sdp_ufrag(s.peer_sdp, ufrag, sizeof(ufrag));
 				snprintf(s.c.remote_ufrag, sizeof(s.c.remote_ufrag),
 					 "%s", ufrag);
+				s.c.remote_gen = sig_peer_gen(s.sig);
 				/* The claimant a single-connection host serves is
 				 * the identity in the answer it takes up, as
 				 * lan_drain and the turnstile record theirs. */
