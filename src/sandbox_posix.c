@@ -60,6 +60,26 @@ static int sandbox_disabled(void)
 # define SB_INSTRUMENTED 1
 #endif
 
+/* LeakSanitizer's exit scan forks a tracer and reads /proc, which a confined
+ * role denies, so it is turned off once confined rather than the sandbox
+ * widened to host it; unconfined tests still get it, release builds no symbol. */
+#ifdef SB_INSTRUMENTED
+#include <sanitizer/lsan_interface.h>
+static volatile int sb_lsan_off;
+int __lsan_is_turned_off(void)
+{
+	return sb_lsan_off;
+}
+static void sb_lsan_disable(void)
+{
+	sb_lsan_off = 1;
+}
+#else
+static void sb_lsan_disable(void)
+{
+}
+#endif
+
 /*
  * The directory a sanitiser has been told to write its reports into, or NULL.
  *
@@ -402,6 +422,7 @@ static int apply_macos(const struct sandbox_cfg *cfg)
 		 wants_tcp(cfg) ? sb_profile_tcp : "");
 	if (seatbelt(prof, params))
 		layers |= SANDBOX_L_SECCOMP | SANDBOX_L_LANDLOCK;
+	sb_lsan_disable();
 	return layers;
 }
 
@@ -3134,6 +3155,8 @@ static int apply_linux(const struct sandbox_cfg *cfg)
 	layers |= drop_caps();
 	layers |= no_new_privs();
 	layers |= seccomp_apply(cfg, confine);
+	if (confine)
+		sb_lsan_disable();
 	return layers;
 }
 
