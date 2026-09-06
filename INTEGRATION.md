@@ -85,8 +85,9 @@ and its tokens are gone, because it is the only file that names the
 process: a service still winding down -- or wedged on its way out --
 stays a session `stop` can act on and `show` can resolve, rather than
 becoming an invisible process still holding the port. A pidfile naming a
-pid that is not running is stale state, and any comrade invocation
-sweeps it.
+pid that is not running is stale state, and the next comrade invocation
+that starts or stops a session sweeps it; `show`, `capture` and
+`attach` read the state as it is.
 
     comrade stop [--id NAME]
 
