@@ -6986,6 +6986,7 @@ static int host_turnstile(struct sess *s)
 				    s->admitted_n >= cfg->host_admit_max) {
 					dbg_logf("host: admission budget spent "
 						 "-- claim ignored");
+					sig_release(s->sig);
 					s->have_peer_sdp = 0;
 					break;
 				}
