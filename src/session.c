@@ -1602,8 +1602,8 @@ static int fan_local_sdp(struct sess *s)
 
 /*
  * "v6 direct": a host reaches its own global v6 at the address the kernel
- * sources outbound from, which we learn without STUN via source_addr's connect
- * trick. That is the privacy (temporary) address where RFC 4941 is enabled and
+ * sources outbound from, which we learn without STUN via net_source_addr.
+ * That is the privacy (temporary) address where RFC 4941 is enabled and
  * the stable one otherwise -- either way, the address we effectively listen on.
  * libjuice instead enumerates the interface's stable address, which need not be
  * the source and is a tracking handle besides. So rewrite the one global v6
@@ -3565,21 +3565,6 @@ static int on_stream_output(void *arg, const uint8_t *data, size_t len)
 	return transport_send((struct conn *)arg, data, len);
 }
 
-/*
- * Ask the kernel which local address it would source outbound packets from
- * toward a generic global destination. UDP connect() sends no packet; it only
- * triggers route and source-address selection, disclosing nothing. Used to
- * bind ICE to its real source so its host candidate matches what the peer
- * sees, which is what a no-STUN path needs.
- *
- * raw/rawlen optionally receive the address, so a caller compares addresses
- * rather than the two spellings of one.
- */
-static int source_addr(int family, char *out, size_t outlen)
-{
-	return net_source_addr(family, out, outlen, NULL, NULL);
-}
-
 /* A fresh source port: one port carries one path, so each re-gather draws its
  * own rather than colliding with the port a parked agent still holds. */
 static void conn_fresh_port(struct conn *c)
@@ -3635,7 +3620,6 @@ static void conn_gen_ice(struct conn *c)
 static int nat_setup(struct conn *c)
 {
 	struct sess *s = c->sess;
-	static char bind_addr[64];
 	struct nat_config cfg;
 	struct ice_ctx *ctx;
 
@@ -3656,12 +3640,6 @@ static int nat_setup(struct conn *c)
 		cfg.stun_port = colon ? (uint16_t)atoi(colon + 1) : 3478;
 		if (!cfg.stun_port)
 			cfg.stun_port = 3478;
-	}
-	if (!cfg.stun_host && !(s->cfg->sig_flags & SIG_MCAST)) {
-		int af = s->cfg->family == 4 ? AF_INET : AF_INET6;
-
-		if (!source_addr(af, bind_addr, sizeof(bind_addr)))
-			cfg.bind_address = bind_addr;
 	}
 	cfg.bind_port = c->bind_port;
 	cfg.ice_ufrag = c->ice_ufrag;
