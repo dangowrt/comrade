@@ -6329,6 +6329,8 @@ static void punch_scan(struct sess *s, struct worker *ws, struct conn **punching
 				}
 				c->nat = NULL;
 				c->nat_ctx = NULL;
+				snprintf(t->remote_pwd, sizeof(t->remote_pwd),
+					 "%s", c->remote_pwd);
 				__atomic_store_n(&t->resume_pending, 0,
 						 __ATOMIC_RELAXED);
 				punching[i] = NULL;
