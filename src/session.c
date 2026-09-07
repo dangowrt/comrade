@@ -3503,12 +3503,25 @@ static void host_lan_recv(void *arg, const struct sockaddr *src, socklen_t srcle
 		probe_adopt(s, data, len, &mapped);
 }
 
+/* Trickle the peer's latest candidates into an agent still punching; same
+ * credentials let libjuice add the new lines and ignore repeats. Skipped once
+ * connected, when redelivered dups only churn the candidate table. */
+static void conn_amend_remote(struct conn *c, struct sess *s)
+{
+	char filtered[NAT_SDP_MAX];
+
+	if (!c || !c->nat || nat_connected(c->nat))
+		return;
+	sdp_filter_peer(s->peer_sdp, s->cfg->family, filtered,
+			sizeof(filtered));
+	nat_set_remote_description(c->nat, filtered);
+}
+
 static void on_peer_offer(void *arg, const uint8_t *data, size_t len)
 {
 	struct sess *s = arg;
 	struct conn *c = s->offer_conn;
 	char incoming[NAT_SDP_MAX];
-	char filtered[NAT_SDP_MAX];
 	char ufrag[40];
 
 	if (!c)
@@ -3538,13 +3551,9 @@ static void on_peer_offer(void *arg, const uint8_t *data, size_t len)
 	}
 	s->have_peer_sdp = 1;
 	/* Later arrivals are fresh candidates (multicast trickles one source at
-	 * a time); feed them straight into the already-primed agent -- but not
-	 * once connected, when the mailbox GET keeps redelivering the same set and
-	 * re-adding it only churns the agent (and logs "max candidates"). */
-	if (c->nat && s->remote_set && !nat_connected(c->nat)) {
-		sdp_filter_peer(s->peer_sdp, s->cfg->family, filtered, sizeof(filtered));
-		nat_set_remote_description(c->nat, filtered);
-	}
+	 * a time); feed them into the already-primed agent. */
+	if (s->remote_set)
+		conn_amend_remote(c, s);
 }
 
 /*
@@ -6126,6 +6135,28 @@ static int punch_tried_again(const struct sess *s, struct conn *const *punching,
 	return 0;
 }
 
+static struct conn *punch_by_ufrag(struct conn *const *punching,
+				   const struct sess *s, const char *ufrag)
+{
+	int i;
+
+	if (!ufrag[0])
+		return NULL;
+	for (i = 0; i < HOST_MAX_WORKERS; i++)
+		if (punching[i] && !strcmp(s->punch_ufrag[i], ufrag))
+			return punching[i];
+	return NULL;
+}
+
+static void punch_amend_repost(struct conn *const *punching, struct sess *s,
+			       const char *ufrag, const char *pwd)
+{
+	struct conn *pc = punch_by_ufrag(punching, s, ufrag);
+
+	if (pc && !strcmp(pc->remote_pwd, pwd))
+		conn_amend_remote(pc, s);
+}
+
 /* How long the punch running for this claimant has had, if there is one: a
  * fresh ask that arrives inside the floor is turned away rather than served,
  * so the punch already running for it keeps its budget. */
@@ -6865,6 +6896,8 @@ static int host_turnstile(struct sess *s)
 						 "lanq=%d justserved=%d made=%d",
 						 cu, cp, w ? 1 : 0, again, adm,
 						 lanq, just, made);
+
+					punch_amend_repost(punching, s, cu, cp);
 
 					/*
 					 * The very attempt this worker was
