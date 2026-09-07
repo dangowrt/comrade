@@ -5025,7 +5025,6 @@ static int conn_run(struct conn *c, int drive_sig)
 			struct nat_agent *old = c->nat;
 			struct ice_ctx *old_ctx = c->nat_ctx;
 
-			conn_drop_ice_path(c);
 			c->nat = got->agent;	/* bound to it for life */
 			c->nat_ctx = got;
 			__atomic_store_n(&c->resume_ctx, (struct ice_ctx *)0,
