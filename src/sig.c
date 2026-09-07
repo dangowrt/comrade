@@ -22,22 +22,6 @@
 /* the mcast value prepends a 2-byte direct-transport port to the candpack */
 #define SIG_MCAST_SEALED_MAX (2 + SIG_MAX_VALUE + SEAL_OVERHEAD)
 #define SIG_SDP_MAX 4096		/* raw ICE description in/out of candpack */
-/*
- * How long the candidates must have stopped arriving before an offer that
- * changed is stored.
- *
- * A host gathers over seconds and posts again for every candidate, and each
- * post is a round trip and a sequence bump for a description about to be
- * superseded a moment later. Waiting for the arrivals to stop -- every new one
- * putting the wait back to the beginning -- stores the settled description
- * once instead.
- *
- * THE FIRST OFFER IS NEVER HELD BACK. Nothing can find this host until one is
- * stored, so trading that latency for tidiness would spend the one number that
- * matters. The wait applies from the second offer on, which is where the
- * repetition is.
- */
-#define SIG_OFFER_SETTLE_MS 5000
 
 #define SIG_DHT_GET_MS 1000
 #define SIG_DHT_PUT_MS 1000		/* re-run the convergent store/gather this
@@ -161,8 +145,6 @@ struct sig {
 	int have_peer_claim_pk;
 	uint8_t my_packed[SIG_MAX_VALUE];	/* staged before it can be boxed */
 	size_t my_packed_len;
-	uint64_t settle_ms;		/* host: hold the store until the
-					 * candidates have stopped arriving */
 	uint64_t my_ident;		/* our description sans its candidates:
 					 * a change here is not gathering */
 	char my_ufrag[64];		/* our claim's ICE ufrag: recognises our
@@ -368,14 +350,6 @@ static void sdp_ufrag_of(const char *sdp, char *out, size_t outlen)
 	out[i] = '\0';
 }
 
-uint64_t sig_offer_settle_until(int is_host, int stored_before,
-			       int only_candidates, uint64_t now)
-{
-	if (!is_host || !stored_before || !only_candidates)
-		return 0;		/* due at once */
-	return now + SIG_OFFER_SETTLE_MS;
-}
-
 /*
  * Build what goes in our slot from the packed description we hold, and stage
  * it. The host prefixes the key claims are boxed to; a client boxes to that
@@ -447,8 +421,8 @@ static int sig_stage(struct sig *s)
  * name for itself. Candidate lines are left out, so two descriptions differing
  * only in how many candidates have turned up so far hash the same.
  *
- * A collision would delay one offer by the settle window and nothing else,
- * which is why a hash is enough to decide this.
+ * A collision would at worst treat one change as the wrong kind for a single
+ * put, nothing worse, so a hash is enough to decide this.
  */
 static uint64_t sdp_identity(const char *sdp)
 {
@@ -504,13 +478,13 @@ int sig_post(struct sig *s, const uint8_t *data, size_t len)
 	if (changed) {
 		uint64_t ident = sdp_identity(sdp);
 
-		s->settle_ms = sig_offer_settle_until(s->is_host,
-						      s->puts_ok != 0,
-						      ident == s->my_ident,
-						      now_ms());
+		/* News (rotation, fresh password, rebuilt agent, first offer)
+		 * stores at once; a candidate-only amendment rides the put
+		 * cadence and the peer-change nudge, not a store per candidate. */
+		if (ident != s->my_ident || !s->puts_ok)
+			s->next_put_ms = 0;
 		s->my_ident = ident;
 	}
-	s->next_put_ms = 0;
 	s->next_mcast_ms = 0;
 	return 0;
 }
@@ -549,14 +523,13 @@ int sig_rotate(struct sig *s, const uint8_t *offer, size_t len)
 		return rc;
 	mailbox_arm_release(&s->mb);	/* omit the answer slot on the next write */
 	s->have_last = 0;	/* re-deliver the next answer even if identical */
-	s->settle_ms = 0;	/* the turnstile is a mutex: due now */
 	return 0;
 }
 
 void sig_release(struct sig *s)
 {
 	mailbox_arm_release(&s->mb);
-	s->settle_ms = 0;		/* the turnstile is a mutex: due now */
+	s->next_put_ms = 0;		/* the turnstile is a mutex: due now */
 	/*
 	 * Emptying the slot means the next answer is new business even if it is
 	 * the same bytes, exactly as after a rotate. A client whose claim was
@@ -596,7 +569,6 @@ void sig_end(struct sig *s)
 		return;
 	mailbox_entomb(&s->mb, sealed, (size_t)n);
 	s->ending = 1;
-	s->settle_ms = 0;
 	s->next_put_ms = 0;		/* place it now, not on the next round */
 	dbg_logf("sig: publishing the tombstone");
 }
@@ -998,6 +970,9 @@ static void deliver_peer(struct sig *s, const uint8_t *sealed, size_t len)
 	memcpy(s->last_peer, plain, (size_t)n);
 	s->last_peer_len = (size_t)n;
 	s->have_last = 1;
+	/* Theirs received (a host's answer, a client's offer): amend our own
+	 * slot for the peer now engaging rather than at the next put. */
+	s->next_put_ms = 0;
 	n = slot_unwrap(s, plain, (size_t)n, packed, sizeof(packed), NULL, 0);
 	if (n < 0) {
 		refuse_slot(s, sealed, len);
@@ -1437,13 +1412,6 @@ static void dht_pump(struct sig *s, uint64_t now)
 	}
 	if (now < s->next_put_ms)
 		return;
-	/* Candidates still arriving: store the settled description rather than
-	 * one of the several on the way to it. */
-	if (s->settle_ms) {
-		if (now < s->settle_ms)
-			return;
-		s->settle_ms = 0;
-	}
 	if (s->ending) {
 		/*
 		 * Both routes have to carry it, because they reach different
