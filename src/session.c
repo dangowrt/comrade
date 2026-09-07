@@ -4432,6 +4432,84 @@ static uint32_t resume_backoff(struct conn *c)
 	return c->rs_backoff;
 }
 
+static int fam_usable_addr(const struct netmon_addr *addrs, size_t naddrs,
+			   int family)
+{
+	int af = family == 6 ? AF_INET6 : AF_INET;
+	size_t i;
+
+	for (i = 0; i < naddrs; i++)
+		if (addrs[i].family == af)
+			return 1;
+	return 0;
+}
+
+/* Split from net_pump so the in-place resume can watch the interfaces too. */
+static void net_watch(struct sess *s, uint64_t now)
+{
+	struct netmon_addr addrs[NETMON_MAX_ADDRS];
+	const struct session_cfg *cfg = s->cfg;
+	uint8_t fp4[32], fp6[32], fpif[32];
+	unsigned ch = 0;
+	int synth = 0;
+	size_t n;
+
+	if (cfg->test_roam_ms > 0 && s->next_roam_ms && now >= s->next_roam_ms &&
+	    (cfg->test_roam_max <= 0 || s->roams < cfg->test_roam_max)) {
+		s->next_roam_ms = now + (uint64_t)cfg->test_roam_ms;
+		s->roams++;
+		ch = cfg->test_roam_mask ? cfg->test_roam_mask :
+		     (NETMON_CH_V4 | NETMON_CH_V6 | NETMON_CH_IFACE);
+		synth = 1;
+	}
+	if (!synth && now < s->netmon.next_check_ms)
+		return;
+	n = netmon_snapshot(addrs, NETMON_MAX_ADDRS);
+	netmon_fingerprint(fp4, fp6, fpif, addrs, n);
+	ch |= netmon_changed_fam_fp(&s->netmon, now, fp4, fp6, fpif);
+	netstate_on_netmon(&s->ns, ch, fam_usable_addr(addrs, n, 4),
+			   fam_usable_addr(addrs, n, 6), now);
+	if (ch) {
+		__atomic_add_fetch(&s->netgen, 1, __ATOMIC_RELAXED);
+		dbg_logf("net: change v4=%d v6=%d iface=%d",
+			 !!(ch & NETMON_CH_V4), !!(ch & NETMON_CH_V6),
+			 !!(ch & NETMON_CH_IFACE));
+	}
+	s->net_ch |= ch;
+}
+
+static void net_change_reset(struct sess *s)
+{
+	s->have_local_sdp = 0;
+	s->have_peer_sdp = 0;
+	s->remote_set = 0;
+	s->local_sdp[0] = '\0';
+	s->peer_sdp[0] = '\0';
+	pthread_mutex_lock(&s->trickle_lock);
+	s->trickle_sdp[0] = '\0';
+	s->trickle_dirty = 0;
+	s->pending_sdp_set = 0;
+	s->npool4 = 0;
+	stun_mapping_reset(&s->map4);
+	pthread_mutex_unlock(&s->trickle_lock);
+	s->stun_rotations = 0;
+	/* a fresh index: the per-session walk can leave a stale one on a dead
+	 * server, whose offer then carries no reflexive address */
+	if (s->stun_count > 0) {
+		uint8_t rb[2];
+
+		random_bytes(rb, 2);
+		__atomic_store_n(&s->ice_attempt,
+				 ((rb[0] << 8) | rb[1]) % s->stun_count,
+				 __ATOMIC_RELAXED);
+	}
+	__atomic_store_n(&s->have_priv4, 0, __ATOMIC_RELAXED);
+	__atomic_store_n(&s->have_srflx4, 0, __ATOMIC_RELAXED);
+	s->pool_reported = 0;
+	s->pool_posted = 0;
+	s->mapping_reported = 0;
+}
+
 /*
  * Client-side in-place resume: while the link is lost, run the claim half of
  * the join machinery from inside the live connection -- gather a fresh agent
@@ -4488,10 +4566,17 @@ static void resume_tick(struct conn *c)
 	}
 	if (c->parked && now >= c->parked_until_ms && !conn_carrying_parked(c))
 		conn_reap_parked(c);
+	/* The in-place resume never returns through the reconnect the up-loops
+	 * lean on to see a move, so the interfaces are watched from here. */
+	net_watch(s, now);
+	if (net_changed(s)) {
+		if (sig_rebuild(s, "on the new network"))
+			return;
+		net_change_reset(s);
+		c->rs_state = 0;
+	}
 	switch (c->rs_state) {
 	case 0:
-		if (net_changed(s) && sig_rebuild(s, "on the new network"))
-			return;
 		conn_park_ice(c, now);
 		conn_fresh_pwd(c);
 		conn_fresh_port(c);
@@ -5375,25 +5460,6 @@ static void update_expect(struct sess *s)
 #define DHT_CONCLUDE_MS 25000
 
 /*
- * Is there a usable address of `family` on an interface: netmon's snapshot
- * already drops loopback interfaces and v6 link-local, which reach nothing off
- * the segment they are on. The interfaces rather than our ICE candidates,
- * because the candidate policy answers who we can punch with and says nothing
- * about the family's reach to the DHT, which binds its own sockets.
- */
-static int fam_usable_addr(const struct netmon_addr *addrs, size_t naddrs,
-			   int family)
-{
-	int af = family == 6 ? AF_INET6 : AF_INET;
-	size_t i;
-
-	for (i = 0; i < naddrs; i++)
-		if (addrs[i].family == af)
-			return 1;
-	return 0;
-}
-
-/*
  * This family's DHT attempt can no longer produce an ack worth waiting for:
  * the operator declined the DHT outright, or its grace has passed with
  * neither family ever captured -- sig itself never stops trying a family
@@ -5429,92 +5495,18 @@ static void gather_facts(struct sess *s, int family, struct tokgen_facts *f)
 
 
 
-/* The one place a network change is noticed and acted on, at the top of both
- * loops. What is left for each is taken from net_changed. */
+/*
+ * The per-loop network tick: notice a change (net_watch), take the DHT acks,
+ * drain the STUN facts, then apply what the model decided. What a move leaves
+ * for each loop to finish is taken from net_changed.
+ */
 static void net_pump(struct sess *s, uint64_t now)
 {
-	const struct session_cfg *cfg = s->cfg;
-	unsigned ch = 0;
-	int synth = 0;
-
-	if (cfg->test_roam_ms > 0 && s->next_roam_ms && now >= s->next_roam_ms &&
-	    (cfg->test_roam_max <= 0 || s->roams < cfg->test_roam_max)) {
-		s->next_roam_ms = now + (uint64_t)cfg->test_roam_ms;
-		s->roams++;
-		ch = cfg->test_roam_mask ? cfg->test_roam_mask :
-		     (NETMON_CH_V4 | NETMON_CH_V6 | NETMON_CH_IFACE);
-		synth = 1;
-	}
-	if (synth || now >= s->netmon.next_check_ms) {
-		struct netmon_addr addrs[NETMON_MAX_ADDRS];
-		uint8_t fp4[32], fp6[32], fpif[32];
-		size_t n = netmon_snapshot(addrs, NETMON_MAX_ADDRS);
-
-		netmon_fingerprint(fp4, fp6, fpif, addrs, n);
-		ch |= netmon_changed_fam_fp(&s->netmon, now, fp4, fp6, fpif);
-		netstate_on_netmon(&s->ns, ch, fam_usable_addr(addrs, n, 4),
-				   fam_usable_addr(addrs, n, 6), now);
-		if (ch) {
-			/* every path is unproven again */
-			__atomic_add_fetch(&s->netgen, 1, __ATOMIC_RELAXED);
-			dbg_logf("net: change v4=%d v6=%d iface=%d",
-				 !!(ch & NETMON_CH_V4), !!(ch & NETMON_CH_V6),
-				 !!(ch & NETMON_CH_IFACE));
-		}
-		s->net_ch |= ch;
-	}
+	net_watch(s, now);
 	ns_take_acks(s, now);
 	ns_drain(s);
 	netstate_tick(&s->ns, now);
 	net_settle(s);
-}
-
-
-/* The half of a move that is the same wherever it is noticed. What differs --
- * which agent to tear down, which state to return to -- stays with each loop. */
-static void net_change_reset(struct sess *s)
-{
-	s->have_local_sdp = 0;
-	s->have_peer_sdp = 0;
-	s->remote_set = 0;
-	s->local_sdp[0] = '\0';
-	s->peer_sdp[0] = '\0';
-	pthread_mutex_lock(&s->trickle_lock);
-	s->trickle_sdp[0] = '\0';
-	s->trickle_dirty = 0;
-	s->pending_sdp_set = 0;
-	s->npool4 = 0;
-	stun_mapping_reset(&s->map4);
-	pthread_mutex_unlock(&s->trickle_lock);
-	s->stun_rotations = 0;		/* fresh budget on the new network */
-	/*
-	 * And a fresh place in the pool to spend it from. The budget above is
-	 * per network; the position it walks from was not, so each move handed
-	 * the new network wherever the last one had got to, and the walk was
-	 * unbounded across a session. Landing on a server that does not answer
-	 * then meant an offer with no reflexive address in it -- which looks
-	 * from this end exactly like one that works, while no peer can punch to
-	 * it -- and nothing ever moved off that server again. Restarting on the
-	 * very same network succeeded, because startup draws a fresh index.
-	 *
-	 * Random rather than zero, or the head of the list would take every
-	 * host's first attempt on every network.
-	 */
-	if (s->stun_count > 0) {
-		uint8_t rb[2];
-
-		random_bytes(rb, 2);
-		__atomic_store_n(&s->ice_attempt,
-				 ((rb[0] << 8) | rb[1]) % s->stun_count,
-				 __ATOMIC_RELAXED);
-	}
-	__atomic_store_n(&s->have_priv4, 0, __ATOMIC_RELAXED);
-					/* and fresh v4 facts to run it on */
-	__atomic_store_n(&s->have_srflx4, 0, __ATOMIC_RELAXED);
-	s->pool_reported = 0;
-	s->pool_posted = 0;
-	s->mapping_reported = 0;
-	/* Rows are not flushed here: each family redraws its own. */
 }
 
 /*
