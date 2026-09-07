@@ -735,6 +735,10 @@ struct sess {
 	struct netstate ns;
 	unsigned net_ch;		/* families whose move the loop still owes
 					 * its own teardown for */
+	unsigned net_pending;		/* a move seen but not yet released to
+					 * net_ch, held until a roam's burst of
+					 * interface changes settles */
+	uint64_t net_hold_ms;		/* release once quiet this long */
 	pthread_mutex_t ns_lock;
 	struct nsfacts ns_facts;
 	/* The epoch each producer was started for, stamped before it starts. */
@@ -4444,6 +4448,12 @@ static int fam_usable_addr(const struct netmon_addr *addrs, size_t naddrs,
 	return 0;
 }
 
+/* A roam surfaces as a burst of interface changes (down, link-local, v4, v6,
+ * a temporary address); coalesce them into one acted-on change by holding it
+ * until the interfaces are quiet, each new change restarting the hold. */
+#define NET_HOLD_MS 750
+#define NET_HOLD_POLL_MS 250
+
 /* Split from net_pump so the in-place resume can watch the interfaces too. */
 static void net_watch(struct sess *s, uint64_t now)
 {
@@ -4474,8 +4484,15 @@ static void net_watch(struct sess *s, uint64_t now)
 		dbg_logf("net: change v4=%d v6=%d iface=%d",
 			 !!(ch & NETMON_CH_V4), !!(ch & NETMON_CH_V6),
 			 !!(ch & NETMON_CH_IFACE));
+		s->net_pending |= ch;
+		s->net_hold_ms = synth ? now : now + NET_HOLD_MS;
 	}
-	s->net_ch |= ch;
+	if (s->net_pending && now >= s->net_hold_ms) {
+		s->net_ch |= s->net_pending;
+		s->net_pending = 0;
+	} else if (s->net_pending) {
+		s->netmon.next_check_ms = now + NET_HOLD_POLL_MS;
+	}
 }
 
 static void net_change_reset(struct sess *s)
