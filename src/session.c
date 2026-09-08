@@ -3529,6 +3529,14 @@ static void conn_amend_remote(struct conn *c, struct sess *s)
 	nat_set_remote_description(c->nat, filtered);
 }
 
+/* True when a freshly-seen offer names a different peer identity than the one
+ * this end primed against: a rotation or a move, not the primed offer's own
+ * later candidates. */
+static int offer_rotated(const char *primed_ufrag, const char *offer_ufrag)
+{
+	return primed_ufrag[0] && strcmp(offer_ufrag, primed_ufrag) != 0;
+}
+
 static void on_peer_offer(void *arg, const uint8_t *data, size_t len)
 {
 	struct sess *s = arg;
@@ -3551,7 +3559,7 @@ static void on_peer_offer(void *arg, const uint8_t *data, size_t len)
 	incoming[len] = '\0';
 	cand_sdp_ufrag(incoming, ufrag, sizeof(ufrag));
 	snprintf(s->cur_offer_ufrag, sizeof(s->cur_offer_ufrag), "%s", ufrag);
-	if (c->remote_ufrag[0] && strcmp(ufrag, c->remote_ufrag)) {
+	if (offer_rotated(c->remote_ufrag, ufrag)) {
 		dbg_logf("session: ignore rotated offer while punching");
 		return;
 	}
@@ -4666,9 +4674,8 @@ static void resume_tick(struct conn *c)
 		/* A higher generation is the host having moved, its candidates
 		 * gone: re-gather. A same-generation rotation is pickup churn,
 		 * and chasing it aborts a punch still in flight. */
-		if (s->remote_set && c->remote_ufrag[0] &&
-		    s->cur_offer_ufrag[0] &&
-		    strcmp(s->cur_offer_ufrag, c->remote_ufrag) &&
+		if (s->remote_set && s->cur_offer_ufrag[0] &&
+		    offer_rotated(c->remote_ufrag, s->cur_offer_ufrag) &&
 		    sig_peer_gen(s->sig) > c->remote_gen) {
 			c->rs_state = 0;
 			return;
