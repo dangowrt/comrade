@@ -268,6 +268,16 @@ struct ice_ctx {
 	struct conn *shell;
 };
 
+/* Agents this connection maintains beyond c->nat: a resume sets one aside
+ * rather than destroy it, punches launch more in parallel, and the path
+ * ranking decides which carries. Allocated as needed up to the ceiling. */
+#define ICE_HOLD_MAX 16
+struct ice_hold {
+	struct nat_agent *agent;
+	struct ice_ctx *ctx;
+	uint64_t until_ms;	/* reaped once past this with nothing carrying it */
+};
+
 struct conn {
 	struct sess *sess;		/* the session this connection belongs to */
 
@@ -311,14 +321,12 @@ struct conn {
 	struct nat_agent *nat;
 	struct ice_ctx *nat_ctx;
 	/*
-	 * The agent a resume set aside rather than destroyed, and the deadline
-	 * it is held to. Its path stays in the table and is probed like any
-	 * other, so the ranking decides whether it still carries; nothing
-	 * promotes it, because a path already names the agent it sends through.
+	 * Agents set aside rather than destroyed. Each path stays in the table
+	 * and is probed like any other, so the ranking decides which carries;
+	 * nothing promotes one, because a path already names the agent it sends
+	 * through.
 	 */
-	struct nat_agent *parked;
-	struct ice_ctx *parked_ctx;
-	uint64_t parked_until_ms;
+	struct ice_hold holds[ICE_HOLD_MAX];
 	struct stream *stream;
 	pthread_mutex_t stream_lock;	/* guards c->stream: a transport receive
 					 * thread (libjuice) or the host's main
@@ -999,26 +1007,63 @@ static void conn_free_agent(struct conn *c, struct nat_agent *agent,
 	free(ctx);
 }
 
-static void conn_reap_parked(struct conn *c)
+static void conn_reap_holds(struct conn *c)
 {
-	conn_free_agent(c, c->parked, c->parked_ctx);
-	c->parked = NULL;
-	c->parked_ctx = NULL;
-	c->parked_until_ms = 0;
+	int i;
+
+	for (i = 0; i < ICE_HOLD_MAX; i++) {
+		if (!c->holds[i].agent)
+			continue;
+		conn_free_agent(c, c->holds[i].agent, c->holds[i].ctx);
+		c->holds[i].agent = NULL;
+		c->holds[i].ctx = NULL;
+		c->holds[i].until_ms = 0;
+	}
 }
 
-/* Is the session being carried on the agent that was set aside? */
-static int conn_carrying_parked(struct conn *c)
+/* The hold index whose agent carries the session now, or -1. */
+static int conn_carrying_hold(struct conn *c)
 {
-	int sel, yes = 0;
+	int sel, i, held = -1;
 
 	pthread_mutex_lock(&c->path_lock);
 	sel = c->paths.sel;
-	if (sel >= 0 && c->paths.p[sel].used && c->parked &&
-	    c->paths.p[sel].agent == c->parked)
-		yes = 1;
+	if (sel >= 0 && c->paths.p[sel].used && c->paths.p[sel].agent)
+		for (i = 0; i < ICE_HOLD_MAX; i++)
+			if (c->holds[i].agent == c->paths.p[sel].agent) {
+				held = i;
+				break;
+			}
 	pthread_mutex_unlock(&c->path_lock);
-	return yes;
+	return held;
+}
+
+static int conn_has_hold(const struct conn *c)
+{
+	int i;
+
+	for (i = 0; i < ICE_HOLD_MAX; i++)
+		if (c->holds[i].agent)
+			return 1;
+	return 0;
+}
+
+/* Reap a held agent once its deadline has passed and it is not carrying. */
+static void conn_holds_gc(struct conn *c, uint64_t now)
+{
+	int carrying = conn_carrying_hold(c);
+	int i;
+
+	for (i = 0; i < ICE_HOLD_MAX; i++) {
+		if (!c->holds[i].agent || i == carrying)
+			continue;
+		if (now < c->holds[i].until_ms)
+			continue;
+		conn_free_agent(c, c->holds[i].agent, c->holds[i].ctx);
+		c->holds[i].agent = NULL;
+		c->holds[i].ctx = NULL;
+		c->holds[i].until_ms = 0;
+	}
 }
 
 /*
@@ -1031,11 +1076,10 @@ static int conn_carrying_parked(struct conn *c)
  */
 static void conn_park_ice(struct conn *c, uint64_t now)
 {
-	if (c->parked)
-		conn_reap_parked(c);
-	c->parked = c->nat;
-	c->parked_ctx = c->nat_ctx;
-	c->parked_until_ms = now + RESUME_ATTEMPT_MS;
+	conn_reap_holds(c);
+	c->holds[0].agent = c->nat;
+	c->holds[0].ctx = c->nat_ctx;
+	c->holds[0].until_ms = now + RESUME_ATTEMPT_MS;
 	c->nat = NULL;
 	c->nat_ctx = NULL;
 }
@@ -1150,24 +1194,44 @@ static void path_desc(const struct path *p, char *out, size_t n)
  * are asked before the table is locked, since an agent call may not be made
  * under it.
  */
-static int path_usable_now(const struct conn *c, const struct path *p,
-			   int nat_ok, int parked_ok)
+static int conn_live_agents(struct conn *c, struct nat_agent **live)
+{
+	int n = 0, i;
+
+	if (c->nat && nat_connected(c->nat))
+		live[n++] = c->nat;
+	for (i = 0; i < ICE_HOLD_MAX; i++)
+		if (c->holds[i].agent && nat_connected(c->holds[i].agent))
+			live[n++] = c->holds[i].agent;
+	return n;
+}
+
+static int agent_listed(struct nat_agent *const *live, int n,
+			const struct nat_agent *a)
+{
+	int i;
+
+	for (i = 0; i < n; i++)
+		if (live[i] == a)
+			return 1;
+	return 0;
+}
+
+static int path_usable_now(const struct path *p,
+			   struct nat_agent *const *live, int nlive)
 {
 	if (p->kind != PATH_ICE)
 		return 1;
-	if (p->agent && p->agent == c->nat)
-		return nat_ok;
-	if (p->agent && p->agent == c->parked)
-		return parked_ok;
-	return 0;
+	return agent_listed(live, nlive, p->agent);
 }
 
 static int conn_pick(struct conn *c, struct path_pick *out)
 {
 	char from[PATH_LABEL_MAX + 64], to[PATH_LABEL_MAX + 64];
-	int ice_ok = c->nat && nat_connected(c->nat);
-	int parked_ok = c->parked && nat_connected(c->parked);
+	struct nat_agent *live[ICE_HOLD_MAX + 1];
+	int nlive, i, prev, sel;
 
+	nlive = conn_live_agents(c, live);
 	/*
 	 * Published for the threads that may not touch the agent: it belongs to
 	 * this connection's own thread, which destroys it on a resume graft, so
@@ -1175,17 +1239,15 @@ static int conn_pick(struct conn *c, struct path_pick *out)
 	 * only ever be a turn out of date, which is what a status line is
 	 * anyway.
 	 */
-	c->ice_up = ice_ok || parked_ok;
-	int i, prev, sel;
-
+	c->ice_up = nlive > 0;
 	memset(out, 0, sizeof(*out));
 	out->kind = -1;
 	from[0] = '\0';
 	to[0] = '\0';
 	pthread_mutex_lock(&c->path_lock);
 	for (i = 0; i < PATH_TABLE_MAX; i++)
-		c->paths.p[i].usable = path_usable_now(c, &c->paths.p[i],
-						       ice_ok, parked_ok);
+		c->paths.p[i].usable = path_usable_now(&c->paths.p[i],
+						       live, nlive);
 	prev = c->paths.sel;
 	sel = path_select(&c->paths, now_ms());
 	if (sel >= 0) {
@@ -3058,17 +3120,19 @@ static int conn_ice_ep(struct nat_agent *agent, struct path_ep *ep)
  */
 static void path_tick(struct conn *c, uint64_t now)
 {
-	struct sess *s = c->sess;
+	int kind[PATH_TABLE_MAX], drop[PATH_TABLE_MAX], due[PATH_TABLE_MAX];
+	char wdesc[PATH_TABLE_MAX][PATH_LABEL_MAX + 64];
+	int i, k, n = 0, m = 0, nw = 0, neps = 0, nlive;
+	struct nat_agent *live[ICE_HOLD_MAX + 1];
+	struct nat_agent *agent[PATH_TABLE_MAX];
+	struct nat_agent *epa[ICE_HOLD_MAX + 1];
 	struct sockaddr_in6 to[PATH_TABLE_MAX];
 	struct path_probe pr[PATH_TABLE_MAX];
-	uint64_t nonce[PATH_TABLE_MAX];
-	struct path_ep ice, pice;
-	struct nat_agent *agent[PATH_TABLE_MAX];
-	uint8_t out[PROBE_MAX];
-	char wdesc[PATH_TABLE_MAX][PATH_LABEL_MAX + 64];
 	enum path_warmth wto[PATH_TABLE_MAX];
-	int kind[PATH_TABLE_MAX], drop[PATH_TABLE_MAX], due[PATH_TABLE_MAX];
-	int i, n = 0, m = 0, nw = 0, have_ice = 0, have_pice = 0, ice_ok, parked_ok;
+	struct path_ep eps[ICE_HOLD_MAX + 1];
+	uint64_t nonce[PATH_TABLE_MAX];
+	struct sess *s = c->sess;
+	uint8_t out[PROBE_MAX];
 	size_t len;
 
 	if (!c->claim_ufrag[0])
@@ -3076,18 +3140,25 @@ static void path_tick(struct conn *c, uint64_t now)
 	/* Each agent names its own nominated pair, on the one cadence. */
 	if (now >= c->next_ice_ep_ms) {
 		c->next_ice_ep_ms = now + PATH_KEEP_MS;
-		have_ice = !conn_ice_ep(c->nat, &ice);
-		have_pice = !conn_ice_ep(c->parked, &pice);
+		if (c->nat && !conn_ice_ep(c->nat, &eps[neps])) {
+			epa[neps] = c->nat;
+			neps++;
+		}
+		for (i = 0; i < ICE_HOLD_MAX; i++)
+			if (c->holds[i].agent &&
+			    !conn_ice_ep(c->holds[i].agent, &eps[neps])) {
+				epa[neps] = c->holds[i].agent;
+				neps++;
+			}
 	}
-	ice_ok = c->nat && nat_connected(c->nat);
-	parked_ok = c->parked && nat_connected(c->parked);
+	nlive = conn_live_agents(c, live);
 	pthread_mutex_lock(&c->path_lock);
 	for (i = 0; i < PATH_TABLE_MAX; i++) {
 		struct path *p = &c->paths.p[i];
 
 		if (!p->used)
 			continue;
-		p->usable = path_usable_now(c, p, ice_ok, parked_ok);
+		p->usable = path_usable_now(p, live, nlive);
 		path_probe_expire(p, now);
 		/* A qualified path's warmth changing is the silence verdict the
 		 * selection acts on, so it is logged like the loss one. */
@@ -3101,10 +3172,13 @@ static void path_tick(struct conn *c, uint64_t now)
 				nw++;
 			}
 		}
-		if (p->kind == PATH_ICE && have_ice && p->agent == c->nat)
-			path_set_peer_ep(p, &ice, s->keys.sig_key);
-		if (p->kind == PATH_ICE && have_pice && p->agent == c->parked)
-			path_set_peer_ep(p, &pice, s->keys.sig_key);
+		if (p->kind == PATH_ICE)
+			for (k = 0; k < neps; k++)
+				if (p->agent == epa[k]) {
+					path_set_peer_ep(p, &eps[k],
+							 s->keys.sig_key);
+					break;
+				}
 		if (p->usable && path_probe_due(p, now))
 			due[n++] = i;
 	}
@@ -4563,10 +4637,14 @@ static void net_change_reset(struct sess *s)
  */
 static void resume_tick(struct conn *c)
 {
-	struct sess *s = c->sess;
-	uint64_t now = now_ms();
-	int lost;
+	struct ice_ctx *spare_ctx;
+	struct nat_agent *spare;
+	struct sess *s;
+	uint64_t now;
+	int lost, hi;
 
+	s = c->sess;
+	now = now_ms();
 	pthread_mutex_lock(&c->hb_lock);
 	lost = c->lost_since_ms != 0 &&
 	       now - c->lost_since_ms >= RESUME_AFTER_MS;
@@ -4583,29 +4661,28 @@ static void resume_tick(struct conn *c)
 		 * carrying: it takes the current role and the punch being
 		 * built in its place is let go.
 		 */
-		if (conn_carrying_parked(c)) {
-			struct nat_agent *spare = c->nat;
-			struct ice_ctx *spare_ctx = c->nat_ctx;
-
-			c->nat = c->parked;
-			c->nat_ctx = c->parked_ctx;
-			c->parked = NULL;
-			c->parked_ctx = NULL;
-			c->parked_until_ms = 0;
+		hi = conn_carrying_hold(c);
+		if (hi >= 0) {
+			spare = c->nat;
+			spare_ctx = c->nat_ctx;
+			c->nat = c->holds[hi].agent;
+			c->nat_ctx = c->holds[hi].ctx;
+			c->holds[hi].agent = NULL;
+			c->holds[hi].ctx = NULL;
+			c->holds[hi].until_ms = 0;
 			conn_free_agent(c, spare, spare_ctx);
 			dbg_logf("resume: carried by the agent set aside");
-		} else if (c->parked) {
-			/* A non-parked path carries, so free the set-aside
-			 * agent now, not at its deadline: a second punch would
-			 * else ride along on its own port for the whole span. */
-			conn_reap_parked(c);
+		} else if (conn_has_hold(c)) {
+			/* A non-held path carries, so free the set-aside agents
+			 * now, not at their deadline: a second punch would else
+			 * ride along on its own port for the whole span. */
+			conn_reap_holds(c);
 			dbg_logf("resume: the agent set aside answered "
 				 "nothing");
 		}
 		return;
 	}
-	if (c->parked && now >= c->parked_until_ms && !conn_carrying_parked(c))
-		conn_reap_parked(c);
+	conn_holds_gc(c, now);
 	/* The in-place resume never returns through the reconnect the up-loops
 	 * lean on to see a move, so the interfaces are watched from here. */
 	net_watch(s, now);
@@ -5943,7 +6020,7 @@ static void conn_dissolve(struct conn *c)
 	struct ice_ctx *got;
 
 	conn_unregister(c->sess, c);
-	conn_reap_parked(c);
+	conn_reap_holds(c);
 	conn_drop_ice_path(c);
 	conn_free_agent(c, c->nat, c->nat_ctx);
 	/* A re-punch grafted for a worker that left its loop before adopting
@@ -7637,7 +7714,7 @@ done:
 	pthread_mutex_unlock(&s.c.stream_lock);
 	if (st_done)
 		stream_destroy(st_done);
-	conn_reap_parked(&s.c);
+	conn_reap_holds(&s.c);
 	conn_drop_ice_path(&s.c);
 	conn_free_agent(&s.c, s.c.nat, s.c.nat_ctx);
 	if (s.lan)
