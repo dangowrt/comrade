@@ -404,7 +404,7 @@ struct conn {
 					 * RESUME_FIRST_MS up to RESUME_ATTEMPT_MS */
 	uint64_t rs_prime_ms;		/* client: when the current offer was
 					 * primed, to bound a stalled resume */
-	struct ice_ctx *resume_ctx;	/* the handover slot; see above */
+	struct ice_ctx *resume_q[ICE_HOLD_MAX];	/* graft handoff queue; see above */
 	volatile int resume_pending;
 	uint64_t resume_last_ms;	/* host: when a resume punch last began,
 					 * so a redelivered claim in the window
@@ -1022,6 +1022,22 @@ static void conn_reap_holds(struct conn *c)
 	}
 }
 
+/* Set an agent aside in the hold set, freeing it if the set is full. */
+static void conn_hold_add(struct conn *c, struct nat_agent *agent,
+			  struct ice_ctx *ctx, uint64_t until)
+{
+	int i;
+
+	for (i = 0; i < ICE_HOLD_MAX; i++)
+		if (!c->holds[i].agent) {
+			c->holds[i].agent = agent;
+			c->holds[i].ctx = ctx;
+			c->holds[i].until_ms = until;
+			return;
+		}
+	conn_free_agent(c, agent, ctx);
+}
+
 /* The hold index whose agent carries the session now, or -1. */
 static int conn_carrying_hold(struct conn *c)
 {
@@ -1058,7 +1074,8 @@ static void conn_holds_gc(struct conn *c, uint64_t now)
 	for (i = 0; i < ICE_HOLD_MAX; i++) {
 		if (!c->holds[i].agent || i == carrying)
 			continue;
-		if (now < c->holds[i].until_ms)
+		if (now < c->holds[i].until_ms &&
+		    !nat_failed(c->holds[i].agent))
 			continue;
 		conn_free_agent(c, c->holds[i].agent, c->holds[i].ctx);
 		c->holds[i].agent = NULL;
@@ -5005,6 +5022,7 @@ static int conn_run(struct conn *c, int drive_sig)
 	sock_t sp[2], cp[2];
 	struct stream *st;
 	pthread_t th;
+	int qi;
 
 	/* Both pairs must be sockets, not pipes: they are polled in the same
 	 * set as the transport, and WSAPoll takes nothing else (see wsock.h). */
@@ -5123,17 +5141,20 @@ static int conn_run(struct conn *c, int drive_sig)
 		 * re-pointed at this connection before it was parked, so its
 		 * packets have been landing in the stream all along; this
 		 * makes it the sending agent too. */
-		got = __atomic_load_n(&c->resume_ctx, __ATOMIC_ACQUIRE);
-		if (got) {
-			struct nat_agent *old = c->nat;
-			struct ice_ctx *old_ctx = c->nat_ctx;
-
+		for (qi = 0; qi < ICE_HOLD_MAX; qi++) {
+			got = __atomic_load_n(&c->resume_q[qi], __ATOMIC_ACQUIRE);
+			if (!got)
+				continue;
+			__atomic_store_n(&c->resume_q[qi], (struct ice_ctx *)0,
+					 __ATOMIC_RELAXED);
+			/* Keep the incumbent as a hold; the ranking decides
+			 * which agent carries, a silent one ages out. */
+			if (c->nat)
+				conn_hold_add(c, c->nat, c->nat_ctx,
+					      now_ms() + RESUME_ATTEMPT_MS);
 			c->nat = got->agent;	/* bound to it for life */
 			c->nat_ctx = got;
-			__atomic_store_n(&c->resume_ctx, (struct ice_ctx *)0,
-					 __ATOMIC_RELAXED);
 			conn_add_ice_path(c);
-			conn_free_agent(c, old, old_ctx);
 			__atomic_store_n(&c->bh_mute, 0, __ATOMIC_RELAXED);
 			/* The resumed link earns a full liveness window; without
 			 * this it is judged by silence that predates it. */
@@ -5174,6 +5195,7 @@ static int conn_run(struct conn *c, int drive_sig)
 		 * one carrying it, so a switch is an immediate reordering rather
 		 * than a rediscovery. */
 		path_tick(c, now_ms());
+		conn_holds_gc(c, now_ms());
 		if (__atomic_load_n(&c->carry_epoch, __ATOMIC_RELAXED) !=
 		    carry_seen) {
 			carry_seen = __atomic_load_n(&c->carry_epoch,
@@ -6019,6 +6041,7 @@ static struct conn *conn_alloc(struct sess *s)
 static void conn_dissolve(struct conn *c)
 {
 	struct ice_ctx *got;
+	int i;
 
 	conn_unregister(c->sess, c);
 	conn_reap_holds(c);
@@ -6026,10 +6049,12 @@ static void conn_dissolve(struct conn *c)
 	conn_free_agent(c, c->nat, c->nat_ctx);
 	/* A re-punch grafted for a worker that left its loop before adopting
 	 * it: nobody else will. */
-	got = __atomic_exchange_n(&c->resume_ctx, (struct ice_ctx *)0,
-				  __ATOMIC_ACQUIRE);
-	if (got)
-		conn_free_agent(c, got->agent, got);
+	for (i = 0; i < ICE_HOLD_MAX; i++) {
+		got = __atomic_exchange_n(&c->resume_q[i], (struct ice_ctx *)0,
+					  __ATOMIC_ACQUIRE);
+		if (got)
+			conn_free_agent(c, got->agent, got);
+	}
 }
 
 
@@ -6372,6 +6397,20 @@ static void lan_drain(struct sess *s, struct worker *ws, int *dash_seq)
 	s->lan_pending_n = 0;			/* drained; overflow re-offered */
 }
 
+/* Hand a grafted agent's context to the worker through a free queue slot. The
+ * worker drains every slot each pass, so a free one is normally there. */
+static void resume_q_publish(struct conn *t, struct ice_ctx *ctx)
+{
+	int i;
+
+	for (i = 0; i < ICE_HOLD_MAX; i++)
+		if (!__atomic_load_n(&t->resume_q[i], __ATOMIC_ACQUIRE)) {
+			__atomic_store_n(&t->resume_q[i], ctx, __ATOMIC_RELEASE);
+			return;
+		}
+	dbg_logf("host: resume queue full -- graft dropped");
+}
+
 /*
  * Advance each in-flight ICE punch. Release-on-pickup means the listener has
  * already rotated on, so a wedged punch here never head-of-line-blocks the next
@@ -6420,9 +6459,7 @@ static void punch_scan(struct sess *s, struct worker *ws, int *dash_seq)
 					__atomic_store_n(&c->nat_ctx->c, t,
 							 __ATOMIC_RELAXED);
 					nat_rebind(c->nat, c->nat_ctx);
-					__atomic_store_n(&t->resume_ctx,
-							 c->nat_ctx,
-							 __ATOMIC_RELEASE);
+					resume_q_publish(t, c->nat_ctx);
 				}
 				c->nat = NULL;
 				c->nat_ctx = NULL;
