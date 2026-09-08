@@ -6490,8 +6490,10 @@ static void punch_scan(struct sess *s, struct worker *ws, int *dash_seq)
 			 * dissolved without a worker, a dashboard row, or a
 			 * registration of its own.
 			 */
-			if (c->punch_resume) {
-				t = c->punch_resume;
+			t = c->punch_resume;
+			if (!t)
+				t = worker_by_ufrag(ws, c->punch_ufrag);
+			if (t) {
 				dbg_logf("host: punch connected -> resume "
 					 "worker");
 				if (c->nat_ctx) {
@@ -6508,8 +6510,11 @@ static void punch_scan(struct sess *s, struct worker *ws, int *dash_seq)
 				c->nat_ctx = NULL;
 				snprintf(t->remote_pwd, sizeof(t->remote_pwd),
 					 "%s", c->remote_pwd);
-				__atomic_sub_fetch(&t->resume_pending, 1,
-						   __ATOMIC_RELAXED);
+				if (c->punch_resume)
+					__atomic_sub_fetch(&t->resume_pending, 1,
+							   __ATOMIC_RELAXED);
+				else if (s->admitted_n > 0)
+					s->admitted_n--;
 				s->punching[i] = NULL;
 				/*
 				 * Dissolved now, released when the agent it
