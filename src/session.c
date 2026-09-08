@@ -724,6 +724,9 @@ struct sess {
 					 * proof only, no pool/mapping use for v6 */
 	int probe6_running;
 	volatile int probe6_stop;
+	pthread_t warm_th;		/* resolves the STUN pool into the cache */
+	int warm_running;
+	volatile int warm_stop;
 	/*
 	 * RFC 4787 mapping classification built from the same probe's
 	 * responses (see stun_mapping_add) -- read and grown under
@@ -7415,6 +7418,12 @@ int session_run(const struct session_cfg *cfg)
 				 ((rb[0] << 8) | rb[1]) % s.stun_count,
 				 __ATOMIC_RELAXED);
 	}
+	/* Resolve the pool into the cache off the loop, so the probe threads read
+	 * addresses instead of blocking on a name lookup after a move. */
+	if (cfg->stun_auto && s.stun_count > 0 &&
+	    !stun_pool_warm_start(s.stun_servers, s.stun_count, &s.warm_stop,
+				  &s.warm_th))
+		s.warm_running = 1;
 	/* The probes are scheduled by the reachability model, which asks for the
 	 * first round on its first tick. */
 	nat_log_level(cfg->log_level);	/* < 0 silences libjuice (see nat_log_level) */
@@ -7873,6 +7882,11 @@ done:
 	stun_probe6_halt(&s);
 	stun_probe_reap(&s);
 	stun_probe6_reap(&s);
+	if (s.warm_running) {
+		__atomic_store_n(&s.warm_stop, 1, __ATOMIC_RELAXED);
+		pthread_join(s.warm_th, NULL);
+		s.warm_running = 0;
+	}
 	stunlist_free(s.stun_servers, s.stun_count);
 	pthread_mutex_destroy(&s.trickle_lock);
 	pthread_mutex_destroy(&s.c.status_lock);

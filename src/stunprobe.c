@@ -135,6 +135,9 @@ int stun_probe_mapped4(const uint8_t *pkt, size_t len,
  * restart -- a fair trade for a probe that asks several at once.
  */
 #define STUN_CACHE_MAX 256	/* names times the addresses each carries */
+#define STUN_WARM_ADDRS 16	/* cache every A record a name carries, not one */
+#define STUN_WARM_REFRESH_S (6 * 3600)	/* re-resolve, so a server that moves
+					 * does not bite a very long session */
 
 struct stun_cache_entry {
 	char name[128];
@@ -212,6 +215,34 @@ static void cache_put(const char *name, int family,
 		e->family = family;
 		memcpy(&e->sa, sa, sizeof(e->sa));
 		e->len = len;
+	}
+	pthread_mutex_unlock(&stun_cache_lock);
+}
+
+/* Swap in a freshly resolved set for a name under one lock, so a reader never
+ * sees it empty and a failed resolve leaves the last good set in place (the
+ * caller calls this only once cnt > 0). */
+static void cache_replace(const char *name, const struct sockaddr_storage *sa,
+			  const socklen_t *len, const int *fam, int cnt)
+{
+	struct stun_cache_entry *e;
+	int i;
+
+	if (strlen(name) >= sizeof(e->name))
+		return;
+	pthread_mutex_lock(&stun_cache_lock);
+	for (i = 0; i < stun_cache_n; ) {
+		if (!strcmp(stun_cache[i].name, name))
+			stun_cache[i] = stun_cache[--stun_cache_n];
+		else
+			i++;
+	}
+	for (i = 0; i < cnt && stun_cache_n < STUN_CACHE_MAX; i++) {
+		e = &stun_cache[stun_cache_n++];
+		strcpy(e->name, name);
+		e->family = fam[i];
+		memcpy(&e->sa, &sa[i], sizeof(e->sa));
+		e->len = len[i];
 	}
 	pthread_mutex_unlock(&stun_cache_lock);
 }
@@ -316,6 +347,122 @@ int stun_server_ip4(const char *server, char *out, size_t outn, int allow_net)
 	return inet_ntop(AF_INET, &sin.sin_addr, out, (socklen_t)outn) ? 1 : 0;
 }
 
+/* Resolve every v4 and v6 address a server carries into the cache, replacing
+ * what was there only once the lookup succeeds so a transient failure keeps the
+ * last good set. Blocking; runs off the probe threads (stun_warm_one). */
+static void warm_resolve(const char *server)
+{
+	struct sockaddr_storage sa[STUN_WARM_ADDRS];
+	const char *colon = strrchr(server, ':');
+	struct addrinfo hints, *res, *ai;
+	socklen_t len[STUN_WARM_ADDRS];
+	const char *port = "3478";
+	int fam[STUN_WARM_ADDRS];
+	char host[128];
+	int cnt = 0;
+	size_t hl;
+
+	hl = colon ? (size_t)(colon - server) : strlen(server);
+	if (hl >= sizeof(host))
+		return;
+	memcpy(host, server, hl);
+	host[hl] = '\0';
+	if (colon && colon[1])
+		port = colon + 1;
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_DGRAM;
+	if (getaddrinfo(host, port, &hints, &res) || !res)
+		return;			/* keep the last good set */
+	for (ai = res; ai && cnt < STUN_WARM_ADDRS; ai = ai->ai_next) {
+		if (ai->ai_family != AF_INET && ai->ai_family != AF_INET6)
+			continue;
+		if ((size_t)ai->ai_addrlen > sizeof(sa[0]))
+			continue;
+		memset(&sa[cnt], 0, sizeof(sa[cnt]));
+		memcpy(&sa[cnt], ai->ai_addr, (size_t)ai->ai_addrlen);
+		len[cnt] = (socklen_t)ai->ai_addrlen;
+		fam[cnt] = ai->ai_family;
+		cnt++;
+	}
+	freeaddrinfo(res);
+	if (cnt > 0)
+		cache_replace(server, sa, len, fam, cnt);
+}
+
+struct stun_warm_one {
+	char name[128];
+};
+
+static void *stun_warm_one(void *arg)
+{
+	struct stun_warm_one *j = arg;
+
+	warm_resolve(j->name);
+	free(j);
+	return NULL;
+}
+
+struct stun_warm {
+	char *const *servers;
+	volatile int *stop;
+	int n;
+};
+
+/* Warm the whole pool at once (a dead name cannot hold up the rest), then
+ * re-resolve every STUN_WARM_REFRESH_S so a moved server is picked up. */
+static void *stun_warm_loop(void *arg)
+{
+	struct stun_warm *w = arg;
+	struct stun_warm_one *j;
+	pthread_t th;
+	int i, slept;
+
+	for (;;) {
+		for (i = 0; i < w->n; i++) {
+			if (strlen(w->servers[i]) >= sizeof(j->name))
+				continue;
+			j = malloc(sizeof(*j));
+			if (!j)
+				continue;
+			strcpy(j->name, w->servers[i]);
+			if (pthread_create(&th, NULL, stun_warm_one, j)) {
+				free(j);
+				continue;
+			}
+			pthread_detach(th);
+		}
+		for (slept = 0; slept < STUN_WARM_REFRESH_S; slept++) {
+			if (sb_flag(w->stop))
+				goto done;
+			os_msleep(1000);
+		}
+	}
+done:
+	free(w);
+	return NULL;
+}
+
+int stun_pool_warm_start(char *const *servers, int nservers, volatile int *stop,
+			 pthread_t *th)
+{
+	struct stun_warm *w;
+
+	if (nservers < 1)
+		return -1;
+	w = malloc(sizeof(*w));
+	if (!w)
+		return -1;
+	w->servers = servers;
+	w->stop = stop;
+	w->n = nservers;
+	if (pthread_create(th, NULL, stun_warm_loop, w)) {
+		free(w);
+		return -1;
+	}
+	return 0;
+}
+
 /* Ask one server, naming it in the transaction id's last byte (which the
  * reply check ignores, so any server's answer still validates). */
 static void probe_ask(sock_t fd, uint8_t seed[STUN_PROBE_TXID_LEN], int i,
@@ -340,10 +487,10 @@ void stun_probe_run(char *const *servers, int nservers, int total_ms,
 		    uint8_t seed[STUN_PROBE_TXID_LEN], volatile int *stop,
 		    stun_probe_hit *hit, void *arg)
 {
-	struct sockaddr_in *dst;
+	int i, n = nservers, nres = 0, ndst = 0, max, got;
 	uint64_t t0, next_send = 0;
+	struct sockaddr_in *dst;
 	sock_t fd;
-	int i, n = nservers, nres = 0, ndst = 0, max;
 
 	if (n <= 0)
 		return;
@@ -365,13 +512,13 @@ void stun_probe_run(char *const *servers, int nservers, int total_ms,
 		struct pollfd pf;
 		uint64_t now = os_mono_ms();
 
-		/* One name per pass: getaddrinfo has no timeout, so resolving
-		 * the list up front let one slow name hold up every server
-		 * behind it. Each address it yields is asked as it arrives,
-		 * rather than re-asking every target whenever one resolves. */
+		/* Cache only: getaddrinfo has no timeout, so a slow name run
+		 * here would hold the round (and probe_running) open past
+		 * total_ms, wedging every later round. stun_pool_warm resolves
+		 * off this thread; a name not cached yet waits for the next round. */
 		if (nres < n && ndst < max) {
-			int got = resolve4_all(servers[nres++], &dst[ndst],
-					       max - ndst);
+			got = cache_get_all(servers[nres++], AF_INET,
+					    &dst[ndst], max - ndst);
 
 			for (i = 0; i < got; i++)
 				probe_ask(fd, seed, ndst + i, &dst[ndst + i]);
@@ -405,38 +552,14 @@ void stun_probe_run(char *const *servers, int nservers, int total_ms,
 	free(dst);
 }
 
-/* "host:port" resolved to a target of `family`; 3478 with no or unparsable
- * port. Unlike resolve4_all, keeps whatever sockaddr length getaddrinfo hands
- * back, since a v6 target is a different size. */
+/* A server's cached target of `family` ("host:port"); cache only, so a slow
+ * name never holds the probe round open (see stun_probe_run). stun_pool_warm
+ * fills the cache off this thread. */
 static int resolve_stun(const char *server, int family,
 			struct sockaddr_storage *out, socklen_t *outlen)
 {
-	struct addrinfo hints, *res;
-	const char *colon = strrchr(server, ':');
-	char host[128];
-	const char *port = "3478";
-	size_t hl = colon ? (size_t)(colon - server) : strlen(server);
-
 	*outlen = sizeof(*out);
-	if (cache_get(server, family, out, outlen))
-		return 0;
-	if (hl >= sizeof(host))
-		return -1;
-	memcpy(host, server, hl);
-	host[hl] = '\0';
-	if (colon && colon[1])
-		port = colon + 1;
-
-	memset(&hints, 0, sizeof(hints));
-	hints.ai_family = family;
-	hints.ai_socktype = SOCK_DGRAM;
-	if (getaddrinfo(host, port, &hints, &res) || !res)
-		return -1;
-	memcpy(out, res->ai_addr, (size_t)res->ai_addrlen);
-	*outlen = (socklen_t)res->ai_addrlen;
-	freeaddrinfo(res);
-	cache_put(server, family, out, *outlen);
-	return 0;
+	return cache_get(server, family, out, outlen) ? 0 : -1;
 }
 
 void stun_probe_check(char *const *servers, int nservers, int family,

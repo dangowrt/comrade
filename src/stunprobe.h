@@ -6,6 +6,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <pthread.h>
 
 #define STUN_PROBE_REQ_LEN 20
 #define STUN_PROBE_TXID_LEN 12
@@ -71,6 +72,12 @@ void stun_probe_check(char *const *servers, int nservers, int family,
  * out (outn >= 16). allow_net resolves and caches on a miss (blocking); 0 uses
  * the cache only. Returns 1 on success, 0 if not (yet) known. */
 int stun_server_ip4(const char *server, char *out, size_t outn, int allow_net);
+
+/* Background thread: resolve every server's v4 and v6 addresses into the cache
+ * (so the probe threads never block on DNS), refreshed periodically. *stop ends
+ * it; the thread lands in *th to join. Returns 0 on success. */
+int stun_pool_warm_start(char *const *servers, int nservers, volatile int *stop,
+			 pthread_t *th);
 
 /*
  * RFC 4787 mapping-behaviour classification, built incrementally from the
