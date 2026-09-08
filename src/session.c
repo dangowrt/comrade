@@ -6169,6 +6169,18 @@ static int punch_young(const struct sess *s, const char *ufrag)
 	return 0;
 }
 
+/* How long the punch running for this claimant has run, 0 if none. */
+static uint64_t punch_age(const struct sess *s, const char *ufrag)
+{
+	int i;
+
+	for (i = 0; i < HOST_MAX_WORKERS; i++)
+		if (s->punching[i] &&
+		    !strcmp(s->punching[i]->punch_ufrag, ufrag))
+			return now_ms() - s->punching[i]->punch_start_ms;
+	return 0;
+}
+
 /* Retire it, so the slot and the identity are free for the attempt that
  * replaces it. Only called where that replacement is about to be admitted:
  * dropping a punch and then refusing the claim would leave the claimant worse
@@ -6891,52 +6903,39 @@ static int host_turnstile(struct sess *s)
 						break;
 					}
 
-					if (again && punch_young(s, cu)) {
-						/*
-						 * Asking again while the punch
-						 * we are running for it is still
-						 * young: let that one finish.
-						 * The ask after this one, if it
-						 * comes, is past the floor and
-						 * takes its place as before.
-						 */
+					if (w && again &&
+					    (conn_is_lost(w) ||
+					     !conn_is_proven(w)) &&
+					    punch_age(s, cu) > RESUME_FIRST_MS) {
+						/* Its new password says the old
+						 * punch is abandoned: retire it and
+						 * resume the worker at once, past the
+						 * young-punch and re-claim floors that
+						 * would otherwise make it wait out a
+						 * punch it has already given up on. */
+						dbg_logf("host: claim %.8s again "
+							 "-- resuming its worker",
+							 cu);
+						punch_retire(s, cu);
+						resume = w;
+					} else if (again && punch_young(s, cu)) {
+						/* Still young: let that punch
+						 * finish before it is replaced. */
 						dbg_logf("host: claim %.8s again "
 							 "-- letting its punch "
 							 "run", cu);
 						sig_release(s->sig);
 						s->have_peer_sdp = 0;
 						break;
-					}
-					if (w && (conn_is_lost(w) ||
-						  !conn_is_proven(w)) &&
-					    (again || !punch_in_flight(s, cu)) &&
-					    now_ms() -
-					    __atomic_load_n(&w->resume_last_ms,
-							    __ATOMIC_RELAXED) >
-					    RESUME_ATTEMPT_MS) {
-						/* Its own newer attempt is the
-						 * one thing allowed to take the
-						 * place of a punch we are running
-						 * for it. */
-						/* A worker that has never carried
-						 * anything counts as lost too:
-						 * the punch proved the host's
-						 * half and nothing else, and the
-						 * client saying it is still
-						 * trying is the only account of
-						 * the other half there is.
-						 *
-						 * A repeat of the same claim is
-						 * weak evidence -- the DHT serves
-						 * it back for seconds after it
-						 * was written -- but acting on it
-						 * is another punch for a claimant
-						 * that has none that worked, and
-						 * over concurrent joins that
-						 * measured better than the
-						 * tidiness of ignoring it. */
-						if (again)
-							punch_retire(s, cu);
+					} else if (w && (conn_is_lost(w) ||
+							 !conn_is_proven(w)) &&
+						   !punch_in_flight(s, cu) &&
+						   now_ms() -
+						   __atomic_load_n(&w->resume_last_ms,
+								   __ATOMIC_RELAXED) >
+						   RESUME_ATTEMPT_MS) {
+						/* First re-claim, no punch in
+						 * flight: resume the lost worker. */
 						resume = w;
 					} else if (!w && again) {
 						punch_retire(s, cu);
