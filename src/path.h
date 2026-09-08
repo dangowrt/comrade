@@ -52,7 +52,7 @@ enum path_warmth {
 	PATH_DEAD		/* silent beyond PATH_DEAD_MS */
 };
 
-#define PATH_TABLE_MAX 4			/* paths tracked per connection */
+#define PATH_TABLE_MAX 8			/* paths tracked per connection */
 #define PROBE_EVERY_MS 200		/* probe period while unqualified */
 #define PATH_KEEP_MS 1000		/* probe period once qualified */
 #define PATH_WARM_MS 3000		/* WARM becomes COLD past this */
