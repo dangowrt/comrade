@@ -392,10 +392,11 @@ struct conn {
 	 * publishes the slot last, with release; the worker takes it with
 	 * acquire, which is what makes those earlier stores visible to it.
 	 *
-	 * resume_pending holds the reap off while the punch is in flight. It
-	 * and the stamps below are written by the loop and read by the worker,
-	 * so they are atomic: each is advisory and one-way within a resume,
-	 * and a reader wants the latest answer rather than a synchronised one.
+	 * resume_pending counts the punches in flight resuming this worker; the
+	 * reap is held off while any remains. It and the stamps below are written
+	 * by the loop and read by the worker, so they are atomic: each is
+	 * advisory, and a reader wants the latest count rather than a synchronised
+	 * one.
 	 */
 	int rs_state;
 	uint64_t rs_deadline;
@@ -6276,8 +6277,8 @@ static void punch_retire(struct sess *s, const char *ufrag)
 			continue;
 		dbg_logf("host: claimant tried again -- retiring its punch");
 		if (c->punch_resume) {
-			__atomic_store_n(&c->punch_resume->resume_pending, 0,
-					 __ATOMIC_RELAXED);
+			__atomic_sub_fetch(&c->punch_resume->resume_pending, 1,
+					   __ATOMIC_RELAXED);
 			c->punch_resume = NULL;
 		}
 		s->punching[i] = NULL;
@@ -6427,8 +6428,8 @@ static void punch_scan(struct sess *s, struct worker *ws, int *dash_seq)
 				c->nat_ctx = NULL;
 				snprintf(t->remote_pwd, sizeof(t->remote_pwd),
 					 "%s", c->remote_pwd);
-				__atomic_store_n(&t->resume_pending, 0,
-						 __ATOMIC_RELAXED);
+				__atomic_sub_fetch(&t->resume_pending, 1,
+						   __ATOMIC_RELAXED);
 				s->punching[i] = NULL;
 				/*
 				 * Dissolved now, released when the agent it
@@ -6492,8 +6493,8 @@ static void punch_scan(struct sess *s, struct worker *ws, int *dash_seq)
 			dbg_logf("host: punch %s -> drop",
 				 c->punch_stuck ? "wedged (test)" : "failed");
 			if (c->punch_resume) {
-				__atomic_store_n(&c->punch_resume->resume_pending,
-						 0, __ATOMIC_RELAXED);
+				__atomic_sub_fetch(&c->punch_resume->resume_pending,
+						   1, __ATOMIC_RELAXED);
 			} else if (s->admitted_n > 0) {
 				/* It was counted against the grant when it was
 				 * picked up, and it admitted nobody. Left spent,
@@ -7084,8 +7085,8 @@ static int host_turnstile(struct sess *s)
 				s->punching[pslot] = listen;
 				listen->punch_resume = resume;
 				if (resume) {
-					__atomic_store_n(&resume->resume_pending, 1,
-							 __ATOMIC_RELAXED);
+					__atomic_add_fetch(&resume->resume_pending, 1,
+							   __ATOMIC_RELAXED);
 					__atomic_store_n(&resume->resume_last_ms,
 							 now_ms(),
 							 __ATOMIC_RELAXED);
