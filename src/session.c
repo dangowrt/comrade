@@ -118,11 +118,12 @@ static int fam_idx(int family)
  */
 #define HOST_PUNCH_MS 15000
 /*
- * How long a punch is left alone before a fresh ask from the same claimant may
- * replace it. The claimant asks again every RESUME_ATTEMPT_MS and a punch
- * across a carrier NAT can need longer, so replacing it on every ask is how
- * none of them ever finishes.
+ * How many punches for one claimant may be in flight at once. A returning
+ * client's fresh attempt is launched alongside the running one, not in place
+ * of it, so the ranking carries whichever connects; a low cap bounds the poll
+ * threads and sockets one claimant can hold.
  */
+#define PUNCH_PARALLEL_MAX 3
 /*
  * The counter and tag the transport puts under every stream datagram, and the
  * wire budget they share with KCP: the stream is given the rest (stream.h), so
@@ -135,11 +136,6 @@ static int fam_idx(int family)
 #error "the control message and the key schedule must agree on a half"
 #endif
 
-#define HOST_PUNCH_FLOOR_MS (RESUME_ATTEMPT_MS + RESUME_ATTEMPT_MS / 5)
-#if HOST_PUNCH_FLOOR_MS <= RESUME_ATTEMPT_MS || \
-    HOST_PUNCH_FLOOR_MS >= HOST_PUNCH_MS
-#error "the punch floor must sit between the claimant's cadence and the budget"
-#endif
 /* Between attempts to gather an offer worth publishing. Gathering costs an
  * agent and a round of STUN, and the thing being waited for -- an interface
  * finishing coming up after a move -- takes about this long anyway. */
@@ -6303,56 +6299,30 @@ static void punch_amend_repost(struct sess *s, const char *ufrag,
 		conn_amend_remote(pc, s);
 }
 
-/* How long the punch running for this claimant has had, if there is one: a
- * fresh ask that arrives inside the floor is turned away rather than served,
- * so the punch already running for it keeps its budget. */
-static int punch_young(const struct sess *s, const char *ufrag)
+/* Is a punch for this exact claim (ufrag and password) already in flight? A
+ * repeat under the same password is the DHT re-serving a claim being punched. */
+static int punch_dup(const struct sess *s, const char *ufrag, const char *pwd)
 {
 	int i;
 
 	for (i = 0; i < HOST_MAX_WORKERS; i++)
 		if (s->punching[i] &&
-		    !strcmp(s->punching[i]->punch_ufrag, ufrag))
-			return now_ms() - s->punching[i]->punch_start_ms <
-			       HOST_PUNCH_FLOOR_MS;
+		    !strcmp(s->punching[i]->punch_ufrag, ufrag) &&
+		    !strcmp(s->punching[i]->remote_pwd, pwd))
+			return 1;
 	return 0;
 }
 
-/* How long the punch running for this claimant has run, 0 if none. */
-static uint64_t punch_age(const struct sess *s, const char *ufrag)
+/* How many punches for this claimant are in flight. */
+static int punch_count(const struct sess *s, const char *ufrag)
 {
-	int i;
+	int i, n = 0;
 
 	for (i = 0; i < HOST_MAX_WORKERS; i++)
 		if (s->punching[i] &&
 		    !strcmp(s->punching[i]->punch_ufrag, ufrag))
-			return now_ms() - s->punching[i]->punch_start_ms;
-	return 0;
-}
-
-/* Retire it, so the slot and the identity are free for the attempt that
- * replaces it. Only called where that replacement is about to be admitted:
- * dropping a punch and then refusing the claim would leave the claimant worse
- * off than being told to wait. */
-static void punch_retire(struct sess *s, const char *ufrag)
-{
-	struct conn *c;
-	int i;
-
-	for (i = 0; i < HOST_MAX_WORKERS; i++) {
-		c = s->punching[i];
-		if (!c || strcmp(c->punch_ufrag, ufrag))
-			continue;
-		dbg_logf("host: claimant tried again -- retiring its punch");
-		if (c->punch_resume) {
-			__atomic_sub_fetch(&c->punch_resume->resume_pending, 1,
-					   __ATOMIC_RELAXED);
-			c->punch_resume = NULL;
-		}
-		s->punching[i] = NULL;
-		conn_free(c);
-		return;
-	}
+			n++;
+	return n;
 }
 
 /*
@@ -7059,71 +7029,38 @@ static int host_turnstile(struct sess *s)
 					 * again disturbs the session it just
 					 * got.
 					 */
-					if (made) {
-						dbg_logf("host: claim %.8s is "
-							 "the attempt its worker "
-							 "was made from -- "
-							 "leaving it", cu);
-						sig_release(s->sig);
-						s->have_peer_sdp = 0;
-						break;
-					}
-
-					if (w && again &&
-					    (conn_is_lost(w) ||
-					     !conn_is_proven(w)) &&
-					    punch_age(s, cu) > RESUME_FIRST_MS) {
-						/* Its new password says the old
-						 * punch is abandoned: retire it and
-						 * resume the worker at once, past the
-						 * young-punch and re-claim floors that
-						 * would otherwise make it wait out a
-						 * punch it has already given up on. */
-						dbg_logf("host: claim %.8s again "
-							 "-- resuming its worker",
+					/* The DHT re-serving a claim already in
+					 * hand: leave it and free the mutex slot. */
+					if (made || punch_dup(s, cu, cp) || lanq) {
+						dbg_logf("host: claim %.8s already "
+							 "in hand -- leaving it",
 							 cu);
-						punch_retire(s, cu);
-						resume = w;
-					} else if (again && punch_young(s, cu)) {
-						/* Still young: let that punch
-						 * finish before it is replaced. */
-						dbg_logf("host: claim %.8s again "
-							 "-- letting its punch "
-							 "run", cu);
-						sig_release(s->sig);
-						s->have_peer_sdp = 0;
-						break;
-					} else if (w && (conn_is_lost(w) ||
-							 !conn_is_proven(w)) &&
-						   !adm &&
-						   now_ms() -
-						   __atomic_load_n(&w->resume_last_ms,
-								   __ATOMIC_RELAXED) >
-						   RESUME_ATTEMPT_MS) {
-						/* First re-claim, no punch in
-						 * flight: resume the lost worker. */
-						resume = w;
-					} else if (!w && again) {
-						punch_retire(s, cu);
-					} else if (w || adm || lanq || just) {
-						dbg_logf("host: ignore claim %.8s "
-							 "(worker=%d admitted=%d "
-							 "lanq=%d justserved=%d)",
-							 cu, w ? 1 : 0, adm,
-							 lanq, just);
-						/* Ignoring it is not leaving it
-						 * there: the slot is the mutex,
-						 * and a claim we will not serve
-						 * holding it stops every other
-						 * client from writing one. */
 						sig_release(s->sig);
 						s->have_peer_sdp = 0;
 						break;
 					}
+					if (w && !conn_is_lost(w) &&
+					    conn_is_proven(w)) {
+						dbg_logf("host: ignore claim %.8s "
+							 "(healthy worker)", cu);
+						sig_release(s->sig);
+						s->have_peer_sdp = 0;
+						break;
+					}
+					if (punch_count(s, cu) >=
+					    PUNCH_PARALLEL_MAX) {
+						dbg_logf("host: claim %.8s at the "
+							 "parallel-punch cap", cu);
+						sig_release(s->sig);
+						s->have_peer_sdp = 0;
+						break;
+					}
+					resume = w;
 				}
 				/* A fresh claimant past the admission budget is
 				 * left unserved; a resumption always passes. */
-				if (!resume && cfg->host_admit_max &&
+				if (!resume && !ufrag_admitted(s, cu) &&
+				    cfg->host_admit_max &&
 				    s->admitted_n >= cfg->host_admit_max) {
 					dbg_logf("host: admission budget spent "
 						 "-- claim ignored");
@@ -7164,20 +7101,20 @@ static int host_turnstile(struct sess *s)
 					 sizeof(listen->remote_ufrag), "%s", cu);
 				snprintf(listen->remote_pwd,
 					 sizeof(listen->remote_pwd), "%s", cp);
-				/* Release on pickup: hand the punch to the in-flight
-				 * set and rotate a fresh offer at once, so the next
-				 * client is admitted without waiting for this punch. */
-				s->punching[pslot] = listen;
-				listen->punch_resume = resume;
 				if (resume) {
 					__atomic_add_fetch(&resume->resume_pending, 1,
 							   __ATOMIC_RELAXED);
 					__atomic_store_n(&resume->resume_last_ms,
 							 now_ms(),
 							 __ATOMIC_RELAXED);
-				} else {
+				} else if (!ufrag_admitted(s, cu)) {
 					s->admitted_n++;
 				}
+				/* Release on pickup: hand the punch to the in-flight
+				 * set and rotate a fresh offer at once, so the next
+				 * client is admitted without waiting for this punch. */
+				s->punching[pslot] = listen;
+				listen->punch_resume = resume;
 				pthread_mutex_lock(&listen->claim_lock);
 				snprintf(listen->claim_ufrag,
 					 sizeof(listen->claim_ufrag), "%s", cu);
