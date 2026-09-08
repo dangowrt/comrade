@@ -56,6 +56,13 @@ int path_ep_eq(const struct path_ep *a, const struct path_ep *b)
 	return a->port == b->port && !memcmp(a->addr, b->addr, 16);
 }
 
+/* Same address, port ignored: two endpoints that differ only in port are the
+ * same route, since the port is a NAT pinhole over the one physical path. */
+int path_ep_same_addr(const struct path_ep *a, const struct path_ep *b)
+{
+	return !memcmp(a->addr, b->addr, 16);
+}
+
 int path_ep_from_sockaddr(struct path_ep *ep, const struct sockaddr *sa,
 			  socklen_t len)
 {

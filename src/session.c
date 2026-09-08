@@ -1083,8 +1083,11 @@ static void conn_holds_gc(struct conn *c, uint64_t now)
 	}
 }
 
-/* One punch per route: when two owned agents nominated the same address pair
- * the redundant hold is freed, so only distinct routes are maintained. */
+/* One punch per route: a route is the source and destination address pair, the
+ * port ignored (it is a NAT pinhole over the one physical path). When two owned
+ * agents nominated the same route the redundant hold is freed, so only distinct
+ * routes are maintained; the carrying path is never the one dropped, and a
+ * different source address (a second interface) stays a route of its own. */
 static void conn_route_dedup(struct conn *c)
 {
 	struct ice_ctx *loser_ctx[ICE_HOLD_MAX];
@@ -1101,8 +1104,12 @@ static void conn_route_dedup(struct conn *c)
 		for (j = i + 1; j < PATH_TABLE_MAX; j++) {
 			if (!c->paths.p[j].used ||
 			    c->paths.p[j].kind != PATH_ICE ||
-			    !path_ep_eq(&c->paths.p[i].peer_ep,
-					&c->paths.p[j].peer_ep))
+			    !path_ep_same_addr(&c->paths.p[i].peer_ep,
+					       &c->paths.p[j].peer_ep) ||
+			    !c->paths.p[i].have_self_ep ||
+			    !c->paths.p[j].have_self_ep ||
+			    !path_ep_same_addr(&c->paths.p[i].self_ep,
+					       &c->paths.p[j].self_ep))
 				continue;
 			drop = NULL;
 			if (c->paths.p[j].agent != c->nat && j != sel)

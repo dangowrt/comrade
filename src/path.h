@@ -109,6 +109,7 @@ void path_ep_to_sockaddr(const struct path_ep *ep, struct sockaddr_in6 *out);
 void path_ep_pack(const struct path_ep *ep, uint8_t out[PATH_EP_LEN]);
 void path_ep_unpack(struct path_ep *ep, const uint8_t in[PATH_EP_LEN]);
 int path_ep_eq(const struct path_ep *a, const struct path_ep *b);
+int path_ep_same_addr(const struct path_ep *a, const struct path_ep *b);
 int path_ep_any(const struct path_ep *ep);
 int path_ep_is_v4(const struct path_ep *ep);
 
