@@ -147,6 +147,11 @@ static struct stun_cache_entry stun_cache[STUN_CACHE_MAX];
 static int stun_cache_n;
 static pthread_mutex_t stun_cache_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* Names that failed to resolve, skipped for the life of the process so a dead
+ * pool entry is not handed to libjuice to stall the gather on. */
+static char stun_neg[STUN_CACHE_MAX][128];
+static int stun_neg_n;
+
 /* Every address held for `name`, in insertion order; how many were written. */
 static int cache_get_all(const char *name, int family,
 			 struct sockaddr_in *out, int max)
@@ -211,6 +216,35 @@ static void cache_put(const char *name, int family,
 	pthread_mutex_unlock(&stun_cache_lock);
 }
 
+static int neg_has(const char *name)
+{
+	int i, hit = 0;
+
+	pthread_mutex_lock(&stun_cache_lock);
+	for (i = 0; i < stun_neg_n; i++)
+		if (!strcmp(stun_neg[i], name)) {
+			hit = 1;
+			break;
+		}
+	pthread_mutex_unlock(&stun_cache_lock);
+	return hit;
+}
+
+static void neg_put(const char *name)
+{
+	int i;
+
+	if (strlen(name) >= sizeof(stun_neg[0]))
+		return;
+	pthread_mutex_lock(&stun_cache_lock);
+	for (i = 0; i < stun_neg_n; i++)
+		if (!strcmp(stun_neg[i], name))
+			break;
+	if (i == stun_neg_n && stun_neg_n < STUN_CACHE_MAX)
+		strcpy(stun_neg[stun_neg_n++], name);
+	pthread_mutex_unlock(&stun_cache_lock);
+}
+
 /* "host:port" resolved to a v4 target; 3478 with no or unparsable port. */
 
 /*
@@ -234,6 +268,8 @@ static int resolve4_all(const char *server, struct sockaddr_in *out, int max)
 	n = cache_get_all(server, AF_INET, out, max);
 	if (n)
 		return n;
+	if (neg_has(server))
+		return 0;
 	if (hl >= sizeof(host))
 		return 0;
 	memcpy(host, server, hl);
@@ -244,8 +280,10 @@ static int resolve4_all(const char *server, struct sockaddr_in *out, int max)
 	memset(&hints, 0, sizeof(hints));
 	hints.ai_family = AF_INET;
 	hints.ai_socktype = SOCK_DGRAM;
-	if (getaddrinfo(host, port, &hints, &res) || !res)
+	if (getaddrinfo(host, port, &hints, &res) || !res) {
+		neg_put(server);
 		return 0;
+	}
 	for (ai = res; ai && n < max; ai = ai->ai_next) {
 		if (ai->ai_family != AF_INET ||
 		    ai->ai_addrlen < (socklen_t)sizeof(out[0]))
@@ -263,6 +301,19 @@ static int resolve4_all(const char *server, struct sockaddr_in *out, int max)
 	}
 	freeaddrinfo(res);
 	return n;
+}
+
+int stun_server_ip4(const char *server, char *out, size_t outn, int allow_net)
+{
+	struct sockaddr_in sin;
+	int n;
+
+	n = cache_get_all(server, AF_INET, &sin, 1);
+	if (!n && allow_net)
+		n = resolve4_all(server, &sin, 1);
+	if (n < 1)
+		return 0;
+	return inet_ntop(AF_INET, &sin.sin_addr, out, (socklen_t)outn) ? 1 : 0;
 }
 
 /* Ask one server, naming it in the transaction id's last byte (which the

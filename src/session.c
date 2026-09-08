@@ -3775,24 +3775,45 @@ static int nat_setup(struct conn *c)
 	struct sess *s = c->sess;
 	struct nat_config cfg;
 	struct ice_ctx *ctx;
+	const char *colon;
+	const char *cand;
+	const char *e;
+	int i, picked;
+	char ip[64];
+	size_t hl;
 
 	memset(&cfg, 0, sizeof(cfg));
 	cfg.stun_host = s->cfg->stun_host;
 	cfg.stun_port = s->cfg->stun_port;
 	if (!cfg.stun_host && s->cfg->stun_auto && s->stun_count > 0) {
-		/* Rotate the managed pool across retries, splitting host:port. */
-		const char *e = s->stun_servers[s->ice_attempt % s->stun_count];
-		const char *colon = strrchr(e, ':');
-		size_t hl = colon ? (size_t)(colon - e) : strlen(e);
-
-		if (hl >= sizeof(s->stun_host))
-			hl = sizeof(s->stun_host) - 1;
-		memcpy(s->stun_host, e, hl);
-		s->stun_host[hl] = '\0';
-		cfg.stun_host = s->stun_host;
+		/* Feed libjuice a pre-resolved pool IP: a hostname is re-resolved
+		 * per agent, and a dead name stalls the gather a roam can least
+		 * afford. The prober warms the cache; fall back to the name only
+		 * for a cold start. */
+		picked = 0;
+		e = s->stun_servers[s->ice_attempt % s->stun_count];
+		for (i = 0; i < s->stun_count && !picked; i++) {
+			cand = s->stun_servers[(s->ice_attempt + i) %
+					       s->stun_count];
+			if (stun_server_ip4(cand, ip, sizeof(ip), 0)) {
+				e = cand;
+				picked = 1;
+			}
+		}
+		colon = strrchr(e, ':');
 		cfg.stun_port = colon ? (uint16_t)atoi(colon + 1) : 3478;
 		if (!cfg.stun_port)
 			cfg.stun_port = 3478;
+		if (picked) {
+			memcpy(s->stun_host, ip, strlen(ip) + 1);
+		} else {
+			hl = colon ? (size_t)(colon - e) : strlen(e);
+			if (hl >= sizeof(s->stun_host))
+				hl = sizeof(s->stun_host) - 1;
+			memcpy(s->stun_host, e, hl);
+			s->stun_host[hl] = '\0';
+		}
+		cfg.stun_host = s->stun_host;
 	}
 	cfg.bind_port = c->bind_port;
 	cfg.ice_ufrag = c->ice_ufrag;

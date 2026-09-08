@@ -67,6 +67,11 @@ void stun_probe_check(char *const *servers, int nservers, int family,
 		      int total_ms, uint8_t seed[STUN_PROBE_TXID_LEN],
 		      volatile int *stop, stun_probe_check_hit *hit, void *arg);
 
+/* First cached IPv4 address for `server` ("host[:port]") as a dotted string in
+ * out (outn >= 16). allow_net resolves and caches on a miss (blocking); 0 uses
+ * the cache only. Returns 1 on success, 0 if not (yet) known. */
+int stun_server_ip4(const char *server, char *out, size_t outn, int allow_net);
+
 /*
  * RFC 4787 mapping-behaviour classification, built incrementally from the
  * (address, port) pairs a probe run's `hit` callback sees: every server
