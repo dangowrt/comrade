@@ -6099,20 +6099,6 @@ static int lan_pending_ufrag(const struct sess *s, const char *ufrag)
 	return 0;
 }
 
-/* Is a punch for this claimant running right now? Narrower than
- * ufrag_admitted, whose slots keep naming a claimant for the worker's whole
- * life -- residue that must not veto that same claimant's resumption. */
-static int punch_in_flight(const struct sess *s, const char *ufrag)
-{
-	int i;
-
-	for (i = 0; i < HOST_MAX_WORKERS; i++)
-		if (s->punching[i] &&
-		    !strcmp(s->punching[i]->punch_ufrag, ufrag))
-			return 1;
-	return 0;
-}
-
 /*
  * A claimant we are already punching at has asked again, under a password we
  * have not punched at. Its previous attempt is over as far as it is concerned
@@ -6939,7 +6925,7 @@ static int host_turnstile(struct sess *s)
 						break;
 					} else if (w && (conn_is_lost(w) ||
 							 !conn_is_proven(w)) &&
-						   !punch_in_flight(s, cu) &&
+						   !adm &&
 						   now_ms() -
 						   __atomic_load_n(&w->resume_last_ms,
 								   __ATOMIC_RELAXED) >
