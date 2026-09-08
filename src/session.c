@@ -393,6 +393,8 @@ struct conn {
 	uint64_t rs_deadline;
 	uint32_t rs_backoff;		/* the answer-wait between re-claims, from
 					 * RESUME_FIRST_MS up to RESUME_ATTEMPT_MS */
+	uint64_t rs_prime_ms;		/* client: when the current offer was
+					 * primed, to bound a stalled resume */
 	struct ice_ctx *resume_ctx;	/* the handover slot; see above */
 	volatile int resume_pending;
 	uint64_t resume_last_ms;	/* host: when a resume punch last began,
@@ -4433,6 +4435,11 @@ static int sig_rebuild(struct sess *s, const char *why)
  * host's own cadence so a peer that is simply gone is not hammered. */
 #define RESUME_FIRST_MS 2000
 
+/* Longest a resume agent primed against the host's offer keeps trying before
+ * the client re-gathers under a fresh password: past a healthy connect, below
+ * libjuice's failure timer and the host reap. */
+#define RESUME_PRIME_MS 6000
+
 static uint32_t resume_backoff(struct conn *c)
 {
 	if (!c->rs_backoff)
@@ -4652,6 +4659,7 @@ static void resume_tick(struct conn *c)
 					 sizeof(c->remote_ufrag), "%s", ufrag);
 				c->remote_gen = sig_peer_gen(s->sig);
 				s->remote_set = 1;
+				c->rs_prime_ms = now;
 				dbg_logf("resume: primed offer %s", ufrag);
 			}
 		}
@@ -4667,9 +4675,11 @@ static void resume_tick(struct conn *c)
 		}
 		if (now >= c->rs_deadline) {
 			/* Hold the set and let ICE keep punching every pair in
-			 * parallel; re-gather only when this end moved or
-			 * libjuice's verdict says the agent is spent. */
-			if (!s->remote_set || s->net_ch || nat_failed(c->nat)) {
+			 * parallel; re-gather when this end moved, libjuice says
+			 * the agent is spent, or the prime has stalled past its
+			 * bound so a fresh password reaches the host. */
+			if (!s->remote_set || s->net_ch || nat_failed(c->nat) ||
+			    now - c->rs_prime_ms >= RESUME_PRIME_MS) {
 				c->rs_state = 0;
 				return;
 			}
