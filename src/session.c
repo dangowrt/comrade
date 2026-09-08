@@ -399,6 +399,13 @@ struct conn {
 					 * so a redelivered claim in the window
 					 * between graft and first probe does
 					 * not punch the same worker twice */
+	struct conn *punch_resume;	/* host: the worker this punch resumes,
+					 * NULL for a fresh admit; non-owning */
+	uint64_t punch_start_ms;
+	int punch_stuck;
+	char punch_ufrag[40];		/* host: claimant id while punching;
+					 * cleared at reap while the conn lives,
+					 * so distinct from claim_ufrag */
 	/* The claimant's ICE ufrag, carried for the worker's whole lifetime so the
 	 * host recognises the same client arriving over the other transport. */
 	/*
@@ -773,7 +780,7 @@ struct sess {
 	int adopt_tokens;			/* thousandths of a token */
 	struct adopt_src adopt_src[ADOPT_SRC_MAX];	/* and each source's own */
 	uint64_t adopt_ms;
-	char punch_ufrag[HOST_MAX_WORKERS][40];	/* each punch's claimant id */
+	struct conn *punching[HOST_MAX_WORKERS];	/* in-flight ICE punches */
 	char last_served_ufrag[40];
 	struct claim_served served;	/* claimants this host has served */
 	int admitted_n;			/* claimants admitted this run (the
@@ -3421,7 +3428,8 @@ static int ufrag_admitted(const struct sess *s, const char *ufrag)
 	if (!ufrag[0])
 		return 0;
 	for (i = 0; i < HOST_MAX_WORKERS; i++)
-		if (!strcmp(s->punch_ufrag[i], ufrag))
+		if (s->punching[i] &&
+		    !strcmp(s->punching[i]->punch_ufrag, ufrag))
 			return 1;
 	return 0;
 }
@@ -6084,13 +6092,13 @@ static int lan_pending_ufrag(const struct sess *s, const char *ufrag)
 /* Is a punch for this claimant running right now? Narrower than
  * ufrag_admitted, whose slots keep naming a claimant for the worker's whole
  * life -- residue that must not veto that same claimant's resumption. */
-static int punch_in_flight(const struct sess *s, struct conn *const *punching,
-			   const char *ufrag)
+static int punch_in_flight(const struct sess *s, const char *ufrag)
 {
 	int i;
 
 	for (i = 0; i < HOST_MAX_WORKERS; i++)
-		if (punching[i] && !strcmp(s->punch_ufrag[i], ufrag))
+		if (s->punching[i] &&
+		    !strcmp(s->punching[i]->punch_ufrag, ufrag))
 			return 1;
 	return 0;
 }
@@ -6110,36 +6118,37 @@ static int punch_in_flight(const struct sess *s, struct conn *const *punching,
  * The same password is the opposite case: the DHT serving its previous claim
  * again, which must not disturb the punch already running for it.
  */
-static int punch_tried_again(const struct sess *s, struct conn *const *punching,
-			     const char *ufrag, const char *pwd)
+static int punch_tried_again(const struct sess *s, const char *ufrag,
+			     const char *pwd)
 {
 	int i;
 
 	if (!ufrag[0] || !pwd[0])
 		return 0;
 	for (i = 0; i < HOST_MAX_WORKERS; i++)
-		if (punching[i] && !strcmp(s->punch_ufrag[i], ufrag))
-			return strcmp(punching[i]->remote_pwd, pwd) != 0;
+		if (s->punching[i] &&
+		    !strcmp(s->punching[i]->punch_ufrag, ufrag))
+			return strcmp(s->punching[i]->remote_pwd, pwd) != 0;
 	return 0;
 }
 
-static struct conn *punch_by_ufrag(struct conn *const *punching,
-				   const struct sess *s, const char *ufrag)
+static struct conn *punch_by_ufrag(struct sess *s, const char *ufrag)
 {
 	int i;
 
 	if (!ufrag[0])
 		return NULL;
 	for (i = 0; i < HOST_MAX_WORKERS; i++)
-		if (punching[i] && !strcmp(s->punch_ufrag[i], ufrag))
-			return punching[i];
+		if (s->punching[i] &&
+		    !strcmp(s->punching[i]->punch_ufrag, ufrag))
+			return s->punching[i];
 	return NULL;
 }
 
-static void punch_amend_repost(struct conn *const *punching, struct sess *s,
-			       const char *ufrag, const char *pwd)
+static void punch_amend_repost(struct sess *s, const char *ufrag,
+			       const char *pwd)
 {
-	struct conn *pc = punch_by_ufrag(punching, s, ufrag);
+	struct conn *pc = punch_by_ufrag(s, ufrag);
 
 	if (pc && !strcmp(pc->remote_pwd, pwd))
 		conn_amend_remote(pc, s);
@@ -6148,14 +6157,15 @@ static void punch_amend_repost(struct conn *const *punching, struct sess *s,
 /* How long the punch running for this claimant has had, if there is one: a
  * fresh ask that arrives inside the floor is turned away rather than served,
  * so the punch already running for it keeps its budget. */
-static int punch_young(const struct sess *s, struct conn *const *punching,
-		       const uint64_t *punch_start, const char *ufrag)
+static int punch_young(const struct sess *s, const char *ufrag)
 {
 	int i;
 
 	for (i = 0; i < HOST_MAX_WORKERS; i++)
-		if (punching[i] && !strcmp(s->punch_ufrag[i], ufrag))
-			return now_ms() - punch_start[i] < HOST_PUNCH_FLOOR_MS;
+		if (s->punching[i] &&
+		    !strcmp(s->punching[i]->punch_ufrag, ufrag))
+			return now_ms() - s->punching[i]->punch_start_ms <
+			       HOST_PUNCH_FLOOR_MS;
 	return 0;
 }
 
@@ -6163,24 +6173,22 @@ static int punch_young(const struct sess *s, struct conn *const *punching,
  * replaces it. Only called where that replacement is about to be admitted:
  * dropping a punch and then refusing the claim would leave the claimant worse
  * off than being told to wait. */
-static void punch_retire(struct sess *s, struct conn **punching,
-			 struct conn **punch_resume, const char *ufrag)
+static void punch_retire(struct sess *s, const char *ufrag)
 {
+	struct conn *c;
 	int i;
 
 	for (i = 0; i < HOST_MAX_WORKERS; i++) {
-		struct conn *c = punching[i];
-
-		if (!c || strcmp(s->punch_ufrag[i], ufrag))
+		c = s->punching[i];
+		if (!c || strcmp(c->punch_ufrag, ufrag))
 			continue;
 		dbg_logf("host: claimant tried again -- retiring its punch");
-		if (punch_resume[i]) {
-			__atomic_store_n(&punch_resume[i]->resume_pending, 0,
+		if (c->punch_resume) {
+			__atomic_store_n(&c->punch_resume->resume_pending, 0,
 					 __ATOMIC_RELAXED);
-			punch_resume[i] = NULL;
+			c->punch_resume = NULL;
 		}
-		punching[i] = NULL;
-		s->punch_ufrag[i][0] = '\0';
+		s->punching[i] = NULL;
 		conn_free(c);
 		return;
 	}
@@ -6281,23 +6289,21 @@ static void lan_drain(struct sess *s, struct worker *ws, int *dash_seq)
  * only time out), which the L1-stuck e2e uses to prove the no-block property.
  * Host main thread.
  */
-static void punch_scan(struct sess *s, struct worker *ws, struct conn **punching,
-		       struct conn **punch_resume, uint64_t *punch_start,
-		       int *punch_stuck, int *dash_seq)
+static void punch_scan(struct sess *s, struct worker *ws, int *dash_seq)
 {
 	const struct session_obs *o = s->cfg->obs;
+	char loc[192], rem[192], addr[80];
+	struct conn *c;
+	struct conn *t;
 	int i;
 
 	for (i = 0; i < HOST_MAX_WORKERS; i++) {
-		struct conn *c = punching[i];
-
+		c = s->punching[i];
 		if (!c)
 			continue;
-		if (!punch_stuck[i] && nat_connected(c->nat)) {
-			char loc[192], rem[192], addr[80];
-
+		if (!c->punch_stuck && nat_connected(c->nat)) {
 			snprintf(s->last_served_ufrag, sizeof(s->last_served_ufrag),
-				 "%.39s", s->punch_ufrag[i]);
+				 "%.39s", c->punch_ufrag);
 			s->have_served = 1;
 			/*
 			 * A resumption: hand the punched agent to the worker
@@ -6309,9 +6315,8 @@ static void punch_scan(struct sess *s, struct worker *ws, struct conn **punching
 			 * dissolved without a worker, a dashboard row, or a
 			 * registration of its own.
 			 */
-			if (punch_resume[i]) {
-				struct conn *t = punch_resume[i];
-
+			if (c->punch_resume) {
+				t = c->punch_resume;
 				dbg_logf("host: punch connected -> resume "
 					 "worker");
 				if (c->nat_ctx) {
@@ -6332,11 +6337,7 @@ static void punch_scan(struct sess *s, struct worker *ws, struct conn **punching
 					 "%s", c->remote_pwd);
 				__atomic_store_n(&t->resume_pending, 0,
 						 __ATOMIC_RELAXED);
-				punching[i] = NULL;
-				punch_resume[i] = NULL;
-				s->punch_ufrag[i][0] = '\0';	/* grafted: the
-								 * worker holds
-								 * it now */
+				s->punching[i] = NULL;
 				/*
 				 * Dissolved now, released when the agent it
 				 * lent is destroyed: a callback that loaded
@@ -6367,7 +6368,7 @@ static void punch_scan(struct sess *s, struct worker *ws, struct conn **punching
 					addr);
 				c->link_told_any = 0;
 			}
-			punching[i] = NULL;
+			s->punching[i] = NULL;
 			/*
 			 * Said before it is served, and only to a claimant we
 			 * have served before: that one thought it was resuming
@@ -6377,24 +6378,12 @@ static void punch_scan(struct sess *s, struct worker *ws, struct conn **punching
 			 * the first time has no session of its own to be told
 			 * about, and telling it would end the one it is in.
 			 */
-			if (claim_served_has(&s->served, s->punch_ufrag[i]))
+			if (claim_served_has(&s->served, c->punch_ufrag))
 				conn_tell_fresh(c, NULL);
-			claim_served_note(&s->served, s->punch_ufrag[i]);
+			claim_served_note(&s->served, c->punch_ufrag);
 			conn_register(s, c);
 			if (worker_spawn(ws, c))
 				conn_free(c);		/* table full */
-			/*
-			 * The punch is over whichever way that went, so the
-			 * slot stops naming this claimant: from here the worker
-			 * is what holds the identity, and worker_by_ufrag is
-			 * what answers for it. Left set, the slot goes on
-			 * saying a punch is in flight long after the worker it
-			 * made has been reaped, and ufrag_admitted then refuses
-			 * that claimant every time it comes back -- a client
-			 * whose session never carried asking once a second and
-			 * being ignored for as long as it cares to ask.
-			 */
-			s->punch_ufrag[i][0] = '\0';
 		/*
 		 * A resumption gets the long budget because a client coming
 		 * back may be slow to reappear -- but only one that has a
@@ -6404,16 +6393,15 @@ static void punch_scan(struct sess *s, struct worker *ws, struct conn **punching
 		 * half while the client it belongs to is asking once a second
 		 * and being told a punch is already running for it.
 		 */
-		} else if (now_ms() - punch_start[i] >
-			   ((punch_resume[i] && conn_is_proven(punch_resume[i])) ?
+		} else if (now_ms() - c->punch_start_ms >
+			   ((c->punch_resume && conn_is_proven(c->punch_resume)) ?
 			    ICE_ATTEMPT_MS : HOST_PUNCH_MS) ||
-			   (!punch_stuck[i] && nat_failed(c->nat))) {
+			   (!c->punch_stuck && nat_failed(c->nat))) {
 			dbg_logf("host: punch %s -> drop",
-				 punch_stuck[i] ? "wedged (test)" : "failed");
-			if (punch_resume[i]) {
-				__atomic_store_n(&punch_resume[i]->resume_pending, 0,
-					 __ATOMIC_RELAXED);
-				punch_resume[i] = NULL;
+				 c->punch_stuck ? "wedged (test)" : "failed");
+			if (c->punch_resume) {
+				__atomic_store_n(&c->punch_resume->resume_pending,
+						 0, __ATOMIC_RELAXED);
 			} else if (s->admitted_n > 0) {
 				/* It was counted against the grant when it was
 				 * picked up, and it admitted nobody. Left spent,
@@ -6423,8 +6411,7 @@ static void punch_scan(struct sess *s, struct worker *ws, struct conn **punching
 				 * in the first place. */
 				s->admitted_n--;
 			}
-			punching[i] = NULL;
-			s->punch_ufrag[i][0] = '\0';
+			s->punching[i] = NULL;
 			conn_free(c);
 		}
 	}
@@ -6504,11 +6491,7 @@ static int host_turnstile(struct sess *s)
 	const struct session_obs *o = cfg->obs;
 	struct worker ws[HOST_MAX_WORKERS];
 	struct conn *listen = NULL;
-	struct conn *punching[HOST_MAX_WORKERS];	/* in-flight ICE punches */
-	struct conn *punch_resume[HOST_MAX_WORKERS];	/* worker each punch
-							 * resumes, if any */
-	uint64_t punch_start[HOST_MAX_WORKERS];
-	int punch_stuck[HOST_MAX_WORKERS];		/* test: never connect */
+	int again;
 	enum { TS_GATHER, TS_WAIT_CLAIM } ts = TS_GATHER;
 	uint64_t deadline = now_ms() + (uint64_t)cfg->connect_timeout_s * 1000;
 	uint64_t last_active = now_ms();
@@ -6519,12 +6502,9 @@ static int host_turnstile(struct sess *s)
 	int stuck_left = cfg->test_stuck_punches;
 
 	memset(ws, 0, sizeof(ws));
-	memset(punching, 0, sizeof(punching));
-	memset(punch_resume, 0, sizeof(punch_resume));
-	memset(punch_stuck, 0, sizeof(punch_stuck));
+	memset(s->punching, 0, sizeof(s->punching));
 	s->last_served_ufrag[0] = '\0';
 	s->have_served = 0;
-	memset(s->punch_ufrag, 0, sizeof(s->punch_ufrag));
 
 	while (cfg->host_serve_max == 0 || served < cfg->host_serve_max) {
 		int active = 0;
@@ -6622,13 +6602,16 @@ static int host_turnstile(struct sess *s)
 				 * -- the client wanted its session back, but a
 				 * new one beats none. */
 				for (j = 0; j < HOST_MAX_WORKERS; j++)
-					if (punch_resume[j] == ws[i].c)
-						punch_resume[j] = NULL;
+					if (s->punching[j] &&
+					    s->punching[j]->punch_resume == ws[i].c)
+						s->punching[j]->punch_resume = NULL;
 				if (ws[i].c->claim_ufrag[0])
 					for (j = 0; j < HOST_MAX_WORKERS; j++)
-						if (!strcmp(s->punch_ufrag[j],
+						if (s->punching[j] &&
+						    !strcmp(s->punching[j]->punch_ufrag,
 							    ws[i].c->claim_ufrag)) {
-							s->punch_ufrag[j][0] = '\0';
+							s->punching[j]->punch_ufrag[0]
+								= '\0';
 							break;
 						}
 				/*
@@ -6715,10 +6698,9 @@ static int host_turnstile(struct sess *s)
 		 * concurrently with the listener below. An in-flight punch keeps the
 		 * host non-idle. */
 		report_peer_links(s, ws);
-		punch_scan(s, ws, punching, punch_resume, punch_start,
-			   punch_stuck, &dash_seq);
+		punch_scan(s, ws, &dash_seq);
 		for (i = 0; i < HOST_MAX_WORKERS; i++)
-			if (punching[i])
+			if (s->punching[i])
 				active = 1;
 
 		/*
@@ -6868,8 +6850,6 @@ static int host_turnstile(struct sess *s)
 				sdp_pwd(s->peer_sdp, cp);
 				if (cu[0]) {
 					struct conn *w = worker_by_ufrag(ws, cu);
-					int again = punch_tried_again(s, punching,
-								      cu, cp);
 					int adm = ufrag_admitted(s, cu);
 					int lanq = lan_pending_ufrag(s, cu);
 					int just = s->have_served &&
@@ -6878,6 +6858,7 @@ static int host_turnstile(struct sess *s)
 					int made = w && claim_made(w->remote_pwd,
 								   cp);
 
+					again = punch_tried_again(s, cu, cp);
 					/* Named, because which of these decided
 					 * it is the whole story when a client
 					 * cannot get in and nobody can say why. */
@@ -6887,7 +6868,7 @@ static int host_turnstile(struct sess *s)
 						 cu, cp, w ? 1 : 0, again, adm,
 						 lanq, just, made);
 
-					punch_amend_repost(punching, s, cu, cp);
+					punch_amend_repost(s, cu, cp);
 
 					/*
 					 * The very attempt this worker was
@@ -6910,9 +6891,7 @@ static int host_turnstile(struct sess *s)
 						break;
 					}
 
-					if (again &&
-					    punch_young(s, punching,
-							punch_start, cu)) {
+					if (again && punch_young(s, cu)) {
 						/*
 						 * Asking again while the punch
 						 * we are running for it is still
@@ -6930,8 +6909,7 @@ static int host_turnstile(struct sess *s)
 					}
 					if (w && (conn_is_lost(w) ||
 						  !conn_is_proven(w)) &&
-					    (again ||
-					     !punch_in_flight(s, punching, cu)) &&
+					    (again || !punch_in_flight(s, cu)) &&
 					    now_ms() -
 					    __atomic_load_n(&w->resume_last_ms,
 							    __ATOMIC_RELAXED) >
@@ -6958,13 +6936,10 @@ static int host_turnstile(struct sess *s)
 						 * measured better than the
 						 * tidiness of ignoring it. */
 						if (again)
-							punch_retire(s, punching,
-								     punch_resume,
-								     cu);
+							punch_retire(s, cu);
 						resume = w;
 					} else if (!w && again) {
-						punch_retire(s, punching,
-							     punch_resume, cu);
+						punch_retire(s, cu);
 					} else if (w || adm || lanq || just) {
 						dbg_logf("host: ignore claim %.8s "
 							 "(worker=%d admitted=%d "
@@ -6997,7 +6972,7 @@ static int host_turnstile(struct sess *s)
 				for (i = 0; i < HOST_MAX_WORKERS; i++) {
 					if (ws[i].used)
 						inflight++;
-					if (punching[i]) {
+					if (s->punching[i]) {
 						inflight++;
 						continue;
 					}
@@ -7027,8 +7002,8 @@ static int host_turnstile(struct sess *s)
 				/* Release on pickup: hand the punch to the in-flight
 				 * set and rotate a fresh offer at once, so the next
 				 * client is admitted without waiting for this punch. */
-				punching[pslot] = listen;
-				punch_resume[pslot] = resume;
+				s->punching[pslot] = listen;
+				listen->punch_resume = resume;
 				if (resume) {
 					__atomic_store_n(&resume->resume_pending, 1,
 							 __ATOMIC_RELAXED);
@@ -7042,12 +7017,12 @@ static int host_turnstile(struct sess *s)
 				snprintf(listen->claim_ufrag,
 					 sizeof(listen->claim_ufrag), "%s", cu);
 				pthread_mutex_unlock(&listen->claim_lock);
-				punch_start[pslot] = now_ms();
-				punch_stuck[pslot] = stuck_left > 0;
+				listen->punch_start_ms = now_ms();
+				listen->punch_stuck = stuck_left > 0;
 				if (stuck_left > 0)
 					stuck_left--;
-				snprintf(s->punch_ufrag[pslot],
-					 sizeof(s->punch_ufrag[pslot]),
+				snprintf(listen->punch_ufrag,
+					 sizeof(listen->punch_ufrag),
 					 "%s", cu);
 				listen = NULL;
 				ts = TS_GATHER;
@@ -7101,8 +7076,8 @@ static int host_turnstile(struct sess *s)
 		session_entomb_start(s);
 	wind = now_ms() + SESSION_WIND_MS;
 	for (i = 0; i < HOST_MAX_WORKERS; i++) {
-		if (punching[i])
-			conn_free(punching[i]);
+		if (s->punching[i])
+			conn_free(s->punching[i]);
 		if (!ws[i].used)
 			continue;
 		while (s->session_over && !worker_done(&ws[i]) &&
