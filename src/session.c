@@ -6601,6 +6601,36 @@ static void punch_scan(struct sess *s, struct worker *ws, int *dash_seq)
 	}
 }
 
+/* Free the longest-running punch for a claimant, to admit a fresher one at the
+ * parallel cap: the oldest is on the oldest offer generation, so it is the one
+ * a returning client is least likely to still be answering. */
+static void punch_reap_oldest(struct sess *s, const char *ufrag)
+{
+	uint64_t oldest = 0;
+	int i, victim = -1;
+	struct conn *c;
+
+	for (i = 0; i < HOST_MAX_WORKERS; i++) {
+		c = s->punching[i];
+		if (!c || strcmp(c->punch_ufrag, ufrag))
+			continue;
+		if (victim < 0 || c->punch_start_ms < oldest) {
+			oldest = c->punch_start_ms;
+			victim = i;
+		}
+	}
+	if (victim < 0)
+		return;
+	c = s->punching[victim];
+	if (c->punch_resume)
+		__atomic_sub_fetch(&c->punch_resume->resume_pending, 1,
+				   __ATOMIC_RELAXED);
+	else if (s->admitted_n > 0)
+		s->admitted_n--;
+	s->punching[victim] = NULL;
+	conn_free(c);
+}
+
 /*
  * A host with any signalling backend serves many clients through the turnstile:
  * DHT/ICE joins arrive over the mailbox, and same-segment multicast claimants
@@ -7185,10 +7215,9 @@ static int host_turnstile(struct sess *s)
 					if (punch_count(s, cu) >=
 					    PUNCH_PARALLEL_MAX) {
 						dbg_logf("host: claim %.8s at the "
-							 "parallel-punch cap", cu);
-						sig_release(s->sig);
-						s->have_peer_sdp = 0;
-						break;
+							 "cap -- reap the oldest",
+							 cu);
+						punch_reap_oldest(s, cu);
 					}
 					resume = w;
 				}
