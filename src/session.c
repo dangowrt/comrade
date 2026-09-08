@@ -1084,6 +1084,48 @@ static void conn_holds_gc(struct conn *c, uint64_t now)
 	}
 }
 
+/* One punch per route: when two owned agents nominated the same address pair
+ * the redundant hold is freed, so only distinct routes are maintained. */
+static void conn_route_dedup(struct conn *c)
+{
+	struct ice_ctx *loser_ctx[ICE_HOLD_MAX];
+	struct nat_agent *loser[ICE_HOLD_MAX];
+	int nlose = 0, sel, i, j, h;
+	struct nat_agent *drop;
+
+	pthread_mutex_lock(&c->path_lock);
+	sel = c->paths.sel;
+	for (i = 0; i < PATH_TABLE_MAX; i++) {
+		if (!c->paths.p[i].used || c->paths.p[i].kind != PATH_ICE ||
+		    path_ep_any(&c->paths.p[i].peer_ep))
+			continue;
+		for (j = i + 1; j < PATH_TABLE_MAX; j++) {
+			if (!c->paths.p[j].used ||
+			    c->paths.p[j].kind != PATH_ICE ||
+			    !path_ep_eq(&c->paths.p[i].peer_ep,
+					&c->paths.p[j].peer_ep))
+				continue;
+			drop = NULL;
+			if (c->paths.p[j].agent != c->nat && j != sel)
+				drop = c->paths.p[j].agent;
+			else if (c->paths.p[i].agent != c->nat && i != sel)
+				drop = c->paths.p[i].agent;
+			for (h = 0; drop && h < ICE_HOLD_MAX; h++)
+				if (c->holds[h].agent == drop) {
+					loser[nlose] = drop;
+					loser_ctx[nlose++] = c->holds[h].ctx;
+					c->holds[h].agent = NULL;
+					c->holds[h].ctx = NULL;
+					c->holds[h].until_ms = 0;
+					break;
+				}
+		}
+	}
+	pthread_mutex_unlock(&c->path_lock);
+	for (i = 0; i < nlose; i++)
+		conn_free_agent(c, loser[i], loser_ctx[i]);
+}
+
 /*
  * A resume replaces the agent, and the one being replaced is not known to be
  * dead: it stopped answering, which is also what a drop that ends in a moment
@@ -5196,6 +5238,7 @@ static int conn_run(struct conn *c, int drive_sig)
 		 * than a rediscovery. */
 		path_tick(c, now_ms());
 		conn_holds_gc(c, now_ms());
+		conn_route_dedup(c);
 		if (__atomic_load_n(&c->carry_epoch, __ATOMIC_RELAXED) !=
 		    carry_seen) {
 			carry_seen = __atomic_load_n(&c->carry_epoch,
