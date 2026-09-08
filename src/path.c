@@ -733,6 +733,12 @@ int path_best(const struct path_table *t, uint64_t now)
 	for (i = 0; i < PATH_TABLE_MAX; i++) {
 		if (!t->p[i].used || !t->p[i].usable)
 			continue;
+		/* Carry nothing over a path proven fully lost: every probe of a
+		 * window's worth is gone, so it forwards into a black hole. Let
+		 * the table report none until a real path qualifies. */
+		if (t->p[i].loss_n >= PATH_LOSS_WINDOW / 2 &&
+		    path_loss_ppt(&t->p[i]) >= 1000)
+			continue;
 		if (best < 0 || path_cmp(&t->p[i], &t->p[best], now) < 0)
 			best = i;
 	}
