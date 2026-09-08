@@ -26,15 +26,17 @@
  */
 
 /* Pack an SDP description into out (up to max), stamping it with gen, the
- * offerer's network generation (0 where none). Returns bytes written, -1 on
- * error, 0 if nothing packable (no ufrag/pwd). */
-int candpack_encode(const char *sdp, int for_dht, uint32_t gen, uint8_t *out,
-		    size_t max);
+ * offerer's network generation (0 where none), and offer_ufrag, the ufrag of
+ * the peer offer a claim answers (NULL or "" on an offer, which names none).
+ * Returns bytes written, -1 on error, 0 if nothing packable (no ufrag/pwd). */
+int candpack_encode(const char *sdp, int for_dht, uint32_t gen,
+		    const char *offer_ufrag, uint8_t *out, size_t max);
 
 /* Rebuild an SDP description from packed bytes into out (NUL-terminated, up to
- * max); *gen, if given, takes the stamped generation. Returns the string
- * length, or -1 on error. */
-int candpack_decode(const uint8_t *in, size_t in_len, uint32_t *gen, char *out,
-		    size_t max);
+ * max); *gen, if given, takes the stamped generation, and offer_ufrag, if
+ * given, the named offer ufrag ("" when the packing named none). Returns the
+ * string length, or -1 on error. */
+int candpack_decode(const uint8_t *in, size_t in_len, uint32_t *gen,
+		    char *offer_ufrag, size_t offer_max, char *out, size_t max);
 
 #endif

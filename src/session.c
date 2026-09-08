@@ -1899,6 +1899,7 @@ static void pool_pump(struct sess *s)
 	}
 	if (sdp_ready(s) && n >= 2 && n > s->pool_posted) {
 		s->pool_posted = fan_local_sdp(s);
+		sig_set_claim_offer(s->sig, s->c.remote_ufrag);
 		sig_post(s->sig, (const uint8_t *)s->local_sdp,
 			 strlen(s->local_sdp));
 		/* The fan is the whole answer to a carrier that picks a
@@ -4777,6 +4778,7 @@ static void resume_tick(struct conn *c)
 			snprintf(s->local_sdp, sizeof(s->local_sdp), "%s",
 				 filtered);
 			s->pool_posted = fan_local_sdp(s);
+			sig_set_claim_offer(s->sig, c->remote_ufrag);
 			sig_post(s->sig, (const uint8_t *)s->local_sdp,
 				 strlen(s->local_sdp));
 			sig_redeliver(s->sig);
@@ -4802,6 +4804,11 @@ static void resume_tick(struct conn *c)
 				s->remote_set = 1;
 				c->rs_prime_ms = now;
 				dbg_logf("resume: primed offer %s", ufrag);
+				/* Re-post the claim now naming the offer we
+				 * primed, so the host punches this generation. */
+				sig_set_claim_offer(s->sig, c->remote_ufrag);
+				sig_post(s->sig, (const uint8_t *)s->local_sdp,
+					 strlen(s->local_sdp));
 			}
 		}
 		/* A higher generation is the host having moved, its candidates
@@ -6621,6 +6628,99 @@ static int sig_idle_s(struct sig *sig)
 }
 
 
+/* Offer agents rotated away but kept un-primed, so a claim naming one is
+ * punched with the exact agent the client primed. Each is a poll thread. */
+#define OFFER_KEEP_MAX 3
+#define OFFER_KEEP_MS 10000
+struct kept_offer {
+	struct conn *c;
+	uint64_t until_ms;
+};
+
+static void offer_retire(struct sess *s, struct kept_offer *ring,
+			 struct conn **lp, int published, uint64_t now)
+{
+	struct conn *c = *lp;
+	int i;
+
+	*lp = NULL;
+	s->offer_conn = NULL;
+	if (!c)
+		return;
+	if (published)
+		for (i = 0; i < OFFER_KEEP_MAX; i++)
+			if (!ring[i].c) {
+				ring[i].c = c;
+				ring[i].until_ms = now + OFFER_KEEP_MS;
+				return;
+			}
+	conn_free(c);
+}
+
+static void offer_gc(struct kept_offer *ring, uint64_t now)
+{
+	int i;
+
+	for (i = 0; i < OFFER_KEEP_MAX; i++) {
+		if (!ring[i].c)
+			continue;
+		if (now < ring[i].until_ms && !nat_failed(ring[i].c->nat))
+			continue;
+		conn_free(ring[i].c);
+		ring[i].c = NULL;
+		ring[i].until_ms = 0;
+	}
+}
+
+static void offer_free_all(struct kept_offer *ring)
+{
+	int i;
+
+	for (i = 0; i < OFFER_KEEP_MAX; i++) {
+		conn_free(ring[i].c);
+		ring[i].c = NULL;
+		ring[i].until_ms = 0;
+	}
+}
+
+static int offer_find(struct kept_offer *ring, const char *uf)
+{
+	int i;
+
+	if (!uf || !uf[0])
+		return -1;
+	for (i = 0; i < OFFER_KEEP_MAX; i++)
+		if (ring[i].c && !strcmp(ring[i].c->ice_ufrag, uf))
+			return i;
+	return -1;
+}
+
+static int punch_take(struct sess *s, struct conn *pc, struct conn *resume,
+		      int pslot, const char *cu, const char *cp,
+		      const char *filtered, int stuck)
+{
+	if (nat_set_remote_description(pc->nat, filtered))
+		return -1;
+	snprintf(pc->remote_ufrag, sizeof(pc->remote_ufrag), "%s", cu);
+	snprintf(pc->remote_pwd, sizeof(pc->remote_pwd), "%s", cp);
+	if (resume) {
+		__atomic_add_fetch(&resume->resume_pending, 1, __ATOMIC_RELAXED);
+		__atomic_store_n(&resume->resume_last_ms, now_ms(),
+				 __ATOMIC_RELAXED);
+	} else if (!ufrag_admitted(s, cu)) {
+		s->admitted_n++;
+	}
+	s->punching[pslot] = pc;
+	pc->punch_resume = resume;
+	pthread_mutex_lock(&pc->claim_lock);
+	snprintf(pc->claim_ufrag, sizeof(pc->claim_ufrag), "%s", cu);
+	pthread_mutex_unlock(&pc->claim_lock);
+	pc->punch_start_ms = now_ms();
+	pc->punch_stuck = stuck;
+	snprintf(pc->punch_ufrag, sizeof(pc->punch_ufrag), "%s", cu);
+	return 0;
+}
+
 /*
  * Host turnstile: advertise one offer at a time (a fresh ICE identity per
  * offer) and accept a client's claimed answer. On pickup the listener hands the
@@ -6637,9 +6737,13 @@ static int host_turnstile(struct sess *s)
 {
 	const struct session_cfg *cfg = s->cfg;
 	const struct session_obs *o = cfg->obs;
+	struct kept_offer kept[OFFER_KEEP_MAX];
 	struct worker ws[HOST_MAX_WORKERS];
 	struct conn *listen = NULL;
+	struct conn *pc;
+	char co[40];
 	int again;
+	int ko;
 	enum { TS_GATHER, TS_WAIT_CLAIM } ts = TS_GATHER;
 	uint64_t deadline = now_ms() + (uint64_t)cfg->connect_timeout_s * 1000;
 	uint64_t last_active = now_ms();
@@ -6650,6 +6754,7 @@ static int host_turnstile(struct sess *s)
 	int stuck_left = cfg->test_stuck_punches;
 
 	memset(ws, 0, sizeof(ws));
+	memset(kept, 0, sizeof(kept));
 	memset(s->punching, 0, sizeof(s->punching));
 	s->last_served_ufrag[0] = '\0';
 	s->have_served = 0;
@@ -6685,6 +6790,7 @@ static int host_turnstile(struct sess *s)
 				listen = NULL;
 				s->offer_conn = NULL;
 			}
+			offer_free_all(kept);
 			if (cfg->test_roam_hard)
 				for (i = 0; i < HOST_MAX_WORKERS; i++)
 					if (ws[i].used)
@@ -6705,11 +6811,9 @@ static int host_turnstile(struct sess *s)
 		if (sig_quiet(s->sig)) {
 			dbg_logf("sig: nothing back from the rendezvous for "
 				 "%ds -- rebuilding", sig_idle_s(s->sig));
-			if (listen) {
-				conn_free(listen);
-				listen = NULL;
-				s->offer_conn = NULL;
-			}
+			if (listen)
+				offer_retire(s, kept, &listen,
+					     ts == TS_WAIT_CLAIM, now_ms());
 			if (sig_rebuild(s, "after the rendezvous went quiet"))
 				break;
 			ts = TS_GATHER;
@@ -6847,6 +6951,7 @@ static int host_turnstile(struct sess *s)
 		 * host non-idle. */
 		report_peer_links(s, ws);
 		punch_scan(s, ws, &dash_seq);
+		offer_gc(kept, now_ms());
 		for (i = 0; i < HOST_MAX_WORKERS; i++)
 			if (s->punching[i])
 				active = 1;
@@ -6871,9 +6976,7 @@ static int host_turnstile(struct sess *s)
 				 s->stun_rotations + 1, STUN_ROTATE_MAX);
 			__atomic_add_fetch(&s->ice_attempt, 1, __ATOMIC_RELAXED);
 			s->stun_rotations++;
-			conn_free(listen);
-			listen = NULL;
-			s->offer_conn = NULL;
+			offer_retire(s, kept, &listen, 1, now_ms());
 			s->have_local_sdp = 0;
 			s->local_sdp[0] = '\0';
 			ts = TS_GATHER;
@@ -6996,6 +7099,7 @@ static int host_turnstile(struct sess *s)
 				 */
 				cand_sdp_ufrag(s->peer_sdp, cu, sizeof(cu));
 				sdp_pwd(s->peer_sdp, cp);
+				sig_claim_offer(s->sig, co, sizeof(co));
 				if (cu[0]) {
 					struct conn *w = worker_by_ufrag(ws, cu);
 					int adm = ufrag_admitted(s, cu);
@@ -7012,9 +7116,11 @@ static int host_turnstile(struct sess *s)
 					 * cannot get in and nobody can say why. */
 					dbg_logf("host: claim %.8s pwd %.6s: "
 						 "worker=%d again=%d admitted=%d "
-						 "lanq=%d justserved=%d made=%d",
+						 "lanq=%d justserved=%d made=%d "
+						 "offer=%.8s",
 						 cu, cp, w ? 1 : 0, again, adm,
-						 lanq, just, made);
+						 lanq, just, made,
+						 co[0] ? co : "-");
 
 					punch_amend_repost(s, cu, cp);
 
@@ -7089,45 +7195,34 @@ static int host_turnstile(struct sess *s)
 					 cu);
 				sdp_filter_peer(s->peer_sdp, cfg->family, filtered,
 					   sizeof(filtered));
-				if (nat_set_remote_description(listen->nat,
-							       filtered)) {
-					conn_free(listen);
+				ko = offer_find(kept, co);
+				pc = ko >= 0 ? kept[ko].c : listen;
+				if (punch_take(s, pc, resume, pslot, cu, cp,
+					       filtered, stuck_left > 0)) {
+					conn_free(pc);
+					if (ko >= 0) {
+						kept[ko].c = NULL;
+						kept[ko].until_ms = 0;
+						break;
+					}
 					listen = NULL;
 					s->offer_conn = NULL;
 					ts = TS_GATHER;
 					break;
 				}
-				snprintf(listen->remote_ufrag,
-					 sizeof(listen->remote_ufrag), "%s", cu);
-				snprintf(listen->remote_pwd,
-					 sizeof(listen->remote_pwd), "%s", cp);
-				if (resume) {
-					__atomic_add_fetch(&resume->resume_pending, 1,
-							   __ATOMIC_RELAXED);
-					__atomic_store_n(&resume->resume_last_ms,
-							 now_ms(),
-							 __ATOMIC_RELAXED);
-				} else if (!ufrag_admitted(s, cu)) {
-					s->admitted_n++;
-				}
-				/* Release on pickup: hand the punch to the in-flight
-				 * set and rotate a fresh offer at once, so the next
-				 * client is admitted without waiting for this punch. */
-				s->punching[pslot] = listen;
-				listen->punch_resume = resume;
-				pthread_mutex_lock(&listen->claim_lock);
-				snprintf(listen->claim_ufrag,
-					 sizeof(listen->claim_ufrag), "%s", cu);
-				pthread_mutex_unlock(&listen->claim_lock);
-				listen->punch_start_ms = now_ms();
-				listen->punch_stuck = stuck_left > 0;
 				if (stuck_left > 0)
 					stuck_left--;
-				snprintf(listen->punch_ufrag,
-					 sizeof(listen->punch_ufrag),
-					 "%s", cu);
-				listen = NULL;
-				ts = TS_GATHER;
+				if (ko >= 0) {
+					dbg_logf("host: punched %.8s on the kept "
+						 "offer %.8s", cu, co);
+					kept[ko].c = NULL;
+					kept[ko].until_ms = 0;
+					sig_release(s->sig);
+					s->have_peer_sdp = 0;
+				} else {
+					listen = NULL;
+					ts = TS_GATHER;
+				}
 			}
 			break;
 		}
@@ -7166,6 +7261,7 @@ static int host_turnstile(struct sess *s)
 
 	s->offer_conn = NULL;
 	conn_free(listen);
+	offer_free_all(kept);
 	/*
 	 * Say the session is over before winding the workers down, and keep
 	 * driving the model while they go. A worker lingers to land its
@@ -7495,6 +7591,7 @@ int session_run(const struct session_cfg *cfg)
 				snprintf(s.local_sdp, sizeof(s.local_sdp),
 					 "%s", filtered);
 				s.pool_posted = fan_local_sdp(&s);
+				sig_set_claim_offer(s.sig, s.c.remote_ufrag);
 				sig_post(s.sig, (const uint8_t *)s.local_sdp,
 					 strlen(s.local_sdp));
 				if (cfg->is_host && (cfg->sig_flags & SIG_DHT))
@@ -7529,6 +7626,7 @@ int session_run(const struct session_cfg *cfg)
 				s.pool_posted = fan_local_sdp(&s);
 							/* members learnt since
 							 * the ST_GATHER post */
+				sig_set_claim_offer(s.sig, s.c.remote_ufrag);
 				sig_post(s.sig, (const uint8_t *)s.local_sdp,
 					 strlen(s.local_sdp));
 				s.remote_set = 1;

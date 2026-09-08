@@ -213,6 +213,12 @@ void sig_set_family_up(struct sig *s, int family, int up);
  * fresh offer that only rotated credentials from one that changed networks. */
 void sig_set_gen(struct sig *s, uint32_t gen);
 uint32_t sig_peer_gen(const struct sig *s);
+
+/* Client: name (NULL/"" clears) the offer ufrag our claim answers, packed into
+ * the claim only; sig_claim_offer reads a served claim's name back on the host
+ * ("" when none), so the turnstile matches it beside the claimant ufrag/pwd. */
+void sig_set_claim_offer(struct sig *s, const char *ufrag);
+void sig_claim_offer(const struct sig *s, char *out, size_t n);
 /* Host: adopt an already-known rendezvous node (from a persisted token) as the
  * located anchor and keep it warm with the direct store, instead of locating a
  * fresh one -- so the token stays stable across idle re-attempts. */

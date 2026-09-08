@@ -154,6 +154,10 @@ struct sig {
 					 * into the packed slot; the peer's, read
 					 * back off its slot, is peer_gen */
 	uint32_t peer_gen;
+	char claim_offer[64];		/* client: the offer ufrag our claim names,
+					 * so the host punches the generation we
+					 * primed */
+	char peer_claim_offer[64];	/* host: the offer ufrag a served claim named */
 
 	int locate;
 	int put_inflight;		/* a convergent host store is running */
@@ -460,7 +464,9 @@ int sig_post(struct sig *s, const uint8_t *data, size_t len)
 	memcpy(sdp, data, len);
 	sdp[len] = '\0';
 	sdp_ufrag_of(sdp, s->my_ufrag, sizeof(s->my_ufrag));
-	plen = candpack_encode(sdp, 1, s->my_gen, packed, sizeof(packed));
+	plen = candpack_encode(sdp, 1, s->my_gen,
+			       s->is_host ? NULL : s->claim_offer, packed,
+			       sizeof(packed));
 	if (plen <= 0)
 		return -1;
 	/*
@@ -660,6 +666,23 @@ void sig_set_gen(struct sig *s, uint32_t gen)
 uint32_t sig_peer_gen(const struct sig *s)
 {
 	return s->peer_gen;
+}
+
+void sig_set_claim_offer(struct sig *s, const char *ufrag)
+{
+	if (!s || s->is_host)
+		return;
+	snprintf(s->claim_offer, sizeof(s->claim_offer), "%s",
+		 ufrag ? ufrag : "");
+}
+
+void sig_claim_offer(const struct sig *s, char *out, size_t n)
+{
+	if (!out || !n)
+		return;
+	out[0] = '\0';
+	if (s && s->is_host)
+		snprintf(out, n, "%s", s->peer_claim_offer);
 }
 
 int sig_locate(struct sig *s)
@@ -978,7 +1001,10 @@ static void deliver_peer(struct sig *s, const uint8_t *sealed, size_t len)
 		refuse_slot(s, sealed, len);
 		return;
 	}
-	slen = candpack_decode(packed, (size_t)n, &s->peer_gen, sdp, sizeof(sdp));
+	slen = candpack_decode(packed, (size_t)n, &s->peer_gen,
+			       s->is_host ? s->peer_claim_offer : NULL,
+			       s->is_host ? sizeof(s->peer_claim_offer) : 0,
+			       sdp, sizeof(sdp));
 	if (slen < 0)
 		return;
 	if (s->cb)
@@ -1213,7 +1239,8 @@ static void deliver_peer_mcast(struct sig *s, const uint8_t *sealed, size_t len,
 			NULL, 0);
 	if (n < 0)
 		return;
-	slen = candpack_decode(packed, (size_t)n, &s->peer_gen, sdp, sizeof(sdp));
+	slen = candpack_decode(packed, (size_t)n, &s->peer_gen, NULL, 0, sdp,
+			       sizeof(sdp));
 	if (slen >= 0 && s->cb && !(s->is_host && s->mcast_claims))
 		s->cb(s->arg, (const uint8_t *)sdp, (size_t)slen);
 

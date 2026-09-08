@@ -35,10 +35,10 @@ static void for_dht_check(void)
 	char out[2048];
 	int n, r;
 
-	n = candpack_encode(sdp, 1, 0, buf, sizeof(buf));
+	n = candpack_encode(sdp, 1, 0, NULL, buf, sizeof(buf));
 	assert(n > 0);
 
-	r = candpack_decode(buf, (size_t)n, NULL, out, sizeof(out));
+	r = candpack_decode(buf, (size_t)n, NULL, NULL, 0, out, sizeof(out));
 	assert(r > 0);
 
 	/* ufrag/pwd preserved (libjuice rejects a description lacking them). */
@@ -68,9 +68,9 @@ static void full_set_check(void)
 
 	/* Permissive keeps every on-link address, including private v4 and the
 	 * link-local v6 that same-segment peers use. All five survive. */
-	n = candpack_encode(sdp, 0, 0, buf, sizeof(buf));
+	n = candpack_encode(sdp, 0, 0, NULL, buf, sizeof(buf));
 	assert(n > 0);
-	r = candpack_decode(buf, (size_t)n, NULL, out, sizeof(out));
+	r = candpack_decode(buf, (size_t)n, NULL, NULL, 0, out, sizeof(out));
 	assert(r > 0);
 	assert(strstr(out, "192.168.0.2"));
 	assert(strstr(out, "10.1.2.3"));
@@ -85,7 +85,7 @@ static void no_creds_check(void)
 
 	/* Nothing packable without credentials. */
 	n = candpack_encode("a=candidate:1 1 UDP 100 203.0.113.5 9 typ host\n", 1,
-			    0, buf, sizeof(buf));
+			    0, NULL, buf, sizeof(buf));
 	assert(n == 0);
 }
 
@@ -97,15 +97,66 @@ static void gen_check(void)
 	uint32_t g = 0;
 	int n, r;
 
-	n = candpack_encode(sdp, 1, 0xdeadbeef, buf, sizeof(buf));
+	n = candpack_encode(sdp, 1, 0xdeadbeef, NULL, buf, sizeof(buf));
 	assert(n > 0);
-	r = candpack_decode(buf, (size_t)n, &g, out, sizeof(out));
+	r = candpack_decode(buf, (size_t)n, &g, NULL, 0, out, sizeof(out));
 	assert(r > 0);
 	assert(g == 0xdeadbeef);
-	n = candpack_encode(sdp, 1, 0, buf, sizeof(buf));
+	n = candpack_encode(sdp, 1, 0, NULL, buf, sizeof(buf));
 	assert(n > 0);
-	r = candpack_decode(buf, (size_t)n, &g, out, sizeof(out));
+	r = candpack_decode(buf, (size_t)n, &g, NULL, 0, out, sizeof(out));
 	assert(r > 0 && g == 0);
+}
+
+/* The offer ufrag a claim answers rides the packed slot and comes back whole;
+ * a packing that names none decodes to the empty string. */
+static void offer_check(void)
+{
+	char co[64], out[2048];
+	uint8_t buf[512];
+	int n, r;
+
+	n = candpack_encode(sdp, 1, 0, "9f3c2a1b", buf, sizeof(buf));
+	assert(n > 0);
+	co[0] = 'x';
+	r = candpack_decode(buf, (size_t)n, NULL, co, sizeof(co), out,
+			    sizeof(out));
+	assert(r > 0);
+	assert(!strcmp(co, "9f3c2a1b"));
+	/* the candidates and creds are unaffected by the named offer */
+	assert(strstr(out, "a=ice-ufrag:abcdef01\n"));
+	assert(count_cands(out) == 4);
+
+	n = candpack_encode(sdp, 1, 0, NULL, buf, sizeof(buf));
+	assert(n > 0);
+	co[0] = 'x';
+	r = candpack_decode(buf, (size_t)n, NULL, co, sizeof(co), out,
+			    sizeof(out));
+	assert(r > 0);
+	assert(co[0] == '\0');
+}
+
+/* A version-2 buffer predates the offer-ufrag field and still decodes. */
+static void v2_compat_check(void)
+{
+	static const uint8_t v2[] = {
+		2, 0, 0, 0, 0,
+		4, 'a', 'b', 'c', 'd',
+		4, '1', '2', '3', '4',
+		0
+	};
+	char co[64], out[2048];
+	uint32_t g = 1;
+	int r;
+
+	co[0] = 'x';
+	r = candpack_decode(v2, sizeof(v2), &g, co, sizeof(co), out,
+			    sizeof(out));
+	assert(r > 0);
+	assert(g == 0);
+	assert(co[0] == '\0');
+	assert(strstr(out, "a=ice-ufrag:abcd\n"));
+	assert(strstr(out, "a=ice-pwd:1234\n"));
 }
 
 int main(void)
@@ -114,6 +165,8 @@ int main(void)
 	full_set_check();
 	no_creds_check();
 	gen_check();
+	offer_check();
+	v2_compat_check();
 	printf("candpack_test: all checks passed\n");
 	return 0;
 }

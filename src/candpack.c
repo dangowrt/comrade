@@ -9,7 +9,7 @@
 #include "candpack.h"
 #include "candpolicy.h"
 
-#define CANDPACK_VERSION 2
+#define CANDPACK_VERSION 3
 
 #define CT_HOST 0
 #define CT_SRFLX 1
@@ -75,20 +75,23 @@ static int cred_value(const char *line, const char *key, char *out, size_t max)
 	return 1;
 }
 
-int candpack_encode(const char *sdp, int for_dht, uint32_t gen, uint8_t *out,
-		    size_t max)
+int candpack_encode(const char *sdp, int for_dht, uint32_t gen,
+		    const char *offer_ufrag, uint8_t *out, size_t max)
 {
-	struct cand_policy pol;
 	char ufrag[257], pwd[257];
+	struct cand_policy pol;
+	size_t ncand_off;
+	int ul, pl, oul;
 	char line[512];
 	const char *p;
-	size_t o = 0;
-	size_t ncand_off;
 	int ncand = 0;
-	int ul, pl;
+	size_t o = 0;
 
 	ufrag[0] = '\0';
 	pwd[0] = '\0';
+	oul = offer_ufrag ? (int)strlen(offer_ufrag) : 0;
+	if (oul > 255)
+		return -1;
 
 	/*
 	 * A private v4 address (RFC1918/CGNAT) is kept for the DHT even though
@@ -122,13 +125,18 @@ int candpack_encode(const char *sdp, int for_dht, uint32_t gen, uint8_t *out,
 
 	ul = (int)strlen(ufrag);
 	pl = (int)strlen(pwd);
-	if (max < (size_t)(1 + 4 + 1 + ul + 1 + pl + 1))
+	if (max < (size_t)(1 + 4 + 1 + oul + 1 + ul + 1 + pl + 1))
 		return -1;
 	out[o++] = CANDPACK_VERSION;
 	out[o++] = (uint8_t)(gen >> 24);
 	out[o++] = (uint8_t)(gen >> 16);
 	out[o++] = (uint8_t)(gen >> 8);
 	out[o++] = (uint8_t)gen;
+	out[o++] = (uint8_t)oul;
+	if (oul) {
+		memcpy(out + o, offer_ufrag, (size_t)oul);
+		o += (size_t)oul;
+	}
 	out[o++] = (uint8_t)ul;
 	memcpy(out + o, ufrag, (size_t)ul);
 	o += (size_t)ul;
@@ -189,15 +197,21 @@ int candpack_encode(const char *sdp, int for_dht, uint32_t gen, uint8_t *out,
 	return (int)o;
 }
 
-int candpack_decode(const uint8_t *in, size_t in_len, uint32_t *gen, char *out,
-		    size_t max)
+int candpack_decode(const uint8_t *in, size_t in_len, uint32_t *gen,
+		    char *offer_ufrag, size_t offer_max, char *out, size_t max)
 {
+	char ufrag[257], pwd[257];
+	int ul, pl, ncand, k, oul;
 	size_t i = 0;
 	int o = 0, r;
-	int ul, pl, ncand, k;
-	char ufrag[257], pwd[257];
+	int ver;
 
-	if (in_len < 1 || in[i++] != CANDPACK_VERSION)
+	if (offer_ufrag && offer_max)
+		offer_ufrag[0] = '\0';
+	if (in_len < 1)
+		return -1;
+	ver = in[i++];
+	if (ver != 2 && ver != CANDPACK_VERSION)
 		return -1;
 	if (i + 4 > in_len)
 		return -1;
@@ -205,8 +219,22 @@ int candpack_decode(const uint8_t *in, size_t in_len, uint32_t *gen, char *out,
 		*gen = ((uint32_t)in[i] << 24) | ((uint32_t)in[i + 1] << 16) |
 		       ((uint32_t)in[i + 2] << 8) | (uint32_t)in[i + 3];
 	i += 4;
-	if (i >= in_len)
+	/* The v2 wire carried no offer ufrag; decode it, naming none. */
+	oul = 0;
+	if (ver >= 3) {
+		if (i >= in_len)
+			return -1;
+		oul = in[i++];
+	}
+	if (i + (size_t)oul >= in_len)
 		return -1;
+	if (ver >= 3 && offer_ufrag && offer_max) {
+		if ((size_t)oul >= offer_max)
+			return -1;
+		memcpy(offer_ufrag, in + i, (size_t)oul);
+		offer_ufrag[oul] = '\0';
+	}
+	i += (size_t)oul;
 	ul = in[i++];
 	if (i + (size_t)ul >= in_len)
 		return -1;
