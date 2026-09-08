@@ -4566,15 +4566,21 @@ static void report_links(struct sess *s)
 }
 
 /*
- * net_pump has already noticed and told the model which family moved; this is
- * the loop collecting the part only it can do, and clearing the debt.
+ * Clear the move debt when re-establishing a link. Only ever reached off a lost
+ * or not-yet-connected link, so a live link is never torn down by an address
+ * change: those are folded in per-family by net_settle. netgen bumps here, not
+ * on the netmon poll, so a temporary address coming or going under a live link
+ * does not mark it moved.
  */
-static int net_changed(struct sess *s)
+static int net_moved(struct sess *s)
 {
 	unsigned ch = s->net_ch;
 
 	s->net_ch = 0;
-	return ch != 0;
+	if (!ch)
+		return 0;
+	__atomic_add_fetch(&s->netgen, 1, __ATOMIC_RELAXED);
+	return 1;
 }
 
 static int sig_rebuild(struct sess *s, const char *why)
@@ -4655,7 +4661,6 @@ static void net_watch(struct sess *s, uint64_t now)
 	netstate_on_netmon(&s->ns, ch, fam_usable_addr(addrs, n, 4),
 			   fam_usable_addr(addrs, n, 6), now);
 	if (ch) {
-		__atomic_add_fetch(&s->netgen, 1, __ATOMIC_RELAXED);
 		dbg_logf("net: change v4=%d v6=%d iface=%d",
 			 !!(ch & NETMON_CH_V4), !!(ch & NETMON_CH_V6),
 			 !!(ch & NETMON_CH_IFACE));
@@ -4764,7 +4769,7 @@ static void resume_tick(struct conn *c)
 	/* The in-place resume never returns through the reconnect the up-loops
 	 * lean on to see a move, so the interfaces are watched from here. */
 	net_watch(s, now);
-	if (net_changed(s)) {
+	if (net_moved(s)) {
 		if (sig_rebuild(s, "on the new network"))
 			return;
 		net_change_reset(s);
@@ -5706,7 +5711,7 @@ static void gather_facts(struct sess *s, int family, struct tokgen_facts *f)
 /*
  * The per-loop network tick: notice a change (net_watch), take the DHT acks,
  * drain the STUN facts, then apply what the model decided. What a move leaves
- * for each loop to finish is taken from net_changed.
+ * for each loop to finish is taken from net_moved.
  */
 static void net_pump(struct sess *s, uint64_t now)
 {
@@ -6805,7 +6810,7 @@ static int host_turnstile(struct sess *s)
 		 * pump_once has finished dispatching, so no sig callback is in
 		 * flight and the rebuild is safe here.
 		 */
-		if (net_changed(s)) {
+		if (net_moved(s)) {
 			if (listen) {
 				conn_free(listen);
 				listen = NULL;
@@ -7495,7 +7500,7 @@ int session_run(const struct session_cfg *cfg)
 		 * from there. pump_once above has finished dispatching, so no sig
 		 * callback is in flight.
 		 */
-		if (st != ST_RUN && net_changed(&s)) {
+		if (st != ST_RUN && net_moved(&s)) {
 			if (sig_rebuild(&s, "on the new network")) {
 				st = ST_FAIL;
 				break;
@@ -7790,7 +7795,7 @@ int session_run(const struct session_cfg *cfg)
 				/* Nothing has been watching the interfaces
 				 * while the link was up, so look now. */
 				net_pump(&s, now_ms());
-				if (net_changed(&s)) {
+				if (net_moved(&s)) {
 					net_change_reset(&s);
 					pthread_mutex_lock(&s.c.path_lock);
 					path_table_clear(&s.c.paths);
