@@ -1921,6 +1921,54 @@ static void pool_pump(struct sess *s)
 	}
 }
 
+/* Re-post the offer with the candidates libjuice gathered since it was first
+ * published: a late srflx otherwise reaches only the dashboard, never the peer's
+ * mailbox (fan_local_sdp re-posts the prober's pool, not libjuice's own). */
+static void offer_refresh(struct sess *s)
+{
+	char raw[NAT_SDP_MAX];
+	char filtered[NAT_SDP_MAX];
+
+	/* The host's listener only: the client's own claim slot is posted by the
+	 * resume machinery, and re-posting it from here races that. */
+	if (!s->sig || !s->offer_conn || s->offer_conn == &s->c ||
+	    !s->offer_conn->nat)
+		return;
+	if (nat_local_description(s->offer_conn->nat, raw, sizeof(raw)))
+		return;
+	pthread_mutex_lock(&s->trickle_lock);
+	snprintf(s->pending_sdp, sizeof(s->pending_sdp), "%s", raw);
+	s->pending_sdp_set = 1;
+	pthread_mutex_unlock(&s->trickle_lock);
+	if (!sdp_ready(s))
+		return;
+	sdp_filter(s->local_sdp, s->cfg->family, filtered, sizeof(filtered));
+	snprintf(s->local_sdp, sizeof(s->local_sdp), "%s", filtered);
+	fan_local_sdp(s);
+	sig_post(s->sig, (const uint8_t *)s->local_sdp, strlen(s->local_sdp));
+}
+
+/* A late local candidate reached the model: re-post it to the mailbox (so the
+ * peer sees what was gathered, not just the dashboard) and show it locally.
+ * repost is set only once an offer is live (TS_WAIT_CLAIM), so a re-post never
+ * outruns the turnstile's gated first publish. */
+static void trickle_flush(struct sess *s, const struct session_obs *o, int repost)
+{
+	char buf[NAT_SDP_MAX];
+
+	if (!s->trickle_dirty)
+		return;
+	pthread_mutex_lock(&s->trickle_lock);
+	memcpy(buf, s->trickle_sdp, sizeof(buf));
+	s->trickle_sdp[0] = '\0';
+	s->trickle_dirty = 0;
+	pthread_mutex_unlock(&s->trickle_lock);
+	if (repost)
+		offer_refresh(s);
+	if (o && o->net)
+		report_candidates(s, buf);
+}
+
 /*
  * Like sdp_filter(), for a peer's SDP.
  *
@@ -6885,17 +6933,8 @@ static int host_turnstile(struct sess *s)
 			ts = TS_GATHER;
 		}
 
+		trickle_flush(s, o, ts == TS_WAIT_CLAIM);
 		if (o) {			/* dashboard: local candidates */
-			if (o->net && s->trickle_dirty) {
-				char buf[NAT_SDP_MAX];
-
-				pthread_mutex_lock(&s->trickle_lock);
-				memcpy(buf, s->trickle_sdp, sizeof(buf));
-				s->trickle_sdp[0] = '\0';
-				s->trickle_dirty = 0;
-				pthread_mutex_unlock(&s->trickle_lock);
-				report_candidates(s, buf);
-			}
 			if (o->net && sdp_ready(s))
 				obs_report_net(s);
 			if (o->tick)
@@ -7596,17 +7635,8 @@ int session_run(const struct session_cfg *cfg)
 				       CONN_GATHERING : CONN_CONNECTING);
 			s.c.next_status_ms = now_ms() + 500;
 		}
+		trickle_flush(&s, o, 0);
 		if (o) {
-			if (o->net && s.trickle_dirty) {
-				char buf[NAT_SDP_MAX];
-
-				pthread_mutex_lock(&s.trickle_lock);
-				memcpy(buf, s.trickle_sdp, sizeof(buf));
-				s.trickle_sdp[0] = '\0';
-				s.trickle_dirty = 0;
-				pthread_mutex_unlock(&s.trickle_lock);
-				report_candidates(&s, buf);
-			}
 			if (o->net && sdp_ready(&s))
 				obs_report_net(&s);	/* view de-dups */
 			if (o->tick)
