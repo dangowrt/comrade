@@ -533,8 +533,9 @@ struct conn {
 	 * the peer used, read by the loop that reports the peer's row. */
 	volatile int read_only;
 	int ro_reported;		/* main-thread only: sent to the view yet */
-	volatile int peer_fresh;	/* the host said it is serving us from a
-					 * worker we were never part of */
+	int peer_fresh;			/* the host said it is serving us from a
+					 * worker we were never part of; atomic,
+					 * set by a worker, read by the main loop */
 	volatile int fwd_refused;	/* forwards the ssh thread refused */
 	int fwd_reported;		/* main-thread only: refusal surfaced yet */
 };
@@ -1661,7 +1662,7 @@ static void publish_status(struct conn *c, int state)
 		cs.since_s = (int)((now_ms() - c->lost_since_ms) / 1000);
 	cs.silent_s = c->hb_pong_seen ?
 		(int)((now_ms() - c->hb_last_pong) / 1000) : -1;
-	cs.gone = c->peer_fresh;
+	cs.gone = __atomic_load_n(&c->peer_fresh, __ATOMIC_RELAXED);
 	pthread_mutex_unlock(&c->hb_lock);
 
 	pthread_mutex_lock(&c->status_lock);
@@ -2935,8 +2936,9 @@ static void probe_apply(struct conn *c, const struct path_probe *pr,
 		/* A connection that never carried a session has none to be
 		 * told about: this is the answer to a resume, and a first join
 		 * is not one. */
-		if (had && !c->sess->cfg->is_host && !c->peer_fresh) {
-			c->peer_fresh = 1;
+		if (had && !c->sess->cfg->is_host &&
+		    !__atomic_load_n(&c->peer_fresh, __ATOMIC_RELAXED)) {
+			__atomic_store_n(&c->peer_fresh, 1, __ATOMIC_RELAXED);
 			dbg_logf("peer: served by a new worker -- this session "
 				 "is over, rejoining");
 		}
@@ -5239,7 +5241,7 @@ static int conn_run(struct conn *c, int drive_sig)
 
 	/* The path is up on entry, so start the liveness clock as alive, and
 	 * what was said about the session before this one is spent. */
-	c->peer_fresh = 0;
+	__atomic_store_n(&c->peer_fresh, 0, __ATOMIC_RELAXED);
 	pthread_mutex_lock(&c->hb_lock);
 	c->hb_last_pong = now_ms();
 	__atomic_store_n(&c->hb_last_heard, c->hb_last_pong, __ATOMIC_RELAXED);
