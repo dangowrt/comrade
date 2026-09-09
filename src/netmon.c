@@ -186,6 +186,12 @@ void netmon_fingerprint(uint8_t fp4[32], uint8_t fp6[32], uint8_t fpif[32],
 		struct cc_blake2b *c = a->family == AF_INET6 ? &c6 : &c4;
 		uint8_t fb = a->family == AF_INET6 ? 6 : 4;
 
+		/* APIPA routes nowhere off-segment, so its transient arrival
+		 * during a DHCP handover must not read as a v4 move; the LAN
+		 * path still sees it through netmon_snapshot. */
+		if (a->family == AF_INET && a->addr[0] == 169 &&
+		    a->addr[1] == 254)
+			continue;
 		cc_blake2b_update(c, (const uint8_t *)a->ifname,
 				  sizeof(a->ifname));
 		cc_blake2b_update(c, &a->addr[0], al);
