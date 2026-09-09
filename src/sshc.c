@@ -616,6 +616,7 @@ int sshc_connect_fd(sock_t fd, const struct sshc_opts *o)
 	ssh_channel chan = NULL;
 	socket_t sock = fd;
 	bool ssh_config = false;
+	int channel_open = 0;
 	int rc = -1;
 
 	if (!o)
@@ -665,6 +666,7 @@ int sshc_connect_fd(sock_t fd, const struct sshc_opts *o)
 		dbg_logf("sshc: channel open failed: %s", ssh_get_error(s));
 		goto out;
 	}
+	channel_open = 1;
 	dbg_logf("sshc: channel open ok");
 	if (o->forward_only) {
 		/* No shell: hold the session channel open as a keepalive and
@@ -707,6 +709,8 @@ out:
 		ssh_channel_free(chan);
 	}
 	if (s) {
+		if (!channel_open && sock_valid(sock))
+			sock_shutdown(sock, SHUT_RDWR);
 		ssh_disconnect(s);
 		ssh_free(s);
 	}
