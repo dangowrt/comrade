@@ -398,8 +398,6 @@ struct conn {
 	uint64_t rs_deadline;
 	uint32_t rs_backoff;		/* the answer-wait between re-claims, from
 					 * RESUME_FIRST_MS up to RESUME_ATTEMPT_MS */
-	uint64_t rs_prime_ms;		/* client: when the current offer was
-					 * primed, to bound a stalled resume */
 	struct ice_ctx *resume_q[ICE_HOLD_MAX];	/* graft handoff queue; see above */
 	volatile int resume_pending;
 	uint64_t resume_last_ms;	/* host: when a resume punch last began,
@@ -2183,7 +2181,7 @@ static void ns_drain(struct sess *s)
 static void pool_note(struct sess *s, const uint8_t b[4])
 {
 	static const uint8_t zero[4] = { 0 };
-	int i;
+	int added, i;
 
 	/*
 	 * Not the unspecified address. A gathering agent emits it as a
@@ -2193,13 +2191,19 @@ static void pool_note(struct sess *s, const uint8_t b[4])
 	 */
 	if (!memcmp(b, zero, sizeof(zero)))
 		return;
+	added = 0;
 	pthread_mutex_lock(&s->trickle_lock);
 	for (i = 0; i < s->npool4; i++)
 		if (!memcmp(s->pool4[i], b, 4))
 			break;
-	if (i == s->npool4 && i < POOL4_MAX)
+	if (i == s->npool4 && i < POOL4_MAX) {
 		memcpy(s->pool4[s->npool4++], b, 4);
+		added = s->npool4;
+	}
 	pthread_mutex_unlock(&s->trickle_lock);
+	if (added)
+		dbg_logf("stun: egress +%u.%u.%u.%u (pool now %d)",
+			 b[0], b[1], b[2], b[3], added);
 }
 
 static void mapping_note(struct sess *s, const uint8_t addr[4], uint16_t port)
@@ -2301,6 +2305,7 @@ static int stun_probe_kick(struct sess *s)
 	if (pthread_create(&s->probe_th, NULL, stun_probe_thread, s))
 		return 0;
 	s->probe_running = 1;
+	dbg_logf("stun: v4 probe round started");
 	return 1;
 }
 
@@ -4635,8 +4640,15 @@ static int net_moved(struct sess *s)
 	unsigned ch = s->net_ch;
 
 	s->net_ch = 0;
-	if (!ch)
+	/* Only a v4 change re-establishes: a v6 or interface flap must not
+	 * disrupt a live v4 link or discard its accumulated egress pool
+	 * (netstate tracks v6 candidates on its own). */
+	if (!(ch & NETMON_CH_V4))
 		return 0;
+	/* The move is acted on now; drop any burst remnant still coalescing in
+	 * net_pending so a trailing v6/iface flap cannot re-commit this v4 and
+	 * fire a second, redundant re-gather. A genuine later change re-arms. */
+	s->net_pending = 0;
 	__atomic_add_fetch(&s->netgen, 1, __ATOMIC_RELAXED);
 	return 1;
 }
@@ -4658,11 +4670,6 @@ static int sig_rebuild(struct sess *s, const char *why)
  * race with the host's regather is re-posted in seconds, backing off to the
  * host's own cadence so a peer that is simply gone is not hammered. */
 #define RESUME_FIRST_MS 2000
-
-/* Longest a resume agent primed against the host's offer keeps trying before
- * the client re-gathers under a fresh password: past a healthy connect, below
- * libjuice's failure timer and the host reap. */
-#define RESUME_PRIME_MS 6000
 
 static uint32_t resume_backoff(struct conn *c)
 {
@@ -4783,6 +4790,7 @@ static void resume_tick(struct conn *c)
 	struct sess *s;
 	uint64_t now;
 	int lost, hi;
+	int n;
 
 	s = c->sess;
 	now = now_ms();
@@ -4886,13 +4894,29 @@ static void resume_tick(struct conn *c)
 					 sizeof(c->remote_ufrag), "%s", ufrag);
 				c->remote_gen = sig_peer_gen(s->sig);
 				s->remote_set = 1;
-				c->rs_prime_ms = now;
 				dbg_logf("resume: primed offer %s", ufrag);
-				/* Re-post the claim now naming the offer we
-				 * primed, so the host punches this generation. */
+				/* Named, and posted only once primed: the host
+				 * punches the agent this end punches, not whatever
+				 * listener a rotation left in the slot. */
 				sig_set_claim_offer(s->sig, c->remote_ufrag);
 				sig_post(s->sig, (const uint8_t *)s->local_sdp,
 					 strlen(s->local_sdp));
+				dbg_logf("resume: claim posted for %s", ufrag);
+			}
+		}
+		/* Late pool addresses reach the host's in-flight punch only
+		 * through a re-post under the same credentials (a fresh gather
+		 * would mint a password and abort the punch). */
+		if (s->remote_set && s->have_local_sdp) {
+			pthread_mutex_lock(&s->trickle_lock);
+			n = s->npool4;
+			pthread_mutex_unlock(&s->trickle_lock);
+			if (n >= 2 && n > s->pool_posted) {
+				s->pool_posted = fan_local_sdp(s);
+				sig_set_claim_offer(s->sig, c->remote_ufrag);
+				sig_post(s->sig, (const uint8_t *)s->local_sdp,
+					 strlen(s->local_sdp));
+				dbg_logf("resume: trickled pool -> %d", n);
 			}
 		}
 		/* A higher generation is the host having moved, its candidates
@@ -4905,12 +4929,11 @@ static void resume_tick(struct conn *c)
 			return;
 		}
 		if (now >= c->rs_deadline) {
-			/* Hold the set and let ICE keep punching every pair in
-			 * parallel; re-gather when this end moved, libjuice says
-			 * the agent is spent, or the prime has stalled past its
-			 * bound so a fresh password reaches the host. */
-			if (!s->remote_set || s->net_ch || nat_failed(c->nat) ||
-			    now - c->rs_prime_ms >= RESUME_PRIME_MS) {
+			/* Hold the credentials and let ICE keep punching every
+			 * pair until it proves one or gives the pair up; re-gather
+			 * only when this end moved or the agent is spent, not on a
+			 * clock that would abort a punch still landing. */
+			if (!s->remote_set || s->net_ch || nat_failed(c->nat)) {
 				c->rs_state = 0;
 				return;
 			}
@@ -5443,6 +5466,8 @@ static int conn_run(struct conn *c, int drive_sig)
 			reach_take(s, c);
 			rdv_serve_ask(s, c, now_ms());
 			rdv_ask(s, c, now_ms());
+			ns_drain(s);
+			netstate_tick(&s->ns, now_ms());
 			net_settle(s);
 		}
 		if (drive_sig && !s->cfg->is_host)
