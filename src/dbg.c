@@ -2,6 +2,7 @@
 /* Copyright (C) 2026 Daniel Golle <daniel@makrotopia.org> */
 
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,6 +21,37 @@ const char *dbg_path(char *buf, size_t n)
 		return path;
 	snprintf(buf, n, "%s/comrade-debug.log", os_tmpdir());
 	return buf;
+}
+
+int dbg_ice_level(void)
+{
+	const char *e = getenv("COMRADE_ICE_LOG");
+
+	return (e && e[0]) ? atoi(e) : -1;
+}
+
+int dbg_mailbox_on(void)
+{
+	const char *e = getenv("COMRADE_MAILBOX_LOG");
+
+	return e && e[0] && e[0] != '0';
+}
+
+void dbg_hex(const char *what, const void *buf, size_t len)
+{
+	static const char hx[] = "0123456789abcdef";
+	const uint8_t *p = buf;
+	char line[2401];
+	size_t i, n;
+
+	n = len > 1200 ? 1200 : len;
+	for (i = 0; i < n; i++) {
+		line[2 * i] = hx[p[i] >> 4];
+		line[2 * i + 1] = hx[p[i] & 15];
+	}
+	line[2 * n] = '\0';
+	dbg_logf("%s: %luB hex=%s%s", what, (unsigned long)len, line,
+		 len > n ? ".." : "");
 }
 
 void dbg_logf(const char *fmt, ...)

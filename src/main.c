@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "appdir.h"
+#include "dbg.h"
 #include "fwdspec.h"
 #include "host.h"
 #include "sandbox.h"
@@ -136,7 +137,7 @@ static int session_connect(const char *arg, int ui_mode, int no_mcast,
 	cfg.sig_flags = (no_dht ? 0 : SIG_DHT) | (no_mcast ? 0 : SIG_MCAST);
 	cfg.stun_port = 3478;
 	cfg.stun_auto = 1;
-	cfg.log_level = -1;
+	cfg.log_level = dbg_ice_level();
 	cfg.connect_timeout_s = 0;	/* keep trying; the operator ends it */
 	cfg.interactive = 1;
 	cfg.forward_only = forward_only;	/* -N: no shell, forwarding only */

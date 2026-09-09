@@ -19,4 +19,14 @@ void dbg_logf(const char *fmt, ...)
  * where no log is asked for. */
 const char *dbg_path(char *buf, size_t n);
 
+/* Libjuice log level from COMRADE_ICE_LOG (juice_log_level_t: 0 verbose ..
+ * 6 none), or -1 (silent) when unset. */
+int dbg_ice_level(void);
+
+/* Non-zero when COMRADE_MAILBOX_LOG asks for byte-exact BEP44 mailbox dumps. */
+int dbg_mailbox_on(void);
+
+/* Append one line: "<what>: <len>B hex=<hex>" (hex capped for long blobs). */
+void dbg_hex(const char *what, const void *buf, size_t len);
+
 #endif

@@ -451,6 +451,22 @@ static uint64_t sdp_identity(const char *sdp)
 	return h;
 }
 
+static void sig_mb_note(const char *tag, uint32_t gen, const char *off,
+			const uint8_t *packed, size_t plen, const char *sdp)
+{
+	char flat[SIG_SDP_MAX];
+	size_t i;
+
+	if (!dbg_mailbox_on())
+		return;
+	dbg_hex(tag, packed, plen);
+	for (i = 0; sdp[i] && i < sizeof(flat) - 1; i++)
+		flat[i] = (sdp[i] == '\n' || sdp[i] == '\r') ? '|' : sdp[i];
+	flat[i] = '\0';
+	dbg_logf("mailbox %s gen=%u off=%s sdp=[%s]", tag, (unsigned)gen,
+		 off && off[0] ? off : "-", flat);
+}
+
 int sig_post(struct sig *s, const uint8_t *data, size_t len)
 {
 	char sdp[SIG_SDP_MAX];
@@ -484,6 +500,9 @@ int sig_post(struct sig *s, const uint8_t *data, size_t len)
 	if (changed) {
 		uint64_t ident = sdp_identity(sdp);
 
+		sig_mb_note(s->is_host ? "PUT offer" : "PUT claim", s->my_gen,
+			    s->is_host ? NULL : s->claim_offer, packed,
+			    (size_t)plen, sdp);
 		/* News (rotation, fresh password, rebuilt agent, first offer)
 		 * stores at once; a candidate-only amendment rides the put
 		 * cadence and the peer-change nudge, not a store per candidate. */
@@ -1007,6 +1026,9 @@ static void deliver_peer(struct sig *s, const uint8_t *sealed, size_t len)
 			       sdp, sizeof(sdp));
 	if (slen < 0)
 		return;
+	sig_mb_note(s->is_host ? "GET claim" : "GET offer", s->peer_gen,
+		    s->is_host ? s->peer_claim_offer : NULL, packed,
+		    (size_t)n, sdp);
 	if (s->cb)
 		s->cb(s->arg, (const uint8_t *)sdp, (size_t)slen);
 }

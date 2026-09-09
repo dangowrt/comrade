@@ -672,7 +672,7 @@ target_link_libraries(comrade_sig PUBLIC comrade_dht comrade_mailbox
 
 add_library(comrade_nat STATIC src/nat.c)
 target_include_directories(comrade_nat PUBLIC src)
-target_link_libraries(comrade_nat PUBLIC LibJuice::LibJuice)
+target_link_libraries(comrade_nat PUBLIC LibJuice::LibJuice comrade_dbg)
 
 add_library(comrade_stunprobe STATIC src/stunprobe.c)
 target_include_directories(comrade_stunprobe PUBLIC src)

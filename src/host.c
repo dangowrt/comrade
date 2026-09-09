@@ -1031,7 +1031,7 @@ static void svc_serve(struct svc *v, void *hostkey, int no_mcast, int no_dht)
 	cfg.sig_flags = (no_dht ? 0 : SIG_DHT) | (no_mcast ? 0 : SIG_MCAST);
 	cfg.stun_port = 3478;
 	cfg.stun_auto = 1;
-	cfg.log_level = -1;
+	cfg.log_level = dbg_ice_level();
 	cfg.connect_timeout_s = 60;
 	cfg.hostkey = hostkey;
 	cfg.no_fwd = v->no_fwd;

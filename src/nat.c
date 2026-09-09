@@ -7,6 +7,7 @@
 
 #include <juice/juice.h>
 
+#include "dbg.h"
 #include "nat.h"
 
 struct nat_agent {
@@ -235,13 +236,22 @@ int nat_selected(struct nat_agent *a, char *local, size_t local_len,
 					     remote, remote_len) == JUICE_ERR_SUCCESS ? 0 : -1;
 }
 
+static void nat_log_cb(juice_log_level_t level, const char *message)
+{
+	(void)level;
+	dbg_logf("ice: %s", message);
+}
+
 void nat_log_level(int level)
 {
 	/*
 	 * A negative level means silence. libjuice otherwise defaults to warnings
 	 * on stderr, which on the client is the terminal running tmux -- its once-
-	 * a-second ICE lines would corrupt the shared session.
+	 * a-second ICE lines would corrupt the shared session. When asked for a
+	 * level, route libjuice's lines into the timestamped debug log.
 	 */
+	if (level >= 0)
+		juice_set_log_handler(nat_log_cb);
 	juice_set_log_level(level < 0 ? JUICE_LOG_LEVEL_NONE :
 			    (juice_log_level_t)level);
 }
