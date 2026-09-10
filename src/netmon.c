@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 /* Copyright (C) 2026 Daniel Golle <daniel@makrotopia.org> */
 
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -327,6 +328,118 @@ void netmon_src_close(struct netmon *m)
 	m->ev_ok = 0;
 }
 
+#elif defined(__APPLE__)
+
+int netmon_src_open(struct netmon *m)
+{
+	sock_t fd;
+
+	m->ev_ok = 0;
+	m->ev_fd = INVALID_SOCK;
+	fd = socket(PF_ROUTE, SOCK_RAW, AF_UNSPEC);
+	if (!sock_valid(fd))
+		return -1;
+	sock_set_nonblock(fd);
+	m->ev_fd = fd;
+	m->ev_ok = 1;
+	return 0;
+}
+
+void netmon_src_close(struct netmon *m)
+{
+	if (!m->ev_ok)
+		return;
+	sock_close(m->ev_fd);
+	m->ev_fd = INVALID_SOCK;
+	m->ev_ok = 0;
+}
+
+#elif defined(_WIN32)
+
+/* The change APIs are callbacks on a thread of the system pool; a byte down a
+ * loopback socketpair turns each into a readable fd the WSAPoll loop already
+ * watches. The row and kind are discarded: an event only means "re-sample". */
+static void netmon_win_wake(struct netmon *m)
+{
+	uint8_t b = 1;
+
+	sock_write(m->ev_wr, &b, 1);
+}
+
+static void NETIOAPI_API_ netmon_addr_cb(void *ctx,
+					 MIB_UNICASTIPADDRESS_ROW *row,
+					 MIB_NOTIFICATION_TYPE kind)
+{
+	(void)row;
+	(void)kind;
+	netmon_win_wake((struct netmon *)ctx);
+}
+
+static void NETIOAPI_API_ netmon_iface_cb(void *ctx,
+					  MIB_IPINTERFACE_ROW *row,
+					  MIB_NOTIFICATION_TYPE kind)
+{
+	(void)row;
+	(void)kind;
+	netmon_win_wake((struct netmon *)ctx);
+}
+
+int netmon_src_open(struct netmon *m)
+{
+	sock_t sv[2];
+	HANDLE ha;
+	HANDLE hi;
+
+	m->ev_ok = 0;
+	m->ev_rd = INVALID_SOCK;
+	m->ev_wr = INVALID_SOCK;
+	m->ev_h_addr = NULL;
+	m->ev_h_iface = NULL;
+	if (sock_pair(sv))
+		return -1;
+	sock_set_nonblock(sv[0]);
+	sock_set_nonblock(sv[1]);
+	m->ev_rd = sv[0];
+	m->ev_wr = sv[1];
+	if (NotifyUnicastIpAddressChange(AF_UNSPEC, netmon_addr_cb, m, FALSE,
+					 &ha) != NO_ERROR) {
+		sock_close(m->ev_rd);
+		sock_close(m->ev_wr);
+		m->ev_rd = INVALID_SOCK;
+		m->ev_wr = INVALID_SOCK;
+		return -1;
+	}
+	if (NotifyIpInterfaceChange(AF_UNSPEC, netmon_iface_cb, m, FALSE,
+				    &hi) != NO_ERROR) {
+		CancelMibChangeNotify2(ha);
+		sock_close(m->ev_rd);
+		sock_close(m->ev_wr);
+		m->ev_rd = INVALID_SOCK;
+		m->ev_wr = INVALID_SOCK;
+		return -1;
+	}
+	m->ev_h_addr = ha;
+	m->ev_h_iface = hi;
+	m->ev_ok = 1;
+	return 0;
+}
+
+void netmon_src_close(struct netmon *m)
+{
+	if (!m->ev_ok)
+		return;
+	/* synchronous: it waits out any callback in flight before the fd goes */
+	CancelMibChangeNotify2((HANDLE)m->ev_h_iface);
+	CancelMibChangeNotify2((HANDLE)m->ev_h_addr);
+	sock_close(m->ev_rd);
+	sock_close(m->ev_wr);
+	m->ev_rd = INVALID_SOCK;
+	m->ev_wr = INVALID_SOCK;
+	m->ev_h_addr = NULL;
+	m->ev_h_iface = NULL;
+	m->ev_ok = 0;
+}
+
 #else
 
 int netmon_src_open(struct netmon *m)
@@ -362,6 +475,7 @@ void netmon_drain_event(struct netmon *m)
 	ssize_t rc;
 	sock_t fd;
 	int seen;
+	int e;
 
 	if (!m->ev_ok)
 		return;
@@ -378,8 +492,20 @@ void netmon_drain_event(struct netmon *m)
 			seen = 1;
 			continue;
 		}
-		if (rc < 0 && sock_err_would_block(sock_errno()))
+		if (rc == 0)
 			break;
+		e = sock_errno();
+		if (sock_err_would_block(e))
+			break;
+#ifndef _WIN32
+		/* a multicast overflow drops messages but leaves the socket
+		 * usable: force a re-sample and keep the source, rather than
+		 * fall back to the poll for the rest of the run */
+		if (e == ENOBUFS) {
+			seen = 1;
+			break;
+		}
+#endif
 		netmon_src_close(m);
 		seen = 1;
 		break;
