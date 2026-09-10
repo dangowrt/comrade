@@ -4944,6 +4944,14 @@ static void resume_tick(struct conn *c)
 				c->rs_state = 0;
 				return;
 			}
+			/* Re-post the claim, not only the offer: the host reaps
+			 * the worker on a stale claim, and losing it forces a
+			 * full re-join. Same credentials, punch undisturbed. */
+			if (s->have_local_sdp) {
+				sig_set_claim_offer(s->sig, c->remote_ufrag);
+				sig_post(s->sig, (const uint8_t *)s->local_sdp,
+					 strlen(s->local_sdp));
+			}
 			sig_redeliver(s->sig);
 			c->rs_deadline = now + resume_backoff(c);
 		}
