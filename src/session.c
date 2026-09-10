@@ -4795,15 +4795,20 @@ static void resume_tick(struct conn *c)
 	struct sess *s;
 	uint64_t now;
 	int lost, hi;
+	int moved;
 	int n;
 
 	s = c->sess;
 	now = now_ms();
+	/* Watch interfaces every tick, not only once lost: a roam onto a limping
+	 * path never trips "lost" (KCP still trickles), so it must be seen here. */
+	net_watch(s, now);
+	moved = net_moved(s);
 	pthread_mutex_lock(&c->hb_lock);
 	lost = c->lost_since_ms != 0 &&
 	       now - c->lost_since_ms >= RESUME_AFTER_MS;
 	pthread_mutex_unlock(&c->hb_lock);
-	if (!lost) {
+	if (!lost && !moved) {
 		if (c->rs_state) {
 			c->rs_state = 0;
 			c->rs_backoff = 0;
@@ -4837,10 +4842,7 @@ static void resume_tick(struct conn *c)
 		return;
 	}
 	conn_holds_gc(c, now);
-	/* The in-place resume never returns through the reconnect the up-loops
-	 * lean on to see a move, so the interfaces are watched from here. */
-	net_watch(s, now);
-	if (net_moved(s)) {
+	if (moved) {
 		if (sig_rebuild(s, "on the new network"))
 			return;
 		net_change_reset(s);
