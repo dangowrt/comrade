@@ -3917,18 +3917,20 @@ static int nat_setup(struct conn *c)
 
 static void pump_once(struct sess *s, int timeout_cap_ms)
 {
-	struct pollfd fds[6];
-	int timeout, nfds, lnf = 0;
+	int timeout, nfds, lnf = 0, mnf;
+	struct pollfd fds[7];
 
 	nfds = sig_prepare(s->sig, fds, 5, &timeout);
 	if (s->lan)
 		lnf = lanlink_prepare(s->lan, fds + nfds, 6 - nfds, &timeout);
+	mnf = netmon_prepare(&s->netmon, fds + nfds + lnf, 7 - nfds - lnf);
 	if (timeout > timeout_cap_ms)
 		timeout = timeout_cap_ms;
-	sock_poll(fds, (nfds_t)(nfds + lnf), timeout);
+	sock_poll(fds, (nfds_t)(nfds + lnf + mnf), timeout);
 	sig_dispatch(s->sig, fds, nfds);
 	if (s->lan)
 		lanlink_dispatch(s->lan, fds + nfds, lnf);
+	netmon_drain_event(&s->netmon);
 }
 
 /* From the ssh thread: does the KCP stream take more bulk? (The thread is
@@ -4712,6 +4714,7 @@ static void net_watch(struct sess *s, uint64_t now)
 	int synth = 0;
 	size_t n;
 
+	netmon_drain_event(&s->netmon);
 	if (cfg->test_roam_ms > 0 && s->next_roam_ms && now >= s->next_roam_ms &&
 	    (cfg->test_roam_max <= 0 || s->roams < cfg->test_roam_max)) {
 		s->next_roam_ms = now + (uint64_t)cfg->test_roam_ms;
@@ -7490,6 +7493,7 @@ int session_run(const struct session_cfg *cfg)
 	pthread_mutex_init(&s.ns_lock, NULL);
 	nsfacts_init(&s.ns_facts);
 	netmon_init(&s.netmon);
+	netmon_src_open(&s.netmon);
 	netstate_init(&s.ns, cfg->is_host, now_ms());
 	/*
 	 * When the synthetic change is armed follows the path the session
@@ -7969,6 +7973,7 @@ done:
 	if (s.lan)
 		lanlink_destroy(s.lan);
 	sig_destroy(s.sig);
+	netmon_src_close(&s.netmon);
 	/* Teardown, and the one place waiting is right: the session these
 	 * threads write into is about to go away with this frame. */
 	stun_probe_halt(&s);

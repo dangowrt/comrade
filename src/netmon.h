@@ -7,6 +7,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "wsock.h"
+
 #define NETMON_MAX_ADDRS 64
 #define NETMON_POLL_MS 2000
 
@@ -37,6 +39,15 @@ struct netmon {
 					 * that armed its own interval would
 					 * swallow a v6 change seen in the same
 					 * sample */
+	int ev_ok;			/* set once the source opens; else poll */
+#ifdef _WIN32
+	sock_t ev_rd;
+	sock_t ev_wr;
+	void *ev_h_addr;
+	void *ev_h_iface;
+#else
+	sock_t ev_fd;
+#endif
 };
 
 void netmon_init(struct netmon *m);
@@ -57,5 +68,14 @@ unsigned netmon_changed_fam_fp(struct netmon *m, uint64_t now_ms,
 size_t netmon_snapshot(struct netmon_addr *out, size_t max);
 void netmon_fingerprint(uint8_t fp4[32], uint8_t fp6[32], uint8_t fpif[32],
 			struct netmon_addr *addrs, size_t n);
+
+/* Best-effort kernel change-notification source: 0 on success, -1 on failure
+ * (the caller then keeps polling). prepare/dispatch are no-ops until open. */
+int netmon_src_open(struct netmon *m);
+void netmon_src_close(struct netmon *m);
+int netmon_prepare(struct netmon *m, struct pollfd *fds, int maxfds);
+/* Non-blocking drain of the event fd; zeros next_check_ms so the next
+ * netmon_changed* samples at once rather than waiting out the poll interval. */
+void netmon_drain_event(struct netmon *m);
 
 #endif

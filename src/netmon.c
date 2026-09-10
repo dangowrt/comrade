@@ -11,6 +11,11 @@
 #else
 #include <ifaddrs.h>
 #include <net/if.h>
+#ifdef __linux__
+#include <sys/socket.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
+#endif
 #endif
 
 #include "ccrypto.h"
@@ -214,6 +219,15 @@ void netmon_init(struct netmon *m)
 {
 	m->have_fp = 0;
 	m->next_check_ms = 0;
+	m->ev_ok = 0;
+#ifdef _WIN32
+	m->ev_rd = INVALID_SOCK;
+	m->ev_wr = INVALID_SOCK;
+	m->ev_h_addr = NULL;
+	m->ev_h_iface = NULL;
+#else
+	m->ev_fd = INVALID_SOCK;
+#endif
 }
 
 unsigned netmon_changed_fam_fp(struct netmon *m, uint64_t now_ms,
@@ -268,4 +282,108 @@ unsigned netmon_changed_fam(struct netmon *m, uint64_t now_ms)
 int netmon_changed(struct netmon *m, uint64_t now_ms)
 {
 	return netmon_changed_fam(m, now_ms) != 0;
+}
+
+#if defined(__linux__)
+
+static int nl_join(sock_t fd, int group)
+{
+	return setsockopt(fd, SOL_NETLINK, NETLINK_ADD_MEMBERSHIP,
+			  &group, sizeof(group));
+}
+
+int netmon_src_open(struct netmon *m)
+{
+	struct sockaddr_nl sa;
+	sock_t fd;
+
+	m->ev_ok = 0;
+	m->ev_fd = INVALID_SOCK;
+	fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+	if (!sock_valid(fd))
+		return -1;
+	memset(&sa, 0, sizeof(sa));
+	sa.nl_family = AF_NETLINK;
+	/* kernel assigns nl_pid, so no clash with libc's own netlink socket */
+	if (bind(fd, (struct sockaddr *)&sa, sizeof(sa))) {
+		sock_close(fd);
+		return -1;
+	}
+	sock_set_nonblock(fd);
+	nl_join(fd, RTNLGRP_IPV4_IFADDR);
+	nl_join(fd, RTNLGRP_IPV6_IFADDR);
+	nl_join(fd, RTNLGRP_LINK);
+	m->ev_fd = fd;
+	m->ev_ok = 1;
+	return 0;
+}
+
+void netmon_src_close(struct netmon *m)
+{
+	if (!m->ev_ok)
+		return;
+	sock_close(m->ev_fd);
+	m->ev_fd = INVALID_SOCK;
+	m->ev_ok = 0;
+}
+
+#else
+
+int netmon_src_open(struct netmon *m)
+{
+	(void)m;
+	return -1;
+}
+
+void netmon_src_close(struct netmon *m)
+{
+	(void)m;
+}
+
+#endif
+
+int netmon_prepare(struct netmon *m, struct pollfd *fds, int maxfds)
+{
+	if (!m->ev_ok || maxfds < 1)
+		return 0;
+#ifdef _WIN32
+	fds[0].fd = m->ev_rd;
+#else
+	fds[0].fd = m->ev_fd;
+#endif
+	fds[0].events = POLLIN;
+	fds[0].revents = 0;
+	return 1;
+}
+
+void netmon_drain_event(struct netmon *m)
+{
+	uint8_t buf[512];
+	ssize_t rc;
+	sock_t fd;
+	int seen;
+
+	if (!m->ev_ok)
+		return;
+#ifdef _WIN32
+	fd = m->ev_rd;
+#else
+	fd = m->ev_fd;
+#endif
+	seen = 0;
+	/* the payload is discarded; an event only means "re-sample now" */
+	for (;;) {
+		rc = sock_read(fd, buf, sizeof(buf));
+		if (rc > 0) {
+			seen = 1;
+			continue;
+		}
+		if (rc < 0 && sock_err_would_block(sock_errno()))
+			break;
+		netmon_src_close(m);
+		seen = 1;
+		break;
+	}
+	if (seen)
+		m->next_check_ms = 0;
 }
