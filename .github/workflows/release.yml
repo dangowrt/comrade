@@ -335,6 +335,10 @@ jobs:
             echo "skip=true" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Bootstrap Intel bottle build dependency
+        if: matrix.arch == 'x86_64' && steps.guard.outputs.skip != 'true'
+        run: brew install --build-from-source pkgconf
+
       - name: Build the bottle
         if: steps.guard.outputs.skip != 'true'
         run: bash packaging/homebrew/bottle-build.sh
