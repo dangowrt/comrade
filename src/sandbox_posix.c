@@ -747,9 +747,32 @@ static int no_new_privs(void)
 #elif defined(__riscv) && __riscv_xlen == 64
 # define SB_AUDIT_ARCH AUDIT_ARCH_RISCV64
 # define SB_ARCH_NAME "AUDIT_ARCH_RISCV64"
+#elif defined(__s390x__)
+# define SB_AUDIT_ARCH AUDIT_ARCH_S390X
+# define SB_ARCH_NAME "AUDIT_ARCH_S390X"
+# define SB_COMPAT_AUDIT_ARCH AUDIT_ARCH_S390
+# define SB_COMPAT_NR_SOCKET 359
+# define SB_COMPAT_NR_SOCKETCALL 102
+# define SB_COMPAT_NR_IO_URING_SETUP 425
 #elif defined(__loongarch64)
 # define SB_AUDIT_ARCH AUDIT_ARCH_LOONGARCH64
 # define SB_ARCH_NAME "AUDIT_ARCH_LOONGARCH64"
+#endif
+
+#if defined(__linux__) && defined(SYS_seccomp) && !defined(SB_AUDIT_ARCH)
+# if defined(__clang__)
+#  pragma clang diagnostic push
+#  pragma clang diagnostic warning "-W#warnings"
+#  warning seccomp filter disabled: no audit architecture mapping
+#  pragma clang diagnostic pop
+# elif defined(__GNUC__)
+#  pragma GCC diagnostic push
+#  pragma GCC diagnostic warning "-Wcpp"
+#  warning seccomp filter disabled: no audit architecture mapping
+#  pragma GCC diagnostic pop
+# else
+#  pragma message("warning: seccomp filter disabled: no audit architecture mapping")
+# endif
 #endif
 
 #ifdef SYS_seccomp
@@ -2189,14 +2212,12 @@ static int seccomp_nonet(void)
 /* Whether a filter can install here: the syscall exists, this build names an
  * audit arch for the architecture it runs on, and the kernel has seccomp. A
  * kernel can have seccomp while this file has no constant for the arch. */
+#if defined(SYS_seccomp) && defined(SB_AUDIT_ARCH)
 static int seccomp_available(void)
 {
-#if defined(SYS_seccomp) && defined(SB_AUDIT_ARCH)
 	return prctl(PR_GET_SECCOMP) >= 0;
-#else
-	return 0;
-#endif
 }
+#endif
 
 static void seccomp_prepare(const struct sandbox_cfg *cfg)
 {
@@ -3770,11 +3791,13 @@ int sandbox_selftest(void)
 		return 77;
 	}
 #if defined(__linux__)
+#if defined(SYS_seccomp) && defined(SB_AUDIT_ARCH)
 	if (sb_log_mode()) {
 		printf("sandbox selftest: COMRADE_SANDBOX=log confines "
 		       "nothing\n");
 		return 77;
 	}
+#endif
 	return selftest_linux();
 #else
 	printf("sandbox selftest: no syscall filter on this platform\n");
