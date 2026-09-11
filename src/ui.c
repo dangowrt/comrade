@@ -1801,9 +1801,12 @@ void ui_destroy(struct ui *u)
 {
 	if (!u)
 		return;
+	/* Clear the dashboard, or the status row the session left on the last
+	 * line, so it cannot sit above the caller's parting line and read as a
+	 * session still going. */
 	if (u->anim) {
+		fputs(RST "\033[2J\033[H", stdout);
 		show_cursor(u);
-		fputs(RST, stdout);
 		fflush(stdout);
 	}
 	free(u);
