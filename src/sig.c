@@ -1333,12 +1333,27 @@ static void on_host_put(void *arg, int stored, const struct sockaddr *node,
 	s->put_inflight = 0;
 	/* Only a store that found a home earns the wide window for the
 	 * validating gets to pick the rendezvous node; one that stored nowhere
-	 * retries at the normal cadence. */
+	 * retries at the normal cadence, and so does one a release is waiting
+	 * behind. */
 	if (stored > 0) {
-		s->next_put_ms = now_ms() + SIG_DHT_RESTORE_MS;
+		if (!s->mb.need_write)
+			s->next_put_ms = now_ms() + SIG_DHT_RESTORE_MS;
 		if (s->rdv_stage < 3)
 			s->rdv_stage = 3;	/* stored: now reading it back */
 	}
+}
+
+/* Every update opens with reads that spend the per-node budget a deferred
+ * store is waiting on, so the next one starts only once this one is over. */
+static void on_host_store(void *arg, int stored, const struct sockaddr *node,
+			  socklen_t node_len)
+{
+	struct sig *s = arg;
+
+	(void)stored;
+	(void)node;
+	(void)node_len;
+	s->put_inflight = 0;
 }
 
 /* A tombstone store came back. One node that took it is enough for that route:
@@ -1531,12 +1546,14 @@ static void dht_pump(struct sig *s, uint64_t now)
 			s->put_inflight = 1;
 			if (s->rdv_stage < 2)
 				s->rdv_stage = 2;	/* placing the mailbox */
-			bep44_update(s->engine, s->keys.bep44_sk,
-				     s->keys.bep44_pk, SIG_SALT, sig_merge,
-				     s, on_host_put, s);
+			if (bep44_update(s->engine, s->keys.bep44_sk,
+					 s->keys.bep44_pk, SIG_SALT, sig_merge,
+					 s, on_host_put, s))
+				s->put_inflight = 0;
 			s->next_put_ms = now +
 				(eager ? SIG_DHT_PUT_MS : SIG_DHT_PUT_SLOW_MS);
-		} else if (s->mb.have_mine && now >= s->next_wide_put_ms) {
+		} else if (s->mb.have_mine && now >= s->next_wide_put_ms &&
+			   !s->put_inflight) {
 			/*
 			 * The value where the key says it belongs, not only
 			 * where it first landed. Which nodes are closest drifts
@@ -1546,13 +1563,15 @@ static void dht_pump(struct sig *s, uint64_t now)
 			 * there and not merely on the handful we pinned once.
 			 */
 			sig_note_put(s);
-			bep44_update(s->engine, s->keys.bep44_sk,
-				     s->keys.bep44_pk, SIG_SALT, sig_merge,
-				     s, NULL, NULL);
+			s->put_inflight = 1;
+			if (bep44_update(s->engine, s->keys.bep44_sk,
+					 s->keys.bep44_pk, SIG_SALT, sig_merge,
+					 s, on_host_store, s))
+				s->put_inflight = 0;
 			s->next_wide_put_ms = now + SIG_DHT_WIDE_PUT_MS;
 			s->next_put_ms = now + SIG_DHT_PUT_MS;
 		} else if (s->mb.have_mine && (s->rnode4_len || s->rnode6_len) &&
-			   s->mb.need_write) {
+			   s->mb.need_write && !s->put_inflight) {
 			/*
 			 * Locating done: keep the anchor warm with a direct
 			 * store -- a round-trip to the pinned node, no
@@ -1561,9 +1580,11 @@ static void dht_pump(struct sig *s, uint64_t now)
 			 * the token never churns and the mailbox never expires.
 			 */
 			sig_note_put(s);
-			bep44_update_direct(s->engine, s->keys.bep44_sk,
-					    s->keys.bep44_pk, SIG_SALT,
-					    sig_merge, s, NULL, NULL);
+			s->put_inflight = 1;
+			if (bep44_update_direct(s->engine, s->keys.bep44_sk,
+						s->keys.bep44_pk, SIG_SALT,
+						sig_merge, s, on_host_store, s))
+				s->put_inflight = 0;
 			s->next_put_ms = now + SIG_DHT_PUT_MS;
 		}
 	} else if (mailbox_client_should_claim(&s->mb) && claim_current(s)) {
