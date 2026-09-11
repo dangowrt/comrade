@@ -681,21 +681,31 @@ def cmd_components(args):
     rules = rules_load()
     local = [{"pattern": p, "component": c} for _, p, c in rules]
     remote = None
+    filed = {}
     note = ""
     try:
         conn = connect_open()
         info = project_info(conn, project_get(args))
         maps = conn.call("configurationservice", "getComponentMaps",
-                         filterSpec={})
+                         filterSpec={"namePattern": info["component_map"]})
         for m in maps:
             if get(m, "componentMapId", "name") != info["component_map"]:
                 continue
             remote = [{"pattern": get(r, "pathPattern", default=""),
                        "component": get(r, "componentId", "name", default="")}
                       for r in many(m, "componentPathRules")]
+        if remote is None:
+            note = "Connect shows this user no component map"
+        # What the map did to the last build is visible whatever the
+        # user may read: every defect names the component it landed in.
+        snaps = snapshots_all(conn, info["stream"])
+        if snaps:
+            for d in defects_snapshot(conn, info["project"], snaps[-1]["id"]):
+                name = get(d, "componentName", default="")
+                filed[name] = filed.get(name, 0) + 1
     except Fail as e:
         note = str(e)
-    data = {"local": local, "remote": remote, "note": note}
+    data = {"local": local, "remote": remote, "note": note, "filed": filed}
 
     def text():
         print("rules for the Analysis Settings tab, in order:")
@@ -703,13 +713,19 @@ def cmd_components(args):
               ["component", "path pattern"])
         if remote is None:
             print(f"Scan's map not compared: {note}")
-            return
-        if remote == local:
+        elif remote == local:
             print("Scan's component map matches.")
+        else:
+            print("Scan's component map differs:")
+            table([[r["component"], r["pattern"]] for r in remote],
+                  ["component", "path pattern"])
+        if not filed:
             return
-        print("Scan's component map differs:")
-        table([[r["component"], r["pattern"]] for r in remote],
-              ["component", "path pattern"])
+        print("the last build's defects are filed under:")
+        table([[name, n] for name, n in sorted(filed.items())],
+              ["component", "defects"])
+        if all(name.endswith(".Other") for name in filed):
+            print("everything is in Other: the rules are not entered on Scan")
     emit(args, data, text)
 
 
