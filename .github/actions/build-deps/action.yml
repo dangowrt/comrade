@@ -1,0 +1,228 @@
+name: Build the dependencies
+description: >
+  Provision the base packages and build comrade's not-yet-packaged
+  dependencies (libjuice, kcp, jech/dht, monocypher) into a user-writable
+  prefix, exported as DEPS. The sources are checked out under deps-src/ so
+  that the tree, the caches and the analysis component rules all name them
+  by one path.
+
+inputs:
+  crypto:
+    description: The crypto backend the job builds for (auto, openssl, gcrypt or monocypher); monocypher is built only for its own entry.
+    default: auto
+  dht:
+    description: How jech/dht is provided, checkout (a plain clone for COMRADE_DHT_DIR) or shared (libdht.so built into the prefix, Linux only).
+    default: checkout
+  cache:
+    description: Cache the built prefix and the dht checkout, keyed on the pinned versions.
+    default: 'true'
+  wrapper:
+    description: A command prefix for every dependency compile, such as cov-build --dir cov-int.
+    default: ''
+  extra-packages:
+    description: Additional apt packages for the Linux base install.
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    # Every out-of-tree dependency is fetched from github.com. Anonymous
+    # clones are rate-limited per source IP, and a shared-egress fleet trips
+    # that limit; routing them through the job token makes them authenticated
+    # (5000 req/hr per repo) instead. Forks use their own token, so a fork's
+    # CI stays charged to the forker.
+    - name: Route GitHub fetches through the job token
+      shell: bash
+      run: |
+        git config --global \
+          url."https://x-access-token:${{ github.token }}@github.com/".insteadOf \
+          "https://github.com/"
+
+    # Dependency versions come from the shared manifest, so CI builds the same
+    # set the packaging pipelines do; see packaging/versions.sh.
+    - name: Load dependency versions
+      shell: bash
+      run: |
+        . packaging/versions.sh
+        {
+          echo "KCP_VERSION=$KCP_VERSION"
+          echo "JUICE_VERSION=$JUICE_VERSION"
+          echo "MONOCYPHER_VERSION=$MONOCYPHER_VERSION"
+          echo "DHT_COMMIT=$DHT_COMMIT"
+        } >> "$GITHUB_ENV"
+
+    # Self-hosted runners are not GitHub's images: sudo can be locked (the
+    # Linux runners are containers) and Homebrew can be off PATH (macOS runs
+    # as its own user). Put brew on PATH; the not-yet-packaged deps build into
+    # a user-writable prefix so nothing needs root. The BASE packages -- a
+    # crypto lib, libssh, ninja, pkg-config, cmake >= 3.20, tmux -- must be
+    # provisioned on the runner (a locked container cannot install them;
+    # Configure then fails with a clear list).
+    - name: Put Homebrew on PATH (macOS)
+      if: runner.os == 'macOS'
+      shell: bash
+      run: |
+        # if...fi, not "&& echo": under the runner's set -e a missing
+        # candidate (e.g. /usr/local/bin on an Apple-Silicon runner, where
+        # brew lives in /opt/homebrew) makes "[ -x ] && echo" return non-zero
+        # and fails the step.
+        for d in /opt/homebrew/bin /usr/local/bin; do
+          if [ -x "$d/brew" ]; then echo "$d" >> "$GITHUB_PATH"; fi
+        done
+
+    # Best-effort because a locked container can install nothing and is
+    # expected to carry these already. What it must not do is give up on a
+    # lock: unattended-upgrades holds the dpkg frontend for a while after a
+    # worker boots, and a job starting in that window installed nothing and
+    # then died four steps later on "cmake: command not found". So the lock
+    # is waited out, and what the later steps need is checked here, where the
+    # failure can say which tool is missing and that installing it was tried.
+    - name: Install base packages (best-effort)
+      shell: bash
+      env:
+        EXTRA_PACKAGES: ${{ inputs.extra-packages }}
+      run: |
+        if [ "$RUNNER_OS" = Linux ]; then
+          SUDO=; [ "$(id -u)" = 0 ] || SUDO="sudo -n"
+          n=0
+          until $SUDO apt-get update && $SUDO apt-get install -y --no-install-recommends \
+              cmake ninja-build pkg-config build-essential git curl ca-certificates \
+              libssh-dev tmux libgcrypt20-dev libsodium-dev $EXTRA_PACKAGES; do
+            n=$((n + 1))
+            if [ "$n" -ge 6 ]; then
+              echo "note: could not apt-get; relying on the runner's provisioned packages"
+              break
+            fi
+            echo "apt-get unavailable (attempt $n); retrying in $((n * 15))s"
+            sleep $((n * 15))
+          done
+          missing=
+          for t in cmake git curl; do
+            command -v "$t" >/dev/null 2>&1 || missing="$missing $t"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::runner has no$missing and installing it did not succeed"
+            exit 1
+          fi
+        else
+          brew install cmake ninja pkg-config libssh tmux libgcrypt \
+            || echo "note: brew install failed; relying on the runner's provisioned packages"
+        fi
+
+    # A user-writable prefix for the built deps, and the pkg-config and
+    # runtime library paths that point at it, exported for every later step.
+    - name: Prepare the dependency prefix
+      shell: bash
+      run: |
+        DEPS="$HOME/comrade-ci-deps"
+        mkdir -p "$DEPS/lib" deps-src
+        {
+          echo "DEPS=$DEPS"
+          echo "PKG_CONFIG_PATH=$DEPS/lib/pkgconfig:$DEPS/lib64/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+          if [ "$RUNNER_OS" = macOS ]; then
+            echo "DYLD_LIBRARY_PATH=$DEPS/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
+          else
+            echo "LD_LIBRARY_PATH=$DEPS/lib:$DEPS/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          fi
+        } >> "$GITHUB_ENV"
+
+    # The VMs are ephemeral, so without this the deps are cloned and rebuilt on
+    # every job -- most of the fetch pressure and minutes. Cache the built
+    # prefix and the jech/dht checkout, keyed on the pinned versions and on
+    # this action, since how the prefix was built is part of what it holds; a
+    # per-dep sentinel lets the build steps below skip on a hit.
+    - name: Cache built dependencies
+      if: inputs.cache == 'true'
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/comrade-ci-deps
+          deps-src/dht
+        key: ${{ runner.os }}-cideps-${{ inputs.crypto }}-${{ inputs.dht }}-${{ hashFiles('packaging/versions.sh', '.github/actions/build-deps/action.yml') }}
+
+    # Monocypher is not in the Ubuntu or Homebrew indexes; build the
+    # release tarball the same way a packager would, into the prefix.
+    - name: Build monocypher
+      if: inputs.crypto == 'monocypher'
+      shell: bash
+      env:
+        WRAPPER: ${{ inputs.wrapper }}
+      run: |
+        [ -e "$DEPS/.built-monocypher" ] && { echo "using cached monocypher"; exit 0; }
+        mkdir -p deps-src/monocypher
+        curl --retry 5 --retry-all-errors --retry-delay 5 -fsSL \
+          "https://monocypher.org/download/monocypher-$MONOCYPHER_VERSION.tar.gz" \
+          | tar xz -C deps-src/monocypher --strip-components=1
+        $WRAPPER make -C deps-src/monocypher -j"$(getconf _NPROCESSORS_ONLN)"
+        make -C deps-src/monocypher install PREFIX="$DEPS"
+        touch "$DEPS/.built-monocypher"
+
+    - name: Build libjuice
+      shell: bash
+      env:
+        WRAPPER: ${{ inputs.wrapper }}
+      run: |
+        [ -e "$DEPS/.built-libjuice" ] && { echo "using cached libjuice"; exit 0; }
+        n=0; until git clone --depth 1 -b "v$JUICE_VERSION" \
+            https://github.com/paullouisageneau/libjuice deps-src/libjuice; do
+          n=$((n+1)); [ "$n" -ge 5 ] && { echo "libjuice clone failed"; exit 1; }
+          echo "retry $n in $((n*5))s"; sleep $((n*5))
+        done
+        cmake -S deps-src/libjuice -B deps-src/libjuice/build -G Ninja \
+          -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$DEPS"
+        $WRAPPER cmake --build deps-src/libjuice/build
+        cmake --install deps-src/libjuice/build
+        touch "$DEPS/.built-libjuice"
+
+    # Shared, as the distribution recipes package it: upstream honours
+    # BUILD_SHARED_LIBS but sets no SOVERSION, so the packages impose one.
+    - name: Build kcp
+      shell: bash
+      env:
+        WRAPPER: ${{ inputs.wrapper }}
+      run: |
+        [ -e "$DEPS/.built-kcp" ] && { echo "using cached kcp"; exit 0; }
+        n=0; until git clone --depth 1 -b "$KCP_VERSION" \
+            https://github.com/skywind3000/kcp deps-src/kcp; do
+          n=$((n+1)); [ "$n" -ge 5 ] && { echo "kcp clone failed"; exit 1; }
+          echo "retry $n in $((n*5))s"; sleep $((n*5))
+        done
+        # kcp pins cmake 4.0 for nothing used here; relax the floor so a
+        # provisioned runner's own cmake (>= 3.20) suffices.
+        sed -i.bak 's/cmake_minimum_required(VERSION[^)]*)/cmake_minimum_required(VERSION 3.20)/I' \
+          deps-src/kcp/CMakeLists.txt
+        cmake -S deps-src/kcp -B deps-src/kcp/build -G Ninja -DBUILD_SHARED_LIBS=ON \
+          -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$DEPS"
+        $WRAPPER cmake --build deps-src/kcp/build
+        cmake --install deps-src/kcp/build
+        touch "$DEPS/.built-kcp"
+
+    # comrade compiles dht.c straight in when given a checkout, and links
+    # a shared libdht when not. The build matrix exercises the checkout
+    # route; the packaging jobs and the analysis build take the library.
+    - name: Fetch jech/dht
+      shell: bash
+      run: |
+        [ -e deps-src/dht/dht.c ] && { echo "using cached dht"; exit 0; }
+        n=0; until git clone https://github.com/jech/dht deps-src/dht; do
+          n=$((n+1)); [ "$n" -ge 5 ] && { echo "dht clone failed"; exit 1; }
+          echo "retry $n in $((n*5))s"; sleep $((n*5))
+        done
+        git -C deps-src/dht checkout "$DHT_COMMIT"
+
+    # jech/dht ships a plain Makefile that builds a test binary, not a
+    # library, so the shared object is built directly, as packaging/deb
+    # does. dht.c leaves four symbols undefined for the application to
+    # supply; -shared allows that, and comrade resolves them at link time.
+    - name: Build libdht
+      if: inputs.dht == 'shared'
+      shell: bash
+      env:
+        WRAPPER: ${{ inputs.wrapper }}
+      run: |
+        [ -e "$DEPS/.built-libdht" ] && { echo "using cached libdht"; exit 0; }
+        $WRAPPER cc -O2 -fPIC -Wall -c -o deps-src/dht/dht.o deps-src/dht/dht.c
+        cc -shared -Wl,-soname,libdht.so.0 -o "$DEPS/lib/libdht.so.0" deps-src/dht/dht.o
+        ln -sf libdht.so.0 "$DEPS/lib/libdht.so"
+        install -Dm644 deps-src/dht/dht.h "$DEPS/include/dht/dht.h"
+        touch "$DEPS/.built-libdht"
