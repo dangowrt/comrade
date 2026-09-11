@@ -1202,7 +1202,7 @@ static void update_store(struct b44_op *op)
 	op->seq = next;
 	op->cas = op->have_best ? op->best_seq : -1;
 	op->is_put = 1;
-	if (!store_start(op))
+	if (!store_start(op) && !op->store_deferred)
 		op_finish(op);
 }
 
@@ -1286,7 +1286,7 @@ static void op_step(struct b44_op *op)
 			op_finish(op);
 			return;
 		}
-		if (!store_start(op))
+		if (!store_start(op) && !op->store_deferred)
 			op_finish(op);
 		return;
 	}

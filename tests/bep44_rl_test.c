@@ -408,6 +408,50 @@ static void a_node_is_told_the_sequence_it_holds(void)
 	assert(node_cas(&n, 7) == 0);
 }
 
+/* A store the budget holds back on every node is not one that reached nobody:
+ * the operation waits, and the next step past the budget sends it. */
+static void a_store_held_back_everywhere_waits(void)
+{
+	static const uint8_t v[] = { 'd', '1', ':', 'a', 'e' };
+	struct sockaddr_in a;
+	uint8_t target[20];
+	struct b44_op *op;
+	uint64_t *tat;
+	uint64_t t;
+
+	memset(&a, 0, sizeof(a));
+	a.sin_family = AF_INET;
+	a.sin_addr.s_addr = htonl(0x0a000001);
+	a.sin_port = htons(6881);
+	assert(!bep44_pin_add(E, NULL, (struct sockaddr *)&a, sizeof(a)));
+	memset(target, 1, sizeof(target));
+	op = op_new(E, target, 1);
+	assert(op && op->nnodes == 1);
+	op->is_put = 1;
+	memcpy(op->value, v, sizeof(v));
+	op->value_len = sizeof(v);
+	op->seq = 1;
+	op->cas = -1;
+	op->nodes[0].state = B44_NODE_REPLIED;
+	op->nodes[0].token_len = 1;
+	op->nodes[0].token[0] = 't';
+
+	tat = seed_bucket(E, (struct sockaddr *)&a, sizeof(a));
+	assert(tat);
+	t = now_ms();
+	*tat = t + (uint64_t)(B44_NODE_BURST + 1) * B44_NODE_COST_MS;
+	op_step(op);
+	assert(E->ops == op);
+	assert(op->phase == B44_PHASE_STORE && op->store_deferred);
+	assert(op->nodes[0].state == B44_NODE_REPLIED);
+
+	*tat = t;
+	op_step(op);
+	assert(E->ops == op);
+	assert(!op->store_deferred);
+	assert(op->nodes[0].state == B44_NODE_STORE_INFLIGHT);
+}
+
 int main(void)
 {
 	void (*tests[])(void) = {
@@ -418,6 +462,7 @@ int main(void)
 		an_unchanged_re_store_keeps_the_sequence,
 		a_node_is_told_the_sequence_it_holds,
 		peers_behind_one_address_are_not_banned_for_normal_use,
+		a_store_held_back_everywhere_waits,
 	};
 	size_t i;
 
