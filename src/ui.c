@@ -568,10 +568,50 @@ static const char *link_word(const struct peerrow *p)
 	}
 }
 
+/* Deterministic dashboard order, so rows do not reshuffle as they arrive out
+ * of order: addresses by family then scope then text, links by name. */
+static int net_cmp(const void *a, const void *b)
+{
+	const struct netrow *x = a;
+	const struct netrow *y = b;
+
+	if (x->family != y->family)
+		return x->family - y->family;
+	if (x->scope != y->scope)
+		return x->scope - y->scope;
+	return strcmp(x->addr, y->addr);
+}
+
+static int link_cmp(const void *a, const void *b)
+{
+	const struct linkrow *x = a;
+	const struct linkrow *y = b;
+
+	return strcmp(x->name, y->name);
+}
+
+static void draw_net_row(const struct netrow *n)
+{
+	const char *col, *txt;
+
+	net_label(n->scope, n->via, &col, &txt);
+	line("  " DIM "%s" RST "  " CYN "%-40s" RST "%s%s" RST,
+	     n->family == 6 ? "IPv6" : "IPv4", n->addr, col, txt);
+}
+
+static void draw_link_row(const struct linkrow *l)
+{
+	line("  " DIM "LINK" RST "  " CYN "%-44s" RST "%s%s", l->name,
+	     l->has4 ? BGR "v4 " RST : DIM "-- " RST,
+	     l->has6 ? BGR "v6" RST : DIM "--" RST);
+}
+
 static void draw(struct ui *u)
 {
 	int i, f = u->spin & 3, ns = 0, rc;
 	const char *c4, *t4, *c6, *t6;
+	struct linkrow slink[8];
+	struct netrow snet[12];
 
 	if (u->view == UI_VIEW_QR_RO && !u->have_token_ro)
 		u->view = UI_VIEW_QR_RW;
@@ -613,21 +653,14 @@ static void draw(struct ui *u)
 	     DIM "  (per-destination NAT mapping)" RST : "");
 	if (!u->nnet && !u->nlink)
 		line(DIM "  probing ..." RST);
-	for (i = 0; i < u->nnet; i++) {
-		struct netrow *n = &u->net[i];
-		const char *col, *txt;
-
-		net_label(n->scope, n->via, &col, &txt);
-		line("  " DIM "%s" RST "  " CYN "%-40s" RST "%s%s" RST,
-		     n->family == 6 ? "IPv6" : "IPv4", n->addr, col, txt);
-	}
-	for (i = 0; i < u->nlink; i++) {
-		struct linkrow *l = &u->link[i];
-
-		line("  " DIM "LINK" RST "  " CYN "%-44s" RST "%s%s", l->name,
-		     l->has4 ? BGR "v4 " RST : DIM "-- " RST,
-		     l->has6 ? BGR "v6" RST : DIM "--" RST);
-	}
+	memcpy(snet, u->net, (size_t)u->nnet * sizeof(snet[0]));
+	qsort(snet, (size_t)u->nnet, sizeof(snet[0]), net_cmp);
+	for (i = 0; i < u->nnet; i++)
+		draw_net_row(&snet[i]);
+	memcpy(slink, u->link, (size_t)u->nlink * sizeof(slink[0]));
+	qsort(slink, (size_t)u->nlink, sizeof(slink[0]), link_cmp);
+	for (i = 0; i < u->nlink; i++)
+		draw_link_row(&slink[i]);
 	line("");
 
 	rc = u->role == UI_ROLE_HOST ? rdv_combined(u->stage4, u->stage6) : -1;
