@@ -4278,8 +4278,9 @@ static const uint8_t *ep_bytes(const struct sockaddr *sa, uint16_t *port)
 }
 
 /* A client's way back in: the rendezvous it holds now, as the host named it
- * over the control channel, written into the token it arrived on. A family
- * with none keeps whatever that token said. Model thread only. */
+ * over the control channel, written into the token it arrived on. A DIRECT
+ * slot is the host's own endpoint and stays; a family with no node keeps
+ * whatever that token said. Model thread only. */
 static void client_token_pump(struct sess *s)
 {
 	static const int famv[2] = { 4, 6 };
@@ -4293,6 +4294,8 @@ static void client_token_pump(struct sess *s)
 		uint16_t port = 0;
 		const uint8_t *b;
 
+		if (s->tok_state[i] == TOKEN_STATE_DIRECT)
+			continue;
 		if (!netstate_anchor(&s->ns, famv[i], node, &nlen, NULL) ||
 		    !nlen)
 			continue;
