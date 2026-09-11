@@ -6660,7 +6660,8 @@ static void punch_scan(struct sess *s, struct worker *ws, int *dash_seq)
 			 */
 			if (claim_served_has(&s->served, c->punch_ufrag))
 				conn_tell_fresh(c, NULL);
-			claim_served_note(&s->served, c->punch_ufrag);
+			claim_served_note(&s->served, c->punch_ufrag,
+					  c->remote_pwd);
 			conn_register(s, c);
 			if (worker_spawn(ws, c))
 				conn_free(c);		/* table full */
@@ -7256,6 +7257,9 @@ static int host_turnstile(struct sess *s)
 								   cp);
 
 					again = punch_tried_again(s, cu, cp);
+					if (!made)
+						made = claim_served_made(&s->served,
+									 cu, cp);
 					/* Named, because which of these decided
 					 * it is the whole story when a client
 					 * cannot get in and nobody can say why. */

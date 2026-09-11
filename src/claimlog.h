@@ -32,16 +32,25 @@ int claim_made(const char *conn_pwd, const char *claim_pwd);
  *
  * A ring: only the recent ones matter, and a claimant that has fallen out of
  * it is treated as new, which costs it the notice and nothing else.
+ *
+ * The password of the attempt each was served from is kept beside it, so the
+ * mailbox repeating that claim once the worker it made is gone is still told
+ * from the claimant asking again.
  */
 #define CLAIM_SERVED_MAX 8
 #define CLAIM_UFRAG_LEN 40
+#define CLAIM_PWD_LEN 40
 
 struct claim_served {
 	char ufrag[CLAIM_SERVED_MAX][CLAIM_UFRAG_LEN];
+	char pwd[CLAIM_SERVED_MAX][CLAIM_PWD_LEN];
 	int next;
 };
 
-void claim_served_note(struct claim_served *l, const char *ufrag);
+void claim_served_note(struct claim_served *l, const char *ufrag,
+		       const char *pwd);
 int claim_served_has(const struct claim_served *l, const char *ufrag);
+int claim_served_made(const struct claim_served *l, const char *ufrag,
+		      const char *pwd);
 
 #endif /* COMRADE_CLAIMLOG_H */
