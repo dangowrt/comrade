@@ -558,6 +558,25 @@ for example:
 
     cmake -B build -DCMAKE_PREFIX_PATH=/usr/src/local -DCOMRADE_DHT_DIR=/usr/src/dht
 
+### Coverity Scan
+
+Every push to `main` that passes the build workflow is submitted to
+[Coverity Scan](https://scan.coverity.com/projects/dangowrt-comrade) by
+`.github/workflows/coverity.yml`: at most one submission per UTC day, one
+crypto backend per submission in the fixed order openssl, gcrypt,
+monocypher (each run takes the successor of the last submitted backend,
+seeded by the run number when no marker survives). The dependency sources
+are compiled under the capture as well, and the component rules in
+`tools/coverity-components`, entered by hand on the project's Analysis
+Settings tab, file their findings under `3rd-party.*`. The workflow needs
+the `COVERITY_SCAN_TOKEN` repository secret and the `COVERITY_SCAN_EMAIL`
+repository variable and skips without them. `tools/coverity.sh` drives
+the build tool and the upload, there and by hand; `tools/covscan.py`
+reads the results through the Connect API on scan9
+(`COVERITY_CONNECT_USER`, `COVERITY_CONNECT_KEY`) and the digest mailbox
+(`~/.netrc`). A commit that fixes a reported defect carries the trailer
+`Addresses-Coverity-ID: <CID> ("<type>")`.
+
 ## Dependencies
 
 All libraries are system-provided, nothing is vendored. Every one of them
