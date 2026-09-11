@@ -335,6 +335,9 @@ int main(int argc, char **argv)
 		cfg.test_recv = rx;
 		cfg.test_recv_cap = SSH_NONCE;
 		cfg.test_recv_len = &rx_got;
+		/* The way back in, printed as it changes like the host's mint. */
+		host.tok = cfg.tok;
+		cfg.on_token_state = on_token_state;
 	}
 
 	if (is_host && cfg.test_single_conn && cfg.host_serve_max > 0) {

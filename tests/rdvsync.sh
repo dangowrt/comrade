@@ -9,7 +9,7 @@
 # rendezvous now, over the control channel, or the next move on either end
 # costs it a full convergent search it should not have needed.
 #
-# Two things pinned here:
+# Three things pinned here:
 #
 #   1. a client that joined on a token naming no rendezvous ends up holding
 #      the host's node, and the same one the host puts in the token it would
@@ -18,6 +18,8 @@
 #      the thread driving the signalling: every client is served by a worker,
 #      so an announcement written only by the signalling thread reaches
 #      nobody at all.
+#   3. the token a client leaves with names that node: what it prints as the
+#      way back in is the invitation as it stands, not as it arrived.
 #
 # Over a private DHT this script starts (tests/swarm.sh); COMRADE_E2E_NET=1
 # uses the real one.
@@ -143,6 +145,17 @@ for n in 1 2; do
 		grep "rdv:" "$tmp/c$n.dbg" | tail -3
 		rc=1
 	}
+	# The last token the client printed is the one it would leave with.
+	last=$(sed -n 's/^COMRADE TOKEN: //p' "$tmp/c$n.out" | tail -1)
+	d=$("$E2E" token "$last" 2>/dev/null)
+	case "$d" in
+	*"ep${fam}_rdv=1"*"ep$fam=$rdv"*) ;;
+	*)
+		echo "client $n would leave on a token not naming $rdv on v$fam"
+		echo "$d" | head -4
+		rc=1
+		;;
+	esac
 done
 
 # Each client says what it can reach as it joins, which is what lets a host

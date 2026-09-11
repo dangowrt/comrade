@@ -4259,6 +4259,62 @@ static void rdv_adopt(struct sess *s, struct conn *c)
 	}
 }
 
+/* The bare address bytes and host-order port a token slot carries. */
+static const uint8_t *ep_bytes(const struct sockaddr *sa, uint16_t *port)
+{
+	if (sa->sa_family == AF_INET6) {
+		const struct sockaddr_in6 *a = (const struct sockaddr_in6 *)sa;
+
+		*port = ntohs(a->sin6_port);
+		return (const uint8_t *)&a->sin6_addr;
+	}
+	if (sa->sa_family == AF_INET) {
+		const struct sockaddr_in *a = (const struct sockaddr_in *)sa;
+
+		*port = ntohs(a->sin_port);
+		return (const uint8_t *)&a->sin_addr;
+	}
+	return NULL;
+}
+
+/* A client's way back in: the rendezvous it holds now, as the host named it
+ * over the control channel, written into the token it arrived on. A family
+ * with none keeps whatever that token said. Model thread only. */
+static void client_token_pump(struct sess *s)
+{
+	static const int famv[2] = { 4, 6 };
+	int i;
+
+	if (s->cfg->is_host || !s->cfg->on_token_state)
+		return;
+	for (i = 0; i < 2; i++) {
+		uint8_t node[NETSTATE_SA_MAX], nlen = 0;
+		uint8_t a[TOKEN_EP6_LEN];
+		uint16_t port = 0;
+		const uint8_t *b;
+
+		if (!netstate_anchor(&s->ns, famv[i], node, &nlen, NULL) ||
+		    !nlen)
+			continue;
+		b = ep_bytes((struct sockaddr *)node, &port);
+		if (!b)
+			continue;
+		memset(a, 0, sizeof(a));
+		memcpy(a, b, famv[i] == 6 ? TOKEN_EP6_LEN : TOKEN_EP4_LEN);
+		if (s->tok_told[i] &&
+		    s->tok_state[i] == TOKEN_STATE_RENDEZVOUS &&
+		    !memcmp(s->tok_ep[i], a, sizeof(a)) &&
+		    s->tok_port[i] == port)
+			continue;
+		s->tok_state[i] = TOKEN_STATE_RENDEZVOUS;
+		s->tok_told[i] = 1;
+		memcpy(s->tok_ep[i], a, sizeof(a));
+		s->tok_port[i] = port;
+		s->cfg->on_token_state(s->cfg->arg, famv[i],
+				       TOKEN_STATE_RENDEZVOUS, a, port);
+	}
+}
+
 /*
  * Publish what this end can reach, for the connections to tell their peers.
  *
@@ -5487,6 +5543,7 @@ static int conn_run(struct conn *c, int drive_sig)
 			ns_drain(s);
 			netstate_tick(&s->ns, now_ms());
 			net_settle(s);
+			client_token_pump(s);
 		}
 		if (drive_sig && !s->cfg->is_host)
 			resume_tick(c);
@@ -5951,27 +6008,6 @@ static void maybe_announce_rendezvous(struct sess *s)
 
 
 /*
- * The token's view of a sockaddr: the bare address bytes, and the port in host
- * order. NULL for a family the token cannot carry.
- */
-static const uint8_t *ep_bytes(const struct sockaddr *sa, uint16_t *port)
-{
-	if (sa->sa_family == AF_INET6) {
-		const struct sockaddr_in6 *a = (const struct sockaddr_in6 *)sa;
-
-		*port = ntohs(a->sin6_port);
-		return (const uint8_t *)&a->sin6_addr;
-	}
-	if (sa->sa_family == AF_INET) {
-		const struct sockaddr_in *a = (const struct sockaddr_in *)sa;
-
-		*port = ntohs(a->sin_port);
-		return (const uint8_t *)&a->sin_addr;
-	}
-	return NULL;
-}
-
-/*
  * The address bytes and host-order port a carried token already holds for
  * `family`, so a state seeded from it is re-reported with the endpoint it
  * names rather than a fresh one.
@@ -6032,53 +6068,6 @@ static int advert_state(struct sess *s, int fam, enum tok_advert adv,
  * neither family has an address the operator is told, rather than the host
  * hanging silently.
  */
-/*
- * A CLIENT'S WAY BACK IN, KEPT CURRENT.
- *
- * It joined on whatever token it was handed, which may have named no
- * rendezvous at all -- that is what its own DHT warm-up is for -- and it has
- * since been told where the host actually is, over the control channel.
- * Handing the original back when it leaves sends it round the whole convergent
- * search again next time, for a node it is already holding the address of.
- *
- * Only ever a rendezvous this end holds: a family with none keeps whatever the
- * token it arrived on said, since nothing here knows better.
- */
-static void client_token_pump(struct sess *s)
-{
-	static const int famv[2] = { 4, 6 };
-	int i;
-
-	if (s->cfg->is_host || !s->cfg->on_token_state)
-		return;
-	for (i = 0; i < 2; i++) {
-		uint8_t node[NETSTATE_SA_MAX], nlen = 0;
-		uint8_t a[TOKEN_EP6_LEN];
-		uint16_t port = 0;
-		const uint8_t *b;
-
-		if (!netstate_anchor(&s->ns, famv[i], node, &nlen, NULL) ||
-		    !nlen)
-			continue;
-		b = ep_bytes((struct sockaddr *)node, &port);
-		if (!b)
-			continue;
-		memset(a, 0, sizeof(a));
-		memcpy(a, b, famv[i] == 6 ? TOKEN_EP6_LEN : TOKEN_EP4_LEN);
-		if (s->tok_told[i] &&
-		    s->tok_state[i] == TOKEN_STATE_RENDEZVOUS &&
-		    !memcmp(s->tok_ep[i], a, sizeof(a)) &&
-		    s->tok_port[i] == port)
-			continue;
-		s->tok_state[i] = TOKEN_STATE_RENDEZVOUS;
-		s->tok_told[i] = 1;
-		memcpy(s->tok_ep[i], a, sizeof(a));
-		s->tok_port[i] = port;
-		s->cfg->on_token_state(s->cfg->arg, famv[i],
-				       TOKEN_STATE_RENDEZVOUS, a, port);
-	}
-}
-
 static void token_pump(struct sess *s)
 {
 	static const int famv[2] = { 4, 6 };
@@ -6942,7 +6931,6 @@ static int host_turnstile(struct sess *s)
 		maybe_announce_rendezvous(s);	/* report the rendezvous */
 		report_mailbox(s);
 		token_pump(s);			/* mint and advertise the token */
-		client_token_pump(s);		/* or keep the way back in */
 		rdv_publish(s);			/* where we rendezvous, for the
 						 * workers to announce */
 		reach_publish(s);		/* and what we can reach */
@@ -7609,6 +7597,7 @@ int session_run(const struct session_cfg *cfg)
 		maybe_announce_rendezvous(&s);
 		report_mailbox(&s);
 		token_pump(&s);
+		client_token_pump(&s);
 		/*
 		 * A host with one connection has no turnstile to notice the end
 		 * in, so it is noticed here: the shared session is gone, and
