@@ -33,8 +33,7 @@ int conn_write(const char *path, const struct conn_status *st)
 	fprintf(f, "%d\t%s\t%s\t%d\t%d\t%s\t%d\t%s\t%d\t%d\n", st->state,
 		st->peer[0] ? st->peer : "-", st->rdv[0] ? st->rdv : "-",
 		st->rtt_ms, st->since_s, st->rdv6[0] ? st->rdv6 : "-",
-		st->read_only, st->alt[0] ? st->alt : "-", st->warm_alt,
-		st->rtt_known);
+		st->read_only, "-", st->nproven, st->rtt_known);
 	fclose(f);
 	/*
 	 * The line names the peer's address and both rendezvous nodes. The
@@ -92,12 +91,10 @@ int conn_read(const char *path, struct conn_status *st)
 		case 6:
 			st->read_only = atoi(tok);
 			break;
-		case 7:
-			if (strcmp(tok, "-"))
-				snprintf(st->alt, sizeof(st->alt), "%s", tok);
+		case 7:			/* the retired alt slot: kept so 8+ stay put */
 			break;
 		case 8:
-			st->warm_alt = atoi(tok);
+			st->nproven = atoi(tok);
 			break;
 		case 9:
 			st->rtt_known = atoi(tok);

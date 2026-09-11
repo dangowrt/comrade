@@ -58,11 +58,10 @@ struct conn_status {
 	 * on silence is what this end does when nobody says anything. */
 	int gone;
 	int read_only;			/* this side is a view-only guest */
-	/* The warm paths held besides the one in use: the best-ranked of them,
-	 * and how many there are. What the session would move to were the path
-	 * in use to die. */
-	char alt[80];
-	int warm_alt;
+	/* Distinct paths a probe has ever qualified to this peer, the one in use
+	 * included: what it is known reachable on, counted as the host dashboard
+	 * counts it. */
+	int nproven;
 };
 
 /* Serialise/parse to a tmpfs file. Return 0 on success, -1 on failure. */

@@ -1399,38 +1399,6 @@ static int conn_rtt_ms(struct conn *c, int *out)
 	return *out > 0;
 }
 
-/*
- * The warm paths this connection holds besides the one carrying the session:
- * how many there are, and the best-ranked of them, printable (view). This is
- * what the session would move to were the path in use to die, so it is the
- * evidence for the status row's promise that a roam is a reordering. Call it
- * after conn_pick, which is what refreshes `usable`.
- */
-static int conn_warm_alts(struct conn *c, char *best, size_t n)
-{
-	uint64_t now = now_ms();
-	int i, sel, top = -1, cnt = 0;
-
-	best[0] = '\0';
-	pthread_mutex_lock(&c->path_lock);
-	sel = c->paths.sel;
-	for (i = 0; i < PATH_TABLE_MAX; i++) {
-		struct path *p = &c->paths.p[i];
-
-		if (!p->used || !p->usable || i == sel)
-			continue;
-		if (path_warmth_of(p, now) != PATH_WARM)
-			continue;
-		cnt++;
-		if (top < 0 || path_cmp(p, &c->paths.p[top], now) < 0)
-			top = i;
-	}
-	if (top >= 0)
-		snprintf(best, n, "%s", c->paths.p[top].label);
-	pthread_mutex_unlock(&c->path_lock);
-	return cnt;
-}
-
 /* How many distinct paths to this peer a probe has ever qualified. `qualified`
  * latches and never clears on silence, so this is the count of endpoints the
  * connection was actually proven on, stable as they later fall dead. */
@@ -1655,7 +1623,7 @@ static void publish_status(struct conn *c, int state)
 	 * pair that answered nothing -- so a roam updates it and a loss does not
 	 * cycle it through the addresses being retried. */
 	conn_path_label(c, cs.peer, sizeof(cs.peer));
-	cs.warm_alt = conn_warm_alts(c, cs.alt, sizeof(cs.alt));
+	cs.nproven = conn_proven_paths(c);
 	/* Both families, so a session that started on one can be seen to gain the
 	 * other once the in-band rendezvous exchange propagates it. */
 	fmt_rdv_fam(s, 4, cs.rdv, sizeof(cs.rdv));

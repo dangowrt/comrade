@@ -62,16 +62,13 @@ void statusbar_render(int rows, int cols, const struct conn_status *st)
 	if (p > 0 && p < (int)sizeof(text) && st->since_s > 0 &&
 	    st->state == CONN_LOST)
 		p += snprintf(text + p, sizeof(text) - p, " %ds", st->since_s);
-	if (p > 0 && p < (int)sizeof(text) && st->peer[0])
+	/* The path in use, and how many others the peer was proven on: the row
+	 * is one line, so the rest are counted, never listed. */
+	if (p > 0 && p < (int)sizeof(text) && st->peer[0]) {
 		p += snprintf(text + p, sizeof(text) - p, "  peer %s", st->peer);
-	/* The path in use, and what it would move to: a roam is a reordering of
-	 * paths already warm, so the alternative is worth seeing before it is
-	 * needed. Only the best one is named; the count carries the rest. */
-	if (p > 0 && p < (int)sizeof(text) && st->alt[0]) {
-		p += snprintf(text + p, sizeof(text) - p, "  alt %s", st->alt);
-		if (p > 0 && p < (int)sizeof(text) && st->warm_alt > 1)
-			p += snprintf(text + p, sizeof(text) - p, " +%d",
-				      st->warm_alt - 1);
+		if (p > 0 && p < (int)sizeof(text) && st->nproven > 1)
+			p += snprintf(text + p, sizeof(text) - p, " (+%d)",
+				      st->nproven - 1);
 	}
 	if (p > 0 && p < (int)sizeof(text) && st->rdv[0])
 		p += snprintf(text + p, sizeof(text) - p, "  rdv4 %s", st->rdv);
