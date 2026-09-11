@@ -1,0 +1,257 @@
+# Submit a Coverity Scan build once a main tree has passed the whole build
+# matrix: one crypto backend per submission, rotating through the three, at
+# most one submission per UTC day. tools/coverity.sh does the capture and
+# the upload here and by hand; tools/covscan.py reads the results. The
+# project needs the COVERITY_SCAN_TOKEN secret and the COVERITY_SCAN_EMAIL
+# variable; without them the run skips, so a fork submits nothing.
+name: coverity
+
+on:
+  workflow_run:
+    workflows: [build]
+    branches: [main]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Submit even if a build went out today
+        type: boolean
+        default: false
+      backend:
+        description: Crypto backend to analyse (auto follows the rotation)
+        type: choice
+        options: [auto, openssl, gcrypt, monocypher]
+        default: auto
+
+permissions:
+  contents: read
+
+# An upload in flight is never cancelled: Scan counts it against the weekly
+# quota whether or not the job survives to read the answer.
+concurrency:
+  group: coverity
+  cancel-in-progress: false
+
+jobs:
+  # Whether to submit and with which backend, decided from cache keys alone
+  # so that no API permission is needed: a day marker and a sha+backend
+  # marker gate, and the newest "last" marker names the backend submitted
+  # before this one. A workflow_run for a pull request carries the fork's
+  # branch name, so only a push to this repository is taken.
+  gate:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ${{ vars.RUNNER_LINUX && fromJSON(vars.RUNNER_LINUX) || 'ubuntu-latest' }}
+    timeout-minutes: 10
+    outputs:
+      skip: ${{ steps.decide.outputs.skip }}
+      backend: ${{ steps.backend.outputs.backend }}
+      sha: ${{ steps.ids.outputs.sha }}
+      day: ${{ steps.ids.outputs.day }}
+    env:
+      TOKEN: ${{ secrets.COVERITY_SCAN_TOKEN }}
+      EMAIL: ${{ vars.COVERITY_SCAN_EMAIL }}
+    steps:
+      - name: Guard on the token and the notification address
+        id: guard
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "COVERITY_SCAN_TOKEN is not set; skipping." >&2
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+          if [ -z "$EMAIL" ]; then
+            echo "COVERITY_SCAN_EMAIL is not set; skipping." >&2
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Name the tree and the day
+        id: ids
+        run: |
+          echo "sha=${{ github.event.workflow_run.head_sha || github.sha }}" >> "$GITHUB_OUTPUT"
+          echo "day=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+
+      - name: Look for a submission today
+        if: steps.guard.outputs.skip != 'true'
+        id: day
+        uses: actions/cache/restore@v4
+        with:
+          path: .coverity-last
+          key: coverity-day-${{ steps.ids.outputs.day }}
+          lookup-only: true
+
+      # The primary key never exists; the prefix restores the newest marker.
+      - name: Restore the last submission marker
+        if: steps.guard.outputs.skip != 'true'
+        id: last
+        uses: actions/cache/restore@v4
+        with:
+          path: .coverity-last
+          key: coverity-last-${{ github.run_id }}
+          restore-keys: coverity-last-
+
+      # The successor of the last submitted backend, in a fixed order, so
+      # every third submission completes a rotation however many runs the
+      # day gate skipped in between; the run number seeds it when no marker
+      # survived. A dispatch may name the backend outright.
+      - name: Choose the backend
+        if: steps.guard.outputs.skip != 'true'
+        id: backend
+        env:
+          REQUESTED: ${{ inputs.backend || 'auto' }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          if [ "$REQUESTED" != auto ]; then
+            backend=$REQUESTED
+            why="requested"
+          elif [ -f .coverity-last ]; then
+            read -r _ last < .coverity-last
+            case $last in
+              openssl) backend=gcrypt ;;
+              gcrypt) backend=monocypher ;;
+              *) backend=openssl ;;
+            esac
+            why="follows $last, the last submitted"
+          else
+            set -- openssl gcrypt monocypher
+            shift $((RUN_NUMBER % 3))
+            backend=$1
+            why="run $RUN_NUMBER mod 3, no marker"
+          fi
+          echo "backend: $backend ($why)"
+          echo "backend=$backend" >> "$GITHUB_OUTPUT"
+
+      - name: Look for this tree with this backend
+        if: steps.guard.outputs.skip != 'true'
+        id: sha
+        uses: actions/cache/restore@v4
+        with:
+          path: .coverity-last
+          key: coverity-sha-${{ steps.ids.outputs.sha }}-${{ steps.backend.outputs.backend }}
+          lookup-only: true
+
+      # force lifts the day gate only: three forced dispatches on one tree,
+      # each naming a backend, cover all three within Scan's daily cap.
+      - name: Decide
+        id: decide
+        env:
+          GUARD_SKIP: ${{ steps.guard.outputs.skip }}
+          DAY_HIT: ${{ steps.day.outputs.cache-hit }}
+          SHA_HIT: ${{ steps.sha.outputs.cache-hit }}
+          FORCE: ${{ inputs.force }}
+          SHA: ${{ steps.ids.outputs.sha }}
+          BACKEND: ${{ steps.backend.outputs.backend }}
+        run: |
+          skip=false
+          if [ "$GUARD_SKIP" = true ]; then
+            skip=true
+          elif [ "$SHA_HIT" = true ]; then
+            echo "::notice::$SHA was already submitted with the $BACKEND backend; skipping"
+            skip=true
+          elif [ "$DAY_HIT" = true ] && [ "$FORCE" != true ]; then
+            echo "::notice::a build went out today already; skipping (force overrides)"
+            skip=true
+          fi
+          echo "skip=$skip" >> "$GITHUB_OUTPUT"
+
+  scan:
+    needs: gate
+    if: needs.gate.outputs.skip != 'true'
+    runs-on: ${{ vars.RUNNER_LINUX && fromJSON(vars.RUNNER_LINUX) || 'ubuntu-latest' }}
+    timeout-minutes: 60
+    env:
+      COVERITY_SCAN_TOKEN: ${{ secrets.COVERITY_SCAN_TOKEN }}
+      COVERITY_SCAN_EMAIL: ${{ vars.COVERITY_SCAN_EMAIL }}
+      COVERITY_SCAN_PROJECT: ${{ github.repository }}
+      COVERITY_TOOL_DIR: ${{ runner.temp }}/cov-analysis
+      BACKEND: ${{ needs.gate.outputs.backend }}
+      SHA: ${{ needs.gate.outputs.sha }}
+    steps:
+      # Full history: the submitted version is git describe, which needs
+      # the tags.
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
+          submodules: true
+          fetch-depth: 0
+
+      # The build tool is about 1 GB and Scan updates it about twice a year;
+      # the md5 Scan publishes is the cache key, so a stale copy is never
+      # used and a current one is never fetched twice.
+      - name: Look up the build tool
+        id: tool
+        run: echo "md5=$(sh tools/coverity.sh md5)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/cov-analysis
+          key: coverity-tool-${{ steps.tool.outputs.md5 }}
+
+      - name: Fetch the build tool
+        run: sh tools/coverity.sh tool --yes >> "$GITHUB_PATH"
+
+      # The dependency compiles run under cov-build too, so a defect in one
+      # of them is seen and lands in its own component
+      # (tools/coverity-components); a cached prefix would compile nothing
+      # and capture nothing, so the cache is off. libdht is linked shared as
+      # the packages link it, so its code is captured once, in its own place.
+      - uses: ./.github/actions/build-deps
+        with:
+          crypto: ${{ needs.gate.outputs.backend }}
+          dht: shared
+          cache: 'false'
+          wrapper: cov-build --dir ${{ github.workspace }}/cov-int
+
+      - name: Configure
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$DEPS" \
+            -DCOMRADE_CRYPTO="$BACKEND" \
+            -DCOMRADE_WERROR=ON
+
+      - name: Build under cov-build
+        run: sh tools/coverity.sh capture cov-int -- cmake --build build
+
+      # What the analysed binary loads: the four dependency libraries from
+      # the prefix, and the backend's crypto library.
+      - name: Show what the binary links
+        run: ldd build/comrade
+
+      # The description is what covscan.py parses to find the newest
+      # snapshot per backend; the version comes back on every defect.
+      - name: Submit
+        run: |
+          sh tools/coverity.sh submit cov-int \
+            --version "$(git describe --tags --always)" \
+            --description "backend=$BACKEND sha=$SHA run=${{ github.run_number }}"
+
+      # After the upload only: the markers say a submission went out.
+      - name: Write the markers
+        run: echo "$SHA $BACKEND" > .coverity-last
+
+      - uses: actions/cache/save@v4
+        with:
+          path: .coverity-last
+          key: coverity-day-${{ needs.gate.outputs.day }}
+
+      - uses: actions/cache/save@v4
+        with:
+          path: .coverity-last
+          key: coverity-sha-${{ needs.gate.outputs.sha }}-${{ needs.gate.outputs.backend }}
+
+      - uses: actions/cache/save@v4
+        with:
+          path: .coverity-last
+          key: coverity-last-${{ github.run_id }}
+
+      - name: Keep the build log
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: coverity-build-log
+          path: cov-int/build-log.txt
+          if-no-files-found: ignore
+          retention-days: 7
