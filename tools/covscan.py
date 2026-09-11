@@ -232,21 +232,25 @@ def connect_open():
 
 
 def project_info(conn, project):
+    """Connect knows a Scan project by its slug (owner-repo); the Scan
+    name (owner/repo) is what the submission form and the mails use."""
+    wanted = {project, project.replace("/", "-")}
     projects = conn.call("configurationservice", "getProjects",
-                         filterSpec={"includeStreams": True,
-                                     "namePattern": project})
+                         filterSpec={"includeStreams": True})
     for p in projects:
-        if get(p, "id", "name") != project:
+        name = get(p, "id", "name")
+        if name not in wanted:
             continue
         streams = many(p, "streams")
         if not streams:
-            die(f"project {project} has no stream")
+            die(f"project {name} has no stream")
         s = streams[0]
-        return {"project": project, "stream": get(s, "id", "name"),
+        return {"project": name, "stream": get(s, "id", "name"),
                 "triage_store": get(s, "triageStoreId", "name"),
                 "component_map": get(s, "componentMapId", "name"),
                 "streams": [get(x, "id", "name") for x in streams]}
-    die(f"no project named {project} is visible to this user")
+    seen = ", ".join(sorted(get(p, "id", "name") for p in projects)) or "none"
+    die(f"no project named {project} is visible to this user (visible: {seen})")
 
 
 def description_parse(text):
