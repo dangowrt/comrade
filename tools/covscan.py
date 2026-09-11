@@ -752,7 +752,10 @@ def mail_uids(conn, criteria):
 
 
 def mail_fetch(conn, uid):
-    typ, data = conn.uid("FETCH", uid, "(BODY.PEEK[])")
+    try:
+        typ, data = conn.uid("FETCH", uid, "(BODY.PEEK[])")
+    except imaplib.IMAP4.error as e:
+        die(f"IMAP fetch of UID {uid} failed: {e}")
     if typ != "OK" or not data or not isinstance(data[0], tuple):
         die(f"IMAP fetch of UID {uid} failed: {data}")
     return data[0][1]
@@ -1032,13 +1035,20 @@ def parser_build():
     s.add_argument("--timeout", type=float, help="seconds to wait at most")
     s.set_defaults(func=cmd_mail_wait)
     s = m.add_parser("show")
-    s.add_argument("uid")
+    s.add_argument("uid", type=uid_arg, help="the number mail poll printed")
     s.add_argument("--raw", action="store_true", help="the mail as received")
     s.set_defaults(func=cmd_mail_show)
     s = m.add_parser("done")
-    s.add_argument("uid", nargs="+")
+    s.add_argument("uid", type=uid_arg, nargs="+",
+                   help="the numbers mail poll printed")
     s.set_defaults(func=cmd_mail_done)
     return p
+
+
+def uid_arg(text):
+    if not text.isdigit():
+        raise argparse.ArgumentTypeError(f"a mail UID is a number, not {text!r}")
+    return text
 
 
 def main():
