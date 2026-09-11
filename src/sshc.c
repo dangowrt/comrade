@@ -423,6 +423,20 @@ static int run_forward(ssh_session s, ssh_channel chan,
 	return rc;
 }
 
+/* After the shell channel closes, keep the control plane pumping until the
+ * host's end verdict arrives, or the grace runs out, so the caller can tell a
+ * session that ended from one merely detached. */
+static void wait_end_verdict(ssh_event event, ssh_channel ctl,
+			     volatile int *flag)
+{
+	uint64_t deadline = mono_ms() + SSHC_END_GRACE_MS;
+
+	while (mono_ms() < deadline &&
+	       !__atomic_load_n(flag, __ATOMIC_RELAXED) &&
+	       ctl && ssh_channel_is_open(ctl) && !ssh_channel_is_eof(ctl))
+		ssh_event_dopoll(event, 100);
+}
+
 /*
  * Interactive mode: put the terminal in raw mode and bridge stdin/stdout/stderr
  * to the channel with libssh's connectors (the same mechanism the server uses),
@@ -550,6 +564,11 @@ static int run_interactive(ssh_session s, ssh_channel chan,
 			}
 		}
 	}
+	/* The shell channel closed on its own (a detach, or the session ended):
+	 * wait for the host to say which on the control channel before tearing
+	 * down. A local leave (quit/reconnect/view-only detach) already knows. */
+	if (!quit && !reconnect && !left && o && o->end_verdict)
+		wait_end_verdict(event, ctl, o->end_verdict);
 	sshfwd_destroy(fwd);
 	fwd = NULL;
 	ssh_event_remove_fd(event, s_in);

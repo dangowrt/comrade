@@ -542,6 +542,11 @@ static void drain_messages(struct pump_ctx *c)
  * the channel toward the client: see the comment on pump(). */
 #define SSHD_END_DRAIN_MS 400
 
+/* After the served command exits with no end-fd signal, how long to give the
+ * end monitor to speak before ruling it a detach rather than a session end.
+ * Must exceed the monitor's own settle (spawner.c endmon_alive). */
+#define SSHD_DETACH_CONFIRM_MS 1000
+
 /* End-of-session fd became readable (a liveness monitor exited with the shared
  * session). Flag it; the pump breaks on the flag and closes toward the client. */
 static int on_end_fd(socket_t fd, int revents, void *userdata)
@@ -591,10 +596,12 @@ static int on_end_fd(socket_t fd, int revents, void *userdata)
 static int pump(ssh_session s, ssh_channel chan, const struct sshd_opts *o,
 		int read_only, int allow_shell)
 {
-	sock_t end_fd = o->end_fd;
-	struct pump_ctx c;
-	uint64_t end_ms = 0;
 	int ending = 0, drain = 0, exit_code = 0;
+	uint64_t child_gone_ms = 0;
+	sock_t end_fd = o->end_fd;
+	uint64_t end_ms = 0;
+	struct pump_ctx c;
+	int verdict = 0;
 
 	memset(&c, 0, sizeof(c));
 	c.s = s;
@@ -642,8 +649,8 @@ static int pump(ssh_session s, ssh_channel chan, const struct sshd_opts *o,
 		term_pump(&c);
 		term_feed(&c);
 		sshfwd_tick(c.fwd);
-		if (c.end_hit && !end_ms) {
-			ending = 1;
+		if (c.end_hit && !verdict) {
+			verdict = SSHD_END_SESSION;
 			end_ms = os_mono_ms();
 			/* Out of the event: it stays readable, and leaving it
 			 * in turns the wait below into a spin. */
@@ -652,11 +659,25 @@ static int pump(ssh_session s, ssh_channel chan, const struct sshd_opts *o,
 				end_fd = INVALID_SOCK;
 			}
 		}
-		if (!ending && c.child && cpty_exited(c.child))
-			ending = 1;
-		if (ending && (end_ms ?
-			       os_mono_ms() - end_ms >= SSHD_END_DRAIN_MS :
-			       ++drain >= 3))
+		/* The end fd lags the command's exit by the monitor's settle, so
+		 * once the guest's command has gone we wait that out before ruling
+		 * the end fd's silence a detach rather than a session end. */
+		if (!verdict && c.child && cpty_exited(c.child)) {
+			if (!sock_isset(o->end_fd) || !o->use_pty)
+				ending = 1;	/* no monitor, or no pty to
+						 * detach from: a guest leaving */
+			else if (!child_gone_ms)
+				child_gone_ms = os_mono_ms();
+			else if (os_mono_ms() - child_gone_ms >=
+				 SSHD_DETACH_CONFIRM_MS) {
+				verdict = SSHD_END_DETACH;
+				end_ms = os_mono_ms();
+			}
+		}
+		if (verdict && o->ended_out)
+			__atomic_store_n(o->ended_out, verdict, __ATOMIC_RELAXED);
+		if ((verdict && os_mono_ms() - end_ms >= SSHD_END_DRAIN_MS) ||
+		    (ending && ++drain >= 3))
 			break;
 	}
 

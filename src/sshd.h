@@ -20,6 +20,10 @@
 
 struct spawner;
 
+/* How a served shell ended, for ended_out below. */
+#define SSHD_END_SESSION 1		/* the shared session is gone */
+#define SSHD_END_DETACH 2		/* the guest detached; the session lives */
+
 struct sshd_opts {
 	void *hostkey;			/* ssh_key (private), from sshd_hostkey_new */
 	uint8_t auth[TOKEN_AUTH_LEN];	/* session password material */
@@ -93,6 +97,14 @@ struct sshd_opts {
 	 * worker read-only in the view. Read from another thread, so volatile.
 	 */
 	volatile int *ro_out;
+	/*
+	 * Optional out-parameter, set once (from the ssh thread) to an SSHD_END_*
+	 * code when a served shell ends: SESSION when the end fd has fired,
+	 * DETACH when the command exited and the end fd has stayed silent past
+	 * the monitor's settle. Lets the controller tell the guest which it was.
+	 * Only meaningful when end_fd is set. NULL to ignore.
+	 */
+	volatile int *ended_out;
 	/*
 	 * Optional tmux spawner (see spawner.h). When set, the shell is spawned
 	 * through it rather than by this -- sandboxed -- process execing tmux

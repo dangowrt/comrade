@@ -467,7 +467,11 @@ struct conn {
 	 * which is the difference between offering a rejoin and refusing one.
 	 */
 	int bye_sent;			/* host: told this client */
-	int peer_ended;			/* client: was told */
+	int shell_ended;		/* host: sshd's SSHD_END_* verdict, set on
+					 * the ssh thread */
+	int peer_ended;			/* client: was told the session ended */
+	int end_verdict;		/* client: an end verdict arrived, read by
+					 * the ssh thread's post-close wait */
 
 	/* Liveness heartbeat: a tiny ping/pong over the comrade-ctl channel, so a
 	 * dead link is noticed even when nobody is typing. Riding the reliable
@@ -2657,6 +2661,13 @@ static void ctl_dispatch(void *arg, int type, const uint8_t *pl, size_t plen)
 		dbg_logf("ctl: the host says the shared session has ended");
 		c->peer_ended = 1;
 		c->sess->peer_ended = 1;
+		__atomic_store_n(&c->end_verdict, 1, __ATOMIC_RELAXED);
+	} else if (type == CTLM_DETACHED) {
+		/* The attach ended but the session lives, so the rejoin on offer
+		 * is a real one. The verdict releases the client's post-close
+		 * wait; that no peer_ended came with it keeps the rejoin. */
+		dbg_logf("ctl: the host says we detached; the session lives");
+		__atomic_store_n(&c->end_verdict, 1, __ATOMIC_RELAXED);
 	}
 }
 
@@ -3977,6 +3988,7 @@ static void *ssh_srv_thread(void *p)
 	o.forward_only = s->cfg->forward_only;
 	o.ro_out = &c->read_only;
 	o.fwd_refused_out = &c->fwd_refused;
+	o.ended_out = &c->shell_ended;
 	o.tx_room = conn_tx_room;
 	o.tx_room_arg = c;
 	sshd_serve_fd(c->ssh_fd, &o);
@@ -4005,6 +4017,7 @@ static void *ssh_cli_thread(void *p)
 	o.tx_room_arg = c;
 	o.status = session_status;
 	o.status_arg = c;
+	o.end_verdict = &c->end_verdict;
 	o.send = s->cfg->test_send;
 	o.send_len = s->cfg->test_send_len;
 	o.recv = s->cfg->test_recv;
@@ -5194,6 +5207,7 @@ static int conn_run(struct conn *c, int drive_sig)
 	int done = 0, link_lost = 0;
 	struct sess *s = c->sess;
 	uint32_t carry_seen = 0;
+	int detached_sent = 0;
 	struct sshbridge *br;
 	sock_t sp[2], cp[2];
 	struct stream *st;
@@ -5233,6 +5247,8 @@ static int conn_run(struct conn *c, int drive_sig)
 	c->ssh_ctl_fd = cp[1];
 	c->ctl_fd = cp[0];
 	c->ctl_rf.len = 0;
+	c->shell_ended = 0;
+	c->end_verdict = 0;
 	/* The probe key belongs to the channel that agreed it. */
 	pthread_mutex_lock(&c->key_lock);
 	c->key_ready = 0;
@@ -5469,6 +5485,16 @@ static int conn_run(struct conn *c, int drive_sig)
 					session_entomb_start(s);
 				}
 			}
+		}
+		/* The guest detached and the session lives (sshd waited the end
+		 * monitor out and it stayed silent): say so, so the client offers
+		 * a rejoin rather than waiting on a CTLM_BYE that never comes. */
+		if (s->cfg->is_host && !c->bye_sent && !detached_sent &&
+		    __atomic_load_n(&c->shell_ended, __ATOMIC_RELAXED) ==
+		    SSHD_END_DETACH) {
+			dbg_logf("ctl: telling the client it detached");
+			ctl_send(c, CTLM_DETACHED, NULL, 0);
+			detached_sent = 1;
 		}
 		if (drive_sig) {
 			/*

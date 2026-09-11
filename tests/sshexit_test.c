@@ -34,6 +34,7 @@ struct srv_arg {
 	int use_pty;
 	const char *command;
 	int end_fd;
+	volatile int *ended_out;
 };
 
 static void *srv_thread(void *p)
@@ -47,6 +48,7 @@ static void *srv_thread(void *p)
 	o.command = a->command;
 	o.use_pty = a->use_pty;
 	o.end_fd = a->end_fd;
+	o.ended_out = a->ended_out;
 	sshd_serve_fd(a->fd, &o);
 	return NULL;
 }
@@ -56,6 +58,7 @@ struct cli_arg {
 	uint8_t fp[32];
 	uint8_t auth[TOKEN_AUTH_LEN];
 	int rc;
+	int hold_ms;
 	volatile int done;
 	/* `done` crosses the thread that sets it and the loop that
 	 * waits on it, so it is not a plain int. */
@@ -88,6 +91,7 @@ static void *cli_thread(void *p)
 	co.recv = got;
 	co.recv_cap = sizeof(got);
 	co.recv_len = &gl;
+	co.hold_ms = c->hold_ms;
 	c->rc = sshc_connect_fd(c->fd, &co);
 	pthread_mutex_lock(&c->lock);
 	c->done = 1;
@@ -103,7 +107,8 @@ static void *cli_thread(void *p)
  */
 static int one_round(void *hostkey, const uint8_t fp[32],
 		     const uint8_t auth[TOKEN_AUTH_LEN], int use_pty,
-		     const char *command, int close_after_ms)
+		     const char *command, int close_after_ms, int keep_alive,
+		     volatile int *ended_out, int hold_ms)
 {
 	struct srv_arg sa;
 	struct cli_arg ca;
@@ -118,13 +123,15 @@ static int one_round(void *hostkey, const uint8_t fp[32],
 	memcpy(sa.auth, auth, sizeof(sa.auth));
 	sa.use_pty = use_pty;
 	sa.command = command;
-	if (close_after_ms >= 0) {
+	sa.ended_out = ended_out;
+	if (close_after_ms >= 0 || keep_alive) {
 		assert(pipe(ep) == 0);
 		sa.end_fd = ep[0];	/* read end handed to the server */
 	}
 
 	memset(&ca, 0, sizeof(ca));
 	ca.fd = sp[0];
+	ca.hold_ms = hold_ms;
 	memcpy(ca.fp, fp, 32);
 	memcpy(ca.auth, auth, sizeof(ca.auth));
 
@@ -135,9 +142,10 @@ static int one_round(void *hostkey, const uint8_t fp[32],
 	if (close_after_ms >= 0) {
 		usleep((useconds_t)close_after_ms * 1000);
 		close(ep[1]);		/* EOF on the server's end_fd => end */
+		ep[1] = -1;
 	}
 
-	for (i = 0; i < 50 && !cli_done(&ca); i++)
+	for (i = 0; i < 60 && !cli_done(&ca); i++)
 		usleep(100000);
 	if (!cli_done(&ca))
 		return -1;		/* hung: let the ctest timeout catch it too */
@@ -146,12 +154,15 @@ static int one_round(void *hostkey, const uint8_t fp[32],
 	pthread_join(sth, NULL);
 	if (ep[0] >= 0)
 		close(ep[0]);
+	if (ep[1] >= 0)			/* keep_alive left the session's end open */
+		close(ep[1]);
 	return 0;
 }
 
 int main(void)
 {
 	uint8_t fp[32], auth[TOKEN_AUTH_LEN];
+	volatile int ended = 0;
 	void *hostkey;
 	size_t i;
 
@@ -164,25 +175,39 @@ int main(void)
 	assert(hostkey);
 
 	/* Command exits on its own (a shell whose last command returns). */
-	if (one_round(hostkey, fp, auth, 0, "sleep 0.3", -1)) {
+	if (one_round(hostkey, fp, auth, 0, "sleep 0.3", -1, 0, NULL, 0)) {
 		fprintf(stderr, "SSHEXIT FAIL: client hung, command exit (pipe)\n");
 		sshd_hostkey_free(hostkey);
 		return 1;
 	}
-	if (one_round(hostkey, fp, auth, 1, "sleep 0.3", -1)) {
+	if (one_round(hostkey, fp, auth, 1, "sleep 0.3", -1, 0, NULL, 0)) {
 		fprintf(stderr, "SSHEXIT FAIL: client hung, command exit (pty)\n");
 		sshd_hostkey_free(hostkey);
 		return 1;
 	}
 
 	/* Command lingers (as `tmux attach` does); the end fd ends the session. */
-	if (one_round(hostkey, fp, auth, 1, "sleep 30", 500)) {
+	if (one_round(hostkey, fp, auth, 1, "sleep 30", 500, 0, NULL, 0)) {
 		fprintf(stderr, "SSHEXIT FAIL: client hung, end fd (pty)\n");
 		sshd_hostkey_free(hostkey);
 		return 1;
 	}
 
+	/* Command exits with the end fd present but silent: the session lives,
+	 * so this is a detach. The client holds while the server classifies it,
+	 * which must be a detach and not a session end. */
+	if (one_round(hostkey, fp, auth, 1, "sleep 0.3", -1, 1, &ended, 4000)) {
+		fprintf(stderr, "SSHEXIT FAIL: client hung, detach (pty)\n");
+		sshd_hostkey_free(hostkey);
+		return 1;
+	}
+	if (ended != SSHD_END_DETACH) {
+		fprintf(stderr, "SSHEXIT FAIL: detach not classified (%d)\n", ended);
+		sshd_hostkey_free(hostkey);
+		return 1;
+	}
+
 	sshd_hostkey_free(hostkey);
-	printf("SSHEXIT PASS: client exits on command end and on end fd\n");
+	printf("SSHEXIT PASS: client exits on command end, end fd, and detach\n");
 	return 0;
 }

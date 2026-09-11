@@ -45,6 +45,10 @@
  * tombstone, which says the same thing more slowly.
  */
 #define CTLM_BYE 8
+/* payload: none. The attach ended but the shared session lives (the
+ * counterpart to CTLM_BYE): a detached guest is told to reattach rather than
+ * inferring it from a CTLM_BYE that never comes. */
+#define CTLM_DETACHED 9
 #define CTL_HDR 2
 #define CTL_TS_LEN 8
 #define CTL_RDV_PLEN 19

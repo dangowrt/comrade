@@ -77,6 +77,11 @@ struct sshc_opts {
 	void (*status)(void *arg, struct conn_status *out);
 	void *status_arg;
 
+	/* Raised by the session layer when the host's end verdict (CTLM_BYE or
+	 * CTLM_DETACHED) arrives; interactive mode waits on it after its shell
+	 * channel closes so the caller can tell an ended session from a detach. */
+	volatile int *end_verdict;
+
 	/* test mode (used when interactive == 0): */
 	const uint8_t *send;
 	size_t send_len;
@@ -111,6 +116,11 @@ struct sshc_opts {
  * nothing short of a session's absence reaches it -- and long enough that a
  * resume which is merely slow finishes first and never trips it. */
 #define SSHC_REJOIN_GRACE_S 75
+
+/* How long interactive mode waits for the host's end verdict after the shell
+ * channel closes, before tearing down anyway. Comfortably over the host's
+ * detach-confirm plus drain (sshd), so a verdict on its way is not missed. */
+#define SSHC_END_GRACE_MS 2500
 
 /*
  * Run one SSH session on fd; blocks until it ends. Returns 0 on a clean end,
