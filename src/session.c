@@ -280,7 +280,6 @@ struct conn {
 	/* This connection's ICE identity. A fresh one per host offer (single-use
 	 * per join, so two clients never share credentials); the client keeps its
 	 * one identity for the session. */
-	uint16_t bind_port;
 	char ice_ufrag[16];
 	char ice_pwd[40];
 	/* The peer ICE identity that primed this agent. Candidate trickles from
@@ -3773,17 +3772,9 @@ static int on_stream_output(void *arg, const uint8_t *data, size_t len)
 
 /* A fresh source port: one port carries one path, so each re-gather draws its
  * own rather than colliding with the port a parked agent still holds. */
-static void conn_fresh_port(struct conn *c)
-{
-	uint8_t rb[2];
-
-	random_bytes(rb, 2);
-	c->bind_port = (uint16_t)(40000 + (((rb[0] << 8) | rb[1]) % 20000));
-}
-
-/* Fill a connection's ICE identity: a fresh ufrag/pwd and a random bind port.
- * The host uses a new one per offer (single-use per join, so two clients never
- * share credentials); the client keeps its one for the whole session. */
+/* Fill a connection's ICE identity: a fresh ufrag/pwd. The host uses a new one
+ * per offer (single-use per join, so two clients never share credentials); the
+ * client keeps its one for the whole session. */
 static void conn_gen_ice(struct conn *c)
 {
 	static const char hx[] = "0123456789abcdef";
@@ -3802,7 +3793,6 @@ static void conn_gen_ice(struct conn *c)
 		c->ice_pwd[j * 2 + 1] = hx[rb[j] & 0xf];
 	}
 	c->ice_pwd[32] = '\0';
-	conn_fresh_port(c);
 	/* A client probes under its own identity; a host overwrites this with the
 	 * claimant it admitted (lan_drain, the turnstile at pickup, and the
 	 * single-connection state machine when it takes an answer up). */
@@ -3868,7 +3858,6 @@ static int nat_setup(struct conn *c)
 		}
 		cfg.stun_host = s->stun_host;
 	}
-	cfg.bind_port = c->bind_port;
 	cfg.ice_ufrag = c->ice_ufrag;
 	cfg.ice_pwd = c->ice_pwd;
 	cfg.on_local_sdp = on_local_sdp;
@@ -4901,7 +4890,6 @@ static void resume_tick(struct conn *c)
 	case 0:
 		conn_park_ice(c, now);
 		conn_fresh_pwd(c);
-		conn_fresh_port(c);
 		s->have_local_sdp = 0;
 		s->have_peer_sdp = 0;
 		s->remote_set = 0;
