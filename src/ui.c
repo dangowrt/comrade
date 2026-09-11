@@ -62,7 +62,9 @@ struct peerrow {
 	int link;			/* enum conn_state -- how it is now */
 	int rtt_ms;			/* -1 unmeasured, 0 under a millisecond */
 	int read_only;
+	int nproven;			/* distinct paths ever proven to it */
 	char addr[80];
+	char ident[16];			/* stable label once the link is lost */
 };
 
 /* A link is timed in whole milliseconds, which is all one that answers in
@@ -606,6 +608,31 @@ static void draw_link_row(const struct linkrow *l)
 	     l->has6 ? BGR "v6" RST : DIM "--" RST);
 }
 
+static void draw_peer_row(const struct peerrow *p, int n)
+{
+	const char *addr = p->addr[0] && p->addr[0] != '-' ? p->addr : "";
+	const char *ro = p->read_only ? "  " YEL "view-only" RST : "";
+	char rtt[24], extra[16], buf[16];
+
+	rtt[0] = '\0';
+	extra[0] = '\0';
+	if (p->link == CONN_LIVE && p->rtt_ms >= 0)
+		snprintf(rtt, sizeof(rtt), "  %s",
+			 rtt_text(p->rtt_ms, buf, sizeof(buf)));
+	/* Contact lost: the in-use address means nothing now, so show a stable
+	 * identity, the last carried address and the other proven paths. */
+	if (p->link == CONN_LOST) {
+		if (p->nproven > 1)
+			snprintf(extra, sizeof(extra), " (+%d)", p->nproven - 1);
+		line("  " BGR "#%d" RST " %s  " DIM "%s" RST "  " CYN "%s" RST
+		     DIM "%s" RST "%s", n, link_word(p), p->ident, addr, extra,
+		     ro);
+		return;
+	}
+	line("  " BGR "#%d" RST " %s  " CYN "%s" RST DIM "%s" RST "%s",
+	     n, link_word(p), addr, rtt, ro);
+}
+
 static void draw(struct ui *u)
 {
 	int i, f = u->spin & 3, ns = 0, rc;
@@ -711,19 +738,8 @@ static void draw(struct ui *u)
 		line(CYN "PEERS" RST);
 		if (!u->npeer)
 			line(DIM "  none yet -- you can enter and wait" RST);
-		for (i = 0; i < u->npeer; i++) {
-			struct peerrow *p = &u->peer[i];
-			char rtt[24], buf[16];
-
-			rtt[0] = '\0';
-			if (p->link == CONN_LIVE && p->rtt_ms >= 0)
-				snprintf(rtt, sizeof(rtt), "  %s",
-					 rtt_text(p->rtt_ms, buf, sizeof(buf)));
-			line("  " BGR "#%d" RST " %s  " CYN "%s" RST DIM "%s" RST
-			     "%s", i + 1, link_word(p), p->addr[0] &&
-			     p->addr[0] != '-' ? p->addr : "", rtt,
-			     p->read_only ? "  " YEL "view-only" RST : "");
-		}
+		for (i = 0; i < u->npeer; i++)
+			draw_peer_row(&u->peer[i], i + 1);
 		line("");
 		if (notice_live(u))
 			line(BGR "[ %s ]" RST, u->notice);
@@ -957,17 +973,20 @@ static void um_mailbox(struct ui *u, const struct session_mailbox *m)
 		     (long long)m->seq, m->gets, m->puts);
 }
 
-static void um_peer_link(struct ui *u, int id, int state, int rtt_ms)
+static void um_peer_link(struct ui *u, int id, int state, int rtt_ms,
+			 int nproven)
 {
 	int i;
 
 	for (i = 0; i < u->npeer; i++) {
 		if (u->peer[i].id != id)
 			continue;
-		if (u->peer[i].link == state && u->peer[i].rtt_ms == rtt_ms)
+		if (u->peer[i].link == state && u->peer[i].rtt_ms == rtt_ms &&
+		    u->peer[i].nproven == nproven)
 			return;
 		u->peer[i].link = state;
 		u->peer[i].rtt_ms = rtt_ms;
+		u->peer[i].nproven = nproven;
 		if (u->anim)
 			u->dirty = 1;
 		else
@@ -1067,8 +1086,12 @@ static void um_peer(struct ui *u, int id, int state, const char *addr)
 		 * what somebody else's link was doing when they went. */
 		u->peer[at].link = CONN_CONNECTING;
 		u->peer[at].rtt_ms = -1;
+		u->peer[at].nproven = 0;
+		u->peer[at].ident[0] = '\0';
 	}
 	u->peer[at].state = state;
+	/* The controller reports only the path in use, so what it sends is what
+	 * to show; it keeps the last one over a loss and never a stale one. */
 	if (have_addr)
 		snprintf(u->peer[at].addr, sizeof(u->peer[at].addr), "%s", addr);
 	u->dirty = 1;
@@ -1086,6 +1109,22 @@ static void um_peer_ro(struct ui *u, int id)
 	for (i = 0; i < u->npeer; i++)
 		if (u->peer[i].id == id) {
 			u->peer[i].read_only = 1;
+			u->dirty = 1;
+			return;
+		}
+}
+
+/* The peer's stable identity (host dashboard): shown once the link is lost. */
+static void um_peer_ident(struct ui *u, int id, const char *ident)
+{
+	int i;
+
+	if (!u->anim)
+		return;
+	for (i = 0; i < u->npeer; i++)
+		if (u->peer[i].id == id) {
+			snprintf(u->peer[i].ident, sizeof(u->peer[i].ident),
+				 "%s", ident);
 			u->dirty = 1;
 			return;
 		}
@@ -1203,14 +1242,15 @@ static void cb_mailbox(void *a, const struct session_mailbox *m)
 {
 	um_mailbox(a, m);
 }
-static void cb_peer_link(void *a, int id, int st, int rtt)
+static void cb_peer_link(void *a, int id, int st, int rtt, int np)
 {
-	um_peer_link(a, id, st, rtt);
+	um_peer_link(a, id, st, rtt, np);
 }
 static void cb_token(void *a, const char *t) { um_token(a, t); }
 static void cb_token_ro(void *a, const char *t) { um_token_ro(a, t); }
 static void cb_peer(void *a, int id, int s, const char *ad) { um_peer(a, id, s, ad); }
 static void cb_peer_ro(void *a, int id) { um_peer_ro(a, id); }
+static void cb_peer_ident(void *a, int id, const char *s) { um_peer_ident(a, id, s); }
 static void cb_reset(void *a) { um_reset(a); }
 static void cb_net_reset(void *a, int f) { um_net_reset(a, f); }
 static void cb_esc(void *a, const char *w) { um_escalate(a, w); }
@@ -1259,6 +1299,7 @@ void ui_bind(struct ui *u, struct session_obs *obs)
 	obs->token_ro = cb_token_ro;
 	obs->peer = cb_peer;
 	obs->peer_ro = cb_peer_ro;
+	obs->peer_ident = cb_peer_ident;
 	obs->reset = cb_reset;
 	obs->net_reset = cb_net_reset;
 	obs->escalate = cb_esc;
@@ -1392,9 +1433,9 @@ static void em_mailbox(void *a, const struct session_mailbox *m)
 	      (long long)m->seq, m->gets, m->puts, m->claim, m->age_get_s,
 	      m->age_put_s, m->rdv_holding, m->rdv_proven);
 }
-static void em_peer_link(void *a, int id, int st, int rtt)
+static void em_peer_link(void *a, int id, int st, int rtt, int np)
 {
-	emitf(a, "K %d %d %d\n", id, st, rtt);
+	emitf(a, "K %d %d %d %d\n", id, st, rtt, np);
 }
 static void em_token(void *a, const char *t)
 {
@@ -1411,6 +1452,10 @@ static void em_peer(void *a, int id, int s, const char *ad)
 static void em_peer_ro(void *a, int id)
 {
 	emitf(a, "O %d\n", id);
+}
+static void em_peer_ident(void *a, int id, const char *ident)
+{
+	emitf(a, "D %d %s\n", id, ident);
 }
 static void em_reset(void *a)
 {
@@ -1474,6 +1519,7 @@ void ui_emitter(struct session_obs *obs, sock_t fd)
 	obs->token_ro = em_token_ro;
 	obs->peer = em_peer;
 	obs->peer_ro = em_peer_ro;
+	obs->peer_ident = em_peer_ident;
 	obs->reset = em_reset;
 	obs->link_reset = em_link_reset;
 	obs->net_reset = em_net_reset;
@@ -1499,9 +1545,9 @@ void ui_emitter_token_ro(const struct session_obs *obs, const char *token_str)
 
 static void feed(struct ui *u, char *ln)
 {
-	int a, b, c;
-	char s[160];
+	int a, b, c, np;
 	char tok[256];
+	char s[160];
 
 	switch (ln[0]) {
 	case 'N':
@@ -1560,13 +1606,14 @@ static void feed(struct ui *u, char *ln)
 		if (sscanf(ln + 1, "%d", &a) == 1)
 			um_peer_ro(u, a);
 		break;
-	case 'K': {
-		int st, rtt;
-
-		if (sscanf(ln + 1, "%d %d %d", &a, &st, &rtt) == 3)
-			um_peer_link(u, a, st, rtt);
+	case 'K':
+		if (sscanf(ln + 1, "%d %d %d %d", &a, &b, &c, &np) == 4)
+			um_peer_link(u, a, b, c, np);
 		break;
-	}
+	case 'D':
+		if (sscanf(ln + 1, "%d %15s", &a, s) == 2)
+			um_peer_ident(u, a, s);
+		break;
 	case 'E':
 		if (sscanf(ln + 1, " %159[^\n]", s) == 1)
 			um_escalate(u, s);

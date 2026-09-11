@@ -28,7 +28,7 @@ int main(void)
 
 	/* A peer arrives, its link is reported, and it leaves. */
 	um_peer(&u, 1, SESSION_PEER_LIVE, "10.0.0.1:1");
-	um_peer_link(&u, 1, CONN_UNKNOWN, 42);
+	um_peer_link(&u, 1, CONN_UNKNOWN, 42, 0);
 	assert(u.npeer == 1 && u.peer[0].link == CONN_UNKNOWN);
 	um_peer(&u, 1, SESSION_PEER_GONE, "");
 	assert(u.npeer == 0);
@@ -38,6 +38,21 @@ int main(void)
 	assert(u.npeer == 1);
 	assert(u.peer[0].link == CONN_CONNECTING);
 	assert(u.peer[0].rtt_ms == -1);
+	um_peer(&u, 2, SESSION_PEER_GONE, "");
+	assert(u.npeer == 0);
+
+	/* A peer holds a stable identity and its proven-path count across a lost
+	 * link, and the address tracks whatever path the controller reports as
+	 * the one in use -- the controller, not the view, keeps it current. */
+	um_peer(&u, 3, SESSION_PEER_LIVE, "10.0.0.3:3");
+	um_peer_ident(&u, 3, "abc12345");
+	um_peer_link(&u, 3, CONN_LOST, -1, 3);
+	assert(u.npeer == 1);
+	assert(u.peer[0].link == CONN_LOST);
+	assert(!strcmp(u.peer[0].ident, "abc12345"));
+	assert(u.peer[0].nproven == 3);
+	um_peer(&u, 3, SESSION_PEER_LIVE, "10.0.0.9:9");
+	assert(!strcmp(u.peer[0].addr, "10.0.0.9:9"));
 
 	printf("ui: a new peer row inherits nothing from the slot's last "
 	       "occupant\n");

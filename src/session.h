@@ -124,6 +124,10 @@ struct session_obs {
 	/* The peer identified by `id` authenticated read-only (view-only guest);
 	 * fired once, after its row exists, so the dashboard can mark it. */
 	void (*peer_ro)(void *arg, int id);
+	/* A stable printable identity for peer `id` (the host's truncated claim
+	 * ufrag), fired once after its row exists. It labels the peer when the
+	 * link is lost and the in-use address is no longer meaningful. */
+	void (*peer_ident)(void *arg, int id, const char *ident);
 	/* A forwarding request from peer `id` was refused (the host declines
 	 * forwarding, or the guest is read-only). Fired once, so an operator
 	 * sees an attempted tunnel rather than the guest failing silently. */
@@ -174,11 +178,12 @@ struct session_obs {
 	void (*peer_path_reset)(void *arg, int id);
 	/*
 	 * Peer `id`'s link, on the same scale the local status bar uses
-	 * (enum conn_state), with its smoothed round trip in ms (0 unknown).
-	 * A move puts every peer back to unknown: what proved a path was
-	 * traffic arriving on the network we have left.
+	 * (enum conn_state), with its smoothed round trip in ms (0 unknown) and
+	 * the number of distinct paths to it a probe has ever qualified. A move
+	 * puts every peer back to unknown: what proved a path was traffic
+	 * arriving on the network we have left.
 	 */
-	void (*peer_link)(void *arg, int id, int state, int rtt_ms);
+	void (*peer_link)(void *arg, int id, int state, int rtt_ms, int nproven);
 	/* Periodic heartbeat, ~10/s: advance spinners, repaint. */
 	void (*tick)(void *arg);
 };

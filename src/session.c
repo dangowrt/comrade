@@ -481,7 +481,7 @@ struct conn {
 	 * report is only made when one of the two CHANGES, so a state believed
 	 * already told is a row left showing whatever it had.
 	 */
-	int link_told, rtt_told, link_told_any;
+	int link_told, rtt_told, paths_told, link_told_any;
 	unsigned live_gen;		/* the network generation this link was
 					 * last proven on; older means we have
 					 * no evidence about it here */
@@ -1427,6 +1427,21 @@ static int conn_warm_alts(struct conn *c, char *best, size_t n)
 	return cnt;
 }
 
+/* How many distinct paths to this peer a probe has ever qualified. `qualified`
+ * latches and never clears on silence, so this is the count of endpoints the
+ * connection was actually proven on, stable as they later fall dead. */
+static int conn_proven_paths(struct conn *c)
+{
+	int i, n = 0;
+
+	pthread_mutex_lock(&c->path_lock);
+	for (i = 0; i < PATH_TABLE_MAX; i++)
+		if (c->paths.p[i].used && c->paths.p[i].qualified)
+			n++;
+	pthread_mutex_unlock(&c->path_lock);
+	return n;
+}
+
 /* Classify a bare address string by reachability scope. */
 static int addr_scope(const char *addr)
 {
@@ -1632,17 +1647,11 @@ static void publish_status(struct conn *c, int state)
 	 * file) leaves it clear and marks read-only guests on the dashboard. */
 	cs.read_only = !s->cfg->is_host &&
 		       (s->cfg->tok.flags & TOKEN_FLAG_RO) != 0;
-	/* Show the endpoint that is actually carrying KCP right now: the path
-	 * in use when it names one, otherwise the selected -- proven -- ICE
-	 * pair. Never a mere gathered candidate. */
+	/* Only the selected, proven path -- never a gathered candidate or an ICE
+	 * pair that answered nothing -- so a roam updates it and a loss does not
+	 * cycle it through the addresses being retried. */
 	conn_path_label(c, cs.peer, sizeof(cs.peer));
 	cs.warm_alt = conn_warm_alts(c, cs.alt, sizeof(cs.alt));
-	if (!cs.peer[0] && c->nat && nat_connected(c->nat)) {
-		char loc[192], rem[192];
-
-		if (!nat_selected(c->nat, loc, sizeof(loc), rem, sizeof(rem)))
-			cand_addr(rem, cs.peer, sizeof(cs.peer));
-	}
 	/* Both families, so a session that started on one can be seen to gain the
 	 * other once the in-band rendezvous exchange propagates it. */
 	fmt_rdv_fam(s, 4, cs.rdv, sizeof(cs.rdv));
@@ -6269,6 +6278,25 @@ static int worker_done(struct worker *w)
 }
 
 /* Each served peer's link, whenever one moves. */
+static void report_peer_link_one(const struct session_obs *o, struct sess *s,
+				 struct conn *c)
+{
+	int st = conn_link_state(s, c);
+	int np = conn_proven_paths(c);
+	int rtt = 0;
+
+	if (!conn_rtt_ms(c, &rtt))
+		rtt = -1;		/* nothing measured; 0 is under a ms */
+	if (c->link_told_any && c->link_told == st && c->rtt_told == rtt &&
+	    c->paths_told == np)
+		return;
+	c->link_told = st;
+	c->rtt_told = rtt;
+	c->paths_told = np;
+	c->link_told_any = 1;
+	o->peer_link(o->arg, c->dash_id, st, rtt, np);
+}
+
 static void report_peer_links(struct sess *s, struct worker *ws)
 {
 	const struct session_obs *o = s->cfg->obs;
@@ -6276,24 +6304,21 @@ static void report_peer_links(struct sess *s, struct worker *ws)
 
 	if (!o || !o->peer_link)
 		return;
-	for (i = 0; i < HOST_MAX_WORKERS; i++) {
-		struct conn *c = ws[i].used ? ws[i].c : NULL;
-		int st, rtt;
+	for (i = 0; i < HOST_MAX_WORKERS; i++)
+		if (ws[i].used)
+			report_peer_link_one(o, s, ws[i].c);
+}
 
-		if (!c)
-			continue;
-		st = conn_link_state(s, c);
-		rtt = 0;
-		if (!conn_rtt_ms(c, &rtt))
-			rtt = -1;	/* nothing measured; 0 is under a ms */
-		if (c->link_told_any && c->link_told == st &&
-		    c->rtt_told == rtt)
-			continue;
-		c->link_told = st;
-		c->rtt_told = rtt;
-		c->link_told_any = 1;
-		o->peer_link(o->arg, c->dash_id, st, rtt);
-	}
+/* The peer's stable identity for the dashboard: a truncated copy of the claim
+ * ufrag, sent once as its row is opened. */
+static void emit_peer_ident(const struct session_obs *o, struct conn *c)
+{
+	char id8[9];
+
+	if (!o || !o->peer_ident || !c->claim_ufrag[0])
+		return;
+	snprintf(id8, sizeof(id8), "%.8s", c->claim_ufrag);
+	o->peer_ident(o->arg, c->dash_id, id8);
 }
 
 /* A worker runs one connected client's session on the shared command (tmux
@@ -6528,6 +6553,7 @@ static void lan_drain(struct sess *s, struct worker *ws, int *dash_seq)
 		if (o && o->peer) {
 			o->peer(o->arg, c->dash_id, SESSION_PEER_SEEN, addr);
 			o->peer(o->arg, c->dash_id, SESSION_PEER_LIVE, addr);
+			emit_peer_ident(o, c);
 			c->link_told_any = 0;
 		}
 		if (worker_spawn(ws, c)) {	/* worker table full */
@@ -6645,6 +6671,7 @@ static void punch_scan(struct sess *s, struct worker *ws, int *dash_seq)
 					addr);
 				o->peer(o->arg, c->dash_id, SESSION_PEER_LIVE,
 					addr);
+				emit_peer_ident(o, c);
 				c->link_told_any = 0;
 			}
 			s->punching[i] = NULL;
