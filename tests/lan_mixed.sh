@@ -49,7 +49,14 @@ if [ $? -eq 77 ]; then
 fi
 
 tmp=$(mktemp -d)
-cleanup() { kill "$hpid" "$apid" "$bpid" 2>/dev/null; swarm_stop; rm -rf "$tmp"; }
+keep() {
+	if [ "${COMRADE_E2E_KEEP:-0}" = 1 ]; then
+		echo "logs kept in $tmp"
+	else
+		rm -rf "$tmp"
+	fi
+}
+cleanup() { kill "$hpid" "$apid" "$bpid" 2>/dev/null; swarm_stop; keep; }
 trap cleanup EXIT INT TERM
 apid=""; bpid=""
 
@@ -83,7 +90,7 @@ sleep 2
 
 # Client B forced onto DHT/ICE (DHT-only unless --mcast). Best-effort completion;
 # what must happen is that the host picks up its claim (asserted via the log).
-"$E2E" client "$tok" --hold-ms 500 --timeout 40 \
+COMRADE_DEBUG="$tmp/b.log" "$E2E" client "$tok" --hold-ms 500 --timeout 40 \
 	>"$tmp/b.out" 2>"$tmp/b.err" &
 bpid=$!
 wait "$bpid" 2>/dev/null || true
@@ -100,6 +107,7 @@ grep -q "E2E PASS client" "$tmp/a.out" 2>/dev/null || {
 if ! grep -q "claim received -> punch" "$tmp/host.log" 2>/dev/null; then
 	echo "host never engaged the ICE turnstile for the DHT claimant (STRICT):"
 	tail -8 "$tmp/host.log" 2>/dev/null; tail -4 "$tmp/b.err" 2>/dev/null
+	echo "what B was doing:"; tail -8 "$tmp/b.log" 2>/dev/null
 	rc=1
 fi
 
