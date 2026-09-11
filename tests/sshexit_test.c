@@ -110,10 +110,11 @@ static int one_round(void *hostkey, const uint8_t fp[32],
 		     const char *command, int close_after_ms, int keep_alive,
 		     volatile int *ended_out, int hold_ms)
 {
+	int have_ep = close_after_ms >= 0 || keep_alive;
+	int sp[2], ep[2], i, rc = 0;
+	pthread_t sth, cth;
 	struct srv_arg sa;
 	struct cli_arg ca;
-	pthread_t sth, cth;
-	int sp[2], ep[2] = { -1, -1 }, i;
 
 	assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0);
 
@@ -124,7 +125,7 @@ static int one_round(void *hostkey, const uint8_t fp[32],
 	sa.use_pty = use_pty;
 	sa.command = command;
 	sa.ended_out = ended_out;
-	if (close_after_ms >= 0 || keep_alive) {
+	if (have_ep) {
 		assert(pipe(ep) == 0);
 		sa.end_fd = ep[0];	/* read end handed to the server */
 	}
@@ -142,21 +143,21 @@ static int one_round(void *hostkey, const uint8_t fp[32],
 	if (close_after_ms >= 0) {
 		usleep((useconds_t)close_after_ms * 1000);
 		close(ep[1]);		/* EOF on the server's end_fd => end */
-		ep[1] = -1;
 	}
 
 	for (i = 0; i < 60 && !cli_done(&ca); i++)
 		usleep(100000);
-	if (!cli_done(&ca))
-		return -1;		/* hung: let the ctest timeout catch it too */
-
-	pthread_join(cth, NULL);
-	pthread_join(sth, NULL);
-	if (ep[0] >= 0)
-		close(ep[0]);
-	if (ep[1] >= 0)			/* keep_alive left the session's end open */
+	if (!cli_done(&ca)) {
+		rc = -1;		/* hung: let the ctest timeout catch it too */
+	} else {
+		pthread_join(cth, NULL);
+		pthread_join(sth, NULL);
+		if (have_ep)
+			close(ep[0]);
+	}
+	if (have_ep && close_after_ms < 0)	/* keep_alive left it open */
 		close(ep[1]);
-	return 0;
+	return rc;
 }
 
 int main(void)
