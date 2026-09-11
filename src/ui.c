@@ -619,18 +619,13 @@ static void draw_peer_row(const struct peerrow *p, int n)
 	if (p->link == CONN_LIVE && p->rtt_ms >= 0)
 		snprintf(rtt, sizeof(rtt), "  %s",
 			 rtt_text(p->rtt_ms, buf, sizeof(buf)));
-	/* Contact lost: the in-use address means nothing now, so show a stable
-	 * identity, the last carried address and the other proven paths. */
-	if (p->link == CONN_LOST) {
-		if (p->nproven > 1)
-			snprintf(extra, sizeof(extra), " (+%d)", p->nproven - 1);
-		line("  " BGR "#%d" RST " %s  " DIM "%s" RST "  " CYN "%s" RST
-		     DIM "%s" RST "%s", n, link_word(p), p->ident, addr, extra,
-		     ro);
-		return;
-	}
-	line("  " BGR "#%d" RST " %s  " CYN "%s" RST DIM "%s" RST "%s",
-	     n, link_word(p), addr, rtt, ro);
+	if (p->nproven > 1)
+		snprintf(extra, sizeof(extra), " (+%d)", p->nproven - 1);
+	/* Every peer reads the same way in every state: its stable identity,
+	 * the address of the path in use now, the round trip while live, and
+	 * how many other paths it was proven on. */
+	line("  " BGR "#%d" RST " %s  " DIM "%s" RST "  " CYN "%s" RST DIM
+	     "%s%s" RST "%s", n, link_word(p), p->ident, addr, rtt, extra, ro);
 }
 
 static void draw(struct ui *u)
