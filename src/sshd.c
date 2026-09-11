@@ -346,10 +346,8 @@ static void term_pump(struct pump_ctx *c)
 		cap = (size_t)win;
 	n = sock_read(cpty_out(c->child), c->out_buf, cap);
 	if (n == 0) {
-		/* The end of the child's output, where the platform gives one:
-		 * a Linux pty master answers EIO instead, and either way the
-		 * child exiting is what ends the pump. */
-		ssh_channel_send_eof(c->chan);
+		/* A BSD pty master answers 0 where Linux answers EIO; the
+		 * channel's EOF waits for the pump's verdict either way. */
 		c->term_eof = 1;
 	} else if (n < 0) {
 		int e = sock_errno();

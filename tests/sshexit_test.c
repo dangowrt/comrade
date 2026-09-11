@@ -111,12 +111,15 @@ static int one_round(void *hostkey, const uint8_t fp[32],
 		     volatile int *ended_out, int hold_ms)
 {
 	int have_ep = close_after_ms >= 0 || keep_alive;
-	int sp[2], ep[2], i, rc = 0;
+	int sp[2], ep[2], i, rc = 0, ep_open = 1;
 	pthread_t sth, cth;
 	struct srv_arg sa;
 	struct cli_arg ca;
 
 	assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0);
+	/* Opened on every path: the analysers agree on a descriptor that
+	 * always exists and disagree on one that sometimes does. */
+	assert(pipe(ep) == 0);
 
 	memset(&sa, 0, sizeof(sa));
 	sa.fd = sp[1];
@@ -125,10 +128,8 @@ static int one_round(void *hostkey, const uint8_t fp[32],
 	sa.use_pty = use_pty;
 	sa.command = command;
 	sa.ended_out = ended_out;
-	if (have_ep) {
-		assert(pipe(ep) == 0);
+	if (have_ep)
 		sa.end_fd = ep[0];	/* read end handed to the server */
-	}
 
 	memset(&ca, 0, sizeof(ca));
 	ca.fd = sp[0];
@@ -143,6 +144,7 @@ static int one_round(void *hostkey, const uint8_t fp[32],
 	if (close_after_ms >= 0) {
 		usleep((useconds_t)close_after_ms * 1000);
 		close(ep[1]);		/* EOF on the server's end_fd => end */
+		ep_open = 0;
 	}
 
 	for (i = 0; i < 60 && !cli_done(&ca); i++)
@@ -152,10 +154,9 @@ static int one_round(void *hostkey, const uint8_t fp[32],
 	} else {
 		pthread_join(cth, NULL);
 		pthread_join(sth, NULL);
-		if (have_ep)
-			close(ep[0]);
 	}
-	if (have_ep && close_after_ms < 0)	/* keep_alive left it open */
+	close(ep[0]);
+	if (ep_open)			/* keep_alive left it open */
 		close(ep[1]);
 	return rc;
 }
