@@ -1936,12 +1936,12 @@ static void trickle_flush(struct sess *s, const struct session_obs *o, int repos
 {
 	char buf[NAT_SDP_MAX];
 
-	if (!s->trickle_dirty)
+	if (!__atomic_load_n(&s->trickle_dirty, __ATOMIC_RELAXED))
 		return;
 	pthread_mutex_lock(&s->trickle_lock);
 	memcpy(buf, s->trickle_sdp, sizeof(buf));
 	s->trickle_sdp[0] = '\0';
-	s->trickle_dirty = 0;
+	__atomic_store_n(&s->trickle_dirty, 0, __ATOMIC_RELAXED);
 	pthread_mutex_unlock(&s->trickle_lock);
 	if (repost)
 		offer_refresh(s);
@@ -2394,7 +2394,7 @@ static void on_ice_candidate(void *arg, const char *cand)
 		memcpy(s->trickle_sdp + used, cand, n);
 		s->trickle_sdp[used + n] = '\n';
 		s->trickle_sdp[used + n + 1] = '\0';
-		s->trickle_dirty = 1;
+		__atomic_store_n(&s->trickle_dirty, 1, __ATOMIC_RELAXED);
 	}
 	pthread_mutex_unlock(&s->trickle_lock);
 }
@@ -4803,7 +4803,7 @@ static void net_change_reset(struct sess *s)
 	s->peer_sdp[0] = '\0';
 	pthread_mutex_lock(&s->trickle_lock);
 	s->trickle_sdp[0] = '\0';
-	s->trickle_dirty = 0;
+	__atomic_store_n(&s->trickle_dirty, 0, __ATOMIC_RELAXED);
 	s->pending_sdp_set = 0;
 	s->npool4 = 0;
 	stun_mapping_reset(&s->map4);
@@ -4908,7 +4908,7 @@ static void resume_tick(struct conn *c)
 		c->remote_ufrag[0] = '\0';
 		pthread_mutex_lock(&s->trickle_lock);
 		s->trickle_sdp[0] = '\0';
-		s->trickle_dirty = 0;
+		__atomic_store_n(&s->trickle_dirty, 0, __ATOMIC_RELAXED);
 		s->pending_sdp_set = 0;
 		pthread_mutex_unlock(&s->trickle_lock);
 		if (nat_setup(c))
@@ -5718,7 +5718,7 @@ static int client_regather(struct sess *s)
 	s->peer_sdp[0] = '\0';
 	pthread_mutex_lock(&s->trickle_lock);
 	s->trickle_sdp[0] = '\0';	/* drop the old agent's trickle */
-	s->trickle_dirty = 0;
+	__atomic_store_n(&s->trickle_dirty, 0, __ATOMIC_RELAXED);
 	s->pending_sdp_set = 0;
 	pthread_mutex_unlock(&s->trickle_lock);
 	s->peer_state = SESSION_PEER_SEEN;
