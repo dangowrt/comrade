@@ -769,6 +769,10 @@ def mail_text(msg):
 
 
 RE_SUBJECT_NEW = re.compile(r"^New Defects reported by Coverity Scan for (.+)$")
+RE_SUBJECT_DONE = re.compile(r"^Coverity Scan: Analysis completed for (.+)$")
+RE_BUILD_ID = re.compile(r"^Build ID:\s*(\d+)$")
+RE_FOUND = re.compile(r"^New Defects Found:\s*(\d+)$")
+RE_ELIMINATED = re.compile(r"^Defects Eliminated:\s*(\d+)$")
 RE_NEW = re.compile(r"^(\d+) new defect\(s\) introduced to (.+?) found with"
                     r" Coverity Scan\.?$")
 RE_FIXED = re.compile(r"^(\d+) defect\(s\), reported by Coverity Scan earlier,"
@@ -861,11 +865,32 @@ def digest_parse(text):
     return event
 
 
+def notice_parse(text, project):
+    """The analysis-completed notice: the build and its two counts."""
+    event = {"type": "analysis-completed", "project": project,
+             "build_id": None, "new": None, "eliminated": None}
+    for line in text.split("\n"):
+        s = line.strip()
+        if m := RE_BUILD_ID.match(s):
+            event["build_id"] = int(m.group(1))
+        elif m := RE_FOUND.match(s):
+            event["new"] = int(m.group(1))
+        elif m := RE_ELIMINATED.match(s):
+            event["eliminated"] = int(m.group(1))
+    if event["build_id"] is None and event["new"] is None:
+        return None
+    return event
+
+
 def mail_event(uid, msg):
     subject = (msg["subject"] or "").replace("\n", " ").strip()
     base = {"uid": uid, "date": msg["date"], "subject": subject}
     if RE_SUBJECT_NEW.match(subject):
         parsed = digest_parse(mail_text(msg))
+        if parsed:
+            return dict(base, **parsed)
+    elif m := RE_SUBJECT_DONE.match(subject):
+        parsed = notice_parse(mail_text(msg), m.group(1))
         if parsed:
             return dict(base, **parsed)
     return dict(base, type="unknown")
@@ -885,8 +910,12 @@ def events_text(events):
         print("no unhandled Scan mail")
     for ev in events:
         print(f"UID {ev['uid']}  {ev['date']}  {ev['subject']}")
+        if ev["type"] == "analysis-completed":
+            print(f"  build {ev['build_id']}: {ev['new']} new defect(s), "
+                  f"{ev['eliminated']} eliminated; list --scope last has them")
+            continue
         if ev["type"] != "new-defects":
-            print("  not parsed; mail show UID --raw prints it")
+            print(f"  not parsed; mail show {ev['uid']} --raw prints it")
             continue
         print(f"  {ev['new']} new, {ev['fixed']} marked fixed, "
               f"{ev['shown']} shown"
