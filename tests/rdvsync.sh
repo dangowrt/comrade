@@ -39,7 +39,14 @@ tmp="$(mktemp -d)"
 hostpid=""
 c1=""
 c2=""
-trap 'kill "$hostpid" "$c1" "$c2" 2>/dev/null; swarm_stop; rm -rf "$tmp"' EXIT
+keep() {
+	if [ "${COMRADE_E2E_KEEP:-0}" = 1 ]; then
+		echo "logs kept in $tmp"
+	else
+		rm -rf "$tmp"
+	fi
+}
+trap 'kill "$hostpid" "$c1" "$c2" 2>/dev/null; swarm_stop; keep' EXIT
 
 COMRADE_DEBUG="$tmp/host.dbg" "$E2E" host --serve 2 --timeout 150 \
 	> "$tmp/host.out" 2> "$tmp/host.err" &
@@ -132,6 +139,7 @@ for n in 1 2; do
 	grep -q "E2E PASS client" "$tmp/c$n.out" || {
 		echo "client $n never finished its session:"
 		tail -5 "$tmp/c$n.out"
+		echo "what client $n was doing:"; tail -8 "$tmp/c$n.dbg"
 		rc=1
 	}
 	# -F: a v6 endpoint is written [addr]:port, which as a pattern is a
@@ -169,5 +177,9 @@ if [ "$told" -lt 2 ]; then
 	grep "reach:" "$tmp/host.dbg" | tail -4
 	rc=1
 fi
-[ "$rc" = 0 ] && echo "rendezvous consensus: both clients hold the host's node"
+if [ "$rc" = 0 ]; then
+	echo "rendezvous consensus: both clients hold the host's node"
+else
+	echo "what the host decided:"; grep 'host: ' "$tmp/host.dbg" | tail -20
+fi
 exit $rc

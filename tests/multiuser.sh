@@ -27,12 +27,20 @@ if [ "${COMRADE_E2E_NET:-0}" != 1 ]; then
 fi
 
 tmp=$(mktemp -d)
-cleanup() { kill "$hpid" $cpids 2>/dev/null; swarm_stop; rm -rf "$tmp"; }
+keep() {
+	if [ "${COMRADE_E2E_KEEP:-0}" = 1 ]; then
+		echo "logs kept in $tmp"
+	else
+		rm -rf "$tmp"
+	fi
+}
+cleanup() { kill "$hpid" $cpids 2>/dev/null; swarm_stop; keep; }
 trap cleanup EXIT INT TERM
 cpids=""
 
 # Host serves exactly N clients through the turnstile, then exits.
-"$E2E" host --serve "$N" >"$tmp/host.out" 2>"$tmp/host.err" &
+COMRADE_DEBUG="$tmp/host.log" "$E2E" host --serve "$N" \
+	>"$tmp/host.out" 2>"$tmp/host.err" &
 hpid=$!
 
 # Wait for a token whose rendezvous node is in it, so the clients skip cold
@@ -55,7 +63,8 @@ if [ -z "$tok" ]; then echo "no rendezvous token after 120s"; cat "$tmp/host.err
 # Launch N clients at once against the one token: they race the turnstile.
 j=0
 while [ "$j" -lt "$N" ]; do
-	"$E2E" client "$tok" >"$tmp/c$j.out" 2>"$tmp/c$j.err" &
+	COMRADE_DEBUG="$tmp/c$j.log" "$E2E" client "$tok" \
+		>"$tmp/c$j.out" 2>"$tmp/c$j.err" &
 	cpids="$cpids $!"
 	j=$((j + 1))
 done
@@ -68,6 +77,7 @@ j=0
 while [ "$j" -lt "$N" ]; do
 	if ! grep -q "E2E PASS client" "$tmp/c$j.out"; then
 		echo "client $j did not pass:"; cat "$tmp/c$j.out" "$tmp/c$j.err"; rc=1
+		echo "what client $j was doing:"; tail -8 "$tmp/c$j.log" 2>/dev/null
 	fi
 	j=$((j + 1))
 done
@@ -76,6 +86,7 @@ wait "$hpid" 2>/dev/null || true
 if [ "$rc" -eq 0 ]; then
 	echo "multiuser e2e: $N clients attached one host through the turnstile"
 else
+	echo "what the host decided:"; grep 'host: ' "$tmp/host.log" 2>/dev/null | tail -20
 	echo "multiuser e2e FAILED"
 fi
 exit "$rc"
