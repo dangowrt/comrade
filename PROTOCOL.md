@@ -1119,6 +1119,14 @@ that has qualified nothing recovers by re-claiming with a fresh ICE identity
   client would be punched by a listener whose credentials it never had. Acted on
   once per rotation, so a burst of joiners does not re-gather in lockstep.
 
+A claim is written once, and written again only while the offer it names is
+still the one advertised: a slot found empty then is a write that never landed.
+Once the host has rotated past that offer it can only release the claim, so
+re-posting it would take the mutex from the next joiner for nothing, and the
+rules above re-claim with a fresh one instead. A claim amended with late
+candidates is posted again whatever the offer, and the host trickles those into
+the punch in flight.
+
 A client also re-claims when an SSH bring-up fails outright. A host never
 re-gathers: the turnstile owns its offer, and it retries its own listener. The
 direct LAN path is exempt from all of it -- its admission queue is per claimant

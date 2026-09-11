@@ -158,6 +158,8 @@ struct sig {
 					 * so the host punches the generation we
 					 * primed */
 	char peer_claim_offer[64];	/* host: the offer ufrag a served claim named */
+	char peer_offer_ufrag[64];	/* client: the ufrag of the offer last read */
+	int claim_unwritten;		/* client: a claim changed since last written */
 
 	int locate;
 	int put_inflight;		/* a convergent host store is running */
@@ -509,6 +511,7 @@ int sig_post(struct sig *s, const uint8_t *data, size_t len)
 		if (ident != s->my_ident || !s->puts_ok)
 			s->next_put_ms = 0;
 		s->my_ident = ident;
+		s->claim_unwritten = 1;
 	}
 	s->next_mcast_ms = 0;
 	return 0;
@@ -557,11 +560,10 @@ void sig_release(struct sig *s)
 	s->next_put_ms = 0;		/* the turnstile is a mutex: due now */
 	/*
 	 * Emptying the slot means the next answer is new business even if it is
-	 * the same bytes, exactly as after a rotate. A client whose claim was
-	 * let go re-puts the one it already has -- nothing about it changed --
-	 * so a delivery de-duplicated against the copy we just released is one
-	 * the host never sees, and the claimant goes on writing into a mailbox
-	 * that is answering nobody.
+	 * the same bytes, exactly as after a rotate. A replica the release never
+	 * reached keeps serving the claim just let go, and a delivery
+	 * de-duplicated against that copy is one the turnstile never judges
+	 * again -- so the release is never written to it either.
 	 */
 	s->have_last = 0;
 }
@@ -1026,6 +1028,9 @@ static void deliver_peer(struct sig *s, const uint8_t *sealed, size_t len)
 			       sdp, sizeof(sdp));
 	if (slen < 0)
 		return;
+	if (!s->is_host)
+		sdp_ufrag_of(sdp, s->peer_offer_ufrag,
+			     sizeof(s->peer_offer_ufrag));
 	sig_mb_note(s->is_host ? "GET claim" : "GET offer", s->peer_gen,
 		    s->is_host ? s->peer_claim_offer : NULL, packed,
 		    (size_t)n, sdp);
@@ -1420,6 +1425,15 @@ static int warming(const struct sig *s)
 	return (s->up4 && !s->acked4) || (s->up6 && !s->acked6);
 }
 
+/* Past a rotation the host can only release the claim it names, so a re-post
+ * would take the mutex from the next joiner for nothing. */
+static int claim_current(const struct sig *s)
+{
+	if (s->claim_unwritten || !s->claim_offer[0])
+		return 1;
+	return !strcmp(s->claim_offer, s->peer_offer_ufrag);
+}
+
 static void dht_pump(struct sig *s, uint64_t now)
 {
 	if (!dhtnode_ready(s->node))
@@ -1552,7 +1566,7 @@ static void dht_pump(struct sig *s, uint64_t now)
 					    sig_merge, s, NULL, NULL);
 			s->next_put_ms = now + SIG_DHT_PUT_MS;
 		}
-	} else if (mailbox_client_should_claim(&s->mb)) {
+	} else if (mailbox_client_should_claim(&s->mb) && claim_current(s)) {
 		/*
 		 * The claim goes to the pinned rendezvous first: a round trip
 		 * rather than a lookup, so the turnstile is taken as quickly as
@@ -1578,6 +1592,7 @@ static void dht_pump(struct sig *s, uint64_t now)
 		dbg_logf("sig: writing claim to the rendezvous%s",
 			 wide ? " (convergent)" : "");
 		sig_note_put(s);
+		s->claim_unwritten = 0;
 		if (wide)
 			bep44_update(s->engine, s->keys.bep44_sk,
 				     s->keys.bep44_pk, SIG_SALT, sig_merge, s,
