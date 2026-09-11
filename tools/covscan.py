@@ -15,9 +15,12 @@ defect viewer, and the mailbox that receives Scan's digests.
   covscan.py [--json] components
   covscan.py [--json] mail poll | wait [--timeout S] | show UID [--raw] | done UID...
 
-Environment: COVERITY_CONNECT_URL (default https://scan9.scan.coverity.com),
-COVERITY_CONNECT_USER and COVERITY_CONNECT_KEY, COVERITY_SCAN_PROJECT (default
-the origin remote's owner/repo), COVERITY_IMAP_URL (default
+Environment: COVERITY_CONNECT_KEY_FILE (the authentication key file Connect
+hands out; it names the login, the key and the instance) or
+COVERITY_CONNECT_USER and COVERITY_CONNECT_KEY, COVERITY_CONNECT_URL (default
+the key file's instance, else https://scan9.scan.coverity.com),
+COVERITY_SCAN_PROJECT (default the origin remote's owner/repo),
+COVERITY_IMAP_URL (default
 imaps://coverity@pidgin.makrotopia.org/, the path names the folder),
 COVERITY_IMAP_PASSWORD (default the ~/.netrc entry for the host).
 """
@@ -189,14 +192,43 @@ def soap_fault(raw):
     return f"{text}: {msg}" if msg else text
 
 
+def key_file_load(path):
+    """The authentication key file Connect hands out: login, key and where
+    it is good, as {"username", "key", "comments": {"host", "port", "ssl"}}."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except OSError as e:
+        die(f"{path}: {e.strerror}")
+    except ValueError as e:
+        die(f"{path}: not a Coverity authentication key file: {e}")
+    user, key = data.get("username"), data.get("key")
+    if not user or not key:
+        die(f"{path}: no username and key in it")
+    where = data.get("comments") or {}
+    url = None
+    if where.get("host"):
+        scheme = "https" if where.get("ssl", "true") == "true" else "http"
+        port = where.get("port")
+        default = "443" if scheme == "https" else "80"
+        url = f"{scheme}://{where['host']}" + \
+            (f":{port}" if port and port != default else "")
+    return user, key, url
+
+
 def connect_open():
+    path = os.environ.get("COVERITY_CONNECT_KEY_FILE")
     user = os.environ.get("COVERITY_CONNECT_USER")
     key = os.environ.get("COVERITY_CONNECT_KEY")
+    url = os.environ.get("COVERITY_CONNECT_URL")
+    if path:
+        file_user, file_key, file_url = key_file_load(path)
+        user, key = user or file_user, key or file_key
+        url = url or file_url
     if not user or not key:
-        die("COVERITY_CONNECT_USER and COVERITY_CONNECT_KEY are not both set")
-    url = os.environ.get("COVERITY_CONNECT_URL",
-                         "https://scan9.scan.coverity.com")
-    return Connect(url, user, key)
+        die("set COVERITY_CONNECT_KEY_FILE, or COVERITY_CONNECT_USER and"
+            " COVERITY_CONNECT_KEY")
+    return Connect(url or "https://scan9.scan.coverity.com", user, key)
 
 
 def project_info(conn, project):

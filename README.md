@@ -572,9 +572,10 @@ Settings tab, file their findings under `3rd-party.*`. The workflow needs
 the `COVERITY_SCAN_TOKEN` repository secret and the `COVERITY_SCAN_EMAIL`
 repository variable and skips without them. `tools/coverity.sh` drives
 the build tool and the upload, there and by hand; `tools/covscan.py`
-reads the results through the Connect API on scan9
-(`COVERITY_CONNECT_USER`, `COVERITY_CONNECT_KEY`) and the digest mailbox
-(`~/.netrc`). A commit that fixes a reported defect carries the trailer
+reads the results through the Connect API behind the defect viewer (the
+authentication key file from a Connect user profile, named by
+`COVERITY_CONNECT_KEY_FILE`) and the digest mailbox (`~/.netrc`). A
+commit that fixes a reported defect carries the trailer
 `Addresses-Coverity-ID: <CID> ("<type>")`.
 
 ## Dependencies
