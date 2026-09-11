@@ -165,7 +165,6 @@ jobs:
       COVERITY_SCAN_TOKEN: ${{ secrets.COVERITY_SCAN_TOKEN }}
       COVERITY_SCAN_EMAIL: ${{ vars.COVERITY_SCAN_EMAIL }}
       COVERITY_SCAN_PROJECT: ${{ github.repository }}
-      COVERITY_TOOL_DIR: ${{ runner.temp }}/cov-analysis
       BACKEND: ${{ needs.gate.outputs.backend }}
       SHA: ${{ needs.gate.outputs.sha }}
     steps:
@@ -179,10 +178,14 @@ jobs:
 
       # The build tool is about 1 GB and Scan updates it about twice a year;
       # the md5 Scan publishes is the cache key, so a stale copy is never
-      # used and a current one is never fetched twice.
+      # used and a current one is never fetched twice. The directory is
+      # exported from a step because runner.temp is out of reach of a
+      # job-level env.
       - name: Look up the build tool
         id: tool
-        run: echo "md5=$(sh tools/coverity.sh md5)" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "COVERITY_TOOL_DIR=$RUNNER_TEMP/cov-analysis" >> "$GITHUB_ENV"
+          echo "md5=$(sh tools/coverity.sh md5)" >> "$GITHUB_OUTPUT"
 
       - uses: actions/cache@v4
         with:
