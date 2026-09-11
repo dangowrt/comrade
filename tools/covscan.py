@@ -287,9 +287,12 @@ def snapshots_all(conn, stream):
 
 
 def snapshots_current(snaps):
-    """The newest snapshot per backend, a snapshot without one under None."""
+    """The newest snapshot per backend. One without a backend (a build
+    submitted by hand) is superseded by anything newer, so it counts only
+    while it is the newest of all."""
     newest = {}
     for s in snaps:
+        newest.pop(None, None)
         newest[s["backend"]] = s
     return newest
 
