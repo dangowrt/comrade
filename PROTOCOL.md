@@ -1128,12 +1128,18 @@ Because a re-claiming client discards the offer it was given, and the host has n
 reason to rewrite an offer nobody has taken, `sig_redeliver()` makes the next
 read deliver the current offer again rather than dedupe it away.
 
-**The host does not reject a claim that answers a retired offer.** It punches
-with whatever is listening when it reads the claim, which is the point of
-release-on-pickup: rejecting stalls exactly the joiners that arrive while a punch
-is wedged (measured, and what `turnstile_stuck.sh` exists to catch). A claimant
-paired with an agent it never primed against simply never qualifies, and the
-rules above recover it.
+**A claim that answers a retired offer is released, not punched.** Release-on-
+pickup hands the offer's agent to the claimant it picked up, so a second claim
+naming that offer can only be paired with the listener that replaced it, whose
+credentials the claimant never primed: that punch cannot land, and taking it up
+costs a punch slot for `HOST_PUNCH_MS` and a rotation that strands every other
+queued claimant once more. The host frees the answer slot at once instead, and
+the claimant's release rule above re-claims against the current offer. An offer
+rotated away without a pickup (a STUN rotation, a quiet rendezvous) stays in a
+kept ring for `OFFER_KEEP_MS`, and a claim naming one of those is punched with
+the exact agent it primed. The joiners `turnstile_stuck.sh` protects read the
+offer minted at the wedged pickup and claim that one, so they are served as
+before.
 
 **A claim naming a claimant the host already serves is a resumption.** The
 ufrag is session-stable, so it names the same client across its claims. If the

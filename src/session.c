@@ -7307,6 +7307,17 @@ static int host_turnstile(struct sess *s)
 					}
 					resume = w;
 				}
+				/* Neither listening nor kept: the listener's
+				 * credentials are not the ones it primed, so a
+				 * punch cannot land. */
+				if (co[0] && offer_find(kept, co) < 0 &&
+				    strcmp(co, listen->ice_ufrag)) {
+					dbg_logf("host: claim %.8s names the retired "
+						 "offer %.8s -- released", cu, co);
+					sig_release(s->sig);
+					s->have_peer_sdp = 0;
+					break;
+				}
 				/* A fresh claimant past the admission budget is
 				 * left unserved; a resumption always passes. */
 				if (!resume && !ufrag_admitted(s, cu) &&
