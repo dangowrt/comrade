@@ -1,0 +1,17 @@
+# Coverity Scan component rules for dangowrt/comrade: one rule per line,
+# path pattern (a regular expression matched against the whole path), a tab,
+# component name; the first matching rule wins. Entered by hand on the
+# project's Analysis Settings tab, and applied to every file path by
+# tools/covscan.py, so the third-party split never depends on the Scan UI
+# alone. The dependency sources sit under deps-src/ in the analysis build
+# (.github/actions/build-deps) and the installed headers under
+# comrade-ci-deps/include/.
+.*/deps-src/libjuice/.*	3rd-party.libjuice
+.*/deps-src/kcp/.*	3rd-party.kcp
+.*/deps-src/dht/.*	3rd-party.libdht
+.*/deps-src/monocypher/.*	3rd-party.monocypher
+.*/comrade-ci-deps/include/.*	3rd-party.headers
+^/usr/include/.*	3rd-party.system
+.*/tests/.*	tests
+.*/tools/.*	tools
+.*	comrade
