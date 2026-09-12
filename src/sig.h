@@ -366,9 +366,11 @@ int sig_link_ifaces(struct sig *s, struct sig_mcast_if *out, int max);
  * was mid-claim when the host roamed is answered rather than erased.
  *
  * Must be called before the mailbox publishes anything. Ignored on a client,
- * which mints no such key. `sk` is the secret half; the public half is derived.
+ * which mints no such key. `sk` is the secret half; the public half is
+ * derived. Returns 0 on success (including when ignored), -1 if the public
+ * half could not be derived.
  */
-void sig_use_claim_key(struct sig *s, const uint8_t sk[32]);
+int sig_use_claim_key(struct sig *s, const uint8_t sk[32]);
 
 /* The key this signaller is using, so a caller can keep it for the next one.
  * Returns 0 and fills `sk` on a host, -1 on a client. */

@@ -4617,10 +4617,12 @@ static int sig_arm(struct sess *s)
 	 * claimant answers the new offer instead. So the key belongs to the
 	 * session, which the rebuild does not replace.
 	 */
-	if (s->have_claim_sk)
-		sig_use_claim_key(s->sig, s->claim_sk);
-	else if (!sig_claim_key(s->sig, s->claim_sk))
+	if (s->have_claim_sk) {
+		if (sig_use_claim_key(s->sig, s->claim_sk))
+			return -1;
+	} else if (!sig_claim_key(s->sig, s->claim_sk)) {
 		s->have_claim_sk = 1;
+	}
 	s->dht_since_ms = now_ms();	/* a rebuild is a fresh attempt, and a
 					 * fresh grace, on the new network */
 	sig_subscribe(s->sig, on_peer_offer, s);

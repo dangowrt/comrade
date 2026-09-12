@@ -296,12 +296,12 @@ static void sig_free(struct sig *s, int persist)
 	free(s);
 }
 
-void sig_use_claim_key(struct sig *s, const uint8_t sk[32])
+int sig_use_claim_key(struct sig *s, const uint8_t sk[32])
 {
 	if (!s || !s->is_host || !sk)
-		return;
+		return 0;
 	memcpy(s->claim_sk, sk, 32);
-	cc_x25519_public(s->claim_pk, s->claim_sk);
+	return cc_x25519_public(s->claim_pk, s->claim_sk) ? -1 : 0;
 }
 
 int sig_claim_key(const struct sig *s, uint8_t sk[32])
