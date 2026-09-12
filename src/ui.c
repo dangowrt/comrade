@@ -1330,6 +1330,7 @@ static void *emit_writer(void *arg)
 		ev = e->head;
 		pthread_mutex_unlock(&e->lock);
 
+		/* Once queued, ->next is a producer's only write; off/len/line are ours. */
 		n = sock_write(e->fd, ev->line + ev->off, ev->len - ev->off);
 		if (n > 0) {
 			pthread_mutex_lock(&e->lock);
@@ -1484,6 +1485,7 @@ void ui_emitter(struct session_obs *obs, sock_t fd)
 	memset(obs, 0, sizeof(*obs));
 	if (!e)
 		return;
+	e->fd = fd;
 	if (pthread_mutex_init(&e->lock, NULL)) {
 		free(e);
 		return;
@@ -1500,7 +1502,6 @@ void ui_emitter(struct session_obs *obs, sock_t fd)
 		return;
 	}
 	pthread_detach(e->writer);
-	e->fd = fd;
 	obs->arg = e;
 	obs->net = em_net;
 	obs->mapping4 = em_mapping4;
