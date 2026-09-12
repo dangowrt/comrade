@@ -2602,10 +2602,9 @@ static int stage_etc(const char *root)
 		return fail ? -1 : 0;
 	}
 	if (dir_is_shared(rdir)) {
-		/* dnsmasq rewrites by removing and recreating; the gap is not
-		 * the confinement's failure. */
-		if (access(target, F_OK) == 0 &&
-		    bind_at(root, target, target, 0, 1) < 0)
+		/* A source gone by now was rewritten, not unstageable. */
+		if (bind_at(root, target, target, 0, 1) < 0 &&
+		    access(target, F_OK) == 0)
 			fail = 1;
 	} else if (stage_ro(root, rdir) < 0) {
 		fail = 1;
