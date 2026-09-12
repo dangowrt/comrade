@@ -24,6 +24,7 @@ struct stream {
 	uint32_t rate_t;		/* last delivery-rate sample time */
 	uint32_t rate_una;		/* snd_una at that sample */
 	uint32_t rate_sps;		/* EWMA delivered segments per second */
+	int rate_init;			/* rate_t set; 0 is a legal time */
 };
 
 #ifdef COMRADE_HAVE_KCP_CC
@@ -50,6 +51,7 @@ struct stream_cc {
 	double rtprop;			/* least RTT seen, ms */
 	IUINT32 rtprop_t;
 	IUINT32 round_t;		/* current sample round */
+	int round_init;			/* round_t set; 0 is a legal time */
 	double acked_round;
 	int app_limited;		/* round had no backlog to measure */
 	int startup;
@@ -152,8 +154,9 @@ static void cc_on_tick(ikcpcb *kcp)
 	double bdp, cw;
 	int i;
 
-	if (!c->round_t) {
-		c->round_t = kcp->current ? kcp->current : 1;
+	if (!c->round_init) {
+		c->round_init = 1;
+		c->round_t = kcp->current;
 		return;
 	}
 	if ((double)dt >= round) {
@@ -341,8 +344,9 @@ uint32_t stream_update(struct stream *s, uint32_t now_ms)
 	pthread_mutex_lock(&s->lock);
 	ikcp_update(s->kcp, now_ms);
 	next = ikcp_check(s->kcp, now_ms);
-	if (!s->rate_t) {
-		s->rate_t = now_ms ? now_ms : 1;
+	if (!s->rate_init) {
+		s->rate_init = 1;
+		s->rate_t = now_ms;
 		s->rate_una = s->kcp->snd_una;
 	}
 	dt = now_ms - s->rate_t;
@@ -351,7 +355,7 @@ uint32_t stream_update(struct stream *s, uint32_t now_ms)
 
 		s->rate_sps -= s->rate_sps / 4;
 		s->rate_sps += d * 1000 / dt / 4;
-		s->rate_t = now_ms ? now_ms : 1;
+		s->rate_t = now_ms;
 		s->rate_una = s->kcp->snd_una;
 	}
 	pthread_mutex_unlock(&s->lock);
