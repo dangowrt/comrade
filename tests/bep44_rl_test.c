@@ -426,6 +426,137 @@ static void a_node_is_told_the_sequence_it_holds(void)
 	assert(node_cas(&n, 7) == 0);
 }
 
+static void addr4_make(struct sockaddr_in *a, uint32_t host, uint16_t port)
+{
+	memset(a, 0, sizeof(*a));
+	a->sin_family = AF_INET;
+	a->sin_addr.s_addr = htonl(host);
+	a->sin_port = htons(port);
+}
+
+static struct b44_node *node_at_addr(struct b44_op *op,
+				     const struct sockaddr_in *a)
+{
+	int i;
+
+	for (i = 0; i < op->nnodes; i++) {
+		if (op->nodes[i].sslen == (socklen_t)sizeof(*a) &&
+		    !memcmp(&op->nodes[i].ss, a, sizeof(*a)))
+			return &op->nodes[i];
+	}
+	return NULL;
+}
+
+static size_t get_reply(uint8_t *out, size_t cap, const uint8_t sk[64],
+			const uint8_t pk[32], const uint8_t closer_id[20],
+			const struct sockaddr_in *closer, int64_t seq)
+{
+	static const uint8_t v[] = { '3', ':', 'a', 'b', 'c' };
+	uint8_t sigbuf[BEP44_MAX_VALUE + 128];
+	uint8_t compact[26];
+	struct benc_buf b;
+	size_t sigbuf_len;
+	uint8_t sig[64];
+	uint8_t id[20];
+
+	memset(id, 0xaa, sizeof(id));
+	memcpy(compact, closer_id, 20);
+	memcpy(compact + 20, &closer->sin_addr, 4);
+	memcpy(compact + 24, &closer->sin_port, 2);
+
+	sigbuf_len = bep44_sig_buffer(sigbuf, sizeof(sigbuf), "offer", seq, v,
+				      sizeof(v));
+	assert(sigbuf_len);
+	assert(!cc_ed25519_sign(sig, sk, sigbuf, sigbuf_len));
+
+	benc_buf_init(&b, out, cap);
+	benc_raw_add(&b, "d1:rd", 5);
+	benc_key_add(&b, "id");
+	benc_str_add(&b, id, sizeof(id));
+	benc_key_add(&b, "k");
+	benc_str_add(&b, pk, 32);
+	benc_key_add(&b, "nodes");
+	benc_str_add(&b, compact, sizeof(compact));
+	benc_key_add(&b, "seq");
+	benc_int_add(&b, seq);
+	benc_key_add(&b, "sig");
+	benc_str_add(&b, sig, sizeof(sig));
+	benc_key_add(&b, "token");
+	benc_str_add(&b, "tok", 3);
+	benc_key_add(&b, "v");
+	benc_raw_add(&b, v, sizeof(v));
+	benc_raw_add(&b, "e1:t", 4);
+	benc_str_add(&b, "pm\0\0", 4);
+	benc_raw_add(&b, "1:y1:re", 7);
+	assert(!b.err);
+	return b.len;
+}
+
+/* Merging the closer nodes the same reply brought moves the replier along the
+ * distance-sorted set, and the sequence it reported has to move with it. */
+static void a_reply_is_recorded_against_its_own_node(void)
+{
+	struct sockaddr_in replier, closer, other;
+	uint8_t sk[64], pk[32], seed[32];
+	uint8_t buf[B44_MSG_MAX];
+	struct b44_node *n;
+	struct b44_op *op;
+	uint8_t id[20];
+	size_t len;
+	int i;
+
+	for (i = 0; i < 32; i++)
+		seed[i] = (uint8_t)(i + 1);
+	assert(!cc_ed25519_key_pair(sk, pk, seed));
+
+	addr4_make(&replier, 0xc6336401, 6881);		/* 198.51.100.1 */
+	addr4_make(&closer, 0xc6336402, 6881);
+	addr4_make(&other, 0xc6336403, 6881);
+
+	op = op_create(E, pk, "offer", 0);
+	assert(op && !op->nnodes);
+
+	memset(id, 0xaa, sizeof(id));
+	assert(node_insert(op, id, (struct sockaddr *)&replier,
+			   sizeof(replier), 0) == 1);
+	memset(id, 0xbb, sizeof(id));
+	assert(node_insert(op, id, (struct sockaddr *)&other, sizeof(other),
+			   0) == 1);
+
+	/* One request stays in flight so the step ending the reply leaves the
+	 * operation alive to be read. */
+	for (i = 0; i < op->nnodes; i++) {
+		assert(req_alloc(op, i));
+		op->nodes[i].state = B44_NODE_INFLIGHT;
+	}
+
+	n = node_at_addr(op, &replier);
+	assert(n);
+	len = get_reply(buf, sizeof(buf), sk, pk, op->target, &closer, 7);
+	for (i = 0; i < B44_REQS_MAX; i++) {
+		if (op->reqs[i].in_use && &op->nodes[op->reqs[i].node] == n)
+			break;
+	}
+	assert(i < B44_REQS_MAX);
+	reply_handle(op, &op->reqs[i], buf, len, 0, (struct sockaddr *)&replier,
+		     sizeof(replier));
+
+	assert(op->nnodes == 3);
+	assert(node_at_addr(op, &closer) < node_at_addr(op, &replier));
+
+	n = node_at_addr(op, &replier);
+	assert(n && n->state == B44_NODE_REPLIED && n->token_len == 3);
+	assert(n->have_seq && n->seq == 7);
+	assert(node_cas(n, 5) == 7);
+
+	n = node_at_addr(op, &closer);
+	assert(n && !n->have_seq);
+	assert(node_cas(n, 5) == 5);
+
+	n = node_at_addr(op, &other);
+	assert(n && !n->have_seq);
+}
+
 /* A store the budget holds back on every node is not one that reached nobody:
  * the operation waits, and the next step past the budget sends it. */
 static void a_store_held_back_everywhere_waits(void)
@@ -481,6 +612,7 @@ int main(void)
 		a_node_is_told_the_sequence_it_holds,
 		peers_behind_one_address_are_not_banned_for_normal_use,
 		a_store_held_back_everywhere_waits,
+		a_reply_is_recorded_against_its_own_node,
 	};
 	size_t i;
 

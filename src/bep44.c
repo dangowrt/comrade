@@ -1482,6 +1482,11 @@ static void reply_handle(struct b44_op *op, struct b44_req *req,
 		}
 	}
 
+	/* Before the merge below, which inserts into op->nodes and leaves this
+	 * pointer naming whichever node the shift moved into the slot. */
+	if (!op->is_put)
+		value_check(op, node, from, fromlen, rdict, rlen);
+
 	/* A rendezvous op talks only to the nodes it was seeded/pinned with, so
 	 * it never grows toward the target: skip the returned closer nodes. */
 	if (!op->direct &&
@@ -1500,9 +1505,6 @@ static void reply_handle(struct b44_op *op, struct b44_req *req,
 		if (!benc_str_get(val, val_len, &data, &data_len))
 			nodes_compact_add(op, data, data_len, AF_INET6);
 	}
-
-	if (!op->is_put)
-		value_check(op, node, from, fromlen, rdict, rlen);
 
 	op_step(op);
 }
