@@ -30,9 +30,10 @@ unsigned long os_thread_id(void)
 	return (unsigned long)GetCurrentThreadId();
 }
 
-void os_chmod_private(const char *path)
+int os_chmod_private(const char *path)
 {
 	(void)path;		/* the ACL the file inherits is the user's */
+	return 0;
 }
 
 double os_uptime_s(void)
@@ -99,9 +100,9 @@ unsigned long os_thread_id(void)
 	return (unsigned long)(uintptr_t)pthread_self();
 }
 
-void os_chmod_private(const char *path)
+int os_chmod_private(const char *path)
 {
-	chmod(path, S_IRUSR | S_IWUSR);
+	return chmod(path, S_IRUSR | S_IWUSR);
 }
 
 double os_uptime_s(void)

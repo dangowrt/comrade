@@ -25,9 +25,10 @@ int os_rename_replace(const char *tmp, const char *dst);
  * choosing the same temporary name. */
 unsigned long os_thread_id(void);
 
-/* Readable and writable by this user and nobody else. A no-op where the
- * filesystem has no such notion. */
-void os_chmod_private(const char *path);
+/* Readable and writable by this user and nobody else. A no-op (returning 0)
+ * where the filesystem has no such notion. Returns 0 on success, -1 if the
+ * mode could not be set. */
+int os_chmod_private(const char *path);
 
 /* getpid() / GetCurrentProcessId(). */
 long os_getpid(void);

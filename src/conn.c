@@ -40,7 +40,10 @@ int conn_write(const char *path, const struct conn_status *st)
 	 * directory it sits in is the user's own, but the file need not be
 	 * readable beyond them either.
 	 */
-	os_chmod_private(tmp);
+	if (os_chmod_private(tmp)) {
+		remove(tmp);
+		return -1;
+	}
 	if (os_rename_replace(tmp, path)) {
 		remove(tmp);
 		return -1;
