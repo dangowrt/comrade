@@ -428,11 +428,17 @@ carries no BEP44 support.
 - **put** KRPC (`bep44.c:put_send`), `a` dict keys in sorted order:
   `cas` (opt), `id`(20, node id), `k`(32, `bep44_pk`), `salt`(`"m"`),
   `seq`(int), `sig`(64), `token`(write token from the node), `v`(raw container).
-- **seq/cas rule** (`bep44.c`): a put with a prior value already observed uses
-  `seq = best_seq + 1` and `cas = best_seq` (compare-and-swap against the last
-  seen seq); a first put with no prior value uses `seq = 1` and omits `cas`. Both
-  roles put and both use CAS -- the host on offer rotation, the client on the
-  answer write -- not the client alone.
+- **seq/cas rule** (`bep44.c:store_seq`, `node_cas`): the value is stored at
+  `seq = best_seq + 1`, `best_seq` being the highest sequence the lookup found,
+  or at `best_seq` itself when the bytes to store are exactly the ones found (a
+  refresh, so the keep-warm re-stores do not walk the sequence up); a first put
+  with no prior value uses `seq = 1`. `cas` is decided per node: the sequence
+  that node reported holding in the lookup, the lookup's best for a node that
+  reported none, and omitted where nothing was found at all. A node whose copy
+  fell behind is thereby caught up rather than refusing every later store with
+  301, and whatever a peer wrote to it alone is still read from it. Both roles
+  put and both use CAS -- the host on offer rotation, the client on the answer
+  write -- not the client alone.
 - **Transaction id** (`bep44.c:tid_bytes`): every KRPC query tags `t` with four
   bytes, `'p' 'm'` then a **16-bit little-endian** per-request counter; a reply is
   matched back to its pending request by that id.
