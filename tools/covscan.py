@@ -412,10 +412,8 @@ def git_claims():
             continue
         sha, subject, values = rec.strip("\n").split("\x1f", 2)
         for value in values.splitlines():
-            m = re.match(r"\s*(\d+)", value)
-            if m:
-                claims.setdefault(int(m.group(1)), []).append(
-                    (sha[:12], subject))
+            for cid in re.findall(r"\d+", value.split("(")[0]):
+                claims.setdefault(int(cid), []).append((sha[:12], subject))
     return claims
 
 
