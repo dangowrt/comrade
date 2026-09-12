@@ -86,7 +86,7 @@ static int print_version(void)
  */
 struct rejoin {
 	struct token tok;
-	char str[TOKEN_STR_LEN];
+	char str[TOKEN_STR_LEN + 1];
 };
 
 static void on_rejoin_state(void *arg, int family, int state,
