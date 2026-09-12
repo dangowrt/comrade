@@ -162,6 +162,25 @@ size_t netmon_snapshot(struct netmon_addr *out, size_t max)
 
 #endif /* _WIN32 */
 
+static int fp_ctx_init(struct cc_blake2b *c4, struct cc_blake2b *c6,
+		       struct cc_blake2b *cif)
+{
+	uint8_t drop[32];
+
+	if (cc_blake2b_init(c4, 32))
+		return -1;
+	if (cc_blake2b_init(c6, 32)) {
+		cc_blake2b_final(c4, drop);
+		return -1;
+	}
+	if (cc_blake2b_init(cif, 32)) {
+		cc_blake2b_final(c4, drop);
+		cc_blake2b_final(c6, drop);
+		return -1;
+	}
+	return 0;
+}
+
 /* The fingerprints are process-local roam state, never persisted or sent, so
  * they need not be stable across builds or backends (and with the OpenSSL
  * backend they are truncated BLAKE2b-512, not BLAKE2b-256). Keep it that way:
@@ -178,8 +197,7 @@ void netmon_fingerprint(uint8_t fp4[32], uint8_t fp6[32], uint8_t fpif[32],
 	 * undefined however harmlessly it behaves in practice. */
 	if (addrs && n > 1)
 		qsort(addrs, n, sizeof(*addrs), addr_cmp);
-	if (cc_blake2b_init(&c4, 32) || cc_blake2b_init(&c6, 32) ||
-	    cc_blake2b_init(&cif, 32)) {
+	if (fp_ctx_init(&c4, &c6, &cif)) {
 		memset(fp4, 0, 32);
 		memset(fp6, 0, 32);
 		memset(fpif, 0, 32);
