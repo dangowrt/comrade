@@ -58,7 +58,7 @@ while [ "$i" -lt "$(e2e_loops 120)" ]; do
 	fi
 	sleep 1; i=$((i + 1))
 done
-if [ -z "$tok" ]; then echo "no rendezvous token after 120s"; cat "$tmp/host.err"; exit 1; fi
+if [ -z "$tok" ]; then echo "no rendezvous token after ${i}s"; cat "$tmp/host.err"; exit 1; fi
 
 # Launch N clients at once against the one token: they race the turnstile.
 j=0

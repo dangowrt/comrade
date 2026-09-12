@@ -60,7 +60,7 @@ hpid=$!
 # rebuild, which is what makes each one cheap to recover from.
 tok=""
 i=0
-while [ "$i" -lt 120 ]; do
+while [ "$i" -lt "$(e2e_loops 120)" ]; do
 	cand=$(sed -n 's/^COMRADE TOKEN: //p' "$tmp/host.out" 2>/dev/null | tail -1)
 	if [ -n "$cand" ] && "$E2E" token "$cand" 2>/dev/null |
 	   grep -q 'state[46]=RENDEZVOUS'; then
@@ -71,7 +71,7 @@ while [ "$i" -lt 120 ]; do
 	fi
 	sleep 1; i=$((i + 1))
 done
-if [ -z "$tok" ]; then echo "no rendezvous token after 120s"; cat "$tmp/host.err"; exit 1; fi
+if [ -z "$tok" ]; then echo "no rendezvous token after ${i}s"; cat "$tmp/host.err"; exit 1; fi
 
 COMRADE_DEBUG="$tmp/client.log" "$E2E" client "$tok" --roam-ms 150 \
 	--roams "$ROAMS" --hold-ms 500 --timeout 90 \

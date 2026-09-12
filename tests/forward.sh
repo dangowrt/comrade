@@ -50,7 +50,7 @@ end_host() {
 	for sig in TERM TERM KILL; do
 		kill -"$sig" "$hp" 2>/dev/null || return 0
 		i=0
-		while kill -0 "$hp" 2>/dev/null && [ "$i" -lt 20 ]; do
+		while kill -0 "$hp" 2>/dev/null && [ "$i" -lt "$(e2e_loops 20)" ]; do
 			sleep 0.1
 			i=$((i + 1))
 		done
@@ -80,7 +80,7 @@ sleep 1
 # probe <port> -- prints what came back through the forward
 probe() {
 	i=0
-	while [ "$i" -lt 20 ]; do
+	while [ "$i" -lt "$(e2e_loops 20)" ]; do
 		got=$(nc -w 2 127.0.0.1 "$1" 2>/dev/null | head -1)
 		[ "$got" = "HELLO-FORWARD" ] && { echo ok; return 0; }
 		sleep 1
@@ -92,7 +92,7 @@ probe() {
 
 wait_token() {
 	i=0
-	while [ "$i" -lt 60 ]; do
+	while [ "$i" -lt "$(e2e_loops 60)" ]; do
 		tok=$(sed -n 's/.*"token":"\([^"]*\)".*/\1/p' "$1" 2>/dev/null | tail -1)
 		[ -n "$tok" ] && return 0
 		sleep 1

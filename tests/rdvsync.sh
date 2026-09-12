@@ -57,7 +57,7 @@ hostpid=$!
 # tell them to meet.
 early=""
 i=0
-while [ "$i" -lt 60 ]; do
+while [ "$i" -lt "$(e2e_loops 60)" ]; do
 	early=$(sed -n 's/^COMRADE TOKEN: //p' "$tmp/host.out" 2>/dev/null | head -1)
 	[ -n "$early" ] && break
 	kill -0 "$hostpid" 2>/dev/null || {
@@ -81,7 +81,7 @@ fi
 rdv=""
 fam=""
 i=0
-while [ "$i" -lt 100 ]; do
+while [ "$i" -lt "$(e2e_loops 100)" ]; do
 	c=$(sed -n 's/^COMRADE TOKEN: //p' "$tmp/host.out" 2>/dev/null | tail -1)
 	if [ -n "$c" ]; then
 		d=$("$E2E" token "$c" 2>/dev/null)
@@ -123,7 +123,7 @@ told_both() {
 	[ "$(grep -c "reach: peer [0-9][0-9]* v4 " "$tmp/host.dbg")" -ge 2 ]
 }
 i=0
-while [ "$i" -lt 90 ]; do
+while [ "$i" -lt "$(e2e_loops 90)" ]; do
 	told_both && break
 	kill -0 "$c1" 2>/dev/null || break
 	kill -0 "$c2" 2>/dev/null || break

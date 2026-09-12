@@ -88,7 +88,7 @@ swarm_start() {
 		SWARM_PIDS="$SWARM_PIDS $!"
 		_w=0
 		_port=""
-		while [ "$_w" -lt 50 ]; do
+		while [ "$_w" -lt "$(e2e_loops 50)" ]; do
 			_port=$(sed -n 's/^port //p' "$SWARM_DIR/$_i.out" 2>/dev/null)
 			[ -n "$_port" ] && [ "$_port" != 0 ] && break
 			sleep 0.1

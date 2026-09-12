@@ -68,7 +68,7 @@ hpid=$!
 
 tok=""
 i=0
-while [ "$i" -lt 120 ]; do
+while [ "$i" -lt "$(e2e_loops 120)" ]; do
 	cand=$(sed -n 's/^COMRADE TOKEN: //p' "$tmp/host.out" 2>/dev/null | tail -1)
 	if [ -n "$cand" ] && "$E2E" token "$cand" 2>/dev/null |
 	   grep -q 'state[46]=RENDEZVOUS'; then
@@ -79,7 +79,7 @@ while [ "$i" -lt 120 ]; do
 	fi
 	sleep 1; i=$((i + 1))
 done
-if [ -z "$tok" ]; then echo "no rendezvous token after 120s"; cat "$tmp/host.err"; exit 1; fi
+if [ -z "$tok" ]; then echo "no rendezvous token after ${i}s"; cat "$tmp/host.err"; exit 1; fi
 
 # Client A over the LAN only (multicast/lanlink, DHT dropped), holding so its
 # lanlink worker stays live while the host engages the ICE turnstile for B.

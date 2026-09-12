@@ -46,7 +46,7 @@ hostpid=$!
 
 tok=""
 i=0
-while [ "$i" -lt 120 ]; do
+while [ "$i" -lt "$(e2e_loops 120)" ]; do
 	c=$(sed -n 's/^COMRADE TOKEN: //p' "$tmp/host.out" 2>/dev/null | tail -1)
 	if [ -n "$c" ] && "$E2E" token "$c" 2>/dev/null |
 	    grep -qE "ep4_rdv=1|ep6_rdv=1"; then
@@ -70,7 +70,7 @@ COMRADE_DEBUG="$tmp/client.dbg" "$E2E" client "$tok" \
 	--hold-ms 110000 --timeout 150 > "$tmp/client.out" 2>&1 &
 clientpid=$!
 i=0
-while [ "$i" -lt 120 ]; do
+while [ "$i" -lt "$(e2e_loops 120)" ]; do
 	n=$(grep -c "conn_run: sock_pair" "$tmp/client.dbg" 2>/dev/null)
 	[ "${n:-0}" -ge 2 ] && break
 	kill -0 "$clientpid" 2>/dev/null || break
