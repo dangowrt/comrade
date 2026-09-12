@@ -36,6 +36,11 @@ int os_chmod_private(const char *path)
 	return 0;
 }
 
+FILE *os_fopen_private(const char *path)
+{
+	return fopen(path, "a");
+}
+
 double os_uptime_s(void)
 {
 	return (double)GetTickCount64() / 1000.0;
@@ -76,6 +81,7 @@ uint64_t os_mono_ms(void)
 
 #else /* !_WIN32 */
 
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <sys/stat.h>
@@ -103,6 +109,20 @@ unsigned long os_thread_id(void)
 int os_chmod_private(const char *path)
 {
 	return chmod(path, S_IRUSR | S_IWUSR);
+}
+
+FILE *os_fopen_private(const char *path)
+{
+	FILE *f;
+	int fd;
+
+	fd = open(path, O_WRONLY | O_CREAT | O_APPEND, S_IRUSR | S_IWUSR);
+	if (fd < 0)
+		return NULL;
+	f = fdopen(fd, "a");
+	if (!f)
+		close(fd);
+	return f;
 }
 
 double os_uptime_s(void)

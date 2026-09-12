@@ -6,6 +6,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 
 /*
  * The handful of non-socket, non-terminal OS calls whose Windows spelling
@@ -29,6 +30,11 @@ unsigned long os_thread_id(void);
  * where the filesystem has no such notion. Returns 0 on success, -1 if the
  * mode could not be set. */
 int os_chmod_private(const char *path);
+
+/* Opens path for appending, private at creation rather than corrected after,
+ * so no reader can take a descriptor to it first. Plain fopen() where the ACL
+ * the file inherits is the user's. Returns NULL if it could not be opened. */
+FILE *os_fopen_private(const char *path);
 
 /* getpid() / GetCurrentProcessId(). */
 long os_getpid(void);

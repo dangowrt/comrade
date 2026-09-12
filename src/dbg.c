@@ -65,7 +65,7 @@ void dbg_logf(const char *fmt, ...)
 	path = dbg_path(dflt, sizeof(dflt));
 	if (!path)
 		return;
-	f = fopen(path, "a");
+	f = os_fopen_private(path);
 	if (!f)
 		return;
 	/*
