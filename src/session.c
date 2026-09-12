@@ -5887,19 +5887,20 @@ static void net_pump(struct sess *s, uint64_t now)
 static int conn_link_state(const struct sess *s, struct conn *c)
 {
 	uint64_t now = now_ms(), last;
+	int seen, lost, rtt;
 	unsigned gen;
-	int seen, lost;
 
 	pthread_mutex_lock(&c->hb_lock);
 	last = c->hb_last_pong;
 	seen = c->hb_pong_seen;
 	gen = c->live_gen;
+	rtt = c->hb_rtt;
 	lost = c->lost_since_ms != 0;
 	pthread_mutex_unlock(&c->hb_lock);
 
 	if (!seen)
 		return c->ice_up ? CONN_PUNCHING : CONN_CONNECTING;
-	if (lost && now - last >= hb_lost_ms(c->hb_rtt))
+	if (lost && now - last >= hb_lost_ms(rtt))
 		return CONN_LOST;
 	if (gen != __atomic_load_n(&s->netgen, __ATOMIC_RELAXED))
 		return CONN_UNKNOWN;	/* proven, but somewhere else */
