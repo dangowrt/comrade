@@ -20,14 +20,32 @@ static struct bep44_engine *E;
 
 static struct bep44_engine *fresh(void)
 {
-	uint8_t myid[20];
 	struct bep44_engine *e;
+	struct sockaddr_in a;
+	uint8_t myid[20];
+	sock_t s;
 
 	memset(myid, 7, sizeof(myid));
-	e = bep44_create(myid, INVALID_SOCK, INVALID_SOCK);
+	assert(!wsock_init());
+	s = socket(AF_INET, SOCK_DGRAM, 0);
+	assert(sock_valid(s));
+	memset(&a, 0, sizeof(a));
+	a.sin_family = AF_INET;
+	assert(!bind(s, (struct sockaddr *)&a, sizeof(a)));
+	e = bep44_create(myid, s, INVALID_SOCK);
 	if (e)
 		bep44_serve(e, 1);	/* enables the limiter at its defaults */
+	else
+		sock_close(s);
 	return e;
+}
+
+static void fresh_free(struct bep44_engine *e)
+{
+	sock_t s = e->s4;
+
+	bep44_free(e);
+	sock_close(s);
 }
 
 static int ask6(const uint8_t a[16])
@@ -421,7 +439,7 @@ static void a_store_held_back_everywhere_waits(void)
 
 	memset(&a, 0, sizeof(a));
 	a.sin_family = AF_INET;
-	a.sin_addr.s_addr = htonl(0x0a000001);
+	a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 	a.sin_port = htons(6881);
 	assert(!bep44_pin_add(E, NULL, (struct sockaddr *)&a, sizeof(a)));
 	memset(target, 1, sizeof(target));
@@ -470,10 +488,10 @@ int main(void)
 		E = fresh();
 		assert(E);
 		tests[i]();
-		bep44_free(E);
+		fresh_free(E);
 	}
 	E = fresh();
 	assert(ban_ok(E, NULL, 0) == 1);		/* no address -> not limited */
-	bep44_free(E);
+	fresh_free(E);
 	return 0;
 }

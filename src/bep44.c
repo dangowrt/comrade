@@ -747,7 +747,11 @@ static int get_send(struct b44_op *op, int node)
 	}
 	op->nodes[node].state = op->phase == B44_PHASE_STORE ?
 		B44_NODE_STORE_INFLIGHT : B44_NODE_INFLIGHT;
-	msg_send(op->e, &op->nodes[node].ss, op->nodes[node].sslen, msg, b.len);
+	if (msg_send(op->e, &op->nodes[node].ss, op->nodes[node].sslen, msg,
+		     b.len) < 0) {
+		op->nodes[node].state = B44_NODE_FAILED;
+		req->in_use = 0;
+	}
 	return 0;
 }
 
@@ -807,8 +811,11 @@ static int put_send(struct b44_op *op, int node)
 			return -1;
 		}
 		op->nodes[node].state = B44_NODE_STORE_INFLIGHT;
-		msg_send(op->e, &op->nodes[node].ss, op->nodes[node].sslen,
-			 msg, b.len);
+		if (msg_send(op->e, &op->nodes[node].ss, op->nodes[node].sslen,
+			     msg, b.len) < 0) {
+			op->nodes[node].state = B44_NODE_FAILED;
+			req->in_use = 0;
+		}
 		return 0;
 	}
 
@@ -854,7 +861,11 @@ static int put_send(struct b44_op *op, int node)
 		return -1;
 	}
 	op->nodes[node].state = B44_NODE_STORE_INFLIGHT;
-	msg_send(op->e, &op->nodes[node].ss, op->nodes[node].sslen, msg, b.len);
+	if (msg_send(op->e, &op->nodes[node].ss, op->nodes[node].sslen, msg,
+		     b.len) < 0) {
+		op->nodes[node].state = B44_NODE_FAILED;
+		req->in_use = 0;
+	}
 	return 0;
 }
 
