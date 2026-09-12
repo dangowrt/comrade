@@ -160,6 +160,12 @@ endfunction()
 comrade_add_flag(-Wdate-time)
 comrade_add_flag(-ffile-prefix-map=${CMAKE_SOURCE_DIR}=.)
 
+# The sources are written C89 in a C11 build, and a declaration after a
+# statement is the one part of that a compiler can check. Probed rather than
+# added outright: it is a GCC and clang spelling, and nothing here needs it to
+# build.
+comrade_add_flag(-Wdeclaration-after-statement)
+
 find_package(PkgConfig REQUIRED)
 find_package(Threads REQUIRED)
 pkg_check_modules(LIBSSH IMPORTED_TARGET libssh)

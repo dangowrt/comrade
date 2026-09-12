@@ -601,9 +601,6 @@ static int node_insert(struct b44_op *op, const uint8_t *id,
 	return 1;
 }
 
-static void cache_add(struct bep44_engine *e, const uint8_t id[20],
-		      const struct sockaddr *sa, socklen_t salen);
-
 /*
  * A source we must not serve, refer a peer to, or cache: the unroutable and
  * unspoofable-target ranges jech/dht filters at its own ingress (dht.c
@@ -653,6 +650,76 @@ static int addr_same_host(const struct sockaddr *a, socklen_t alen,
 		return !memcmp(&((const struct sockaddr_in6 *)a)->sin6_addr,
 			       &((const struct sockaddr_in6 *)b)->sin6_addr, 16);
 	return 0;
+}
+
+static int id_nonzero(const uint8_t id[20])
+{
+	int i;
+
+	for (i = 0; i < 20; i++)
+		if (id[i])
+			return 1;
+	return 0;
+}
+
+/* A node address worth handing on as a rendezvous hint: real family, and
+ * neither the address nor the port all-zero (bogus compact entries appear). */
+static int node_addr_usable(const struct sockaddr *sa, socklen_t len)
+{
+	if (sa->sa_family == AF_INET && len >= (socklen_t)sizeof(struct sockaddr_in)) {
+		const struct sockaddr_in *s = (const struct sockaddr_in *)sa;
+
+		return s->sin_port != 0 && s->sin_addr.s_addr != 0;
+	}
+	if (sa->sa_family == AF_INET6 && len >= (socklen_t)sizeof(struct sockaddr_in6)) {
+		const struct sockaddr_in6 *s = (const struct sockaddr_in6 *)sa;
+		static const uint8_t zero[16] = { 0 };
+
+		return s->sin6_port != 0 &&
+		       memcmp(&s->sin6_addr, zero, 16) != 0;
+	}
+	return 0;
+}
+
+/*
+ * Nodes we have seen with their ids, so a get we answer can name closer ones
+ * and the asker's lookup keeps converging. Fed from the compact node lists our
+ * own lookups collect and from peers whose write token proved their address.
+ */
+static void cache_add(struct bep44_engine *e, const uint8_t id[20],
+		      const struct sockaddr *sa, socklen_t salen)
+{
+	struct b44_cnode *c;
+	int i;
+
+	/*
+	 * The id is only ever claimed, never proven (a write token proves the
+	 * address, not the id it travels with), so a poisoned referral can at
+	 * worst mislead a lookup -- values stay Ed25519-verified regardless.
+	 * What is enforced here is that the address is real and routable and
+	 * that one host holds at most one slot.
+	 */
+	if (!e->serving || !id || !id_nonzero(id) || !sa ||
+	    (size_t)salen > sizeof(c->ss) || !node_addr_usable(sa, salen) ||
+	    addr_martian(sa, salen) || !memcmp(id, e->myid, 20))
+		return;
+	for (i = 0; i < B44_CACHE_MAX; i++) {
+		c = &e->cache[i];
+		if (c->sslen && addr_same_host(sa, salen, &c->ss, c->sslen)) {
+			memcpy(c->id, id, 20);
+			memcpy(&c->ss, sa, salen);
+			c->sslen = salen;
+			c->seen_ms = now_ms();
+			return;
+		}
+	}
+	c = &e->cache[e->cache_next];
+	e->cache_next = (e->cache_next + 1) % B44_CACHE_MAX;
+	memset(c, 0, sizeof(*c));
+	memcpy(c->id, id, 20);
+	memcpy(&c->ss, sa, salen);
+	c->sslen = salen;
+	c->seen_ms = now_ms();
 }
 
 static void nodes_compact_add(struct b44_op *op, const uint8_t *data,
@@ -870,16 +937,6 @@ static int put_send(struct b44_op *op, int node)
 }
 
 
-static int id_nonzero(const uint8_t id[20])
-{
-	int i;
-
-	for (i = 0; i < 20; i++)
-		if (id[i])
-			return 1;
-	return 0;
-}
-
 static void retain_add(struct bep44_engine *e, const uint8_t id[20],
 		       const struct sockaddr *sa, socklen_t salen)
 {
@@ -974,28 +1031,20 @@ static void op_retain_nodes(struct bep44_engine *e, struct b44_op *op)
 	}
 }
 
-/* A node address worth handing on as a rendezvous hint: real family, and
- * neither the address nor the port all-zero (bogus compact entries appear). */
-static int node_addr_usable(const struct sockaddr *sa, socklen_t len)
-{
-	if (sa->sa_family == AF_INET && len >= (socklen_t)sizeof(struct sockaddr_in)) {
-		const struct sockaddr_in *s = (const struct sockaddr_in *)sa;
-
-		return s->sin_port != 0 && s->sin_addr.s_addr != 0;
-	}
-	if (sa->sa_family == AF_INET6 && len >= (socklen_t)sizeof(struct sockaddr_in6)) {
-		const struct sockaddr_in6 *s = (const struct sockaddr_in6 *)sa;
-		static const uint8_t zero[16] = { 0 };
-
-		return s->sin6_port != 0 &&
-		       memcmp(&s->sin6_addr, zero, 16) != 0;
-	}
-	return 0;
-}
-
 static void op_finish(struct b44_op *op)
 {
+	struct sockaddr_storage best_node[2];
+	bep44_put_cb *put_cb = op->put_cb;
+	bep44_get_cb *get_cb = op->get_cb;
+	uint8_t have_best = op->have_best;
+	uint16_t best_len = op->best_len;
+	int64_t best_seq = op->best_seq;
 	struct bep44_engine *e = op->e;
+	uint8_t best[BEP44_MAX_VALUE];
+	socklen_t best_node_len[2];
+	int stored = op->stored;
+	void *arg = op->cb_arg;
+	int fam;
 
 	if (debug_on()) {
 		int i, replied = 0, tokened = 0, n6 = 0, r6 = 0, st6 = 0;
@@ -1031,11 +1080,6 @@ static void op_finish(struct b44_op *op)
 		fprintf(stderr, "\n");
 	}
 
-	bep44_put_cb *put_cb = op->put_cb;
-	bep44_get_cb *get_cb = op->get_cb;
-	void *arg = op->cb_arg;
-	int stored = op->stored;
-
 	/*
 	 * For a put, the rendezvous node is the closest node that acknowledged
 	 * storing the value: known here, at store time, from the store itself,
@@ -1058,13 +1102,6 @@ static void op_finish(struct b44_op *op)
 			break;
 		}
 	}
-	uint8_t best[BEP44_MAX_VALUE];
-	uint16_t best_len = op->best_len;
-	int64_t best_seq = op->best_seq;
-	uint8_t have_best = op->have_best;
-	struct sockaddr_storage best_node[2];
-	socklen_t best_node_len[2];
-	int fam;
 
 	memcpy(best_node, op->best_node, sizeof(best_node));
 	memcpy(best_node_len, op->best_node_len, sizeof(best_node_len));
@@ -1688,47 +1725,6 @@ static struct b44_item *item_new(const uint8_t target[20], const uint8_t *v,
 
 /* -- the node cache ------------------------------------------------------ */
 
-/*
- * Nodes we have seen with their ids, so a get we answer can name closer ones
- * and the asker's lookup keeps converging. Fed from the compact node lists our
- * own lookups collect and from peers whose write token proved their address.
- */
-static void cache_add(struct bep44_engine *e, const uint8_t id[20],
-		      const struct sockaddr *sa, socklen_t salen)
-{
-	struct b44_cnode *c;
-	int i;
-
-	/*
-	 * The id is only ever claimed, never proven (a write token proves the
-	 * address, not the id it travels with), so a poisoned referral can at
-	 * worst mislead a lookup -- values stay Ed25519-verified regardless.
-	 * What is enforced here is that the address is real and routable and
-	 * that one host holds at most one slot.
-	 */
-	if (!e->serving || !id || !id_nonzero(id) || !sa ||
-	    (size_t)salen > sizeof(c->ss) || !node_addr_usable(sa, salen) ||
-	    addr_martian(sa, salen) || !memcmp(id, e->myid, 20))
-		return;
-	for (i = 0; i < B44_CACHE_MAX; i++) {
-		c = &e->cache[i];
-		if (c->sslen && addr_same_host(sa, salen, &c->ss, c->sslen)) {
-			memcpy(c->id, id, 20);
-			memcpy(&c->ss, sa, salen);
-			c->sslen = salen;
-			c->seen_ms = now_ms();
-			return;
-		}
-	}
-	c = &e->cache[e->cache_next];
-	e->cache_next = (e->cache_next + 1) % B44_CACHE_MAX;
-	memset(c, 0, sizeof(*c));
-	memcpy(c->id, id, 20);
-	memcpy(&c->ss, sa, salen);
-	c->sslen = salen;
-	c->seen_ms = now_ms();
-}
-
 static size_t cache_nodes(struct bep44_engine *e, const uint8_t target[20],
 			  int af, uint8_t *out, size_t out_cap)
 {
@@ -1736,7 +1732,7 @@ static size_t cache_nodes(struct bep44_engine *e, const uint8_t target[20],
 	int pick[B44_REPLY_NODES];
 	size_t entry = af == AF_INET ? 26 : 38;
 	uint64_t now = now_ms();
-	int i, j, n = 0;
+	int i, j, m, n = 0;
 	size_t len = 0;
 
 	if (out_cap < entry)
@@ -1757,7 +1753,7 @@ static size_t cache_nodes(struct bep44_engine *e, const uint8_t target[20],
 			continue;
 		if (n < B44_REPLY_NODES)
 			n++;
-		for (int m = n - 1; m > j; m--) {
+		for (m = n - 1; m > j; m--) {
 			pick[m] = pick[m - 1];
 			memcpy(pdist[m], pdist[m - 1], 20);
 		}
