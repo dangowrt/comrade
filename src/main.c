@@ -95,7 +95,7 @@ static void on_rejoin_state(void *arg, int family, int state,
 	struct rejoin *r = arg;
 
 	token_set_family(&r->tok, family, state, addr, port);
-	if (token_encode(&r->tok, r->str, sizeof(r->str)))
+	if (token_encode_buf(&r->tok, r->str))
 		r->str[0] = '\0';	/* keep the one we came in on */
 }
 

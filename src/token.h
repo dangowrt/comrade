@@ -86,6 +86,13 @@ struct token {
 };
 
 int token_encode(const struct token *tok, char *dest, size_t dest_len);
+
+/* `dest` must be an array, not a pointer. */
+#define token_encode_buf(tok, dest) \
+	token_encode((tok), (dest), sizeof(dest) + \
+		     0 * sizeof(char[sizeof(dest) >= TOKEN_STR_LEN + 1 ? \
+				     1 : -1]))
+
 /*
  * Returns 0, or TOKEN_ERR_VERSION for a well-formed token of a version this
  * build does not speak, or -1 for anything else. The version is worth telling

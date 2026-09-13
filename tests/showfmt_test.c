@@ -31,9 +31,9 @@ static int run(int what, int nses, int with_ro, const char *statejson,
 	t.version = TOKEN_VERSION;
 	token_set_family(&t, 4, TOKEN_STATE_RENDEZVOUS, a4, 6881);
 	token_set_family(&t, 6, TOKEN_STATE_NONE, NULL, 0);
-	assert(!token_encode(&t, tok, sizeof(tok)));
+	assert(!token_encode_buf(&t, tok));
 	t.flags |= TOKEN_FLAG_RO;
-	assert(!token_encode(&t, ro, sizeof(ro)));
+	assert(!token_encode_buf(&t, ro));
 
 	showfmt_begin(&sf, what, f);
 	for (i = 0; i < nses; i++)

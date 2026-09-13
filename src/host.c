@@ -853,14 +853,14 @@ static void svc_emit_token(struct svc *v)
 	struct token ro;
 	int fd, wrote = 0;
 
-	if (token_encode(&v->tok, tokbuf, sizeof(tokbuf)))
+	if (token_encode_buf(&v->tok, tokbuf))
 		return;
 	if (!strcmp(tokbuf, v->last_tok))
 		return;
 	ro = v->tok;
 	ro.flags |= TOKEN_FLAG_RO;
 	keys_derive_ro_auth(ro.auth, v->tok.auth);
-	if (token_encode(&ro, tokbuf_ro, sizeof(tokbuf_ro)))
+	if (token_encode_buf(&ro, tokbuf_ro))
 		return;
 	snprintf(tmp, sizeof(tmp), "%s.tmp", v->tokfile);
 	unlink(tmp);

@@ -69,7 +69,7 @@ static void token_roundtrip_check(void)
 	size_t i;
 
 	token_fill(&in);
-	assert(token_encode(&in, str, sizeof(str)) == 0);
+	assert(token_encode_buf(&in, str) == 0);
 	/* Always exactly TOKEN_STR_LEN, and no ambiguous glyphs. */
 	assert(strlen(str) == TOKEN_STR_LEN);
 	for (i = 0; str[i]; i++)
@@ -93,7 +93,7 @@ static void token_typo_check(void)
 	size_t i, caught = 0;
 
 	token_fill(&in);
-	assert(token_encode(&in, str, sizeof(str)) == 0);
+	assert(token_encode_buf(&in, str) == 0);
 
 	/* Every single-character substitution is caught by the checksum
 	 * (or is an invalid character); none decodes to a valid token. */
@@ -144,7 +144,7 @@ static void token_kinds_check(void)
 					in.ep4_port = 51820;
 				}
 
-				assert(token_encode(&in, str, sizeof(str)) == 0);
+				assert(token_encode_buf(&in, str) == 0);
 				assert(strlen(str) == TOKEN_STR_LEN);
 				for (i = 0; str[i]; i++)
 					assert(str[i] != '0' && str[i] != 'O' &&
@@ -217,7 +217,7 @@ static void token_state_check(void)
 				assert(!t.ep4_port);
 
 			/* The pair a client reads is the pair the host wrote. */
-			assert(token_encode(&t, str, sizeof(str)) == 0);
+			assert(token_encode_buf(&t, str) == 0);
 			assert(token_decode(&w, str) == 0);
 			assert(token_family_state(&w, 6) == states[s6]);
 			assert(token_family_state(&w, 4) == states[s4]);
@@ -291,7 +291,7 @@ static void token_reject_check(void)
 
 	token_fill(&in);
 	assert(token_encode(&in, small, sizeof(small)) < 0);   /* buffer too small */
-	assert(token_encode(&in, str, sizeof(str)) == 0);
+	assert(token_encode_buf(&in, str) == 0);
 	assert(token_decode(&out, "") < 0);                    /* empty */
 	assert(token_decode(&out, str + 1) < 0);               /* short by one */
 }

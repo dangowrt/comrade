@@ -94,7 +94,7 @@ static void print_token(void)
 {
 	char tokbuf[TOKEN_STR_LEN + 1];
 
-	if (token_encode(&host.tok, tokbuf, sizeof(tokbuf))) {
+	if (token_encode_buf(&host.tok, tokbuf)) {
 		fprintf(stderr, "error: token_encode failed\n");
 		return;
 	}
