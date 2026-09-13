@@ -7539,8 +7539,10 @@ int session_run(const struct session_cfg *cfg)
 	 */
 	s.next_roam_ms = (host_is_multiuser(cfg) && (cfg->sig_flags & SIG_DHT))
 		? 0 : now_ms() + (uint64_t)cfg->test_roam_ms;
-	if (keys_derive(&s.keys, cfg->tok.rdv))
-		return 1;
+	if (keys_derive(&s.keys, cfg->tok.rdv)) {
+		rc = 1;
+		goto done;
+	}
 	if (cfg->stun_auto)
 		s.stun_servers = stunlist_load(&s.stun_count);
 	/* Start the rotation at a random server: it spreads the install base
