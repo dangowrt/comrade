@@ -71,7 +71,8 @@ int main(void)
 	vsock = udp_loopback(&vport);
 	esock = udp_loopback(&eport);
 	fl = fcntl(vsock, F_GETFL, 0);
-	fcntl(vsock, F_SETFL, fl | O_NONBLOCK);
+	assert(fl >= 0);
+	assert(fcntl(vsock, F_SETFL, fl | O_NONBLOCK) == 0);
 
 	e = bep44_create(myid, esock, -1);
 	assert(e);

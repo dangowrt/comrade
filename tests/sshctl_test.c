@@ -102,9 +102,9 @@ int main(void)
 	assert(pipe(endp) == 0);
 	/* Keep the exec'd shell command from inheriting the end-of-session
 	 * write end, so closing it here actually gives endp[0] EOF. */
-	fcntl(endp[1], F_SETFD, FD_CLOEXEC);
-	fcntl(sctl[0], F_SETFL, O_NONBLOCK);
-	fcntl(cctl[0], F_SETFL, O_NONBLOCK);
+	assert(fcntl(endp[1], F_SETFD, FD_CLOEXEC) == 0);
+	assert(fcntl(sctl[0], F_SETFL, O_NONBLOCK) == 0);
+	assert(fcntl(cctl[0], F_SETFL, O_NONBLOCK) == 0);
 
 	ba = sshbridge_create(spa[0], g_a, 1000);
 	bb = sshbridge_create(spb[0], g_b, 1000);
