@@ -16,6 +16,7 @@ set -u
 
 E2E="${1:?path to comrade-e2e}"
 
+. "$(dirname "$0")/e2elib.sh"
 . "$(dirname "$0")/redact.sh"
 redact_output
 
@@ -46,7 +47,7 @@ hpid=$!
 
 tok=""
 i=0
-while [ "$i" -lt 60 ]; do
+while [ "$i" -lt "$(e2e_loops 60)" ]; do
 	c=$(sed -n 's/^COMRADE TOKEN: //p' "$tmp/host.out" 2>/dev/null | tail -1)
 	if [ -n "$c" ] && "$E2E" token "$c" 2>/dev/null |
 	    grep -q 'ep6_settled=1 ep4_settled=1'; then
@@ -63,7 +64,7 @@ COMRADE_DEBUG="$tmp/client.dbg" "$E2E" client "$tok" --mcast --no-dht \
 	--stun none --hold-ms 120000 --timeout 150 > "$tmp/client.out" 2>&1 &
 clientpid=$!
 i=0
-while [ "$i" -lt 90 ]; do
+while [ "$i" -lt "$(e2e_loops 90)" ]; do
 	n=$(grep -c "conn_run: sock_pair" "$tmp/client.dbg" 2>/dev/null)
 	[ "${n:-0}" -ge 2 ] && break
 	kill -0 "$clientpid" 2>/dev/null || break

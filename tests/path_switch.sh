@@ -34,6 +34,7 @@ set -u
 
 E2E="${1:?path to comrade-e2e}"
 
+. "$(dirname "$0")/e2elib.sh"
 . "$(dirname "$0")/redact.sh"
 redact_output
 
@@ -57,7 +58,7 @@ hpid=$!
 # wait for both families to settle; with the DHT declined that is quick.
 tok=""
 i=0
-while [ "$i" -lt 60 ]; do
+while [ "$i" -lt "$(e2e_loops 60)" ]; do
 	cand=$(sed -n 's/^COMRADE TOKEN: //p' "$tmp/host.out" 2>/dev/null | tail -1)
 	if [ -n "$cand" ] && "$E2E" token "$cand" 2>/dev/null |
 	   grep -q 'ep6_settled=1 ep4_settled=1'; then
@@ -68,7 +69,7 @@ while [ "$i" -lt 60 ]; do
 	fi
 	sleep 0.5; i=$((i + 1))
 done
-if [ -z "$tok" ]; then echo "no settled token after ~30s"; cat "$tmp/host.err"; exit 1; fi
+if [ -z "$tok" ]; then echo "no settled token after $i polls"; cat "$tmp/host.err"; exit 1; fi
 
 # Blackhole well after the paths have qualified (the unqualified probe period is
 # 200ms), and hold long enough afterwards for the switch, several heartbeat

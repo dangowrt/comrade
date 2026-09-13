@@ -17,6 +17,7 @@ set -u
 
 CR="${1:?path to comrade}"
 
+. "$(dirname "$0")/e2elib.sh"
 . "$(dirname "$0")/redact.sh"
 redact_output
 
@@ -74,7 +75,7 @@ skip() {
 # service is up -- and it is the file stop resolves the session through.
 wait_pid() {
 	i=0
-	while [ "$i" -lt 100 ]; do
+	while [ "$i" -lt "$(e2e_loops 100)" ]; do
 		[ -s "$COMRADE_STATE_DIR/$1.pid" ] && return 0
 		sleep 0.1
 		i=$((i + 1))
@@ -174,8 +175,10 @@ wait_pid killed || skip "the third host never started"
 spid=$(cat "$COMRADE_STATE_DIR/killed.pid" 2>/dev/null)
 hpid=$spid
 kill -KILL "$spid" 2>/dev/null
+lim=$(e2e_loops 50)
 i=0
-while [ "$i" -lt 50 ] && [ -n "$(ps -o stat= -p "$spid" 2>/dev/null | tr -d ' ')" ] &&
+while [ "$i" -lt "$lim" ] &&
+      [ -n "$(ps -o stat= -p "$spid" 2>/dev/null | tr -d ' ')" ] &&
       [ "$(ps -o stat= -p "$spid" 2>/dev/null | cut -c1)" != Z ]; do
 	sleep 0.1
 	i=$((i + 1))
@@ -184,7 +187,7 @@ state=$(ps -o stat= -p "$spid" 2>/dev/null | cut -c1)
 if [ -z "$state" ]; then
 	skip "the corpse was collected before stop could look at it"
 elif [ "$state" != Z ]; then
-	fail "the killed service is still in state $state after 5s"
+	fail "the killed service is still in state $state after $i polls"
 else
 	out=$("$CR" stop --id killed 2>&1)
 	sc=$?

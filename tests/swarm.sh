@@ -40,14 +40,10 @@
 # tests went back to failing now and then for want of a node to read it from
 # rather than for anything comrade did.
 
+. "$(dirname "$0")/e2elib.sh"
+
 SWARM_PIDS=""
 SWARM_DIR=""
-
-# A wait bound of N, scaled by the run's slowness: an instrumented or loaded
-# lane is many times slower, so its polls wait proportionally longer.
-e2e_loops() {
-	echo $(( ${1:-1} * ${COMRADE_E2E_TIMEOUT_SCALE:-1} ))
-}
 
 # A swarm the run already has: COMRADE_SWARM_FILE names a file the fixture
 # wrote with the bootstrap list, and the nodes behind it outlive any one test.

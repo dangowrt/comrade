@@ -17,6 +17,7 @@
 E2E="${1:?path to comrade-e2e}"
 SEED="${2:?path to comrade-dhtseed}"
 
+. "$(dirname "$0")/e2elib.sh"
 . "$(dirname "$0")/redact.sh"
 redact_output
 

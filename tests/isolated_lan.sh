@@ -20,6 +20,7 @@ set -u
 
 E2E="${1:?path to comrade-e2e}"
 
+. "$(dirname "$0")/e2elib.sh"
 . "$(dirname "$0")/redact.sh"
 redact_output
 
@@ -47,7 +48,7 @@ hpid=$!
 # as ICE gathering. A truncated last line simply fails to decode and we retry.
 tok=""
 i=0
-while [ "$i" -lt 40 ]; do
+while [ "$i" -lt "$(e2e_loops 40)" ]; do
 	cand=$(sed -n 's/^COMRADE TOKEN: //p' "$tmp/host.out" 2>/dev/null | tail -1)
 	if [ -n "$cand" ] && "$E2E" token "$cand" 2>/dev/null |
 	   grep -q 'ep6_settled=1 ep4_settled=1'; then
@@ -58,7 +59,7 @@ while [ "$i" -lt 40 ]; do
 	fi
 	sleep 0.5; i=$((i + 1))
 done
-if [ -z "$tok" ]; then echo "no settled token after ~20s"; cat "$tmp/host.err"; exit 1; fi
+if [ -z "$tok" ]; then echo "no settled token after $i polls"; cat "$tmp/host.err"; exit 1; fi
 
 # Assert the mint: both families settled to NONE, no address of the host's own
 # in either slot, and no token state telling the client to drop a transport

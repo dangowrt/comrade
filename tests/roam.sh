@@ -29,6 +29,7 @@ set -u
 
 E2E="${1:?path to comrade-e2e}"
 
+. "$(dirname "$0")/e2elib.sh"
 . "$(dirname "$0")/redact.sh"
 redact_output
 
@@ -64,7 +65,7 @@ hpid=$!
 # wait for both families to settle; with the DHT declined that is quick.
 tok=""
 i=0
-while [ "$i" -lt 60 ]; do
+while [ "$i" -lt "$(e2e_loops 60)" ]; do
 	cand=$(sed -n 's/^COMRADE TOKEN: //p' "$tmp/host.out" 2>/dev/null | tail -1)
 	if [ -n "$cand" ] && "$E2E" token "$cand" 2>/dev/null |
 	   grep -q 'ep6_settled=1 ep4_settled=1'; then
@@ -75,7 +76,7 @@ while [ "$i" -lt 60 ]; do
 	fi
 	sleep 0.5; i=$((i + 1))
 done
-if [ -z "$tok" ]; then echo "no settled token after ~30s"; cat "$tmp/host.err"; exit 1; fi
+if [ -z "$tok" ]; then echo "no settled token after $i polls"; cat "$tmp/host.err"; exit 1; fi
 
 # A, held open across the rebuilds B has to be admitted after. How long that
 # takes is what the loop below waits for, so the hold is only an upper bound.
@@ -85,12 +86,13 @@ apid=$!
 cpids="$cpids $apid"
 
 # Wait for the rebuilds B has to be admitted after.
+lim=$(e2e_loops 60)
 i=0
-while [ "$i" -lt 60 ]; do
+while [ "$i" -lt "$lim" ]; do
 	[ "$(rebuilds "$tmp/host.log")" -ge 3 ] && break
 	sleep 0.5; i=$((i + 1))
 done
-if [ "$i" -ge 60 ]; then
+if [ "$i" -ge "$lim" ]; then
 	echo "FAIL: the host did not rebuild its signalling (roam seam not firing?)"
 	cat "$tmp/host.err"; exit 1
 fi
