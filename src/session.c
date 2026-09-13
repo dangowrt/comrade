@@ -497,6 +497,9 @@ struct conn {
 					 * peer (fed by the receive threads) */
 	int hb_rtt;			/* round trip from the last pong, ms */
 	int hb_pong_seen;		/* a pong has ever come back on this conn */
+	/* Written only by conn_run, of which exactly one runs per connection,
+	 * so its own reads need no lock; the lock exists for the readers on
+	 * other threads. */
 	uint64_t lost_since_ms;		/* when the link was first seen lost, 0 if live */
 
 	/* What the peer has said about itself, handed from the ctl reader to
