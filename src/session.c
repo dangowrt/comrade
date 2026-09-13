@@ -8028,6 +8028,8 @@ done:
 	pthread_mutex_destroy(&s.c.peer_in_lock);
 	pthread_mutex_destroy(&s.c.stream_lock);
 	pthread_mutex_destroy(&s.c.path_lock);
+	pthread_mutex_destroy(&s.c.key_lock);
 	pthread_mutex_destroy(&s.pub_lock);
+	pthread_mutex_destroy(&s.ns_lock);
 	return rc;
 }
