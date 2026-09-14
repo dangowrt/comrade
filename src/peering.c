@@ -8,6 +8,7 @@
 #include <stdio.h>
 
 #include "dbg.h"
+#include "netroute.h"
 #include "keys.h"
 #include "peering.h"
 
@@ -739,4 +740,219 @@ void peering_owed(struct peering *pr, uint64_t now)
 	pr->next_rdvask_ms[0] = now;
 	pr->next_rdvask_ms[1] = now;
 	pr->next_hb_ms = now;
+}
+
+void peering_acks(struct peering_model *pm, uint64_t now)
+{
+	static const int famv[2] = { 4, 6 };
+	int i;
+
+	if (!pm->sig)
+		return;
+	for (i = 0; i < 2; i++) {
+		struct sockaddr_storage sa;
+		socklen_t sl = sizeof(sa);
+
+		/* Taken first and separately: a get answered by the node this
+		 * end holds and then by another holder would otherwise be read
+		 * as ours having gone quiet, which is how a live rendezvous
+		 * used to be given up seconds after being chosen. */
+		if (sig_take_anchor_seen(pm->sig, famv[i]))
+			netstate_on_anchor_seen(&pm->ns, famv[i], now);
+		/*
+		 * Rendezvousing for the peer on this family is precisely being
+		 * allowed to choose one, so the ordinary trial runs and the
+		 * node that wins it becomes this end's anchor by the rules
+		 * every other node goes through. The peer must not be able to
+		 * tell one found this way from one found for ourselves.
+		 */
+		netstate_set_picking(&pm->ns, famv[i],
+				     pm->is_host || pm->relay_fam[i]);
+		memset(&sa, 0, sizeof(sa));
+		if (!sig_take_ack(pm->sig, famv[i], (struct sockaddr *)&sa, &sl))
+			continue;
+		netstate_on_dht_ack(&pm->ns, famv[i],
+				    netstate_epoch(&pm->ns, famv[i]),
+				    (const uint8_t *)&sa, (int)sl, now);
+	}
+}
+
+/* Which address this machine would send from on `family`, as the kernel
+ * answers it now. */
+static void sample_src(struct peering_model *pm, int family, uint32_t epoch,
+		       uint64_t now)
+{
+	int af = family == 6 ? AF_INET6 : AF_INET;
+	uint8_t raw[16];
+	char text[64];
+	int len = 0;
+
+	if (net_source_addr(af, text, sizeof(text), raw, &len))
+		len = 0;
+	netstate_on_src(&pm->ns, family, epoch, len ? raw : NULL, len,
+			len ? net_addr_scope(text) : 0, len ? text : NULL, now);
+}
+
+static void apply(struct peering_model *pm, struct peering_net *net,
+		  const struct peering_settle *cfg,
+		  const struct netstate_actions *a, uint64_t now)
+{
+	static const int famv[2] = { 4, 6 };
+	int i;
+
+	for (i = 0; i < 2; i++) {
+		unsigned act = a->f[i];
+		int family = famv[i];
+
+		if (act & NSA_SAMPLE_SRC)
+			sample_src(pm, family, a->epoch[i], now);
+		if (act & NSA_KICK_PROBE) {
+			if (peering_net_kick(net, family, a->epoch[i],
+					     cfg->start6))
+				netstate_on_probe_started(&pm->ns, family,
+							  a->epoch[i], now);
+		}
+		if (act & NSA_EMIT_ROWS)
+			obsemit_rows(&pm->oe, family);
+		if (act & NSA_EMIT_CONN) {
+			int conn = netstate_conn(&pm->ns, family);
+
+			if (pm->sig)
+				sig_set_family_up(pm->sig, family,
+						  conn == NET_CONN_UP);
+			obsemit_conn(&pm->oe, family, conn);
+		}
+		if (act & NSA_RDV_PIN) {
+			uint8_t node[NETSTATE_SA_MAX];
+			uint8_t nlen = 0;
+
+			if (pm->sig && netstate_anchor(&pm->ns, family, node,
+						       &nlen, NULL))
+				sig_reinforce(pm->sig, family,
+					      (const struct sockaddr *)node,
+					      (socklen_t)nlen);
+		}
+		if (act & NSA_RDV_RELOCATE && pm->sig)
+			sig_search_again(pm->sig, family);
+		if (act & NSA_RDV_DROP && pm->sig)
+			sig_forget(pm->sig, family);
+		if (act & NSA_EMIT_RDV)
+			obsemit_rendezvous(&pm->oe, cfg->expect4, cfg->expect6);
+		/* NSA_EMIT_TOKEN is advisory: what a token says is recomputed
+		 * on its own cadence, which is what stops one churning through
+		 * the transient states a move passes through. */
+	}
+}
+
+void peering_settle(struct peering_model *pm, struct peering_net *net,
+		    const struct peering_settle *cfg, uint64_t now)
+{
+	struct nsfact f[NSFACTS_OUT];
+	struct netstate_actions a;
+	int n, i;
+
+	n = peering_facts_take(&net->facts, f, NSFACTS_OUT);
+	for (i = 0; i < n; i++) {
+		/* A round's end is said as its last act, so this does not
+		 * wait. */
+		if (f[i].kind == NSF_PROBE_DONE)
+			peering_net_reap(net, f[i].family);
+		peering_facts_feed(&pm->ns, &f[i], f[i].epoch, now);
+	}
+	netstate_tick(&pm->ns, now);
+	if (netstate_take_actions(&pm->ns, &a))
+		apply(pm, net, cfg, &a, now);
+}
+
+void peering_publish(struct peering_model *pm)
+{
+	static const int famv[2] = { 4, 6 };
+	uint8_t pl[CTL_REACH_PLEN];
+	int i, told = 0, moved;
+
+	if (pm->dht)
+		for (i = 0; i < 2; i++) {
+			uint8_t node[NETSTATE_SA_MAX], nlen = 0;
+			int confirmed = 0, same, proven = 0, vouched = 0;
+			int blind = 0, status;
+
+			if (!netstate_anchor(&pm->ns, famv[i], node, &nlen,
+					     &confirmed) || !nlen)
+				continue;
+			netstate_anchor_state(&pm->ns, famv[i], &proven,
+					      &vouched, &blind);
+			status = (proven ? CTL_RDVST_PROVEN : 0) |
+				 (vouched ? CTL_RDVST_VOUCHED : 0) |
+				 (blind ? CTL_RDVST_BLIND : 0);
+			pthread_mutex_lock(&pm->pub_lock);
+			same = pm->rdv[i].have && pm->rdv[i].len == nlen &&
+			       !memcmp(&pm->rdv[i].sa, node, nlen);
+			if (!same || pm->rdv[i].qualified != confirmed ||
+			    pm->rdv[i].status != status) {
+				memset(&pm->rdv[i].sa, 0, sizeof(pm->rdv[i].sa));
+				memcpy(&pm->rdv[i].sa, node, nlen);
+				pm->rdv[i].len = nlen;
+				pm->rdv[i].have = 1;
+				pm->rdv[i].qualified = confirmed;
+				pm->rdv[i].status = status;
+				pm->rdv_gen++;
+				told = 1;
+			}
+			pthread_mutex_unlock(&pm->pub_lock);
+		}
+	if (told) {
+		char b4[80], b6[80];
+
+		/* Named, because "published" alone cannot distinguish the
+		 * family that was already known from the one somebody is
+		 * waiting to be told about. */
+		b4[0] = b6[0] = '\0';
+		pthread_mutex_lock(&pm->pub_lock);
+		if (pm->rdv[0].have)
+			peering_sockaddr_text((struct sockaddr *)&pm->rdv[0].sa,
+					      pm->rdv[0].len, b4, sizeof(b4));
+		if (pm->rdv[1].have)
+			peering_sockaddr_text((struct sockaddr *)&pm->rdv[1].sa,
+					      pm->rdv[1].len, b6, sizeof(b6));
+		pthread_mutex_unlock(&pm->pub_lock);
+		dbg_logf("rdv: publishing set %u: v4 %s v6 %s",
+			 (unsigned)pm->rdv_gen, b4[0] ? b4 : "-",
+			 b6[0] ? b6 : "-");
+	}
+
+	/*
+	 * A verdict alone would not be enough to act on: NET_CONN_UP is
+	 * asserted by a STUN round trip as readily as by the DHT, and it is
+	 * the DHT a peer would be relying on if it asked this end to
+	 * rendezvous for it. So the DHT's own answer travels beside the
+	 * verdict rather than folded into it.
+	 */
+	memset(pl, 0, sizeof(pl));
+	for (i = 0; i < 2; i++) {
+		int conn = 0, acked = 0, state;
+
+		netstate_reach(&pm->ns, famv[i], &conn, &acked);
+		state = conn == NET_CONN_UP ? CTL_REACH_UP :
+			conn == NET_CONN_PENDING ? CTL_REACH_PENDING :
+						   CTL_REACH_DOWN;
+		ctl_reach_encode(pl, i, state, acked ? CTL_REACHF_DHT : 0);
+	}
+	pthread_mutex_lock(&pm->pub_lock);
+	moved = memcmp(pm->reach, pl, sizeof(pl)) != 0;
+	if (moved) {
+		memcpy(pm->reach, pl, sizeof(pl));
+		pm->reach_gen++;
+	}
+	pthread_mutex_unlock(&pm->pub_lock);
+	if (moved)
+		dbg_logf("reach: v4 %u/%u v6 %u/%u", pl[0], pl[1], pl[2],
+			 pl[3]);
+}
+
+void peering_advance(struct peering_model *pm, struct peering_net *net,
+		     const struct peering_settle *cfg, uint64_t now)
+{
+	peering_acks(pm, now);
+	peering_settle(pm, net, cfg, now);
+	peering_publish(pm);
 }
