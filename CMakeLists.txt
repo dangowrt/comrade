@@ -711,7 +711,8 @@ target_link_libraries(comrade_obsemit PUBLIC comrade_netstate comrade_compat)
 add_library(comrade_peering STATIC src/peering.c)
 target_include_directories(comrade_peering PUBLIC src)
 target_link_libraries(comrade_peering PUBLIC comrade_netstate comrade_nsfacts
-	comrade_stunprobe comrade_crypto comrade_dbg comrade_compat)
+	comrade_stunprobe comrade_pathplane comrade_ctlplane comrade_probeplane
+	comrade_crypto comrade_dbg comrade_compat)
 
 add_library(comrade_lanlink STATIC src/lanlink.c)
 target_include_directories(comrade_lanlink PUBLIC src)

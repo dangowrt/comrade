@@ -273,10 +273,11 @@ struct conn {
 					 * not a mere pickup rotation */
 
 	/*
-	 * What this connection's probes and stream datagrams are sealed under,
-	 * and the counters that go with them.
+	 * The three planes this connection peers through: what its probes and
+	 * stream datagrams are sealed under, the paths that carry them, and the
+	 * channel the pair talks over.
 	 */
-	struct probeplane probe;
+	struct peering pr;
 
 	struct nat_agent *nat;
 	struct ice_ctx *nat_ctx;
@@ -300,12 +301,11 @@ struct conn {
 	 * offer holds. So a path carries the session only once a probe has
 	 * round-tripped on it bearing our own claimant identity.
 	 *
-	 * The computations under the plane's lock are the ranking, a handful of
-	 * integer compares over at most PATH_TABLE_MAX entries, and the path
-	 * id, a keyed digest over 36 bytes taken when an endpoint of the pair
-	 * is learnt or changes.
+	 * The computations under the path plane's lock are the ranking, a
+	 * handful of integer compares over at most PATH_TABLE_MAX entries, and
+	 * the path id, a keyed digest over 36 bytes taken when an endpoint of
+	 * the pair is learnt or changes.
 	 */
-	struct pathplane pl;
 	/*
 	 * The turnstile's answer slot is the mutex, so it -- not a clock -- says
 	 * whether this client is still in the running. held_seen records that our
@@ -414,7 +414,6 @@ struct conn {
 	 * reachability, the requests, and the ping and pong a dead link is
 	 * noticed by even when nobody is typing.
 	 */
-	struct ctlplane ctl;
 	/*
 	 * The last link state and round trip reported to the view, and whether
 	 * anything has been. Cleared whenever this connection's row is created,
@@ -898,7 +897,7 @@ static void conn_heard(void *arg, uint64_t now)
 {
 	struct conn *c = arg;
 
-	ctlplane_heard(&c->ctl, now);
+	ctlplane_heard(&c->pr.cp, now);
 }
 
 /* A path becoming usable is the moment to retransmit the stream's backlog,
@@ -925,7 +924,7 @@ static void conn_peer_fresh(void *arg, const struct path_probe *pr,
 	(void)kind;
 	if (pr->type != PROBE_FRESH || !held)
 		return;
-	ctlplane_liveness(&c->ctl, &live);
+	ctlplane_liveness(&c->pr.cp, &live);
 	/* A connection that never carried a session has none to be told about:
 	 * this is the answer to a resume, and a first join is not one. */
 	if (!live.pong_seen || c->sess->cfg->is_host ||
@@ -963,18 +962,18 @@ static int conn_add_lan_path(struct conn *c, enum path_kind kind,
 
 	conn_sinks(c, &k);
 
-	return pathplane_add_ep(&c->pl, &k, kind, remote, label, label_len,
+	return pathplane_add_ep(&c->pr.pl, &k, kind, remote, label, label_len,
 				now_ms());
 }
 
 static void conn_add_ice_path(struct conn *c)
 {
-	pathplane_add_ice(&c->pl, c->nat, now_ms());
+	pathplane_add_ice(&c->pr.pl, c->nat, now_ms());
 }
 
 static void conn_drop_ice_path(struct conn *c)
 {
-	pathplane_drop_ice(&c->pl);
+	pathplane_drop_ice(&c->pr.pl);
 }
 
 /*
@@ -983,11 +982,9 @@ static void conn_drop_ice_path(struct conn *c)
  */
 static void conn_release(struct conn *c)
 {
-	ctlplane_destroy(&c->ctl);
+	peering_destroy(&c->pr);
 	pthread_mutex_destroy(&c->status_lock);
 	pthread_mutex_destroy(&c->stream_lock);
-	pathplane_destroy(&c->pl);
-	probeplane_destroy(&c->probe);
 	pthread_mutex_destroy(&c->claim_lock);
 	free(c);
 }
@@ -998,7 +995,7 @@ static void conn_free_agent(struct conn *c, struct nat_agent *agent,
 			    struct ice_ctx *ctx)
 {
 	if (agent) {
-		pathplane_drop_agent(&c->pl, agent);
+		pathplane_drop_agent(&c->pr.pl, agent);
 		nat_destroy(agent);
 	}
 	/* Past nat_destroy nothing can be inside this agent's callbacks, so a
@@ -1043,15 +1040,15 @@ static int conn_carrying_hold(struct conn *c)
 {
 	int sel, i, held = -1;
 
-	pthread_mutex_lock(&c->pl.lock);
-	sel = c->pl.t.sel;
-	if (sel >= 0 && c->pl.t.p[sel].used && c->pl.t.p[sel].agent)
+	pthread_mutex_lock(&c->pr.pl.lock);
+	sel = c->pr.pl.t.sel;
+	if (sel >= 0 && c->pr.pl.t.p[sel].used && c->pr.pl.t.p[sel].agent)
 		for (i = 0; i < ICE_HOLD_MAX; i++)
-			if (c->holds[i].agent == c->pl.t.p[sel].agent) {
+			if (c->holds[i].agent == c->pr.pl.t.p[sel].agent) {
 				held = i;
 				break;
 			}
-	pthread_mutex_unlock(&c->pl.lock);
+	pthread_mutex_unlock(&c->pr.pl.lock);
 	return held;
 }
 
@@ -1096,27 +1093,27 @@ static void conn_route_dedup(struct conn *c)
 	int nlose = 0, sel, i, j, h;
 	struct nat_agent *drop;
 
-	pthread_mutex_lock(&c->pl.lock);
-	sel = c->pl.t.sel;
+	pthread_mutex_lock(&c->pr.pl.lock);
+	sel = c->pr.pl.t.sel;
 	for (i = 0; i < PATH_TABLE_MAX; i++) {
-		if (!c->pl.t.p[i].used || c->pl.t.p[i].kind != PATH_ICE ||
-		    path_ep_any(&c->pl.t.p[i].peer_ep))
+		if (!c->pr.pl.t.p[i].used || c->pr.pl.t.p[i].kind != PATH_ICE ||
+		    path_ep_any(&c->pr.pl.t.p[i].peer_ep))
 			continue;
 		for (j = i + 1; j < PATH_TABLE_MAX; j++) {
-			if (!c->pl.t.p[j].used ||
-			    c->pl.t.p[j].kind != PATH_ICE ||
-			    !path_ep_same_addr(&c->pl.t.p[i].peer_ep,
-					       &c->pl.t.p[j].peer_ep) ||
-			    !c->pl.t.p[i].have_self_ep ||
-			    !c->pl.t.p[j].have_self_ep ||
-			    !path_ep_same_addr(&c->pl.t.p[i].self_ep,
-					       &c->pl.t.p[j].self_ep))
+			if (!c->pr.pl.t.p[j].used ||
+			    c->pr.pl.t.p[j].kind != PATH_ICE ||
+			    !path_ep_same_addr(&c->pr.pl.t.p[i].peer_ep,
+					       &c->pr.pl.t.p[j].peer_ep) ||
+			    !c->pr.pl.t.p[i].have_self_ep ||
+			    !c->pr.pl.t.p[j].have_self_ep ||
+			    !path_ep_same_addr(&c->pr.pl.t.p[i].self_ep,
+					       &c->pr.pl.t.p[j].self_ep))
 				continue;
 			drop = NULL;
-			if (c->pl.t.p[j].agent != c->nat && j != sel)
-				drop = c->pl.t.p[j].agent;
-			else if (c->pl.t.p[i].agent != c->nat && i != sel)
-				drop = c->pl.t.p[i].agent;
+			if (c->pr.pl.t.p[j].agent != c->nat && j != sel)
+				drop = c->pr.pl.t.p[j].agent;
+			else if (c->pr.pl.t.p[i].agent != c->nat && i != sel)
+				drop = c->pr.pl.t.p[i].agent;
 			for (h = 0; drop && h < ICE_HOLD_MAX; h++)
 				if (c->holds[h].agent == drop) {
 					loser[nlose] = drop;
@@ -1128,7 +1125,7 @@ static void conn_route_dedup(struct conn *c)
 				}
 		}
 	}
-	pthread_mutex_unlock(&c->pl.lock);
+	pthread_mutex_unlock(&c->pr.pl.lock);
 	for (i = 0; i < nlose; i++)
 		conn_free_agent(c, loser[i], loser_ctx[i]);
 }
@@ -1155,14 +1152,14 @@ static void conn_park_ice(struct conn *c, uint64_t now)
  * link-local endpoints a lanlink send cannot reliably reach. */
 static int conn_lan_paths(struct conn *c, int routable_only)
 {
-	return pathplane_lan_paths(&c->pl, routable_only);
+	return pathplane_lan_paths(&c->pr.pl, routable_only);
 }
 
 /* Does this connection hold a lanlink path naming this endpoint? exact asks for
  * the whole endpoint; otherwise the lanlink port alone identifies the peer. */
 static int conn_holds_ep(struct conn *c, const struct path_ep *ep, int exact)
 {
-	return pathplane_holds_ep(&c->pl, ep, exact);
+	return pathplane_holds_ep(&c->pr.pl, ep, exact);
 }
 
 /* What a caller needs of the path carrying the session, copied out under the
@@ -1216,14 +1213,14 @@ static int conn_pick(struct conn *c, struct path_pick *out)
 	out->kind = -1;
 	from[0] = '\0';
 	to[0] = '\0';
-	pthread_mutex_lock(&c->pl.lock);
+	pthread_mutex_lock(&c->pr.pl.lock);
 	for (i = 0; i < PATH_TABLE_MAX; i++)
-		c->pl.t.p[i].usable = pathplane_usable(&c->pl.t.p[i], live,
+		c->pr.pl.t.p[i].usable = pathplane_usable(&c->pr.pl.t.p[i], live,
 						       nlive);
-	prev = c->pl.t.sel;
-	sel = path_select(&c->pl.t, now_ms());
+	prev = c->pr.pl.t.sel;
+	sel = path_select(&c->pr.pl.t, now_ms());
 	if (sel >= 0) {
-		struct path *p = &c->pl.t.p[sel];
+		struct path *p = &c->pr.pl.t.p[sel];
 
 		out->kind = (int)p->kind;
 		out->remote = p->remote;
@@ -1235,12 +1232,12 @@ static int conn_pick(struct conn *c, struct path_pick *out)
 		snprintf(out->label, sizeof(out->label), "%s", p->label);
 		if (sel != prev) {
 			pathplane_desc(p, to, sizeof(to));
-			if (prev >= 0 && c->pl.t.p[prev].used)
-				pathplane_desc(&c->pl.t.p[prev], from,
+			if (prev >= 0 && c->pr.pl.t.p[prev].used)
+				pathplane_desc(&c->pr.pl.t.p[prev], from,
 					       sizeof(from));
 		}
 	}
-	pthread_mutex_unlock(&c->pl.lock);
+	pthread_mutex_unlock(&c->pr.pl.lock);
 	if (to[0]) {
 		dbg_logf("path: carrying %s (was %s)", to,
 			 from[0] ? from : "none");
@@ -1283,16 +1280,16 @@ static int conn_rtt_ms(struct conn *c, int *out)
 	struct ctlplane_live live;
 	int sel, known = 0;
 
-	pthread_mutex_lock(&c->pl.lock);
-	sel = c->pl.t.sel;
-	if (sel >= 0 && c->pl.t.p[sel].qualified) {
-		*out = path_srtt_ms(&c->pl.t.p[sel]);
+	pthread_mutex_lock(&c->pr.pl.lock);
+	sel = c->pr.pl.t.sel;
+	if (sel >= 0 && c->pr.pl.t.p[sel].qualified) {
+		*out = path_srtt_ms(&c->pr.pl.t.p[sel]);
 		known = 1;
 	}
-	pthread_mutex_unlock(&c->pl.lock);
+	pthread_mutex_unlock(&c->pr.pl.lock);
 	if (known)
 		return 1;
-	ctlplane_liveness(&c->ctl, &live);
+	ctlplane_liveness(&c->pr.cp, &live);
 	*out = live.rtt_ms;
 	/* The stream is the worker thread's to destroy, and it clears the
 	 * pointer under this lock before doing so; every other thread reads it
@@ -1311,11 +1308,11 @@ static int conn_proven_paths(struct conn *c)
 {
 	int i, n = 0;
 
-	pthread_mutex_lock(&c->pl.lock);
+	pthread_mutex_lock(&c->pr.pl.lock);
 	for (i = 0; i < PATH_TABLE_MAX; i++)
-		if (c->pl.t.p[i].used && c->pl.t.p[i].qualified)
+		if (c->pr.pl.t.p[i].used && c->pr.pl.t.p[i].qualified)
 			n++;
-	pthread_mutex_unlock(&c->pl.lock);
+	pthread_mutex_unlock(&c->pr.pl.lock);
 	return n;
 }
 
@@ -1331,7 +1328,7 @@ static void conn_offer_path(struct conn *c, const struct sockaddr *sa,
 	if (lanlink_map_peer(sa, len, &remote))
 		return;
 	conn_sinks(c, &k);
-	pathplane_offer_path(&c->pl, &k, &remote, now_ms());
+	pathplane_offer_path(&c->pr.pl, &k, &remote, now_ms());
 }
 
 /*
@@ -1464,7 +1461,7 @@ static void publish_status(struct conn *c, int state)
 	 * loss has lasted.
 	 */
 	cs.rtt_known = conn_rtt_ms(c, &cs.rtt_ms);
-	ctlplane_liveness(&c->ctl, &live);
+	ctlplane_liveness(&c->pr.cp, &live);
 	if (state == CONN_LOST && live.lost_since_ms)
 		cs.since_s = (int)((now_ms() - live.lost_since_ms) / 1000);
 	cs.silent_s = live.pong_seen ?
@@ -2001,7 +1998,7 @@ static int transport_send(struct conn *c, const uint8_t *data, size_t len)
 	struct path_pick pick;
 	size_t n;
 
-	n = probeplane_wrap(&c->probe, buf, sizeof(buf), data, len);
+	n = probeplane_wrap(&c->pr.pp, buf, sizeof(buf), data, len);
 	if (!n)
 		return -1;
 	if (conn_pick(c, &pick))
@@ -2133,7 +2130,7 @@ static void ctl_dispatch(void *arg, int type, const uint8_t *pl, size_t plen)
 	struct conn *c = arg;
 
 	conn_ctl_sinks(c, &k);
-	ctlplane_on_msg(&c->ctl, &k, type, pl, plen,
+	ctlplane_on_msg(&c->pr.cp, &k, type, pl, plen,
 			__atomic_load_n(&c->sess->netgen, __ATOMIC_RELAXED),
 			now_ms());
 }
@@ -2173,7 +2170,7 @@ static size_t conn_probe_seal(struct conn *c, struct path_probe *pr,
 
 	conn_ident(c, mine, sizeof(mine));
 
-	return probeplane_seal(&c->probe, pr, mine, out, PROBE_MAX);
+	return probeplane_seal(&c->pr.pp, pr, mine, out, PROBE_MAX);
 }
 
 
@@ -2234,7 +2231,7 @@ static void probe_recv(struct conn *c, const uint8_t *data, size_t len,
 	struct pathplane_sinks k;
 
 	conn_sinks(c, &k);
-	pathplane_recv(&c->pl, &k, data, len, kind, src, agent, now_ms());
+	pathplane_recv(&c->pr.pl, &k, data, len, kind, src, agent, now_ms());
 }
 
 /*
@@ -2248,7 +2245,7 @@ static void probe_recv(struct conn *c, const uint8_t *data, size_t len,
 static int probe_gate(struct sess *s, struct conn *c, const struct path_ep *ep,
 		      const uint8_t *data, size_t len)
 {
-	return pathplane_gate(c ? &c->pl : NULL, &s->adopt,
+	return pathplane_gate(c ? &c->pr.pl : NULL, &s->adopt,
 			      s->keys.probe_magic, ep, data, len, now_ms());
 }
 
@@ -2278,11 +2275,11 @@ static void probe_adopt(struct sess *s, const uint8_t *data, size_t len,
 		if (!c)
 			continue;
 		conn_sinks(c, &k);
-		claimed = pathplane_claims(&c->pl, &k, data, len, &pr);
+		claimed = pathplane_claims(&c->pr.pl, &k, data, len, &pr);
 		if (!claimed)
 			continue;
 		if (claimed > 0)
-			pathplane_apply(&c->pl, &k, &pr, PATH_SEGMENT, src,
+			pathplane_apply(&c->pr.pl, &k, &pr, PATH_SEGMENT, src,
 					NULL, now_ms());
 		return;
 	}
@@ -2304,11 +2301,11 @@ static void deliver_stream_from(struct conn *c, const uint8_t *data, size_t len,
 	if (__atomic_load_n(&c->bh_mute, __ATOMIC_RELAXED))
 				/* a staged total outage swallows receives */
 		return;
-	if (pathplane_is_probe(&c->pl, data, len)) {
+	if (pathplane_is_probe(&c->pr.pl, data, len)) {
 		probe_recv(c, data, len, kind, src, agent);
 		return;
 	}
-	if (probeplane_unwrap(&c->probe, data, &len))
+	if (probeplane_unwrap(&c->pr.pp, data, &len))
 		return;
 	pthread_mutex_lock(&c->stream_lock);
 	if (c->stream)
@@ -2325,7 +2322,7 @@ static void path_tick(struct conn *c, uint64_t now)
 	struct pathplane_sinks k;
 
 	conn_sinks(c, &k);
-	pathplane_tick(&c->pl, &k, now);
+	pathplane_tick(&c->pr.pl, &k, now);
 }
 
 /*
@@ -2341,7 +2338,7 @@ static int path_ready(struct conn *c)
 		return conn_lan_paths(c, 0) > 0 ||
 		       (c->nat && nat_connected(c->nat));
 
-	return pathplane_any_qualified(&c->pl);
+	return pathplane_any_qualified(&c->pr.pl);
 }
 
 /*
@@ -2566,7 +2563,7 @@ static int conn_is_lost(struct conn *c)
 {
 	int lost;
 
-	lost = ctlplane_lost(&c->ctl);
+	lost = ctlplane_lost(&c->pr.cp);
 	return lost;
 }
 
@@ -2793,9 +2790,9 @@ static void conn_gen_ice(struct conn *c)
 	}
 	/* What a probe proved was proved for one claimant identity, so a fresh
 	 * one voids every measurement; the endpoints themselves stand. */
-	pthread_mutex_lock(&c->pl.lock);
-	path_table_reset_stats(&c->pl.t, now_ms());
-	pthread_mutex_unlock(&c->pl.lock);
+	pthread_mutex_lock(&c->pr.pl.lock);
+	path_table_reset_stats(&c->pr.pl.t, now_ms());
+	pthread_mutex_unlock(&c->pr.pl.lock);
 	c->claim_held_seen = 0;
 	c->claim_lost = 0;
 	c->claim_released_ms = 0;
@@ -3010,7 +3007,7 @@ static void cand_tell(struct conn *c, uint64_t now)
 
 		if (!fam)
 			continue;
-		ctlplane_tell_cand(&c->ctl, &k, fam, (struct sockaddr *)&sa);
+		ctlplane_tell_cand(&c->pr.cp, &k, fam, (struct sockaddr *)&sa);
 	}
 }
 
@@ -3128,7 +3125,7 @@ static void rdv_tell(struct conn *c, uint64_t now)
 		 */
 		if (!pub[i].have)
 			continue;
-		ctlplane_tell_rdv(&c->ctl, &k, famv[i],
+		ctlplane_tell_rdv(&c->pr.cp, &k, famv[i],
 				  (struct sockaddr *)&pub[i].sa,
 				  pub[i].status);
 	}
@@ -3155,7 +3152,7 @@ static void rdv_adopt(struct sess *s, struct conn *c)
 	struct ctlplane_node in[2];
 	int i;
 
-	if (!c || !ctlplane_take_nodes(&c->ctl, in))
+	if (!c || !ctlplane_take_nodes(&c->pr.cp, in))
 		return;
 	for (i = 0; i < 2; i++) {
 		uint8_t node[NETSTATE_SA_MAX], nlen = 0;
@@ -3326,7 +3323,7 @@ static void reach_tell(struct conn *c, uint64_t now)
 	c->reach_told_gen = gen;
 	c->next_reach_tell_ms = now + REACH_TELL_MS;
 	conn_ctl_sinks(c, &k);
-	ctlplane_tell_reach(&c->ctl, &k, pl);
+	ctlplane_tell_reach(&c->pr.cp, &k, pl);
 }
 
 /* Take this peer's account of itself. Kept per connection, since in a
@@ -3340,7 +3337,7 @@ static void reach_take(struct sess *s, struct conn *c)
 	(void)s;
 	if (!c)
 		return;
-	if (!ctlplane_take_reach(&c->ctl, pl))
+	if (!ctlplane_take_reach(&c->pr.cp, pl))
 		return;
 	for (i = 0; i < 2; i++) {
 		int state = 0, flags = 0;
@@ -3405,7 +3402,7 @@ static void rdv_ask(struct sess *s, struct conn *c, uint64_t now)
 
 	if (!s->cfg->is_host || !c || !(s->cfg->sig_flags & SIG_DHT))
 		return;
-	if (!ctlplane_peer_reach(&c->ctl, reach))
+	if (!ctlplane_peer_reach(&c->pr.cp, reach))
 		return;			/* it has not said, so do not presume */
 	for (i = 0; i < 2; i++) {
 		int state = 0, flags = 0;
@@ -3430,7 +3427,7 @@ static void rdv_ask(struct sess *s, struct conn *c, uint64_t now)
 		if (state != CTL_REACH_UP)
 			continue;
 		c->next_rdvask_ms[i] = now + RDVASK_MS;
-		ctlplane_ask_rdv(&c->ctl, famv[i]);
+		ctlplane_ask_rdv(&c->pr.cp, famv[i]);
 		dbg_logf("rdv: asking peer %d to rendezvous on v%d", c->dash_id,
 			 famv[i]);
 	}
@@ -3442,7 +3439,7 @@ static void rdvask_tell(struct conn *c)
 	struct ctlplane_sinks k;
 
 	conn_ctl_sinks(c, &k);
-	ctlplane_tell_asks(&c->ctl, &k);
+	ctlplane_tell_asks(&c->pr.cp, &k);
 }
 
 /*
@@ -3465,7 +3462,7 @@ static void rdv_serve_ask(struct sess *s, struct conn *c, uint64_t now)
 	if (s->cfg->is_host || !s->sig)
 		return;
 	if (c) {
-		ask = ctlplane_take_asks(&c->ctl);
+		ask = ctlplane_take_asks(&c->pr.cp);
 	}
 	for (i = 0; i < 2; i++) {
 		if (ask & (i ? 2 : 1)) {
@@ -3771,7 +3768,7 @@ static void resume_tick(struct conn *c)
 	 * path never trips "lost" (KCP still trickles), so it must be seen here. */
 	net_watch(s, now);
 	moved = net_moved(s);
-	ctlplane_liveness(&c->ctl, &live);
+	ctlplane_liveness(&c->pr.cp, &live);
 	lost = live.lost_since_ms != 0 &&
 	       now - live.lost_since_ms >= RESUME_AFTER_MS;
 	if (!lost && !moved) {
@@ -4158,8 +4155,7 @@ static int conn_run(struct conn *c, int drive_sig)
 	c->shell_ended = 0;
 	c->end_verdict = 0;
 	/* The probe key belongs to the channel that agreed it. */
-	probeplane_reset(&c->probe);
-	ctlplane_reset(&c->ctl);
+	peering_reset(&c->pr);
 	dbg_logf("conn_run: sock_pair ok sp=%d/%d cp=%d/%d, starting ssh thread",
 		 (int)sp[0], (int)sp[1], (int)cp[0], (int)cp[1]);
 	if (pthread_create(&th, NULL,
@@ -4183,7 +4179,7 @@ static int conn_run(struct conn *c, int drive_sig)
 	/* The path is up on entry, so start the liveness clock as alive, and
 	 * what was said about the session before this one is spent. */
 	__atomic_store_n(&c->peer_fresh, 0, __ATOMIC_RELAXED);
-	ctlplane_live_reset(&c->ctl, now_ms());
+	ctlplane_live_reset(&c->pr.cp, now_ms());
 	/*
 	 * And say so before the session starts. Status is published on a
 	 * cadence, so until the first turn of the loop below the last one
@@ -4248,7 +4244,7 @@ static int conn_run(struct conn *c, int drive_sig)
 			__atomic_store_n(&c->bh_mute, 0, __ATOMIC_RELAXED);
 			/* The resumed link earns a full liveness window; without
 			 * this it is judged by silence that predates it. */
-			ctlplane_heard(&c->ctl, now_ms());
+			ctlplane_heard(&c->pr.cp, now_ms());
 			dbg_logf("resume: adopted the re-punched agent");
 		}
 		if (drive_sig) {
@@ -4306,14 +4302,14 @@ static int conn_run(struct conn *c, int drive_sig)
 				c->bh_done = 1;
 				dbg_logf("path blackholed: all");
 			} else if (!conn_pick(c, &pick)) {
-				pthread_mutex_lock(&c->pl.lock);
+				pthread_mutex_lock(&c->pr.pl.lock);
 				memset(&c->bh_ep, 0, sizeof(c->bh_ep));
 				path_ep_from_sockaddr(&c->bh_ep,
 					(struct sockaddr *)&pick.remote,
 					sizeof(pick.remote));
 				c->bh_kind = pick.kind;
 				c->bh_done = 1;
-				pthread_mutex_unlock(&c->pl.lock);
+				pthread_mutex_unlock(&c->pr.pl.lock);
 				dbg_logf("path blackholed: %s",
 					 pick.label[0] ? pick.label : "ICE");
 			}
@@ -4323,9 +4319,9 @@ static int conn_run(struct conn *c, int drive_sig)
 		    s->cfg->test_blackhole_lift_ms > 0 &&
 		    now_ms() - conn_start >
 		    (uint64_t)s->cfg->test_blackhole_lift_ms) {
-			pthread_mutex_lock(&c->pl.lock);
+			pthread_mutex_lock(&c->pr.pl.lock);
 			c->bh_kind = -1;
-			pthread_mutex_unlock(&c->pl.lock);
+			pthread_mutex_unlock(&c->pr.pl.lock);
 			__atomic_store_n(&c->bh_mute, 0, __ATOMIC_RELAXED);
 			dbg_logf("path blackhole lifted");
 		}
@@ -4334,13 +4330,13 @@ static int conn_run(struct conn *c, int drive_sig)
 			struct ctlplane_sinks ck;
 
 			conn_ctl_sinks(c, &ck);
-			ctlplane_offer_key(&c->ctl, &ck);
+			ctlplane_offer_key(&c->pr.cp, &ck);
 		}
 		if (now_ms() >= next_hb) {
 			struct ctlplane_sinks ck;
 
 			conn_ctl_sinks(c, &ck);
-			ctlplane_ping(&c->ctl, &ck, now_ms());
+			ctlplane_ping(&c->pr.cp, &ck, now_ms());
 			next_hb = now_ms() + HB_INTERVAL_MS;
 		}
 		/*
@@ -4422,7 +4418,7 @@ static int conn_run(struct conn *c, int drive_sig)
 			uint64_t now = now_ms(), lp;
 			int state;
 
-			state = ctlplane_judge(&c->ctl, now, &lp) ? CONN_LOST :
+			state = ctlplane_judge(&c->pr.cp, now, &lp) ? CONN_LOST :
 								    CONN_LIVE;
 			publish_status(c, state);
 			/* The heartbeat is end to end, so this says the
@@ -4458,7 +4454,7 @@ static int conn_run(struct conn *c, int drive_sig)
 				struct host_reap hr;
 				int verdict;
 
-				ctlplane_liveness(&c->ctl, &live);
+				ctlplane_liveness(&c->pr.cp, &live);
 				hr.conn_start_ms = conn_start;
 				hr.lost_since_ms = live.lost_since_ms;
 				hr.resume_last_ms =
@@ -4522,8 +4518,7 @@ static int conn_run(struct conn *c, int drive_sig)
 	 * on is built before the next channel exists, so the binding cannot
 	 * outlive the session that agreed it.
 	 */
-	probeplane_reset(&c->probe);
-	ctlplane_reset(&c->ctl);
+	peering_reset(&c->pr);
 	/* Clear the stream under the lock before destroying it: a transport
 	 * receive thread (or the host's main-thread demux) may be about to call
 	 * stream_input on it. After this, deliver_stream sees NULL and no-ops. */
@@ -4753,7 +4748,7 @@ static int conn_link_state(const struct sess *s, struct conn *c)
 	int seen, lost, rtt;
 	unsigned gen;
 
-	ctlplane_liveness(&c->ctl, &live);
+	ctlplane_liveness(&c->pr.cp, &live);
 	last = live.last_pong_ms;
 	seen = live.pong_seen;
 	gen = live.live_gen;
@@ -4994,13 +4989,10 @@ static struct conn *conn_alloc(struct sess *s)
 	c->sess = s;
 	c->ctl_fd = INVALID_SOCK;
 	c->bh_kind = -1;
-	ctlplane_init(&c->ctl, &c->probe);
+	peering_init(&c->pr, s->keys.probe_magic, s->keys.sig_key, now_ms());
 	pthread_mutex_init(&c->status_lock, NULL);
 	pthread_mutex_init(&c->stream_lock, NULL);
 	pthread_mutex_init(&c->claim_lock, NULL);
-	probeplane_init(&c->probe, s->keys.probe_magic, s->keys.sig_key,
-			now_ms());
-	pathplane_init(&c->pl, &c->probe);
 	conn_gen_ice(c);
 	return c;
 }
@@ -5179,7 +5171,7 @@ static int conn_is_proven(struct conn *c)
 {
 	struct ctlplane_live live;
 
-	ctlplane_liveness(&c->ctl, &live);
+	ctlplane_liveness(&c->pr.cp, &live);
 
 	return live.pong_seen;
 }
@@ -6322,13 +6314,10 @@ int session_run(const struct session_cfg *cfg)
 		return 1;
 	pthread_mutex_init(&s.trickle_lock, NULL);
 	pthread_mutex_init(&s.c.status_lock, NULL);	/* s.c.status zeroed = connecting */
-	ctlplane_init(&s.c.ctl, &s.c.probe);
+	peering_init(&s.c.pr, s.keys.probe_magic, s.keys.sig_key, now_ms());
 	pthread_mutex_init(&s.c.stream_lock, NULL);
 	pthread_mutex_init(&s.c.claim_lock, NULL);
 	pthread_mutex_init(&s.pub_lock, NULL);
-	probeplane_init(&s.c.probe, s.keys.probe_magic, s.keys.sig_key,
-			now_ms());
-	pathplane_init(&s.c.pl, &s.c.probe);
 	netmon_init(&s.netmon);
 	netmon_src_open(&s.netmon);
 	netstate_init(&s.ns, cfg->is_host, now_ms());
@@ -6468,9 +6457,9 @@ int session_run(const struct session_cfg *cfg)
 				s.c.nat_ctx = NULL;
 			}
 			conn_gen_ice(&s.c);
-			pthread_mutex_lock(&s.c.pl.lock);
-			path_table_clear(&s.c.pl.t);
-			pthread_mutex_unlock(&s.c.pl.lock);
+			pthread_mutex_lock(&s.c.pr.pl.lock);
+			path_table_clear(&s.c.pr.pl.t);
+			pthread_mutex_unlock(&s.c.pr.pl.lock);
 			net_change_reset(&s);
 			st = ST_WAIT_DHT;
 		}
@@ -6744,9 +6733,9 @@ int session_run(const struct session_cfg *cfg)
 				net_pump(&s, now_ms());
 				if (net_moved(&s)) {
 					net_change_reset(&s);
-					pthread_mutex_lock(&s.c.pl.lock);
-					path_table_clear(&s.c.pl.t);
-					pthread_mutex_unlock(&s.c.pl.lock);
+					pthread_mutex_lock(&s.c.pr.pl.lock);
+					path_table_clear(&s.c.pr.pl.t);
+					pthread_mutex_unlock(&s.c.pr.pl.lock);
 					if (sig_rebuild(&s,
 							"on the new network")) {
 						st = ST_FAIL;
@@ -6826,11 +6815,9 @@ done:
 	stunlist_free(s.stun_servers, s.stun_count);
 	pthread_mutex_destroy(&s.trickle_lock);
 	pthread_mutex_destroy(&s.c.status_lock);
-	probeplane_destroy(&s.c.probe);
+	peering_destroy(&s.c.pr);
 	pthread_mutex_destroy(&s.c.claim_lock);
-	ctlplane_destroy(&s.c.ctl);
 	pthread_mutex_destroy(&s.c.stream_lock);
-	pathplane_destroy(&s.c.pl);
 	pthread_mutex_destroy(&s.pub_lock);
 	peering_net_destroy(&s.net);
 	return rc;

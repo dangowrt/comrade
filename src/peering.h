@@ -19,8 +19,11 @@
 #include <stdint.h>
 #include <pthread.h>
 
+#include "ctlplane.h"
 #include "netstate.h"
 #include "nsfacts.h"
+#include "pathplane.h"
+#include "probeplane.h"
 #include "stunprobe.h"
 
 /*
@@ -216,5 +219,36 @@ void peering_net_halt(struct peering_net *m, int family);
 
 /* Join a round that has posted its end. Idempotent. */
 void peering_net_reap(struct peering_net *m, int family);
+
+/*
+ * ONE PEER.
+ *
+ * The three planes a pair needs, in the one object, wired to each other: the
+ * key schedule both of the others seal and open under, the paths that carry,
+ * and the channel the pair talks over. They are built in that order because
+ * each of the last two holds the first, and a playbook that assembled them
+ * itself would have to know that.
+ */
+struct peering {
+	struct probeplane pp;
+	struct pathplane pl;
+	struct ctlplane cp;
+};
+
+/*
+ * `key` is the base key the establishment primitive derived and `magic` the
+ * demux tag, both of which every holder of the primitive has. `seq0` is where
+ * this end's counters start, and it is the clock rather than one: see
+ * probeplane_init.
+ */
+void peering_init(struct peering *pr, uint32_t magic, const uint8_t key[32],
+		  uint64_t seq0);
+void peering_destroy(struct peering *pr);
+
+/*
+ * A fresh channel: the pair key belonged to the one that agreed it, and the
+ * halves that made it are spent with it.
+ */
+void peering_reset(struct peering *pr);
 
 #endif

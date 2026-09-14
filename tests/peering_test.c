@@ -190,9 +190,41 @@ static void a_move_empties_the_pool(void)
 	peering_pool_destroy(&p);
 }
 
+/*
+ * The three planes a pair needs are wired to each other, in the order that
+ * makes that possible: both of the others hold the key schedule.
+ */
+static void the_three_planes_are_wired_to_each_other(void)
+{
+	static const uint8_t key[32] = { 7, 7, 7 };
+	static const uint8_t half_a[KEYS_HALF_LEN] = { 1 };
+	static const uint8_t half_b[KEYS_HALF_LEN] = { 2 };
+	struct peering pr;
+
+	peering_init(&pr, 0x50454552u, key, 500);
+	assert(pr.pl.pp == &pr.pp);
+	assert(pr.cp.pp == &pr.pp);
+	assert(pr.pp.magic == 0x50454552u);
+	assert(pr.pp.seq == 500 && pr.pp.data_seq == 500);
+	assert(pr.pp.base_ok && !pr.pp.pair_ready);
+
+	/* What the channel agrees is what the paths then seal under. */
+	probeplane_bind(&pr.pp, half_a, half_b);
+	assert(pr.pp.pair_ready);
+	assert(probeplane_tx_ready(&pr.pp));
+
+	peering_reset(&pr);
+	assert(!pr.pp.pair_ready);	/* the pair key went with the channel */
+	assert(!pr.pp.pair_tx);
+	assert(pr.pp.base_ok);
+	assert(!pr.cp.half_sent && !pr.cp.half_seen);
+	peering_destroy(&pr);
+}
+
 int main(void)
 {
 	what_is_posted_is_taken_once();
+	the_three_planes_are_wired_to_each_other();
 	every_distinct_egress_address_is_kept();
 	a_round_forgets_the_samples_and_keeps_the_pool();
 	a_move_empties_the_pool();

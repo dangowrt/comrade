@@ -310,3 +310,24 @@ int peering_net_kick(struct peering_net *m, int family, uint32_t epoch,
 
 	return 1;
 }
+
+void peering_init(struct peering *pr, uint32_t magic, const uint8_t key[32],
+		  uint64_t seq0)
+{
+	probeplane_init(&pr->pp, magic, key, seq0);
+	pathplane_init(&pr->pl, &pr->pp);
+	ctlplane_init(&pr->cp, &pr->pp);
+}
+
+void peering_destroy(struct peering *pr)
+{
+	ctlplane_destroy(&pr->cp);
+	pathplane_destroy(&pr->pl);
+	probeplane_destroy(&pr->pp);
+}
+
+void peering_reset(struct peering *pr)
+{
+	probeplane_reset(&pr->pp);
+	ctlplane_reset(&pr->cp);
+}
