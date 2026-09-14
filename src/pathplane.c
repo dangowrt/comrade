@@ -533,3 +533,78 @@ int pathplane_claims(struct pathplane *pl, const struct pathplane_sinks *k,
 
 	return probeplane_fresh(pl->pp, pr) ? 1 : -1;
 }
+
+int pathplane_pick(struct pathplane *pl, const struct pathplane_sinks *k,
+		   uint64_t now, struct pathplane_pick *out)
+{
+	char from[PATH_LABEL_MAX + 64], to[PATH_LABEL_MAX + 64];
+	struct nat_agent *live[PATHPLANE_LIVE_MAX];
+	int nlive = 0, i, prev, sel;
+
+	if (k->live)
+		nlive = k->live(k->arg, live, PATHPLANE_LIVE_MAX);
+	memset(out, 0, sizeof(*out));
+	out->kind = -1;
+	out->nlive = nlive;
+	from[0] = '\0';
+	to[0] = '\0';
+	pthread_mutex_lock(&pl->lock);
+	for (i = 0; i < PATH_TABLE_MAX; i++)
+		pl->t.p[i].usable = k->live ?
+			pathplane_usable(&pl->t.p[i], live, nlive) : 1;
+	prev = pl->t.sel;
+	sel = path_select(&pl->t, now);
+	if (sel >= 0) {
+		struct path *p = &pl->t.p[sel];
+
+		out->kind = (int)p->kind;
+		out->remote = p->remote;
+		out->agent = p->agent;
+		out->qualified = p->qualified;
+		out->srtt_ms = path_srtt_ms(p);
+		out->blackholed = blackholed(k, out->kind, &p->remote);
+		snprintf(out->label, sizeof(out->label), "%s", p->label);
+		if (sel != prev) {
+			pathplane_desc(p, to, sizeof(to));
+			if (prev >= 0 && pl->t.p[prev].used)
+				pathplane_desc(&pl->t.p[prev], from,
+					       sizeof(from));
+		}
+	}
+	pthread_mutex_unlock(&pl->lock);
+	if (to[0]) {
+		dbg_logf("path: carrying %s (was %s)", to,
+			 from[0] ? from : "none");
+		out->moved = 1;
+	}
+
+	return out->kind < 0 ? -1 : 0;
+}
+
+int pathplane_carry_rtt(struct pathplane *pl, int *out)
+{
+	int sel, known = 0;
+
+	pthread_mutex_lock(&pl->lock);
+	sel = pl->t.sel;
+	if (sel >= 0 && pl->t.p[sel].qualified) {
+		*out = path_srtt_ms(&pl->t.p[sel]);
+		known = 1;
+	}
+	pthread_mutex_unlock(&pl->lock);
+
+	return known;
+}
+
+int pathplane_proven(struct pathplane *pl)
+{
+	int i, n = 0;
+
+	pthread_mutex_lock(&pl->lock);
+	for (i = 0; i < PATH_TABLE_MAX; i++)
+		if (pl->t.p[i].used && pl->t.p[i].qualified)
+			n++;
+	pthread_mutex_unlock(&pl->lock);
+
+	return n;
+}

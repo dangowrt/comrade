@@ -391,9 +391,49 @@ static void nothing_is_probed_without_an_identity(void)
 	end_done(&b);
 }
 
+/*
+ * The ranking is by measurement, and what is read off it says what has been
+ * proven rather than what is merely held.
+ */
+static void the_carry_is_read_off_the_ranking(void)
+{
+	struct pathplane_pick pick;
+	struct end a, b;
+	int rtt = -1;
+
+	end_init(&a, 1, "abcd");
+	end_init(&b, 2, "abcd");
+	assert(pathplane_pick(&a.pl, &a.k, 1000, &pick) == -1);
+	assert(pick.kind == -1);		/* nothing to carry on */
+	assert(!pathplane_proven(&a.pl));
+	assert(!pathplane_carry_rtt(&a.pl, &rtt));
+
+	assert(!pathplane_add_ep(&a.pl, &a.k, PATH_SEGMENT, &b.here, NULL, 0,
+				 1000));
+	assert(!pathplane_pick(&a.pl, &a.k, 1000, &pick));
+	assert(pick.kind == PATH_SEGMENT);
+	assert(pick.moved);			/* it began carrying here */
+	assert(!pick.qualified);		/* but nothing has answered */
+	assert(!pathplane_proven(&a.pl));
+	assert(!pathplane_carry_rtt(&a.pl, &rtt));
+
+	pathplane_tick(&a.pl, &a.k, 1000);
+	assert(deliver(&a, &b, 1010));
+	assert(deliver(&b, &a, 1020));
+	assert(!pathplane_pick(&a.pl, &a.k, 1020, &pick));
+	assert(pick.qualified);
+	assert(!pick.moved);			/* the same path still */
+	assert(pathplane_proven(&a.pl) == 1);
+	assert(pathplane_carry_rtt(&a.pl, &rtt));
+	assert(rtt >= 0);
+	end_done(&a);
+	end_done(&b);
+}
+
 int main(void)
 {
 	a_path_qualifies_only_once_it_answers();
+	the_carry_is_read_off_the_ranking();
 	a_probe_for_another_claimant_is_refused();
 	a_probe_is_acted_on_once();
 	a_ping_from_a_new_source_is_adopted();

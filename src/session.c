@@ -1065,16 +1065,6 @@ static int conn_holds_ep(struct conn *c, const struct path_ep *ep, int exact)
 
 /* What a caller needs of the path carrying the session, copied out under the
  * lock so nothing reaches into the table without it. */
-struct path_pick {
-	int kind;			/* -1 when no path can carry one */
-	int blackholed;			/* the test hook has taken this one away */
-	int qualified;			/* something has actually answered on it */
-	int srtt_ms;			/* its round trip, as the probes see it */
-	struct sockaddr_in6 remote;
-	struct nat_agent *agent;
-	char label[PATH_LABEL_MAX];
-};
-
 /*
  * The path carrying the session, chosen purely by measurement (path_select):
  * the lowest cost in the best occupied warmth tier, ties to the lowest id, both
@@ -1095,58 +1085,24 @@ struct path_pick {
  * are asked before the table is locked, since an agent call may not be made
  * under it.
  */
-static int conn_pick(struct conn *c, struct path_pick *out)
+static int conn_pick(struct conn *c, struct pathplane_pick *out)
 {
-	char from[PATH_LABEL_MAX + 64], to[PATH_LABEL_MAX + 64];
-	struct nat_agent *live[PATHPLANE_LIVE_MAX];
-	int nlive, i, prev, sel;
+	int rc = peering_pick(&c->pr, now_ms(), out);
 
-	nlive = conn_live_agents(c, live, PATHPLANE_LIVE_MAX);
 	/*
-	 * Published for the threads that may not touch the agent: it belongs to
-	 * this connection's own thread, which destroys it on a resume graft, so
-	 * a reader elsewhere holding the pointer holds freed memory. An int can
-	 * only ever be a turn out of date, which is what a status line is
-	 * anyway.
+	 * Published whether or not anything carries, and for the threads that
+	 * may not touch the agent: it belongs to this connection's own thread,
+	 * which destroys it on a resume graft, so a reader elsewhere holding
+	 * the pointer holds freed memory. An int can only ever be a turn out
+	 * of date, which is what a status line is anyway.
 	 */
-	c->ice_up = nlive > 0;
-	memset(out, 0, sizeof(*out));
-	out->kind = -1;
-	from[0] = '\0';
-	to[0] = '\0';
-	pthread_mutex_lock(&c->pr.pl.lock);
-	for (i = 0; i < PATH_TABLE_MAX; i++)
-		c->pr.pl.t.p[i].usable = pathplane_usable(&c->pr.pl.t.p[i], live,
-						       nlive);
-	prev = c->pr.pl.t.sel;
-	sel = path_select(&c->pr.pl.t, now_ms());
-	if (sel >= 0) {
-		struct path *p = &c->pr.pl.t.p[sel];
+	c->ice_up = out->nlive > 0;
+	/* A path becoming the one that carries is the moment to retransmit the
+	 * stream's backlog. */
+	if (out->moved && out->qualified)
+		__atomic_add_fetch(&c->carry_epoch, 1, __ATOMIC_RELAXED);
 
-		out->kind = (int)p->kind;
-		out->remote = p->remote;
-		out->agent = p->agent;
-		out->qualified = p->qualified;
-		out->srtt_ms = path_srtt_ms(p);
-		out->blackholed = conn_path_blackholed(c, out->kind,
-						       &p->remote);
-		snprintf(out->label, sizeof(out->label), "%s", p->label);
-		if (sel != prev) {
-			pathplane_desc(p, to, sizeof(to));
-			if (prev >= 0 && c->pr.pl.t.p[prev].used)
-				pathplane_desc(&c->pr.pl.t.p[prev], from,
-					       sizeof(from));
-		}
-	}
-	pthread_mutex_unlock(&c->pr.pl.lock);
-	if (to[0]) {
-		dbg_logf("path: carrying %s (was %s)", to,
-			 from[0] ? from : "none");
-		if (out->qualified)
-			__atomic_add_fetch(&c->carry_epoch, 1,
-					   __ATOMIC_RELAXED);
-	}
-	return out->kind < 0 ? -1 : 0;
+	return rc;
 }
 
 /* The endpoint the session is on right now, printable (view). Empty for an ICE
@@ -1155,7 +1111,7 @@ static int conn_pick(struct conn *c, struct path_pick *out)
  * on yet: a claim is not evidence. */
 static void conn_path_label(struct conn *c, char *out, size_t n)
 {
-	struct path_pick pick;
+	struct pathplane_pick pick;
 
 	out[0] = '\0';
 	if (!conn_pick(c, &pick) && pick.qualified)
@@ -1179,16 +1135,8 @@ static void conn_path_label(struct conn *c, char *out, size_t n)
 static int conn_rtt_ms(struct conn *c, int *out)
 {
 	struct ctlplane_live live;
-	int sel, known = 0;
 
-	pthread_mutex_lock(&c->pr.pl.lock);
-	sel = c->pr.pl.t.sel;
-	if (sel >= 0 && c->pr.pl.t.p[sel].qualified) {
-		*out = path_srtt_ms(&c->pr.pl.t.p[sel]);
-		known = 1;
-	}
-	pthread_mutex_unlock(&c->pr.pl.lock);
-	if (known)
+	if (pathplane_carry_rtt(&c->pr.pl, out))
 		return 1;
 	ctlplane_liveness(&c->pr.cp, &live);
 	*out = live.rtt_ms;
@@ -1207,14 +1155,7 @@ static int conn_rtt_ms(struct conn *c, int *out)
  * connection was actually proven on, stable as they later fall dead. */
 static int conn_proven_paths(struct conn *c)
 {
-	int i, n = 0;
-
-	pthread_mutex_lock(&c->pr.pl.lock);
-	for (i = 0; i < PATH_TABLE_MAX; i++)
-		if (c->pr.pl.t.p[i].used && c->pr.pl.t.p[i].qualified)
-			n++;
-	pthread_mutex_unlock(&c->pr.pl.lock);
-	return n;
+	return pathplane_proven(&c->pr.pl);
 }
 
 /* An endpoint the peer advertised over CTLM_CAND, entered as one more
@@ -1875,7 +1816,7 @@ static int transport_send(struct conn *c, const uint8_t *data, size_t len)
 {
 	struct sess *s = c->sess;
 	uint8_t buf[STREAM_MTU];
-	struct path_pick pick;
+	struct pathplane_pick pick;
 	size_t n;
 
 	n = probeplane_wrap(&c->pr.pp, buf, sizeof(buf), data, len);
@@ -3648,7 +3589,7 @@ static int conn_run(struct conn *c, int drive_sig)
 		    !c->bh_done &&
 		    now_ms() - conn_start >
 		    (uint64_t)s->cfg->test_blackhole_ms) {
-			struct path_pick pick;
+			struct pathplane_pick pick;
 
 			if (s->cfg->test_blackhole_all) {
 				__atomic_store_n(&c->bh_mute, 1,

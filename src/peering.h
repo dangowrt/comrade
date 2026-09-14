@@ -480,6 +480,10 @@ int peering_claims(struct peering *pr, const uint8_t *data, size_t len,
 		   enum path_kind kind, const struct sockaddr_in6 *src,
 		   uint64_t now);
 
+/* Which path carries this peer right now. */
+int peering_pick(struct peering *pr, uint64_t now,
+		 struct pathplane_pick *out);
+
 /* Enter an endpoint as a path: one this end has been given, and one the peer
  * advertised. */
 int peering_add_path(struct peering *pr, enum path_kind kind,

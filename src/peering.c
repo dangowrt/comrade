@@ -609,6 +609,12 @@ int peering_claims(struct peering *pr, const uint8_t *data, size_t len,
 	return claimed;
 }
 
+int peering_pick(struct peering *pr, uint64_t now,
+		 struct pathplane_pick *out)
+{
+	return pathplane_pick(&pr->pl, &pr->pk, now, out);
+}
+
 int peering_add_path(struct peering *pr, enum path_kind kind,
 		     const struct sockaddr_in6 *remote, char *label,
 		     size_t label_len, uint64_t now)

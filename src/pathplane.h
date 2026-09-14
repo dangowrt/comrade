@@ -144,6 +144,51 @@ int pathplane_lan_paths(struct pathplane *pl, int routable_only);
 int pathplane_any_qualified(struct pathplane *pl);
 
 /*
+ * The round trip on the path that carries, as its probes measured it on the
+ * wire, so it is the figure ping would give. Returns 0 when nothing has
+ * answered on it yet, in which case `out` is untouched and the caller has to
+ * fall back on whatever weaker figure it has.
+ */
+int pathplane_carry_rtt(struct pathplane *pl, int *out);
+
+/*
+ * How many distinct paths a probe has ever qualified. Qualification latches
+ * and never clears on silence, so this counts the endpoints this peer was
+ * actually proven on, and stays stable as they later fall dead.
+ */
+int pathplane_proven(struct pathplane *pl);
+
+/* What a caller needs of the path carrying right now, copied out under the
+ * lock so nothing reaches into the table without it. */
+struct pathplane_pick {
+	int kind;			/* -1 when no path can carry one */
+	int blackholed;			/* the test hook has taken this one away */
+	int qualified;			/* something has actually answered on it */
+	int srtt_ms;			/* its round trip, as the probes see it */
+	struct sockaddr_in6 remote;
+	struct nat_agent *agent;
+	char label[PATH_LABEL_MAX];
+	int nlive;			/* carriers that could send at all */
+	int moved;			/* the carry changed on this call */
+};
+
+/*
+ * Re-evaluate which path carries and report the choice, chosen purely by
+ * measurement: the lowest cost in the best occupied warmth tier, ties to the
+ * lowest id, both ends computing that from the same pair of published views.
+ * Kind plays no part, a path off ICE winning because it measures lower and the
+ * measurement being right where it does not.
+ *
+ * A carrier that has nominated no pair carries nothing at all, so it is marked
+ * unusable rather than ranked; the carriers are asked before the lock, which
+ * is never held across a call into one. Returns 0 when a path was chosen. A
+ * change is logged with both ends' numbers, the one triage surface when a
+ * switch looks wrong.
+ */
+int pathplane_pick(struct pathplane *pl, const struct pathplane_sinks *k,
+		   uint64_t now, struct pathplane_pick *out);
+
+/*
  * Can this path's transport carry a datagram right now? A path off ICE always
  * can; an ICE path only while the agent that owns it holds a pair. `live` is
  * what the playbook's own sink would answer, gathered before the table was
