@@ -22,6 +22,8 @@
 #include "ctlplane.h"
 #include "ctlproto.h"
 #include "netstate.h"
+#include "hbeat.h"
+#include "netmon.h"
 #include "obsemit.h"
 #include "sig.h"
 #include "nsfacts.h"
@@ -298,9 +300,18 @@ struct peering {
 	struct probeplane pp;
 	struct pathplane pl;
 	struct ctlplane cp;
+	struct ctlplane_sinks ck;	/* what carries what it says */
 	int id;				/* the row a watcher knows this peer by */
 	uint64_t next_rdvask_ms[2];	/* when it may be asked again about
 					 * each family; the model's thread */
+	/* The cadences of what this end tells this peer; the channel's own
+	 * thread. */
+	uint64_t next_cand_ms;
+	uint32_t rdv_told_gen;		/* published set this peer has been told */
+	uint64_t next_rdv_tell_ms;	/* backstop repeat of that announcement */
+	uint32_t reach_told_gen;	/* reachability this peer has been told */
+	uint64_t next_reach_tell_ms;
+	uint64_t next_hb_ms;		/* the next ping */
 };
 
 /*
@@ -318,6 +329,25 @@ void peering_destroy(struct peering *pr);
  * halves that made it are spent with it.
  */
 void peering_reset(struct peering *pr);
+
+/*
+ * Rendezvous and reachability announcement backstops. Each end tells the other
+ * the moment its set moves, a family newly qualified or a node replaced, so
+ * nothing waits on a cadence to learn of it; the repeat is only there because
+ * a control frame is written into the channel without waiting to watch it
+ * leave.
+ */
+#define PEERING_RDV_TELL_MS 30000
+#define PEERING_REACH_TELL_MS 30000
+/*
+ * Candidate advertisement cadence. Each end names its own local endpoints on
+ * the shared socket, so both explore the full set rather than only the pair
+ * admission produced, and a multi-homed end has its alternatives warm before
+ * anything fails. Repeated on a period rather than sent once: an interface
+ * brought up mid-session is then advertised within one, and a frame is 21
+ * bytes.
+ */
+#define PEERING_CAND_TELL_MS 5000
 
 /*
  * How often a host repeats a request that a peer rendezvous for it, and how
@@ -343,6 +373,34 @@ void peering_reset(struct peering *pr);
  * stream socket interleave whatever they were framing.
  */
 void peering_absorb(struct peering *pr, uint64_t now);
+
+/* What carries what this peer says, set once after init. */
+void peering_sinks(struct peering *pr, const struct ctlplane_sinks *ck);
+
+/*
+ * SAY THE STANDING THINGS, on their cadences.
+ *
+ * Where this end is rendezvoused, what it can reach, whatever rendezvous it
+ * owes this peer a request for, the endpoints it has learnt about itself, its
+ * half of the pair key, and a ping. Each is sent the moment it moves and
+ * repeated rarely, the repeat being there only because a frame is written into
+ * the channel without waiting to watch it leave.
+ *
+ * `cand_port` is the shared socket's, and the only transport able to send to
+ * an arbitrary endpoint, so an advertised endpoint always becomes a path off
+ * ICE. Zero advertises nothing, which is what an end with no such socket has
+ * to say about where it is.
+ *
+ * Runs on the thread that owns the channel.
+ */
+void peering_say(struct peering *pr, uint16_t cand_port, uint64_t now);
+
+/*
+ * This peer is owed the whole standing set from `now`, whatever an earlier
+ * connection on the same object was told: a channel that has just come up has
+ * heard none of it.
+ */
+void peering_owed(struct peering *pr, uint64_t now);
 
 /* Printable "addr:port" ("[v6]:port") for a sockaddr; empty on failure. */
 void peering_sockaddr_text(const struct sockaddr *sa, socklen_t len, char *out,

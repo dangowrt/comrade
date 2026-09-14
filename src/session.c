@@ -40,41 +40,6 @@
 #include "tokgen.h"
 
 
-/*
- * Rendezvous announcement backstop. Each end tells the other where it
- * rendezvous the moment the set moves -- a family newly qualified, a node
- * replaced -- so nothing waits on a cadence to learn of it. The repeat is only
- * there because a control frame is written into the channel without waiting to
- * watch it leave.
- */
-#define RDV_TELL_MS 30000
-/*
- * Reachability announcement backstop, on the same reasoning and for the same
- * reason: sent the moment it moves, repeated rarely in case a frame was
- * written into a channel that never carried it.
- */
-#define REACH_TELL_MS 30000
-/*
- * How often a host repeats its request that a client rendezvous for it. Slow:
- * the request costs the client a convergent store and the search runs until it
- * succeeds, so repeating is only for a client whose own situation has changed
- * since, or one that never heard the first.
- */
-#define RDVASK_MS 60000
-/* And how long one of those requests stands unrenewed. Several rounds, so a
- * request survives a lost frame or a host busy with something else, but not a
- * host that has stopped needing it. */
-#define RELAY_HOLD_MS (3 * RDVASK_MS)
-/*
- * Candidate advertisement cadence. Each end names its own local endpoints on
- * the shared lanlink socket over CTLM_CAND, so both explore the full set rather
- * than only the pair admission produced, and a multi-homed end has its
- * alternatives warm before anything fails. Repeated on a period rather than
- * sent once: an interface brought up mid-session is then advertised within one,
- * and a frame is 21 bytes.
- */
-#define CAND_TELL_MS 5000
-
 /* [0] is IPv4, [1] is IPv6. */
 static int fam_idx(int family)
 {
@@ -412,13 +377,6 @@ struct conn {
 	 * already told is a row left showing whatever it had.
 	 */
 	int link_told, rtt_told, paths_told, link_told_any;
-	uint64_t next_rdvask_ms[2];	/* host: when this peer may be asked
-					 * again about each family */
-	uint32_t rdv_told_gen;		/* published set this peer has been told */
-	uint64_t next_rdv_tell_ms;	/* backstop repeat of that announcement */
-	uint32_t reach_told_gen;	/* reachability this peer has been told */
-	uint64_t next_reach_tell_ms;
-	uint64_t next_cand_ms;		/* when to advertise our own endpoints */
 
 	/* This connection's status (data only; the view renders it). */
 	pthread_mutex_t status_lock;
@@ -2058,12 +2016,22 @@ static void conn_ctl_other(void *arg, int type, const uint8_t *pl, size_t plen)
 	}
 }
 
+/* Whether the comrade-ctl channel exists yet: a frame written into one that
+ * does not is dropped, and a half spent that way is spent for nothing. */
+static int conn_ctl_ready(void *arg)
+{
+	struct conn *c = arg;
+
+	return sock_valid(c->ctl_fd);
+}
+
 static void conn_ctl_sinks(struct conn *c, struct ctlplane_sinks *k)
 {
 	memset(k, 0, sizeof(*k));
 	k->send = conn_ctl_send;
 	k->offer_path = conn_ctl_offer_path;
 	k->answer_ping = conn_answer_ping;
+	k->ready = conn_ctl_ready;
 	k->pong = conn_pong_seen;
 	k->other = conn_ctl_other;
 	k->arg = c;
@@ -2920,45 +2888,6 @@ static void *ssh_cli_thread(void *p)
 }
 
 /*
- * Advertise our own local endpoints to the peer over CTLM_CAND, so it probes
- * and holds them rather than exploring only the pair admission produced. The
- * port is the shared lanlink socket's: that is the one transport able to send
- * to an arbitrary endpoint, so an advertised endpoint always becomes a SEGMENT
- * or ROUTED path and never an ICE one. The addresses come from the interface
- * snapshot, which already leaves out loopback (which names this machine to
- * nobody else) and IPv6 link-local (which travels without the zone id it cannot
- * be reached without). A session with no lanlink socket advertises nothing.
- * Self-throttled; runs from the connection's own loop.
- */
-static void cand_tell(struct conn *c, uint64_t now)
-{
-	struct netmon_addr addrs[NETMON_MAX_ADDRS];
-	struct ctlplane_sinks k;
-	struct sess *s = c->sess;
-	size_t naddrs, i;
-	uint16_t port;
-
-	if (now < c->next_cand_ms)
-		return;
-	c->next_cand_ms = now + CAND_TELL_MS;
-	if (!s->lan)
-		return;
-	port = lanlink_port(s->lan);
-	if (!port)
-		return;
-	conn_ctl_sinks(c, &k);
-	naddrs = netmon_snapshot(addrs, NETMON_MAX_ADDRS);
-	for (i = 0; i < naddrs; i++) {
-		struct sockaddr_storage sa;
-		int fam = netmon_addr_sockaddr(&addrs[i], port, &sa);
-
-		if (!fam)
-			continue;
-		ctlplane_tell_cand(&c->pr.cp, &k, fam, (struct sockaddr *)&sa);
-	}
-}
-
-/*
  * Publish the anchor each family holds, for the connections to read.
  *
  * Only a qualified one is handed to a peer: a node that has not proven itself
@@ -3043,41 +2972,6 @@ static void rdv_publish(struct sess *s)
  * copy, so a host worker announces exactly as the thread driving the
  * signalling does.
  */
-static void rdv_tell(struct conn *c, uint64_t now)
-{
-	static const int famv[2] = { 4, 6 };
-	struct ctlplane_sinks k;
-	struct sess *s = c->sess;
-	struct peering_rdv pub[2];
-	uint32_t gen;
-	int i;
-
-	pthread_mutex_lock(&s->pm.pub_lock);
-	memcpy(pub, s->pm.rdv, sizeof(pub));
-	gen = s->pm.rdv_gen;
-	pthread_mutex_unlock(&s->pm.pub_lock);
-
-	if (gen == c->rdv_told_gen && now < c->next_rdv_tell_ms)
-		return;
-	c->rdv_told_gen = gen;
-	c->next_rdv_tell_ms = now + RDV_TELL_MS;
-	conn_ctl_sinks(c, &k);
-	for (i = 0; i < 2; i++) {
-		/*
-		 * Unproven ones too. A node this end cannot prove is still
-		 * where it is meeting, and a peer that can reach the family
-		 * may be able to prove it -- which is the whole of how a host
-		 * with no route to a family keeps a rendezvous on it. The
-		 * status byte is what lets the peer tell the cases apart.
-		 */
-		if (!pub[i].have)
-			continue;
-		ctlplane_tell_rdv(&c->pr.cp, &k, famv[i],
-				  (struct sockaddr *)&pub[i].sa,
-				  pub[i].status);
-	}
-}
-
 /* The bare address bytes and host-order port a token slot carries. */
 static const uint8_t *ep_bytes(const struct sockaddr *sa, uint16_t *port)
 {
@@ -3174,42 +3068,6 @@ static void reach_publish(struct sess *s)
 	pthread_mutex_unlock(&s->pm.pub_lock);
 	if (moved)
 		dbg_logf("reach: v4 %u/%u v6 %u/%u", pl[0], pl[1], pl[2], pl[3]);
-}
-
-/*
- * Tell this peer what we can reach, whenever that is no longer what it was
- * told. A connection starts owing it, so the peer knows the moment it is
- * connected and again on every move. Runs on the connection's own thread.
- */
-static void reach_tell(struct conn *c, uint64_t now)
-{
-	struct ctlplane_sinks k;
-	struct sess *s = c->sess;
-	uint8_t pl[CTL_REACH_PLEN];
-	uint32_t gen;
-
-	pthread_mutex_lock(&s->pm.pub_lock);
-	memcpy(pl, s->pm.reach, sizeof(pl));
-	gen = s->pm.reach_gen;
-	pthread_mutex_unlock(&s->pm.pub_lock);
-
-	if (!gen)			/* nothing observed to report yet */
-		return;
-	if (gen == c->reach_told_gen && now < c->next_reach_tell_ms)
-		return;
-	c->reach_told_gen = gen;
-	c->next_reach_tell_ms = now + REACH_TELL_MS;
-	conn_ctl_sinks(c, &k);
-	ctlplane_tell_reach(&c->pr.cp, &k, pl);
-}
-
-/* Send what rdv_ask decided, from the loop that owns the control socket. */
-static void rdvask_tell(struct conn *c)
-{
-	struct ctlplane_sinks k;
-
-	conn_ctl_sinks(c, &k);
-	ctlplane_tell_asks(&c->pr.cp, &k);
 }
 
 /* Everything each served connection's peer has said about itself, drained on
@@ -3833,7 +3691,8 @@ static void net_settle(struct sess *s)
  */
 static int conn_run(struct conn *c, int drive_sig)
 {
-	uint64_t next_hb, conn_start;
+	struct ctlplane_sinks ck;
+	uint64_t conn_start;
 	int done = 0, link_lost = 0;
 	struct sess *s = c->sess;
 	uint32_t carry_seen = 0;
@@ -3914,17 +3773,12 @@ static int conn_run(struct conn *c, int drive_sig)
 	 * anything.
 	 */
 	publish_status(c, CONN_LIVE);
-	next_hb = now_ms();
 	conn_start = now_ms();
-	c->next_cand_ms = conn_start;
 	/* A fresh connection is owed the whole set, whatever an earlier one on
 	 * this struct was told. */
-	c->rdv_told_gen = 0;
-	c->next_rdv_tell_ms = conn_start;
-	c->reach_told_gen = 0;
-	c->next_reach_tell_ms = conn_start;
-	c->next_rdvask_ms[0] = conn_start;
-	c->next_rdvask_ms[1] = conn_start;
+	conn_ctl_sinks(c, &ck);
+	peering_sinks(&c->pr, &ck);
+	peering_owed(&c->pr, conn_start);
 
 	if (drive_sig) {
 		/* Capture a rendezvous node per family for reconnection (the host
@@ -4011,10 +3865,8 @@ static int conn_run(struct conn *c, int drive_sig)
 						    __ATOMIC_RELAXED);
 			stream_kick(st);
 		}
-		cand_tell(c, now_ms());
-		rdv_tell(c, now_ms());
-		reach_tell(c, now_ms());
-		rdvask_tell(c);
+		peering_say(&c->pr, s->lan ? lanlink_port(s->lan) : 0,
+			    now_ms());
 		if (s->cfg->test_blackhole_ms > 0 && c->bh_kind < 0 &&
 		    !c->bh_done &&
 		    now_ms() - conn_start >
@@ -4051,19 +3903,6 @@ static int conn_run(struct conn *c, int drive_sig)
 			dbg_logf("path blackhole lifted");
 		}
 
-		if (sock_valid(c->ctl_fd)) {
-			struct ctlplane_sinks ck;
-
-			conn_ctl_sinks(c, &ck);
-			ctlplane_offer_key(&c->pr.cp, &ck);
-		}
-		if (now_ms() >= next_hb) {
-			struct ctlplane_sinks ck;
-
-			conn_ctl_sinks(c, &ck);
-			ctlplane_ping(&c->pr.cp, &ck, now_ms());
-			next_hb = now_ms() + HB_INTERVAL_MS;
-		}
 		/*
 		 * The shared session ended under us. sshd is closing the shell
 		 * channel on the same signal, and a channel closing on its own

@@ -51,6 +51,9 @@ struct ctlplane_sinks {
 	int (*answer_ping)(void *arg);
 	/* An answer came back, so the peer is there. NULL for none. */
 	void (*pong)(void *arg);
+	/* Whether the channel is there to carry anything at all. NULL for
+	 * "always". */
+	int (*ready)(void *arg);
 	/* A message this plane does not own. NULL to ignore them. */
 	void (*other)(void *arg, int type, const uint8_t *pl, size_t plen);
 	void *arg;

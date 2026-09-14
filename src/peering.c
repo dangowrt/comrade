@@ -573,3 +573,127 @@ void peering_absorb(struct peering *pr, uint64_t now)
 	rdv_serve_ask(pr, now);
 	rdv_ask(pr, now);
 }
+
+void peering_sinks(struct peering *pr, const struct ctlplane_sinks *ck)
+{
+	pr->ck = *ck;
+}
+
+/*
+ * Advertise this end's own endpoints on the shared socket, so the peer probes
+ * and holds them rather than exploring only what admission produced. The
+ * addresses come from the interface snapshot, which already leaves out
+ * loopback, naming this machine to nobody else, and IPv6 link-local, which
+ * travels without the zone id it cannot be reached without.
+ */
+static void cand_tell(struct peering *pr, uint16_t cand_port, uint64_t now)
+{
+	struct netmon_addr addrs[NETMON_MAX_ADDRS];
+	size_t naddrs, i;
+
+	if (now < pr->next_cand_ms)
+		return;
+	pr->next_cand_ms = now + PEERING_CAND_TELL_MS;
+	if (!cand_port)
+		return;
+	naddrs = netmon_snapshot(addrs, NETMON_MAX_ADDRS);
+	for (i = 0; i < naddrs; i++) {
+		struct sockaddr_storage sa;
+		int fam = netmon_addr_sockaddr(&addrs[i], cand_port, &sa);
+
+		if (!fam)
+			continue;
+		ctlplane_tell_cand(&pr->cp, &pr->ck, fam,
+				   (struct sockaddr *)&sa);
+	}
+}
+
+/*
+ * Say where this end is rendezvoused, so a peer that loses its own way back
+ * has somewhere to look. Unproven nodes too: one this end cannot prove is
+ * still where it is meeting, and a peer that can reach the family may be able
+ * to prove it, which is the whole of how an end with no route to a family
+ * keeps a rendezvous on it. The status byte is what lets the peer tell the
+ * cases apart.
+ */
+static void rdv_tell(struct peering *pr, uint64_t now)
+{
+	static const int famv[2] = { 4, 6 };
+	struct peering_model *pm = pr->pm;
+	struct peering_rdv pub[2];
+	uint32_t gen;
+	int i;
+
+	pthread_mutex_lock(&pm->pub_lock);
+	memcpy(pub, pm->rdv, sizeof(pub));
+	gen = pm->rdv_gen;
+	pthread_mutex_unlock(&pm->pub_lock);
+
+	if (gen == pr->rdv_told_gen && now < pr->next_rdv_tell_ms)
+		return;
+	pr->rdv_told_gen = gen;
+	pr->next_rdv_tell_ms = now + PEERING_RDV_TELL_MS;
+	for (i = 0; i < 2; i++) {
+		if (!pub[i].have)
+			continue;
+		ctlplane_tell_rdv(&pr->cp, &pr->ck, famv[i],
+				  (struct sockaddr *)&pub[i].sa,
+				  pub[i].status);
+	}
+}
+
+/*
+ * Tell this peer what this end can reach, whenever that is no longer what it
+ * was told. A peer starts owed it, so it knows the moment it is connected and
+ * again on every move.
+ */
+static void reach_tell(struct peering *pr, uint64_t now)
+{
+	struct peering_model *pm = pr->pm;
+	uint8_t pl[CTL_REACH_PLEN];
+	uint32_t gen;
+
+	pthread_mutex_lock(&pm->pub_lock);
+	memcpy(pl, pm->reach, sizeof(pl));
+	gen = pm->reach_gen;
+	pthread_mutex_unlock(&pm->pub_lock);
+
+	if (!gen)			/* nothing observed to report yet */
+		return;
+	if (gen == pr->reach_told_gen && now < pr->next_reach_tell_ms)
+		return;
+	pr->reach_told_gen = gen;
+	pr->next_reach_tell_ms = now + PEERING_REACH_TELL_MS;
+	ctlplane_tell_reach(&pr->cp, &pr->ck, pl);
+}
+
+void peering_say(struct peering *pr, uint16_t cand_port, uint64_t now)
+{
+	cand_tell(pr, cand_port, now);
+	rdv_tell(pr, now);
+	reach_tell(pr, now);
+	ctlplane_tell_asks(&pr->cp, &pr->ck);
+	/*
+	 * The half is offered only once the channel can actually carry it: a
+	 * frame written into one that is not there yet would be dropped, and
+	 * the half would be spent with nothing having heard it.
+	 */
+	if (!pr->ck.ready || pr->ck.ready(pr->ck.arg))
+		ctlplane_offer_key(&pr->cp, &pr->ck);
+	if (now < pr->next_hb_ms)
+		return;
+	pr->next_hb_ms = now + HB_INTERVAL_MS;
+	ctlplane_ping(&pr->cp, &pr->ck, now);
+}
+
+void peering_owed(struct peering *pr, uint64_t now)
+{
+	pr->next_cand_ms = now;
+	pr->rdv_told_gen = 0;
+	pr->next_rdv_tell_ms = now;
+	pr->reach_told_gen = 0;
+	pr->next_reach_tell_ms = now;
+	pr->next_rdvask_ms[0] = now;
+	pr->next_rdvask_ms[1] = now;
+	pr->next_hb_ms = now;
+}
