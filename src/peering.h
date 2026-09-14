@@ -21,6 +21,7 @@
 
 #include "netstate.h"
 #include "nsfacts.h"
+#include "stunprobe.h"
 
 /*
  * The crossing from the threads that learn something about this network to the
@@ -62,5 +63,80 @@ int peering_facts_take(struct peering_facts *f, struct nsfact *out, int max);
  */
 int peering_facts_feed(struct netstate *ns, const struct nsfact *q,
 		       uint32_t epoch, uint64_t now);
+
+/*
+ * THE EGRESS POOL: the distinct reflexive v4 addresses this machine has been
+ * seen at.
+ *
+ * A carrier that hands out AN EGRESS ADDRESS PER DESTINATION is the case this
+ * exists for, and it is not exotic: one of the routers this was built against
+ * answers from three addresses in one /24 depending on who is asking. Naming
+ * one of them in an offer is therefore a guess, and the peer that matters is
+ * usually looking from somewhere that sees a different one. So every distinct
+ * address is kept and every one is offered, and the pair that answers is the
+ * one that survives, which is ICE's whole argument applied to a fact about the
+ * carrier rather than about the host.
+ *
+ * Grown from the probe thread and the gather thread, read from the loop, so it
+ * carries its own lock. The counts of what has been shown and what has been
+ * posted belong to the loop alone and are outside it.
+ */
+/*
+ * A subscriber's flows spread only as wide as the NAT group behind its session
+ * anchor, never the operator's whole pool: paired pooling is the deployed
+ * default (RFC 6888 REQ-2) and per-subscriber traceability pushes the same
+ * way, so the measured three-member spray is already the pathology and eight
+ * bounds it with headroom. The cap prices only observations: the wire carries
+ * observed members alone, 12 bytes each against what a signalling value holds,
+ * which the encoder answers with a failed post rather than a truncated one.
+ */
+#define PEERING_POOL4_MAX 8
+
+struct peering_pool {
+	pthread_mutex_t lock;
+	uint8_t v4[PEERING_POOL4_MAX][4];
+	int n;
+	/* RFC 4787 mapping classification, from the same probe's responses. */
+	struct stun_mapping map4;
+	int reported;			/* members a watcher has been shown */
+	int posted;			/* members the posted offer fans */
+};
+
+void peering_pool_init(struct peering_pool *p);
+void peering_pool_destroy(struct peering_pool *p);
+
+/*
+ * From the probe thread or the gather thread: keep an address the first time
+ * it is seen, and say how many the pool holds if it was kept. The unspecified
+ * address is refused, a gathering agent emitting it as a placeholder and it
+ * being nowhere a carrier maps this machine to, so fanning an offer across it
+ * would spend every peer's checks on a destination that cannot answer.
+ */
+int peering_pool_note(struct peering_pool *p, const uint8_t addr[4]);
+
+/* A snapshot for the loop thread, and how many were copied. */
+int peering_pool_copy(struct peering_pool *p,
+		      uint8_t out[PEERING_POOL4_MAX][4]);
+int peering_pool_count(struct peering_pool *p);
+
+/* One sample of this socket's mapping, and the verdict the samples reach:
+ * STUN_MAPPING_*, and whether the reflexive PORT held across servers, which is
+ * the one thing a fan across the pool cannot survive moving. */
+void peering_pool_sample(struct peering_pool *p, const uint8_t addr[4],
+			 uint16_t port);
+int peering_pool_mapping(struct peering_pool *p);
+int peering_pool_port_stable(struct peering_pool *p);
+
+/*
+ * Forget the samples: the top of a round. Every round opens a new socket, and
+ * the mapping test asks whether two servers saw the same mapping for the SAME
+ * socket. The POOL is not forgotten with them, because which addresses a
+ * carrier maps us to is a fact about the carrier and accumulates, where a
+ * socket's port is a fact about that socket.
+ */
+void peering_pool_round(struct peering_pool *p);
+
+/* A move: every address seen before it belongs to the network we have left. */
+void peering_pool_reset(struct peering_pool *p);
 
 #endif

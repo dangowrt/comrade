@@ -101,9 +101,101 @@ static void only_a_round_s_end_says_so(void)
 	peering_facts_destroy(&f);
 }
 
+/*
+ * Every distinct egress address is kept, because a carrier that maps per
+ * destination shows a different one to each server it is asked through.
+ */
+static void every_distinct_egress_address_is_kept(void)
+{
+	uint8_t out[PEERING_POOL4_MAX][4];
+	struct peering_pool p;
+	uint8_t a[4] = { 198, 51, 100, 1 };
+	uint8_t b[4] = { 198, 51, 100, 2 };
+	uint8_t zero[4] = { 0, 0, 0, 0 };
+	int i;
+
+	peering_pool_init(&p);
+	assert(!peering_pool_count(&p));
+
+	assert(peering_pool_note(&p, a) == 1);
+	assert(!peering_pool_note(&p, a));	/* the same one, once */
+	assert(peering_pool_note(&p, b) == 2);
+	assert(peering_pool_count(&p) == 2);
+
+	/* A placeholder is nowhere a carrier maps this machine to. */
+	assert(!peering_pool_note(&p, zero));
+	assert(peering_pool_count(&p) == 2);
+
+	assert(peering_pool_copy(&p, out) == 2);
+	assert(!memcmp(out[0], a, 4));
+	assert(!memcmp(out[1], b, 4));
+
+	/* The cap bounds what one network can make this machine remember. */
+	for (i = 0; i < 32; i++) {
+		uint8_t x[4] = { 198, 51, 101, 0 };
+
+		x[3] = (uint8_t)(i + 1);
+		peering_pool_note(&p, x);
+	}
+	assert(peering_pool_count(&p) == PEERING_POOL4_MAX);
+	peering_pool_destroy(&p);
+}
+
+/*
+ * The mapping verdict is about one socket, so it is forgotten at the top of a
+ * round; the pool is about the carrier, so it is not.
+ */
+static void a_round_forgets_the_samples_and_keeps_the_pool(void)
+{
+	struct peering_pool p;
+	uint8_t a[4] = { 198, 51, 100, 1 };
+	uint8_t b[4] = { 198, 51, 100, 2 };
+
+	peering_pool_init(&p);
+	assert(peering_pool_mapping(&p) == STUN_MAPPING_UNKNOWN);
+
+	peering_pool_note(&p, a);
+	peering_pool_sample(&p, a, 4000);
+	peering_pool_sample(&p, a, 4000);
+	assert(peering_pool_mapping(&p) == STUN_MAPPING_INDEPENDENT);
+	assert(peering_pool_port_stable(&p));
+
+	peering_pool_round(&p);
+	assert(peering_pool_mapping(&p) == STUN_MAPPING_UNKNOWN);
+	assert(peering_pool_count(&p) == 1);	/* the carrier's, not the socket's */
+
+	peering_pool_note(&p, b);
+	peering_pool_sample(&p, a, 4000);
+	peering_pool_sample(&p, b, 4001);
+	assert(peering_pool_mapping(&p) == STUN_MAPPING_DEPENDENT);
+	assert(!peering_pool_port_stable(&p));	/* and the fan cannot survive it */
+	peering_pool_destroy(&p);
+}
+
+/* A move: every address seen before it belongs to the network we have left. */
+static void a_move_empties_the_pool(void)
+{
+	struct peering_pool p;
+	uint8_t a[4] = { 198, 51, 100, 1 };
+
+	peering_pool_init(&p);
+	peering_pool_note(&p, a);
+	peering_pool_sample(&p, a, 4000);
+	peering_pool_sample(&p, a, 4000);
+	peering_pool_reset(&p);
+	assert(!peering_pool_count(&p));
+	assert(peering_pool_mapping(&p) == STUN_MAPPING_UNKNOWN);
+	/* And it is the same address again on the next network, as news. */
+	assert(peering_pool_note(&p, a) == 1);
+	peering_pool_destroy(&p);
+}
+
 int main(void)
 {
 	what_is_posted_is_taken_once();
+	every_distinct_egress_address_is_kept();
+	a_round_forgets_the_samples_and_keeps_the_pool();
+	a_move_empties_the_pool();
 	a_fact_is_fed_under_the_model_s_own_epoch();
 	an_address_is_classified_as_it_is_fed();
 	only_a_round_s_end_says_so();
