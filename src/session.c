@@ -242,7 +242,6 @@ struct conn {
 	 * nothing promotes one, because a path already names the agent it sends
 	 * through.
 	 */
-	struct ice_hold holds[ICE_HOLD_MAX];
 	struct stream *stream;
 	pthread_mutex_t stream_lock;	/* guards c->stream: a transport receive
 					 * thread (libjuice) or the host's main
@@ -733,11 +732,15 @@ static int conn_live_agents(void *arg, struct nat_agent **live, int max)
 	struct conn *c = arg;
 	int n = 0, i;
 
+	struct nat_agent *held[PATHPLANE_HOLD_MAX];
+	int nheld;
+
 	if (c->nat && nat_connected(c->nat) && n < max)
 		live[n++] = c->nat;
-	for (i = 0; i < ICE_HOLD_MAX && n < max; i++)
-		if (c->holds[i].agent && nat_connected(c->holds[i].agent))
-			live[n++] = c->holds[i].agent;
+	nheld = pathplane_holds_agents(&c->pr.pl, held, PATHPLANE_HOLD_MAX);
+	for (i = 0; i < nheld && n < max; i++)
+		if (nat_connected(held[i]))
+			live[n++] = held[i];
 
 	return n;
 }
@@ -840,6 +843,43 @@ static void conn_peer_fresh(void *arg, const struct path_probe *pr,
 		 "rejoining");
 }
 
+/*
+ * The connection itself. Only ever after nat_destroy has returned for any
+ * agent whose callbacks could still name it -- see ice_ctx.shell.
+ */
+static void conn_release(struct conn *c)
+{
+	peering_destroy(&c->pr);
+	pthread_mutex_destroy(&c->status_lock);
+	pthread_mutex_destroy(&c->stream_lock);
+	pthread_mutex_destroy(&c->claim_lock);
+	free(c);
+}
+
+/*
+ * Let one carrier's context go. Past nat_destroy nothing can be inside this
+ * agent's callbacks, so a connection that lent it away can finally be given
+ * back.
+ */
+static void conn_agent_free(void *arg, struct nat_agent *agent, void *ctxp)
+{
+	struct ice_ctx *ctx = ctxp;
+
+	(void)arg;
+	if (agent)
+		nat_destroy(agent);
+	if (ctx && ctx->shell)
+		conn_release(ctx->shell);
+	free(ctx);
+}
+
+static int conn_agent_failed(void *arg, struct nat_agent *agent)
+{
+	(void)arg;
+
+	return nat_failed(agent);
+}
+
 static void conn_sinks(struct conn *c, struct pathplane_sinks *k)
 {
 	memset(k, 0, sizeof(*k));
@@ -852,6 +892,8 @@ static void conn_sinks(struct conn *c, struct pathplane_sinks *k)
 	k->kind_of = conn_ep_kind;
 	k->heard = conn_heard;
 	k->qualified = conn_carry_moved;
+	k->agent_free = conn_agent_free;
+	k->agent_failed = conn_agent_failed;
 	k->other = conn_peer_fresh;
 	k->arg = c;
 }
@@ -877,158 +919,48 @@ static void conn_drop_ice_path(struct conn *c)
 	pathplane_drop_ice(&c->pr.pl);
 }
 
-/*
- * The connection itself. Only ever after nat_destroy has returned for any
- * agent whose callbacks could still name it -- see ice_ctx.shell.
- */
-static void conn_release(struct conn *c)
-{
-	peering_destroy(&c->pr);
-	pthread_mutex_destroy(&c->status_lock);
-	pthread_mutex_destroy(&c->stream_lock);
-	pthread_mutex_destroy(&c->claim_lock);
-	free(c);
-}
-
-/* Let one agent go, with the path that borrowed it and the context its
- * callbacks were handed. The table is unlocked before the agent call. */
+/* Every one of these is the path plane's, over the carriers it has set aside;
+ * the sinks say how this session lets one go. */
 static void conn_free_agent(struct conn *c, struct nat_agent *agent,
 			    struct ice_ctx *ctx)
 {
-	if (agent) {
-		pathplane_drop_agent(&c->pr.pl, agent);
-		nat_destroy(agent);
-	}
-	/* Past nat_destroy nothing can be inside this agent's callbacks, so a
-	 * connection that lent it away can finally be given back. */
-	if (ctx && ctx->shell)
-		conn_release(ctx->shell);
-	free(ctx);
+	struct pathplane_sinks k;
+
+	conn_sinks(c, &k);
+	pathplane_free_agent(&c->pr.pl, &k, agent, ctx);
 }
 
 static void conn_reap_holds(struct conn *c)
 {
-	int i;
+	struct pathplane_sinks k;
 
-	for (i = 0; i < ICE_HOLD_MAX; i++) {
-		if (!c->holds[i].agent)
-			continue;
-		conn_free_agent(c, c->holds[i].agent, c->holds[i].ctx);
-		c->holds[i].agent = NULL;
-		c->holds[i].ctx = NULL;
-		c->holds[i].until_ms = 0;
-	}
+	conn_sinks(c, &k);
+	pathplane_holds_free_all(&c->pr.pl, &k);
 }
 
-/* Set an agent aside in the hold set, freeing it if the set is full. */
 static void conn_hold_add(struct conn *c, struct nat_agent *agent,
 			  struct ice_ctx *ctx, uint64_t until)
 {
-	int i;
+	struct pathplane_sinks k;
 
-	for (i = 0; i < ICE_HOLD_MAX; i++)
-		if (!c->holds[i].agent) {
-			c->holds[i].agent = agent;
-			c->holds[i].ctx = ctx;
-			c->holds[i].until_ms = until;
-			return;
-		}
-	conn_free_agent(c, agent, ctx);
+	conn_sinks(c, &k);
+	pathplane_hold_add(&c->pr.pl, &k, agent, ctx, until);
 }
 
-/* The hold index whose agent carries the session now, or -1. */
-static int conn_carrying_hold(struct conn *c)
-{
-	int sel, i, held = -1;
-
-	pthread_mutex_lock(&c->pr.pl.lock);
-	sel = c->pr.pl.t.sel;
-	if (sel >= 0 && c->pr.pl.t.p[sel].used && c->pr.pl.t.p[sel].agent)
-		for (i = 0; i < ICE_HOLD_MAX; i++)
-			if (c->holds[i].agent == c->pr.pl.t.p[sel].agent) {
-				held = i;
-				break;
-			}
-	pthread_mutex_unlock(&c->pr.pl.lock);
-	return held;
-}
-
-static int conn_has_hold(const struct conn *c)
-{
-	int i;
-
-	for (i = 0; i < ICE_HOLD_MAX; i++)
-		if (c->holds[i].agent)
-			return 1;
-	return 0;
-}
-
-/* Reap a held agent once its deadline has passed and it is not carrying. */
 static void conn_holds_gc(struct conn *c, uint64_t now)
 {
-	int carrying = conn_carrying_hold(c);
-	int i;
+	struct pathplane_sinks k;
 
-	for (i = 0; i < ICE_HOLD_MAX; i++) {
-		if (!c->holds[i].agent || i == carrying)
-			continue;
-		if (now < c->holds[i].until_ms &&
-		    !nat_failed(c->holds[i].agent))
-			continue;
-		conn_free_agent(c, c->holds[i].agent, c->holds[i].ctx);
-		c->holds[i].agent = NULL;
-		c->holds[i].ctx = NULL;
-		c->holds[i].until_ms = 0;
-	}
+	conn_sinks(c, &k);
+	pathplane_holds_reap(&c->pr.pl, &k, now);
 }
 
-/* One punch per route: a route is the source and destination address pair, the
- * port ignored (it is a NAT pinhole over the one physical path). When two owned
- * agents nominated the same route the redundant hold is freed, so only distinct
- * routes are maintained; the carrying path is never the one dropped, and a
- * different source address (a second interface) stays a route of its own. */
 static void conn_route_dedup(struct conn *c)
 {
-	struct ice_ctx *loser_ctx[ICE_HOLD_MAX];
-	struct nat_agent *loser[ICE_HOLD_MAX];
-	int nlose = 0, sel, i, j, h;
-	struct nat_agent *drop;
+	struct pathplane_sinks k;
 
-	pthread_mutex_lock(&c->pr.pl.lock);
-	sel = c->pr.pl.t.sel;
-	for (i = 0; i < PATH_TABLE_MAX; i++) {
-		if (!c->pr.pl.t.p[i].used || c->pr.pl.t.p[i].kind != PATH_ICE ||
-		    path_ep_any(&c->pr.pl.t.p[i].peer_ep))
-			continue;
-		for (j = i + 1; j < PATH_TABLE_MAX; j++) {
-			if (!c->pr.pl.t.p[j].used ||
-			    c->pr.pl.t.p[j].kind != PATH_ICE ||
-			    !path_ep_same_addr(&c->pr.pl.t.p[i].peer_ep,
-					       &c->pr.pl.t.p[j].peer_ep) ||
-			    !c->pr.pl.t.p[i].have_self_ep ||
-			    !c->pr.pl.t.p[j].have_self_ep ||
-			    !path_ep_same_addr(&c->pr.pl.t.p[i].self_ep,
-					       &c->pr.pl.t.p[j].self_ep))
-				continue;
-			drop = NULL;
-			if (c->pr.pl.t.p[j].agent != c->nat && j != sel)
-				drop = c->pr.pl.t.p[j].agent;
-			else if (c->pr.pl.t.p[i].agent != c->nat && i != sel)
-				drop = c->pr.pl.t.p[i].agent;
-			for (h = 0; drop && h < ICE_HOLD_MAX; h++)
-				if (c->holds[h].agent == drop) {
-					loser[nlose] = drop;
-					loser_ctx[nlose++] = c->holds[h].ctx;
-					c->holds[h].agent = NULL;
-					c->holds[h].ctx = NULL;
-					c->holds[h].until_ms = 0;
-					break;
-				}
-		}
-	}
-	pthread_mutex_unlock(&c->pr.pl.lock);
-	for (i = 0; i < nlose; i++)
-		conn_free_agent(c, loser[i], loser_ctx[i]);
+	conn_sinks(c, &k);
+	pathplane_route_dedup(&c->pr.pl, &k, c->nat);
 }
 
 /*
@@ -1042,9 +974,7 @@ static void conn_route_dedup(struct conn *c)
 static void conn_park_ice(struct conn *c, uint64_t now)
 {
 	conn_reap_holds(c);
-	c->holds[0].agent = c->nat;
-	c->holds[0].ctx = c->nat_ctx;
-	c->holds[0].until_ms = now + RESUME_ATTEMPT_MS;
+	conn_hold_add(c, c->nat, c->nat_ctx, now + RESUME_ATTEMPT_MS);
 	c->nat = NULL;
 	c->nat_ctx = NULL;
 }
@@ -3183,18 +3113,18 @@ static void resume_tick(struct conn *c)
 		 * carrying: it takes the current role and the punch being
 		 * built in its place is let go.
 		 */
-		hi = conn_carrying_hold(c);
+		hi = pathplane_hold_carrying(&c->pr.pl);
 		if (hi >= 0) {
 			spare = c->nat;
 			spare_ctx = c->nat_ctx;
-			c->nat = c->holds[hi].agent;
-			c->nat_ctx = c->holds[hi].ctx;
-			c->holds[hi].agent = NULL;
-			c->holds[hi].ctx = NULL;
-			c->holds[hi].until_ms = 0;
+			c->nat = c->pr.pl.holds[hi].agent;
+			c->nat_ctx = c->pr.pl.holds[hi].ctx;
+			c->pr.pl.holds[hi].agent = NULL;
+			c->pr.pl.holds[hi].ctx = NULL;
+			c->pr.pl.holds[hi].until_ms = 0;
 			conn_free_agent(c, spare, spare_ctx);
 			dbg_logf("resume: carried by the agent set aside");
-		} else if (conn_has_hold(c)) {
+		} else if (pathplane_has_hold(&c->pr.pl)) {
 			/* A non-held path carries, so free the set-aside agents
 			 * now, not at their deadline: a second punch would else
 			 * ride along on its own port for the whole span. */
