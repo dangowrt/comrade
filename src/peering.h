@@ -287,6 +287,54 @@ void peering_model_init(struct peering_model *pm, int is_host, int dht,
 void peering_model_destroy(struct peering_model *pm);
 
 /*
+ * What the playbook still has a say in while the model is settled: where a v6
+ * round begins in the STUN list, so it walks in step with the agent's own
+ * rotation, and whether a family is one this end is still looking for a node
+ * on, which decides whether a watcher is shown it as being checked.
+ */
+struct peering_settle {
+	int start6;
+	int expect4, expect6;
+};
+
+/*
+ * ONE PASS OVER THE MODEL, in the only order the three model phases run in.
+ *
+ * Every peer's peering_absorb belongs immediately before this, so that what a
+ * peer said is settled in the same pass it arrived and published in the same
+ * pass it was settled. Which peers there are is the playbook's to iterate;
+ * that the three below run in this order is not.
+ */
+void peering_advance(struct peering_model *pm, struct peering_net *net,
+		     const struct peering_settle *cfg, uint64_t now);
+
+/*
+ * TAKE WHAT THE SIGNALLER HAS LEARNT into the model: which nodes answered,
+ * which of them this end may choose between, and the acknowledgement that
+ * proves a family's DHT is reachable at all.
+ */
+void peering_acks(struct peering_model *pm, uint64_t now);
+
+/*
+ * SETTLE WHAT THE MODEL DECIDES: feed it what the producer threads left, let
+ * its clocks run, and carry out what it asks for. Every path that feeds the
+ * model ends here, including the ones that run while a link is up and nothing
+ * is watching the interfaces.
+ */
+void peering_settle(struct peering_model *pm, struct peering_net *net,
+		    const struct peering_settle *cfg, uint64_t now);
+
+/*
+ * PUBLISH what the model holds, for this mailbox's peers to tell theirs: where
+ * this end is rendezvoused, and what it can reach. Nothing is retracted from
+ * the first, a peer holding a node this end has stopped being sure of being
+ * better off than one holding none; the second is retracted as freely as it is
+ * raised, a family that has gone being exactly what the other end needs to
+ * know.
+ */
+void peering_publish(struct peering_model *pm);
+
+/*
  * ONE PEER.
  *
  * The three planes a pair needs, in the one object, wired to each other: the
