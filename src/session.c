@@ -13,7 +13,6 @@
 #include "ctlproto.h"
 #include "dbg.h"
 #include "ccrypto.h"
-#include "dataauth.h"
 #include "keys.h"
 #include "lanlink.h"
 #include "nat.h"
@@ -21,11 +20,11 @@
 #include "netroute.h"
 #include "netstate.h"
 #include "claimlog.h"
-#include "replay.h"
 #include "hbeat.h"
 #include "hostreap.h"
 #include "nsfacts.h"
 #include "path.h"
+#include "probeplane.h"
 #include "session.h"
 #include "sig.h"
 #include "sshbridge.h"
@@ -292,23 +291,10 @@ struct conn {
 					 * not a mere pickup rotation */
 
 	/*
-	 * What this connection's probes are sealed under. Until both ends have
-	 * traded a half over the control channel there is only the session
-	 * key, which every holder of the invitation has; after that the key is
-	 * this pair's alone and no other guest can reach the path plane of
-	 * this connection. The session key stays acceptable until
-	 * until the first frame arrives under the new one, because the far end
-	 * cannot seal with a key it has not derived yet -- and it derives it
-	 * from a half that travels over the stream this key protects.
-	 *
-	 * The lock is held only to copy a key out: the loop thread binds while
-	 * a transport thread may be opening a frame.
+	 * What this connection's probes and stream datagrams are sealed under,
+	 * and the counters that go with them.
 	 */
-	pthread_mutex_t key_lock;
-	uint8_t conn_key[32];
-	int key_ready;			/* both halves in: the key exists */
-	int key_tx;			/* the peer can open it, so seal with it */
-	int key_old_ok;			/* the session key still opens frames */
+	struct probeplane probe;
 	uint8_t key_half_out[CTL_KEY_PLEN];
 	uint8_t key_half_in[CTL_KEY_PLEN];
 	int key_half_sent, key_half_seen;
@@ -423,28 +409,6 @@ struct conn {
 	volatile int ice_up;		/* the agent is connected, for readers
 					 * that may not touch the agent */
 	volatile uint32_t carry_epoch;	/* ++ on a qualified carry switch (roam) */
-	/*
-	 * Each probe carries the next of these, and a receiver drops one whose
-	 * sequence it has already seen. Both the connection's own loop and the
-	 * host's main thread seal probes for it -- the main thread does so from
-	 * the segment receive path -- so the increment is a read-modify-write
-	 * from two threads. Two probes handed the same number is one of them
-	 * discarded as a replay, which on a segment where the pair have just
-	 * met is the direct path failing to prove for no visible reason.
-	 */
-	pthread_mutex_t probe_lock;
-	uint64_t probe_seq;
-	/*
-	 * The stream's own counter and the window that judges it. KCP carries
-	 * SSH, so the bytes are already unreadable to anyone on the path; what
-	 * they lack is any statement of who sent them, and a forged segment is
-	 * worse for this design than a dropped one -- dropping is what the path
-	 * layer survives by moving, while corruption ends the SSH session above
-	 * every path at once.
-	 */
-	uint64_t data_seq;
-	struct replay_win data_rx;		/* our frames on this conn, from 1 */
-	struct replay_win probe_win;	/* and the peer's, each acted on once */
 	/* The path deliberately made to die (test_blackhole_ms); bh_kind is -1
 	 * while none is, bh_done once one has been (so a lift does not re-arm
 	 * it). */
@@ -937,8 +901,7 @@ static void conn_release(struct conn *c)
 	pthread_mutex_destroy(&c->status_lock);
 	pthread_mutex_destroy(&c->stream_lock);
 	pthread_mutex_destroy(&c->path_lock);
-	pthread_mutex_destroy(&c->key_lock);
-	pthread_mutex_destroy(&c->probe_lock);
+	probeplane_destroy(&c->probe);
 	pthread_mutex_destroy(&c->claim_lock);
 	free(c);
 }
@@ -1140,16 +1103,6 @@ static int conn_holds_ep(struct conn *c, const struct path_ep *ep, int exact)
 
 /* What a caller needs of the path carrying the session, copied out under the
  * lock so nothing reaches into the table without it. */
-/* The keys in force on one connection, taken together so a frame is judged
- * against one consistent view of them. */
-struct conn_keys {
-	uint8_t tx[32];
-	uint8_t rx[32];
-	int have_rx;
-	int old_ok;
-};
-
-
 struct path_pick {
 	int kind;			/* -1 when no path can carry one */
 	int blackholed;			/* the test hook has taken this one away */
@@ -2324,25 +2277,6 @@ static void on_ice_candidate(void *arg, const char *cand)
 }
 
 
-/*
- * What this connection may seal with, and what it may open. Sealing moves to
- * the connection key only once the peer has said it can open one; opening
- * accepts the session key until the first frame arrives under the connection
- * key, at which point the invitation's key is done here.
- */
-static void conn_keys_take(struct conn *c, struct conn_keys *k)
-{
-	pthread_mutex_lock(&c->key_lock);
-	memcpy(k->rx, c->conn_key, sizeof(k->rx));
-	k->have_rx = c->key_ready;
-	k->old_ok = c->key_old_ok;
-	if (c->key_tx)
-		memcpy(k->tx, c->conn_key, sizeof(k->tx));
-	else
-		memcpy(k->tx, c->sess->keys.sig_key, sizeof(k->tx));
-	pthread_mutex_unlock(&c->key_lock);
-}
-
 /* Send over whichever transport carries the stream right now, under a counter
  * and a tag that say this end sent it. */
 static int transport_send(struct conn *c, const uint8_t *data, size_t len)
@@ -2350,11 +2284,9 @@ static int transport_send(struct conn *c, const uint8_t *data, size_t len)
 	struct sess *s = c->sess;
 	uint8_t buf[STREAM_MTU];
 	struct path_pick pick;
-	struct conn_keys k;
 	size_t n;
 
-	conn_keys_take(c, &k);
-	n = dataauth_wrap(buf, sizeof(buf), k.tx, data, len, ++c->data_seq);
+	n = probeplane_wrap(&c->probe, buf, sizeof(buf), data, len);
 	if (!n)
 		return -1;
 	if (conn_pick(c, &pick))
@@ -2364,47 +2296,6 @@ static int transport_send(struct conn *c, const uint8_t *data, size_t len)
 	if (pick.kind == PATH_ICE)
 		return pick.agent ? nat_send(pick.agent, buf, n) : -1;
 	return s->lan ? lanlink_send(s->lan, &pick.remote, buf, n) : -1;
-}
-
-/* A frame opened under the connection key: the session key is spent here. */
-static void conn_key_saw_new(struct conn *c)
-{
-	pthread_mutex_lock(&c->key_lock);
-	if (c->key_old_ok) {
-		c->key_old_ok = 0;
-		dbg_logf("path: the invitation's key is done on this "
-			 "connection");
-	}
-	pthread_mutex_unlock(&c->key_lock);
-}
-
-/*
- * Strip the counter and tag from a stream datagram, or refuse it. The tag is
- * checked under the key in force and, while the far end may not have bound
- * one yet, the key it replaced; the counter is then judged once.
- */
-static int stream_auth_open(struct conn *c, const uint8_t *data, size_t *len)
-{
-	struct conn_keys k;
-	uint64_t seq;
-	size_t body;
-	int ok;
-
-	conn_keys_take(c, &k);
-	if (k.have_rx && !dataauth_open(k.rx, data, *len, &body, &seq)) {
-		conn_key_saw_new(c);
-	} else if (!k.old_ok ||
-		   dataauth_open(c->sess->keys.sig_key, data, *len, &body,
-				 &seq)) {
-		return -1;
-	}
-	pthread_mutex_lock(&c->key_lock);
-	ok = replay_ok(&c->data_rx, seq);
-	pthread_mutex_unlock(&c->key_lock);
-	if (!ok)
-		return -1;
-	*len = body;
-	return 0;
 }
 
 /*
@@ -2453,13 +2344,9 @@ static void ctl_send(struct conn *c, int type, const uint8_t *payload,
  */
 static void conn_key_bind(struct conn *c)
 {
-	if (c->key_ready || !c->key_half_sent || !c->key_half_seen)
+	if (c->probe.pair_ready || !c->key_half_sent || !c->key_half_seen)
 		return;
-	pthread_mutex_lock(&c->key_lock);
-	keys_conn_key(c->conn_key, c->sess->keys.sig_key,
-		      c->key_half_out, c->key_half_in);
-	c->key_ready = 1;
-	pthread_mutex_unlock(&c->key_lock);
+	probeplane_bind(&c->probe, c->key_half_out, c->key_half_in);
 	/*
 	 * We can open under it now; the far end may not be able to yet, and it
 	 * is the one that decides when we may seal with it.
@@ -2523,12 +2410,8 @@ static void ctl_dispatch(void *arg, int type, const uint8_t *pl, size_t plen)
 		c->key_half_seen = 1;
 		conn_key_bind(c);
 	} else if (type == CTLM_KEYOK) {
-		pthread_mutex_lock(&c->key_lock);
-		if (c->key_ready && !c->key_tx) {
-			c->key_tx = 1;
+		if (probeplane_tx_ready(&c->probe))
 			dbg_logf("path: sealing to this connection");
-		}
-		pthread_mutex_unlock(&c->key_lock);
 	} else if (type == CTLM_RDVASK && plen >= CTL_RDVASK_PLEN) {
 		if (pl[0] == 4 || pl[0] == 6) {
 			pthread_mutex_lock(&c->peer_in_lock);
@@ -2591,34 +2474,6 @@ static void ctl_readable(struct conn *c)
  * The claimant ufrag is this connection's, whoever filled the rest in. */
 
 
-/* Open a probe addressed to this connection, under the key in force or, while
- * the far end may not have bound yet, the one it replaced. */
-static int conn_probe_open(struct conn *c, struct path_probe *pr,
-			   const uint8_t *data, size_t len)
-{
-	uint32_t magic = c->sess->keys.probe_magic;
-	struct conn_keys k;
-
-	conn_keys_take(c, &k);
-	if (k.have_rx && !path_probe_parse(pr, magic, k.rx, data, len)) {
-		conn_key_saw_new(c);
-		return 0;
-	}
-	if (path_probe_parse(pr, magic, c->sess->keys.sig_key, data, len))
-		return -1;
-	if (k.old_ok)
-		return 0;
-	/*
-	 * Two things still open under the session key on a bound connection:
-	 * anything at all in the moment before the far end binds too, and the
-	 * notice that this session is gone, which comes from a worker the host
-	 * started after reaping the one we had and so shares no key with us.
-	 * The notice is still refused unless it arrives where the session
-	 * actually is, which is what bounds it (probe_apply).
-	 */
-	return pr->type == PROBE_FRESH ? 0 : -1;
-}
-
 /* The claimant identity, copied out under its lock. */
 static void conn_claim_take(struct conn *c, char *out, size_t n)
 {
@@ -2630,15 +2485,11 @@ static void conn_claim_take(struct conn *c, char *out, size_t n)
 static size_t conn_probe_seal(struct conn *c, struct path_probe *pr,
 			      uint8_t *out)
 {
-	struct conn_keys k;
+	char mine[40];
 
-	conn_claim_take(c, pr->ufrag, sizeof(pr->ufrag));
-	pthread_mutex_lock(&c->probe_lock);
-	pr->seq = ++c->probe_seq;
-	pthread_mutex_unlock(&c->probe_lock);
-	conn_keys_take(c, &k);
-	return path_probe_build(out, PROBE_MAX, c->sess->keys.probe_magic,
-				k.tx, pr);
+	conn_claim_take(c, mine, sizeof(mine));
+
+	return probeplane_seal(&c->probe, pr, mine, out, PROBE_MAX);
 }
 
 
@@ -2919,30 +2770,6 @@ static void conn_heard(struct conn *c, uint64_t now)
 	pthread_mutex_unlock(&c->hb_lock);
 }
 
-/*
- * Is this frame one we have not acted on? The seal says the peer wrote it; the
- * sequence says which of its frames this is, and the window refuses a repeat.
- * A frame from a sender that predates this connection carries a sequence the
- * window has never seen and is taken once, which is all a fresh connection can
- * honestly do.
- *
- * Runs on whichever thread received the datagram; the window is the
- * connection's, so it is kept under the same lock as the rest of its
- * heartbeat state.
- */
-static int conn_probe_fresh(struct conn *c, const struct path_probe *pr)
-{
-	int ok;
-
-	pthread_mutex_lock(&c->hb_lock);
-	ok = replay_ok(&c->probe_win, pr->seq);
-	pthread_mutex_unlock(&c->hb_lock);
-	if (!ok)
-		dbg_logf("path: probe %llu again -- dropped",
-			 (unsigned long long)pr->seq);
-	return ok;
-}
-
 /* Unseal a probe and act on it, if it names the claimant this connection
  * serves. Anything else is dropped in silence. */
 static void probe_recv(struct conn *c, const uint8_t *data, size_t len,
@@ -2952,12 +2779,12 @@ static void probe_recv(struct conn *c, const uint8_t *data, size_t len,
 	struct path_probe pr;
 	char mine[40];
 
-	if (conn_probe_open(c, &pr, data, len))
+	if (probeplane_open(&c->probe, &pr, data, len))
 		return;
 	conn_claim_take(c, mine, sizeof(mine));
 	if (strcmp(pr.ufrag, mine))
 		return;			/* not the claimant this conn serves */
-	if (!conn_probe_fresh(c, &pr))
+	if (!probeplane_fresh(&c->probe, &pr))
 		return;
 	conn_heard(c, now_ms());
 	probe_apply(c, &pr, agent, kind, src);
@@ -3004,13 +2831,13 @@ static void probe_adopt(struct sess *s, const uint8_t *data, size_t len,
 	for (i = 0; i < HOST_MAX_WORKERS; i++) {
 		struct conn *c = s->conns[i];
 
-		if (!c || conn_probe_open(c, &pr, data, len))
+		if (!c || probeplane_open(&c->probe, &pr, data, len))
 			continue;
 		conn_claim_take(c, mine, sizeof(mine));
 		if (pr.type != PROBE_PING || !pr.ufrag[0] ||
 		    strcmp(mine, pr.ufrag))
 			continue;
-		if (!conn_probe_fresh(c, &pr))
+		if (!probeplane_fresh(&c->probe, &pr))
 			return;
 		probe_apply(c, &pr, NULL, PATH_SEGMENT, src);
 		return;
@@ -3037,7 +2864,7 @@ static void deliver_stream_from(struct conn *c, const uint8_t *data, size_t len,
 		probe_recv(c, data, len, kind, src, agent);
 		return;
 	}
-	if (stream_auth_open(c, data, &len))
+	if (probeplane_unwrap(&c->probe, data, &len))
 		return;
 	pthread_mutex_lock(&c->stream_lock);
 	if (c->stream)
@@ -5089,11 +4916,7 @@ static int conn_run(struct conn *c, int drive_sig)
 	c->shell_ended = 0;
 	c->end_verdict = 0;
 	/* The probe key belongs to the channel that agreed it. */
-	pthread_mutex_lock(&c->key_lock);
-	c->key_ready = 0;
-	c->key_tx = 0;
-	c->key_old_ok = 1;
-	pthread_mutex_unlock(&c->key_lock);
+	probeplane_reset(&c->probe);
 	c->key_half_sent = 0;
 	c->key_half_seen = 0;
 	dbg_logf("conn_run: sock_pair ok sp=%d/%d cp=%d/%d, starting ssh thread",
@@ -5479,11 +5302,7 @@ static int conn_run(struct conn *c, int drive_sig)
 	 * on is built before the next channel exists, so the binding cannot
 	 * outlive the session that agreed it.
 	 */
-	pthread_mutex_lock(&c->key_lock);
-	c->key_ready = 0;
-	c->key_tx = 0;
-	c->key_old_ok = 1;
-	pthread_mutex_unlock(&c->key_lock);
+	probeplane_reset(&c->probe);
 	c->key_half_sent = 0;
 	c->key_half_seen = 0;
 	/* Clear the stream under the lock before destroying it: a transport
@@ -5992,22 +5811,10 @@ static struct conn *conn_alloc(struct sess *s)
 	pthread_mutex_init(&c->status_lock, NULL);
 	pthread_mutex_init(&c->stream_lock, NULL);
 	pthread_mutex_init(&c->path_lock, NULL);
-	pthread_mutex_init(&c->key_lock, NULL);
-	pthread_mutex_init(&c->probe_lock, NULL);
 	pthread_mutex_init(&c->claim_lock, NULL);
 	path_table_init(&c->paths);
-	/*
-	 * Frames are counted from the clock, not from one. A host that reaps a
-	 * worker serves the returning client from a new connection while the
-	 * client keeps the one it had, so its window would refuse a counter
-	 * that started over -- and a counter that started over is exactly what
-	 * a replayed frame looks like. Starting where the clock is means every
-	 * new connection counts above the one it replaced, and every copy of
-	 * an old frame counts below.
-	 */
-	c->probe_seq = now_ms();
-	c->data_seq = now_ms();
-	c->key_old_ok = 1;
+	probeplane_init(&c->probe, s->keys.probe_magic, s->keys.sig_key,
+			now_ms());
 	conn_gen_ice(c);
 	return c;
 }
@@ -7321,25 +7128,24 @@ int session_run(const struct session_cfg *cfg)
 	s.c.sess = &s;
 	s.c.ctl_fd = INVALID_SOCK;		/* no control channel until run_ssh */
 	s.c.bh_kind = -1;
-	s.c.probe_seq = now_ms();		/* see conn_alloc */
-	s.c.data_seq = now_ms();
-	s.c.key_old_ok = 1;
 	memcpy(s.auth, cfg->tok.auth, TOKEN_AUTH_LEN);
 	/* Seed each family from the token handed in, so a re-serve carries the
 	 * anchor it already published forward instead of wiping the slot. */
 	s.tok_state[0] = token_family_state(&cfg->tok, 4);
 	s.tok_state[1] = token_family_state(&cfg->tok, 6);
+	if (keys_derive(&s.keys, cfg->tok.rdv))
+		return 1;
 	pthread_mutex_init(&s.trickle_lock, NULL);
 	pthread_mutex_init(&s.c.status_lock, NULL);	/* s.c.status zeroed = connecting */
 	pthread_mutex_init(&s.c.hb_lock, NULL);
 	pthread_mutex_init(&s.c.peer_in_lock, NULL);
 	pthread_mutex_init(&s.c.stream_lock, NULL);
 	pthread_mutex_init(&s.c.path_lock, NULL);
-	pthread_mutex_init(&s.c.key_lock, NULL);
-	pthread_mutex_init(&s.c.probe_lock, NULL);
 	pthread_mutex_init(&s.c.claim_lock, NULL);
 	pthread_mutex_init(&s.pub_lock, NULL);
 	path_table_init(&s.c.paths);
+	probeplane_init(&s.c.probe, s.keys.probe_magic, s.keys.sig_key,
+			now_ms());
 	pthread_mutex_init(&s.ns_lock, NULL);
 	nsfacts_init(&s.ns_facts);
 	netmon_init(&s.netmon);
@@ -7358,10 +7164,6 @@ int session_run(const struct session_cfg *cfg)
 	 */
 	s.next_roam_ms = (host_is_multiuser(cfg) && (cfg->sig_flags & SIG_DHT))
 		? 0 : now_ms() + (uint64_t)cfg->test_roam_ms;
-	if (keys_derive(&s.keys, cfg->tok.rdv)) {
-		rc = 1;
-		goto done;
-	}
 	if (cfg->stun_auto)
 		s.stun_servers = stunlist_load(&s.stun_count);
 	/* Start the rotation at a random server: it spreads the install base
@@ -7841,13 +7643,12 @@ done:
 	stunlist_free(s.stun_servers, s.stun_count);
 	pthread_mutex_destroy(&s.trickle_lock);
 	pthread_mutex_destroy(&s.c.status_lock);
-	pthread_mutex_destroy(&s.c.probe_lock);
+	probeplane_destroy(&s.c.probe);
 	pthread_mutex_destroy(&s.c.claim_lock);
 	pthread_mutex_destroy(&s.c.hb_lock);
 	pthread_mutex_destroy(&s.c.peer_in_lock);
 	pthread_mutex_destroy(&s.c.stream_lock);
 	pthread_mutex_destroy(&s.c.path_lock);
-	pthread_mutex_destroy(&s.c.key_lock);
 	pthread_mutex_destroy(&s.pub_lock);
 	pthread_mutex_destroy(&s.ns_lock);
 	return rc;
