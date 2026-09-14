@@ -20,6 +20,7 @@
 #include "netmon.h"
 #include "netroute.h"
 #include "netstate.h"
+#include "obsemit.h"
 #include "claimlog.h"
 #include "hbeat.h"
 #include "hostreap.h"
@@ -657,8 +658,7 @@ struct sess {
 					 * equality, which needs no ordering
 					 * against anything else. */
 	int mapping_reported;		/* 0 not yet, 1 sent independent, 2 sent dependent */
-	struct session_mailbox mb_told;	/* the last mailbox state sent to the view */
-	int mb_told_any;
+	struct obsemit obs;		/* what the watcher has been told */
 
 	/*
 	 * Reachability per family. Producers off this thread leave facts under
@@ -723,24 +723,6 @@ static uint64_t now_ms(void)
 }
 
 /* "addr:port" of a sockaddr into out. */
-static void addr_str(const struct sockaddr *sa, char *out, size_t n)
-{
-	char host[64];
-
-	out[0] = '\0';
-	if (sa->sa_family == AF_INET6) {
-		const struct sockaddr_in6 *a = (const struct sockaddr_in6 *)sa;
-
-		if (inet_ntop(AF_INET6, &a->sin6_addr, host, sizeof(host)))
-			snprintf(out, n, "%s:%u", host, ntohs(a->sin6_port));
-	} else if (sa->sa_family == AF_INET) {
-		const struct sockaddr_in *a = (const struct sockaddr_in *)sa;
-
-		if (inet_ntop(AF_INET, &a->sin_addr, host, sizeof(host)))
-			snprintf(out, n, "%s:%u", host, ntohs(a->sin_port));
-	}
-}
-
 /* First candidate address in an SDP into out; 1 if found. */
 static int sdp_first_addr(const char *sdp, char *out, size_t n)
 {
@@ -3887,17 +3869,11 @@ static int sig_arm(struct sess *s)
  * startup. */
 static void report_links(struct sess *s)
 {
-	const struct session_obs *o = s->cfg->obs;
 	struct sig_mcast_if ifs[16];
-	int ni, k;
 
-	if (!s->lan || !s->sig || !o || !o->link)
+	if (!s->lan || !s->sig)
 		return;
-	ni = sig_link_ifaces(s->sig, ifs, 16);
-	if (o->link_reset)
-		o->link_reset(o->arg);
-	for (k = 0; k < ni; k++)
-		o->link(o->arg, ifs[k].name, ifs[k].has4, ifs[k].has6);
+	obsemit_links(&s->obs, ifs, sig_link_ifaces(s->sig, ifs, 16));
 }
 
 /*
@@ -4325,36 +4301,15 @@ static void net_sample_src(struct sess *s, int family, uint32_t epoch)
  */
 static void report_rendezvous(struct sess *s)
 {
-	static const int famv[2] = { 4, 6 };
-	const struct session_obs *o = s->cfg->obs;
-	int i;
-
-	if (!o || !o->rendezvous)
-		return;
-	for (i = 0; i < 2; i++) {
-		uint8_t node[NETSTATE_SA_MAX], nlen = 0;
-		int proven = 0, vouched = 0, row;
-		char b[80];
-
-		if (netstate_anchor(&s->ns, famv[i], node, &nlen, NULL) &&
-		    nlen) {
-			netstate_anchor_state(&s->ns, famv[i], &proven,
-					      &vouched, NULL);
-			row = proven ? RDV_ROW_PROVEN :
-			      vouched ? RDV_ROW_VOUCHED : RDV_ROW_CHECKING;
-			addr_str((const struct sockaddr *)node, b, sizeof(b));
-			o->rendezvous(o->arg, famv[i], b, row);
-		} else if (s->cfg->is_host &&
-			   (famv[i] == 4 ? s->expect4 : s->expect6)) {
-			o->rendezvous(o->arg, famv[i], "", RDV_ROW_CHECKING);
-		}
-	}
+	/* Only a host looks for one it has not got: a client is told where to
+	 * meet. */
+	obsemit_rendezvous(&s->obs, s->cfg->is_host && s->expect4,
+			   s->cfg->is_host && s->expect6);
 }
 
 static void net_apply(struct sess *s, const struct netstate_actions *a)
 {
 	static const int famv[2] = { 4, 6 };
-	const struct session_obs *o = s->cfg->obs;
 	int i;
 
 	for (i = 0; i < 2; i++) {
@@ -4373,28 +4328,15 @@ static void net_apply(struct sess *s, const struct netstate_actions *a)
 				netstate_on_probe_started(&s->ns, family,
 							  a->epoch[i], now_ms());
 		}
-		if (act & NSA_EMIT_ROWS && o && o->net_reset && o->net) {
-			const struct netstate_row *rows;
-			int n = netstate_rows(&s->ns, family, &rows), k;
-
-			/* Rebuilt, not added to: a row shown before the source
-			 * was known has to be able to go away again. */
-			o->net_reset(o->arg, family);
-			for (k = 0; k < n; k++)
-				if (rows[k].shown)
-					o->net(o->arg, family, rows[k].scope,
-					       netstate_row_via(&s->ns, family,
-								&rows[k]),
-					       rows[k].text);
-		}
+		if (act & NSA_EMIT_ROWS)
+			obsemit_rows(&s->obs, family);
 		if (act & NSA_EMIT_CONN) {
 			int conn = netstate_conn(&s->ns, family);
 
 			if (s->sig)
 				sig_set_family_up(s->sig, family,
 						  conn == NET_CONN_UP);
-			if (o && o->net_conn)
-				o->net_conn(o->arg, family, conn);
+			obsemit_conn(&s->obs, family, conn);
 		}
 		if (act & NSA_RDV_PIN) {
 			uint8_t node[NETSTATE_SA_MAX];
@@ -5119,43 +5061,12 @@ static int conn_link_state(const struct sess *s, struct conn *c)
  */
 static void report_mailbox(struct sess *s)
 {
-	const struct session_obs *o = s->cfg->obs;
-	static const int famv[2] = { 4, 6 };
-	struct session_mailbox m;
 	struct sig_mailbox sm;
-	uint64_t now = now_ms();
-	int i;
 
-	if (!o || !o->mailbox || !s->sig)
+	if (!s->sig)
 		return;
 	sig_mailbox_state(s->sig, &sm);
-	memset(&m, 0, sizeof(m));
-	m.engaged = sm.engaged;
-	m.stage = sm.stage;
-	m.have_mine = sm.have_mine;
-	m.mine_stored = sm.mine_stored;
-	m.peer_seen = sm.peer_seen;
-	m.seq = sm.seq;
-	m.gets = sm.gets;
-	m.puts = sm.puts;
-	m.claim = sm.claim;
-	m.age_get_s = sm.last_get_ms ? (int)((now - sm.last_get_ms) / 1000) : -1;
-	m.age_put_s = sm.last_put_ms ? (int)((now - sm.last_put_ms) / 1000) : -1;
-	for (i = 0; i < 2; i++) {
-		int proven = 0;
-
-		if (!netstate_anchor(&s->ns, famv[i], NULL, NULL, &proven))
-			continue;
-		if (proven)
-			m.rdv_proven = 1;
-		else
-			m.rdv_holding = 1;
-	}
-	if (s->mb_told_any && !memcmp(&m, &s->mb_told, sizeof(m)))
-		return;
-	s->mb_told = m;
-	s->mb_told_any = 1;
-	o->mailbox(o->arg, &m);
+	obsemit_mailbox(&s->obs, &sm, now_ms());
 }
 
 /*
@@ -6702,6 +6613,7 @@ int session_run(const struct session_cfg *cfg)
 	netmon_init(&s.netmon);
 	netmon_src_open(&s.netmon);
 	netstate_init(&s.ns, cfg->is_host, now_ms());
+	obsemit_init(&s.obs, cfg->obs, &s.ns);
 	/*
 	 * When the synthetic change is armed follows the path the session
 	 * meets over, and nothing else. A host whose rendezvous is the DHT
