@@ -49,12 +49,22 @@ rebuilds() {
 }
 
 tmp=$(mktemp -d)
-cleanup() { kill "$hpid" $cpid 2>/dev/null; swarm_stop; rm -rf "$tmp"; }
+keep() {
+	if [ "${COMRADE_E2E_KEEP:-0}" = 1 ]; then
+		echo "logs kept in $tmp"
+	else
+		rm -rf "$tmp"
+	fi
+}
+cleanup() { kill "$hpid" $cpid 2>/dev/null; swarm_stop; keep; }
 trap cleanup EXIT INT TERM
 cpid=""
 ROAMS=3
 
-"$E2E" host --serve 1 --timeout 150 >"$tmp/host.out" 2>"$tmp/host.err" &
+# The host keeps a debug log too: whether a claim was picked up is its half of
+# the answer, and a client that waits out its timeout says nothing about why.
+COMRADE_DEBUG="$tmp/host.log" "$E2E" host --serve 1 --timeout 150 \
+	>"$tmp/host.out" 2>"$tmp/host.err" &
 hpid=$!
 
 # Wait for a rendezvous node in the token: the client re-seeds it on every
@@ -91,7 +101,10 @@ if [ "$n" -lt "$ROAMS" ]; then
 fi
 grep -q "E2E PASS client" "$tmp/c.out" 2>/dev/null || {
 	echo "client never joined after rebuilding its signalling:"
-	cat "$tmp/c.out" "$tmp/c.err"; tail -8 "$tmp/client.log" 2>/dev/null; rc=1; }
+	cat "$tmp/c.out" "$tmp/c.err"
+	echo "-- client --"; tail -20 "$tmp/client.log" 2>/dev/null
+	echo "-- host --"; tail -20 "$tmp/host.log" 2>/dev/null
+	rc=1; }
 if grep -q 'sig: rebuild failed' "$tmp/client.log" 2>/dev/null; then
 	echo "the client gave the session up on a rebuild:"
 	grep 'sig: rebuild' "$tmp/client.log"; rc=1
