@@ -699,6 +699,11 @@ target_include_directories(comrade_pathplane PUBLIC src)
 target_link_libraries(comrade_pathplane PUBLIC comrade_probeplane comrade_dbg
 	comrade_compat)
 
+add_library(comrade_ctlplane STATIC src/ctlplane.c)
+target_include_directories(comrade_ctlplane PUBLIC src)
+target_link_libraries(comrade_ctlplane PUBLIC comrade_probeplane
+	comrade_ctlproto comrade_hbeat comrade_dbg comrade_compat)
+
 add_library(comrade_lanlink STATIC src/lanlink.c)
 target_include_directories(comrade_lanlink PUBLIC src)
 target_link_libraries(comrade_lanlink PUBLIC comrade_compat)
@@ -768,7 +773,7 @@ target_link_libraries(comrade_session PUBLIC
 	comrade_stunprobe comrade_conn comrade_path comrade_ctlproto comrade_dbg
 	comrade_netstate comrade_netroute comrade_nsfacts comrade_hostreap
 	comrade_claimlog comrade_hbeat comrade_replay comrade_dataauth
-	comrade_probeplane comrade_pathplane)
+	comrade_probeplane comrade_pathplane comrade_ctlplane)
 # session.c reads and writes two 64-bit stamps with the __atomic builtins. A
 # target whose widest lock-free atomic is 4 bytes (32-bit MIPS, ARMv5) lowers
 # those to calls into libatomic, so the probe links one and the library is
@@ -1049,6 +1054,11 @@ if(BUILD_TESTING)
 	add_executable(pathplane_test tests/pathplane_test.c)
 	target_link_libraries(pathplane_test comrade_pathplane)
 	add_test(NAME pathplane_test COMMAND pathplane_test)
+
+	# What a pair tells each other once a path carries them.
+	add_executable(ctlplane_test tests/ctlplane_test.c)
+	target_link_libraries(ctlplane_test comrade_ctlplane)
+	add_test(NAME ctlplane_test COMMAND ctlplane_test)
 
 	add_executable(termfilter_test tests/termfilter_test.c)
 	target_link_libraries(termfilter_test comrade_termfilter)
@@ -1494,7 +1504,7 @@ if(BUILD_TESTING)
 		dhtnode_boot_test
 		connkey_test dataauth_test box_test
 		stunprobe_test path_test probeplane_test pathplane_test
-		bep44_test
+		ctlplane_test bep44_test
 		bep44_pin_test bep44_store_test bep44_rl_test
 		sig_rebuild_test natstream_test stream_room_test
 		stream_cc_test sshloop_test sshfwd_test sshexit_test sshro_test

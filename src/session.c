@@ -10,6 +10,7 @@
 
 #include "candpolicy.h"
 #include "conn.h"
+#include "ctlplane.h"
 #include "ctlproto.h"
 #include "dbg.h"
 #include "ccrypto.h"
@@ -296,9 +297,6 @@ struct conn {
 	 * and the counters that go with them.
 	 */
 	struct probeplane probe;
-	uint8_t key_half_out[CTL_KEY_PLEN];
-	uint8_t key_half_in[CTL_KEY_PLEN];
-	int key_half_sent, key_half_seen;
 
 	struct nat_agent *nat;
 	struct ice_ctx *nat_ctx;
@@ -430,11 +428,13 @@ struct conn {
 	int end_verdict;		/* client: an end verdict arrived, read by
 					 * the ssh thread's post-close wait */
 
-	/* Liveness heartbeat: a tiny ping/pong over the comrade-ctl channel, so a
-	 * dead link is noticed even when nobody is typing. Riding the reliable
-	 * SSH/KCP stream, it measures end-to-end liveness -- a pong stops arriving
-	 * once the link has truly stalled, which is exactly the signal we want. */
-	pthread_mutex_t hb_lock;
+	/*
+	 * What the pair says to each other over the comrade-ctl channel, and
+	 * how the link is faring: the key halves, the rendezvous nodes, the
+	 * reachability, the requests, and the ping and pong a dead link is
+	 * noticed by even when nobody is typing.
+	 */
+	struct ctlplane ctl;
 	/*
 	 * The last link state and round trip reported to the view, and whether
 	 * anything has been. Cleared whenever this connection's row is created,
@@ -443,38 +443,6 @@ struct conn {
 	 * already told is a row left showing whatever it had.
 	 */
 	int link_told, rtt_told, paths_told, link_told_any;
-	unsigned live_gen;		/* the network generation this link was
-					 * last proven on; older means we have
-					 * no evidence about it here */
-	uint64_t hb_last_pong;		/* when a pong last came back */
-	/* Touched atomically: every update is under hb_lock with the rest of
-	 * the heartbeat state, but conn_heard tests it on the receive path
-	 * before taking anything, so that this does not cost a lock on every
-	 * packet that arrives. */
-	uint64_t hb_last_heard;		/* when anything last arrived from the
-					 * peer (fed by the receive threads) */
-	int hb_rtt;			/* round trip from the last pong, ms */
-	int hb_pong_seen;		/* a pong has ever come back on this conn */
-	/* Written only by conn_run, of which exactly one runs per connection,
-	 * so its own reads need no lock; the lock exists for the readers on
-	 * other threads. */
-	uint64_t lost_since_ms;		/* when the link was first seen lost, 0 if live */
-
-	/* What the peer has said about itself, handed from the ctl reader to
-	 * whichever loop owns the model; [0]=v4 [1]=v6. */
-	struct rdv_node rdv_in[2];
-	pthread_mutex_t peer_in_lock;
-	int rdv_in_dirty;
-	uint8_t reach_in[CTL_REACH_PLEN];	/* the peer's own reachability */
-	int reach_in_seen;
-	int reach_in_dirty;
-	int rdvask_in;			/* families the peer asked us to
-					 * rendezvous on for it; bit 0 v4, 1 v6 */
-	int rdvask_out;			/* families to ask this peer about,
-					 * decided by the thread that owns the
-					 * model and sent by this connection's
-					 * own loop -- nothing else may write
-					 * ctl_fd, or two frames interleave */
 	uint64_t next_rdvask_ms[2];	/* host: when this peer may be asked
 					 * again about each family */
 	uint32_t rdv_told_gen;		/* published set this peer has been told */
@@ -992,11 +960,7 @@ static void conn_heard(void *arg, uint64_t now)
 {
 	struct conn *c = arg;
 
-	if (now - __atomic_load_n(&c->hb_last_heard, __ATOMIC_RELAXED) < 100)
-		return;
-	pthread_mutex_lock(&c->hb_lock);
-	__atomic_store_n(&c->hb_last_heard, now, __ATOMIC_RELAXED);
-	pthread_mutex_unlock(&c->hb_lock);
+	ctlplane_heard(&c->ctl, now);
 }
 
 /* A path becoming usable is the moment to retransmit the stream's backlog,
@@ -1017,18 +981,16 @@ static void conn_carry_moved(void *arg)
 static void conn_peer_fresh(void *arg, const struct path_probe *pr,
 			    enum path_kind kind, int held)
 {
+	struct ctlplane_live live;
 	struct conn *c = arg;
-	int had;
 
 	(void)kind;
 	if (pr->type != PROBE_FRESH || !held)
 		return;
-	pthread_mutex_lock(&c->hb_lock);
-	had = c->hb_pong_seen;
-	pthread_mutex_unlock(&c->hb_lock);
+	ctlplane_liveness(&c->ctl, &live);
 	/* A connection that never carried a session has none to be told about:
 	 * this is the answer to a resume, and a first join is not one. */
-	if (!had || c->sess->cfg->is_host ||
+	if (!live.pong_seen || c->sess->cfg->is_host ||
 	    __atomic_load_n(&c->peer_fresh, __ATOMIC_RELAXED))
 		return;
 	__atomic_store_n(&c->peer_fresh, 1, __ATOMIC_RELAXED);
@@ -1083,8 +1045,7 @@ static void conn_drop_ice_path(struct conn *c)
  */
 static void conn_release(struct conn *c)
 {
-	pthread_mutex_destroy(&c->hb_lock);
-	pthread_mutex_destroy(&c->peer_in_lock);
+	ctlplane_destroy(&c->ctl);
 	pthread_mutex_destroy(&c->status_lock);
 	pthread_mutex_destroy(&c->stream_lock);
 	pathplane_destroy(&c->pl);
@@ -1381,6 +1342,7 @@ static void conn_path_label(struct conn *c, char *out, size_t n)
  */
 static int conn_rtt_ms(struct conn *c, int *out)
 {
+	struct ctlplane_live live;
 	int sel, known = 0;
 
 	pthread_mutex_lock(&c->pl.lock);
@@ -1392,9 +1354,8 @@ static int conn_rtt_ms(struct conn *c, int *out)
 	pthread_mutex_unlock(&c->pl.lock);
 	if (known)
 		return 1;
-	pthread_mutex_lock(&c->hb_lock);
-	*out = c->hb_rtt;
-	pthread_mutex_unlock(&c->hb_lock);
+	ctlplane_liveness(&c->ctl, &live);
+	*out = live.rtt_ms;
 	/* The stream is the worker thread's to destroy, and it clears the
 	 * pointer under this lock before doing so; every other thread reads it
 	 * the same way or reads freed memory. */
@@ -1535,6 +1496,7 @@ static void fmt_rdv_fam(struct sess *s, int family, char *out, size_t n)
  */
 static void publish_status(struct conn *c, int state)
 {
+	struct ctlplane_live live;
 	struct sess *s = c->sess;
 	struct conn_status cs;
 
@@ -1564,13 +1526,12 @@ static void publish_status(struct conn *c, int state)
 	 * loss has lasted.
 	 */
 	cs.rtt_known = conn_rtt_ms(c, &cs.rtt_ms);
-	pthread_mutex_lock(&c->hb_lock);
-	if (state == CONN_LOST && c->lost_since_ms)
-		cs.since_s = (int)((now_ms() - c->lost_since_ms) / 1000);
-	cs.silent_s = c->hb_pong_seen ?
-		(int)((now_ms() - c->hb_last_pong) / 1000) : -1;
+	ctlplane_liveness(&c->ctl, &live);
+	if (state == CONN_LOST && live.lost_since_ms)
+		cs.since_s = (int)((now_ms() - live.lost_since_ms) / 1000);
+	cs.silent_s = live.pong_seen ?
+		(int)((now_ms() - live.last_pong_ms) / 1000) : -1;
 	cs.gone = __atomic_load_n(&c->peer_fresh, __ATOMIC_RELAXED);
-	pthread_mutex_unlock(&c->hb_lock);
 
 	pthread_mutex_lock(&c->status_lock);
 	c->status = cs;
@@ -2373,10 +2334,11 @@ static int nosigpipe(sock_t fd)
  * effort: SIGPIPE is suppressed (see nosigpipe) so a closed channel during
  * teardown cannot kill us, and a full/short write only ever drops a
  * heartbeat, which the next tick repeats. */
-static void ctl_send(struct conn *c, int type, const uint8_t *payload,
-		     size_t plen)
+static void conn_ctl_send(void *arg, int type, const uint8_t *payload,
+			  size_t plen)
 {
 	uint8_t buf[CTL_FRAME_MAX];
+	struct conn *c = arg;
 	size_t n;
 	ssize_t w;
 
@@ -2387,93 +2349,44 @@ static void ctl_send(struct conn *c, int type, const uint8_t *payload,
 	(void)w;
 }
 
-/*
- * Both halves are in: this connection's probes leave the session key behind.
- * Runs on the loop thread, which is the only writer.
- */
-static void conn_key_bind(struct conn *c)
-{
-	if (c->probe.pair_ready || !c->key_half_sent || !c->key_half_seen)
-		return;
-	probeplane_bind(&c->probe, c->key_half_out, c->key_half_in);
-	/*
-	 * We can open under it now; the far end may not be able to yet, and it
-	 * is the one that decides when we may seal with it.
-	 */
-	ctl_send(c, CTLM_KEYOK, NULL, 0);
-	dbg_logf("path: keyed to this connection, telling the peer");
-}
-
-/* Act on one decoded control message (a ctl_reframer callback): answer a ping,
- * record a pong's round trip, stash the peer's announced rendezvous node for
- * rdv_adopt to take, or enter an endpoint it advertises as one more path.
- * Runs on the connection's own loop thread, the same one as path_tick. */
-static void ctl_dispatch(void *arg, int type, const uint8_t *pl, size_t plen)
+/* Whether this ping is answered: the test hook lets a link go quiet on
+ * purpose. */
+static int conn_answer_ping(void *arg)
 {
 	struct conn *c = arg;
 
-	if (type == CTLM_PING && plen >= CTL_TS_LEN) {
-		if (!c->sess->cfg->test_drop_pong || c->pongs_sent < 2) {
-			c->pongs_sent++;
-			ctl_send(c, CTLM_PONG, pl, CTL_TS_LEN);
-		}
-	} else if (type == CTLM_PONG && plen >= CTL_TS_LEN) {
-		uint64_t now = now_ms();
+	if (c->sess->cfg->test_drop_pong && c->pongs_sent >= 2)
+		return 0;
+	c->pongs_sent++;
 
-		pthread_mutex_lock(&c->hb_lock);
-		c->hb_last_pong = now;
-		c->hb_rtt = (int)(now - ctl_get_u64(pl));
-		c->hb_pong_seen = 1;
-		__atomic_store_n(&c->sess->handshake_seen, 1,
-				 __ATOMIC_RELAXED);
-		/* Traffic arriving is the only thing that proves a path on the
-		 * network we are on now. */
-		c->live_gen = __atomic_load_n(&c->sess->netgen,
-					      __ATOMIC_RELAXED);
-		pthread_mutex_unlock(&c->hb_lock);
-	} else if (type == CTLM_RDV && plen >= CTL_RDV_PLEN) {
-		struct sockaddr_storage sa;
-		socklen_t sl = 0;
-		int fam = ctl_rdv_decode(pl, plen, &sa, &sl);
+	return 1;
+}
 
-		if (fam) {
-			int i = fam_idx(fam);
+/* A pong came back, so a pair has spoken here at least once. */
+static void conn_pong_seen(void *arg)
+{
+	struct conn *c = arg;
 
-			pthread_mutex_lock(&c->peer_in_lock);
-			c->rdv_in[i].sa = sa;
-			c->rdv_in[i].len = sl;
-			c->rdv_in[i].have = 1;
-			c->rdv_in[i].status = plen >= CTL_RDVST_PLEN ?
-					      pl[CTL_RDV_PLEN] : 0;
-			c->rdv_in_dirty = 1;
-			pthread_mutex_unlock(&c->peer_in_lock);
-		}
-	} else if (type == CTLM_REACH && plen >= CTL_REACH_PLEN) {
-		pthread_mutex_lock(&c->peer_in_lock);
-		memcpy(c->reach_in, pl, CTL_REACH_PLEN);
-		c->reach_in_seen = 1;
-		c->reach_in_dirty = 1;
-		pthread_mutex_unlock(&c->peer_in_lock);
-	} else if (type == CTLM_KEY && plen >= CTL_KEY_PLEN) {
-		memcpy(c->key_half_in, pl, CTL_KEY_PLEN);
-		c->key_half_seen = 1;
-		conn_key_bind(c);
-	} else if (type == CTLM_KEYOK) {
-		if (probeplane_tx_ready(&c->probe))
-			dbg_logf("path: sealing to this connection");
-	} else if (type == CTLM_RDVASK && plen >= CTL_RDVASK_PLEN) {
-		if (pl[0] == 4 || pl[0] == 6) {
-			pthread_mutex_lock(&c->peer_in_lock);
-			c->rdvask_in |= pl[0] == 6 ? 2 : 1;
-			pthread_mutex_unlock(&c->peer_in_lock);
-		}
-	} else if (type == CTLM_CAND && plen >= CTL_RDV_PLEN) {
-		struct sockaddr_storage sa;
-		socklen_t sl = 0;
+	__atomic_store_n(&c->sess->handshake_seen, 1, __ATOMIC_RELAXED);
+}
 
-		if (ctl_rdv_decode(pl, plen, &sa, &sl))
-			conn_offer_path(c, (struct sockaddr *)&sa, sl);
-	} else if (type == CTLM_BYE) {
+static void conn_ctl_offer_path(void *arg, const struct sockaddr *sa,
+				socklen_t len)
+{
+	conn_offer_path(arg, sa, len);
+}
+
+/*
+ * What the control plane carries that is about the shared session rather than
+ * about the pair: the two statements the host makes about the session ending.
+ */
+static void conn_ctl_other(void *arg, int type, const uint8_t *pl, size_t plen)
+{
+	struct conn *c = arg;
+
+	(void)pl;
+	(void)plen;
+	if (type == CTLM_BYE) {
 		/*
 		 * The host's shared session has ended. It arrives inside the
 		 * SSH session, so it is the one statement about the end that
@@ -2487,12 +2400,37 @@ static void ctl_dispatch(void *arg, int type, const uint8_t *pl, size_t plen)
 		c->sess->peer_ended = 1;
 		__atomic_store_n(&c->end_verdict, 1, __ATOMIC_RELAXED);
 	} else if (type == CTLM_DETACHED) {
-		/* The attach ended but the session lives, so the rejoin on offer
-		 * is a real one. The verdict releases the client's post-close
-		 * wait; that no peer_ended came with it keeps the rejoin. */
+		/* The attach ended but the session lives, so the rejoin on
+		 * offer is a real one. The verdict releases the client's
+		 * post-close wait; that no peer_ended came with it keeps the
+		 * rejoin. */
 		dbg_logf("ctl: the host says we detached; the session lives");
 		__atomic_store_n(&c->end_verdict, 1, __ATOMIC_RELAXED);
 	}
+}
+
+static void conn_ctl_sinks(struct conn *c, struct ctlplane_sinks *k)
+{
+	memset(k, 0, sizeof(*k));
+	k->send = conn_ctl_send;
+	k->offer_path = conn_ctl_offer_path;
+	k->answer_ping = conn_answer_ping;
+	k->pong = conn_pong_seen;
+	k->other = conn_ctl_other;
+	k->arg = c;
+}
+
+/* Act on one decoded control message (a ctl_reframer callback). Runs on the
+ * connection's own loop thread, the same one as path_tick. */
+static void ctl_dispatch(void *arg, int type, const uint8_t *pl, size_t plen)
+{
+	struct ctlplane_sinks k;
+	struct conn *c = arg;
+
+	conn_ctl_sinks(c, &k);
+	ctlplane_on_msg(&c->ctl, &k, type, pl, plen,
+			__atomic_load_n(&c->sess->netgen, __ATOMIC_RELAXED),
+			now_ms());
 }
 
 /* Drain the comrade-ctl fd and dispatch each complete message the read yields
@@ -2923,9 +2861,7 @@ static int conn_is_lost(struct conn *c)
 {
 	int lost;
 
-	pthread_mutex_lock(&c->hb_lock);
-	lost = c->lost_since_ms != 0;
-	pthread_mutex_unlock(&c->hb_lock);
+	lost = ctlplane_lost(&c->ctl);
 	return lost;
 }
 
@@ -3348,6 +3284,7 @@ static void *ssh_cli_thread(void *p)
 static void cand_tell(struct conn *c, uint64_t now)
 {
 	struct netmon_addr addrs[NETMON_MAX_ADDRS];
+	struct ctlplane_sinks k;
 	struct sess *s = c->sess;
 	size_t naddrs, i;
 	uint16_t port;
@@ -3360,16 +3297,15 @@ static void cand_tell(struct conn *c, uint64_t now)
 	port = lanlink_port(s->lan);
 	if (!port)
 		return;
+	conn_ctl_sinks(c, &k);
 	naddrs = netmon_snapshot(addrs, NETMON_MAX_ADDRS);
 	for (i = 0; i < naddrs; i++) {
 		struct sockaddr_storage sa;
-		uint8_t pl[CTL_RDV_PLEN];
 		int fam = netmon_addr_sockaddr(&addrs[i], port, &sa);
 
 		if (!fam)
 			continue;
-		ctl_rdv_encode(pl, fam, (struct sockaddr *)&sa);
-		ctl_send(c, CTLM_CAND, pl, sizeof(pl));
+		ctlplane_tell_cand(&c->ctl, &k, fam, (struct sockaddr *)&sa);
 	}
 }
 
@@ -3461,6 +3397,7 @@ static void rdv_publish(struct sess *s)
 static void rdv_tell(struct conn *c, uint64_t now)
 {
 	static const int famv[2] = { 4, 6 };
+	struct ctlplane_sinks k;
 	struct sess *s = c->sess;
 	struct rdv_node pub[2];
 	uint32_t gen;
@@ -3475,9 +3412,8 @@ static void rdv_tell(struct conn *c, uint64_t now)
 		return;
 	c->rdv_told_gen = gen;
 	c->next_rdv_tell_ms = now + RDV_TELL_MS;
+	conn_ctl_sinks(c, &k);
 	for (i = 0; i < 2; i++) {
-		uint8_t pl[CTL_RDVST_PLEN];
-
 		/*
 		 * Unproven ones too. A node this end cannot prove is still
 		 * where it is meeting, and a peer that can reach the family
@@ -3487,9 +3423,9 @@ static void rdv_tell(struct conn *c, uint64_t now)
 		 */
 		if (!pub[i].have)
 			continue;
-		ctl_rdv_encode(pl, famv[i], (struct sockaddr *)&pub[i].sa);
-		pl[CTL_RDV_PLEN] = (uint8_t)pub[i].status;
-		ctl_send(c, CTLM_RDV, pl, sizeof(pl));
+		ctlplane_tell_rdv(&c->ctl, &k, famv[i],
+				  (struct sockaddr *)&pub[i].sa,
+				  pub[i].status);
 	}
 }
 
@@ -3511,19 +3447,11 @@ static void rdv_tell(struct conn *c, uint64_t now)
 static void rdv_adopt(struct sess *s, struct conn *c)
 {
 	static const int famv[2] = { 4, 6 };
-	struct rdv_node in[2];
+	struct ctlplane_node in[2];
 	int i;
 
-	if (!c)
+	if (!c || !ctlplane_take_nodes(&c->ctl, in))
 		return;
-	pthread_mutex_lock(&c->peer_in_lock);
-	if (!c->rdv_in_dirty) {
-		pthread_mutex_unlock(&c->peer_in_lock);
-		return;
-	}
-	memcpy(in, c->rdv_in, sizeof(in));
-	c->rdv_in_dirty = 0;
-	pthread_mutex_unlock(&c->peer_in_lock);
 	for (i = 0; i < 2; i++) {
 		uint8_t node[NETSTATE_SA_MAX], nlen = 0;
 		char b[80];
@@ -3676,6 +3604,7 @@ static void reach_publish(struct sess *s)
  */
 static void reach_tell(struct conn *c, uint64_t now)
 {
+	struct ctlplane_sinks k;
 	struct sess *s = c->sess;
 	uint8_t pl[CTL_REACH_PLEN];
 	uint32_t gen;
@@ -3691,7 +3620,8 @@ static void reach_tell(struct conn *c, uint64_t now)
 		return;
 	c->reach_told_gen = gen;
 	c->next_reach_tell_ms = now + REACH_TELL_MS;
-	ctl_send(c, CTLM_REACH, pl, sizeof(pl));
+	conn_ctl_sinks(c, &k);
+	ctlplane_tell_reach(&c->ctl, &k, pl);
 }
 
 /* Take this peer's account of itself. Kept per connection, since in a
@@ -3705,14 +3635,8 @@ static void reach_take(struct sess *s, struct conn *c)
 	(void)s;
 	if (!c)
 		return;
-	pthread_mutex_lock(&c->peer_in_lock);
-	if (!c->reach_in_dirty) {
-		pthread_mutex_unlock(&c->peer_in_lock);
+	if (!ctlplane_take_reach(&c->ctl, pl))
 		return;
-	}
-	c->reach_in_dirty = 0;
-	memcpy(pl, c->reach_in, sizeof(pl));
-	pthread_mutex_unlock(&c->peer_in_lock);
 	for (i = 0; i < 2; i++) {
 		int state = 0, flags = 0;
 
@@ -3772,16 +3696,12 @@ static void rdv_ask(struct sess *s, struct conn *c, uint64_t now)
 {
 	static const int famv[2] = { 4, 6 };
 	uint8_t reach[CTL_REACH_PLEN];
-	int seen, i;
+	int i;
 
 	if (!s->cfg->is_host || !c || !(s->cfg->sig_flags & SIG_DHT))
 		return;
-	pthread_mutex_lock(&c->peer_in_lock);
-	seen = c->reach_in_seen;
-	memcpy(reach, c->reach_in, sizeof(reach));
-	pthread_mutex_unlock(&c->peer_in_lock);
-	if (!seen)			/* it has not said, so do not presume */
-		return;
+	if (!ctlplane_peer_reach(&c->ctl, reach))
+		return;			/* it has not said, so do not presume */
 	for (i = 0; i < 2; i++) {
 		int state = 0, flags = 0;
 
@@ -3805,9 +3725,7 @@ static void rdv_ask(struct sess *s, struct conn *c, uint64_t now)
 		if (state != CTL_REACH_UP)
 			continue;
 		c->next_rdvask_ms[i] = now + RDVASK_MS;
-		pthread_mutex_lock(&c->peer_in_lock);
-		c->rdvask_out |= i ? 2 : 1;
-		pthread_mutex_unlock(&c->peer_in_lock);
+		ctlplane_ask_rdv(&c->ctl, famv[i]);
 		dbg_logf("rdv: asking peer %d to rendezvous on v%d", c->dash_id,
 			 famv[i]);
 	}
@@ -3816,20 +3734,10 @@ static void rdv_ask(struct sess *s, struct conn *c, uint64_t now)
 /* Send what rdv_ask decided, from the loop that owns the control socket. */
 static void rdvask_tell(struct conn *c)
 {
-	static const int famv[2] = { 4, 6 };
-	uint8_t pl[CTL_RDVASK_PLEN];
-	int ask, i;
+	struct ctlplane_sinks k;
 
-	pthread_mutex_lock(&c->peer_in_lock);
-	ask = c->rdvask_out;
-	c->rdvask_out = 0;
-	pthread_mutex_unlock(&c->peer_in_lock);
-	for (i = 0; i < 2; i++) {
-		if (!(ask & (i ? 2 : 1)))
-			continue;
-		pl[0] = (uint8_t)famv[i];
-		ctl_send(c, CTLM_RDVASK, pl, sizeof(pl));
-	}
+	conn_ctl_sinks(c, &k);
+	ctlplane_tell_asks(&c->ctl, &k);
 }
 
 /*
@@ -3852,10 +3760,7 @@ static void rdv_serve_ask(struct sess *s, struct conn *c, uint64_t now)
 	if (s->cfg->is_host || !s->sig)
 		return;
 	if (c) {
-		pthread_mutex_lock(&c->peer_in_lock);
-		ask = c->rdvask_in;
-		c->rdvask_in = 0;
-		pthread_mutex_unlock(&c->peer_in_lock);
+		ask = ctlplane_take_asks(&c->ctl);
 	}
 	for (i = 0; i < 2; i++) {
 		if (ask & (i ? 2 : 1)) {
@@ -4153,6 +4058,7 @@ static void net_change_reset(struct sess *s)
  */
 static void resume_tick(struct conn *c)
 {
+	struct ctlplane_live live;
 	struct ice_ctx *spare_ctx;
 	struct nat_agent *spare;
 	struct sess *s;
@@ -4167,10 +4073,9 @@ static void resume_tick(struct conn *c)
 	 * path never trips "lost" (KCP still trickles), so it must be seen here. */
 	net_watch(s, now);
 	moved = net_moved(s);
-	pthread_mutex_lock(&c->hb_lock);
-	lost = c->lost_since_ms != 0 &&
-	       now - c->lost_since_ms >= RESUME_AFTER_MS;
-	pthread_mutex_unlock(&c->hb_lock);
+	ctlplane_liveness(&c->ctl, &live);
+	lost = live.lost_since_ms != 0 &&
+	       now - live.lost_since_ms >= RESUME_AFTER_MS;
 	if (!lost && !moved) {
 		if (c->rs_state) {
 			c->rs_state = 0;
@@ -4591,8 +4496,7 @@ static int conn_run(struct conn *c, int drive_sig)
 	c->end_verdict = 0;
 	/* The probe key belongs to the channel that agreed it. */
 	probeplane_reset(&c->probe);
-	c->key_half_sent = 0;
-	c->key_half_seen = 0;
+	ctlplane_reset(&c->ctl);
 	dbg_logf("conn_run: sock_pair ok sp=%d/%d cp=%d/%d, starting ssh thread",
 		 (int)sp[0], (int)sp[1], (int)cp[0], (int)cp[1]);
 	if (pthread_create(&th, NULL,
@@ -4616,12 +4520,7 @@ static int conn_run(struct conn *c, int drive_sig)
 	/* The path is up on entry, so start the liveness clock as alive, and
 	 * what was said about the session before this one is spent. */
 	__atomic_store_n(&c->peer_fresh, 0, __ATOMIC_RELAXED);
-	pthread_mutex_lock(&c->hb_lock);
-	c->hb_last_pong = now_ms();
-	__atomic_store_n(&c->hb_last_heard, c->hb_last_pong, __ATOMIC_RELAXED);
-	c->hb_pong_seen = 0;
-	c->lost_since_ms = 0;
-	pthread_mutex_unlock(&c->hb_lock);
+	ctlplane_live_reset(&c->ctl, now_ms());
 	/*
 	 * And say so before the session starts. Status is published on a
 	 * cadence, so until the first turn of the loop below the last one
@@ -4686,10 +4585,7 @@ static int conn_run(struct conn *c, int drive_sig)
 			__atomic_store_n(&c->bh_mute, 0, __ATOMIC_RELAXED);
 			/* The resumed link earns a full liveness window; without
 			 * this it is judged by silence that predates it. */
-			pthread_mutex_lock(&c->hb_lock);
-			__atomic_store_n(&c->hb_last_heard, now_ms(),
-					 __ATOMIC_RELAXED);
-			pthread_mutex_unlock(&c->hb_lock);
+			ctlplane_heard(&c->ctl, now_ms());
 			dbg_logf("resume: adopted the re-punched agent");
 		}
 		if (drive_sig) {
@@ -4771,17 +4667,17 @@ static int conn_run(struct conn *c, int drive_sig)
 			dbg_logf("path blackhole lifted");
 		}
 
-		if (!c->key_half_sent && sock_valid(c->ctl_fd) &&
-		    !random_bytes(c->key_half_out, CTL_KEY_PLEN)) {
-			ctl_send(c, CTLM_KEY, c->key_half_out, CTL_KEY_PLEN);
-			c->key_half_sent = 1;
-			conn_key_bind(c);
+		if (sock_valid(c->ctl_fd)) {
+			struct ctlplane_sinks ck;
+
+			conn_ctl_sinks(c, &ck);
+			ctlplane_offer_key(&c->ctl, &ck);
 		}
 		if (now_ms() >= next_hb) {
-			uint8_t ts[CTL_TS_LEN];
+			struct ctlplane_sinks ck;
 
-			ctl_put_u64(ts, now_ms());
-			ctl_send(c, CTLM_PING, ts, sizeof(ts));
+			conn_ctl_sinks(c, &ck);
+			ctlplane_ping(&c->ctl, &ck, now_ms());
 			next_hb = now_ms() + HB_INTERVAL_MS;
 		}
 		/*
@@ -4803,7 +4699,7 @@ static int conn_run(struct conn *c, int drive_sig)
 			    (ef.revents & (POLLIN | POLLHUP | POLLERR))) {
 				dbg_logf("ctl: telling the client the shared "
 					 "session has ended");
-				ctl_send(c, CTLM_BYE, NULL, 0);
+				conn_ctl_send(c, CTLM_BYE, NULL, 0);
 				c->bye_sent = 1;
 				/*
 				 * On the single-connection path this loop owns
@@ -4829,7 +4725,7 @@ static int conn_run(struct conn *c, int drive_sig)
 		    __atomic_load_n(&c->shell_ended, __ATOMIC_RELAXED) ==
 		    SSHD_END_DETACH) {
 			dbg_logf("ctl: telling the client it detached");
-			ctl_send(c, CTLM_DETACHED, NULL, 0);
+			conn_ctl_send(c, CTLM_DETACHED, NULL, 0);
 			detached_sent = 1;
 		}
 		if (drive_sig) {
@@ -4861,25 +4757,10 @@ static int conn_run(struct conn *c, int drive_sig)
 			resume_tick(c);
 		if (now_ms() >= c->next_status_ms) {
 			uint64_t now = now_ms(), lp;
-			int state, pong_seen;
+			int state;
 
-			pthread_mutex_lock(&c->hb_lock);
-			lp = c->hb_last_pong;
-			if (__atomic_load_n(&c->hb_last_heard,
-					    __ATOMIC_RELAXED) > lp)
-				lp = __atomic_load_n(&c->hb_last_heard,
-						     __ATOMIC_RELAXED);
-			pong_seen = c->hb_pong_seen;
-			if (pong_seen) {
-				if (now - lp > hb_lost_ms(c->hb_rtt)) {
-					if (!c->lost_since_ms)
-						c->lost_since_ms = now;
-				} else {
-					c->lost_since_ms = 0;
-				}
-			}
-			state = c->lost_since_ms ? CONN_LOST : CONN_LIVE;
-			pthread_mutex_unlock(&c->hb_lock);
+			state = ctlplane_judge(&c->ctl, now, &lp) ? CONN_LOST :
+								    CONN_LIVE;
 			publish_status(c, state);
 			/* The heartbeat is end to end, so this says the
 			 * session stopped getting through -- not that any one
@@ -4910,18 +4791,20 @@ static int conn_run(struct conn *c, int drive_sig)
 			    now - conn_start > (uint64_t)s->cfg->test_reap_ms) {
 				done = 1;
 			} else if (s->cfg->is_host) {
+				struct ctlplane_live live;
 				struct host_reap hr;
 				int verdict;
 
+				ctlplane_liveness(&c->ctl, &live);
 				hr.conn_start_ms = conn_start;
-				hr.lost_since_ms = c->lost_since_ms;
+				hr.lost_since_ms = live.lost_since_ms;
 				hr.resume_last_ms =
 					__atomic_load_n(&c->resume_last_ms,
 							__ATOMIC_RELAXED);
 				hr.resume_pending =
 					__atomic_load_n(&c->resume_pending,
 							__ATOMIC_RELAXED);
-				hr.pong_seen = pong_seen;
+				hr.pong_seen = live.pong_seen;
 				verdict = host_reap_due(&hr, now);
 				if (verdict != HOST_REAP_KEEP)
 					done = 1;
@@ -4977,8 +4860,7 @@ static int conn_run(struct conn *c, int drive_sig)
 	 * outlive the session that agreed it.
 	 */
 	probeplane_reset(&c->probe);
-	c->key_half_sent = 0;
-	c->key_half_seen = 0;
+	ctlplane_reset(&c->ctl);
 	/* Clear the stream under the lock before destroying it: a transport
 	 * receive thread (or the host's main-thread demux) may be about to call
 	 * stream_input on it. After this, deliver_stream sees NULL and no-ops. */
@@ -5204,16 +5086,16 @@ static void net_pump(struct sess *s, uint64_t now)
 static int conn_link_state(const struct sess *s, struct conn *c)
 {
 	uint64_t now = now_ms(), last;
+	struct ctlplane_live live;
 	int seen, lost, rtt;
 	unsigned gen;
 
-	pthread_mutex_lock(&c->hb_lock);
-	last = c->hb_last_pong;
-	seen = c->hb_pong_seen;
-	gen = c->live_gen;
-	rtt = c->hb_rtt;
-	lost = c->lost_since_ms != 0;
-	pthread_mutex_unlock(&c->hb_lock);
+	ctlplane_liveness(&c->ctl, &live);
+	last = live.last_pong_ms;
+	seen = live.pong_seen;
+	gen = live.live_gen;
+	rtt = live.rtt_ms;
+	lost = live.lost_since_ms != 0;
 
 	if (!seen)
 		return c->ice_up ? CONN_PUNCHING : CONN_CONNECTING;
@@ -5480,8 +5362,7 @@ static struct conn *conn_alloc(struct sess *s)
 	c->sess = s;
 	c->ctl_fd = INVALID_SOCK;
 	c->bh_kind = -1;
-	pthread_mutex_init(&c->hb_lock, NULL);
-	pthread_mutex_init(&c->peer_in_lock, NULL);
+	ctlplane_init(&c->ctl, &c->probe);
 	pthread_mutex_init(&c->status_lock, NULL);
 	pthread_mutex_init(&c->stream_lock, NULL);
 	pthread_mutex_init(&c->claim_lock, NULL);
@@ -5664,12 +5545,11 @@ static struct conn *worker_by_ufrag(struct worker *ws, const char *ufrag)
  */
 static int conn_is_proven(struct conn *c)
 {
-	int seen;
+	struct ctlplane_live live;
 
-	pthread_mutex_lock(&c->hb_lock);
-	seen = c->hb_pong_seen;
-	pthread_mutex_unlock(&c->hb_lock);
-	return seen;
+	ctlplane_liveness(&c->ctl, &live);
+
+	return live.pong_seen;
 }
 
 /* Is this claimant queued for LAN admission (not yet a worker)? */
@@ -6810,8 +6690,7 @@ int session_run(const struct session_cfg *cfg)
 		return 1;
 	pthread_mutex_init(&s.trickle_lock, NULL);
 	pthread_mutex_init(&s.c.status_lock, NULL);	/* s.c.status zeroed = connecting */
-	pthread_mutex_init(&s.c.hb_lock, NULL);
-	pthread_mutex_init(&s.c.peer_in_lock, NULL);
+	ctlplane_init(&s.c.ctl, &s.c.probe);
 	pthread_mutex_init(&s.c.stream_lock, NULL);
 	pthread_mutex_init(&s.c.claim_lock, NULL);
 	pthread_mutex_init(&s.pub_lock, NULL);
@@ -7317,8 +7196,7 @@ done:
 	pthread_mutex_destroy(&s.c.status_lock);
 	probeplane_destroy(&s.c.probe);
 	pthread_mutex_destroy(&s.c.claim_lock);
-	pthread_mutex_destroy(&s.c.hb_lock);
-	pthread_mutex_destroy(&s.c.peer_in_lock);
+	ctlplane_destroy(&s.c.ctl);
 	pthread_mutex_destroy(&s.c.stream_lock);
 	pathplane_destroy(&s.c.pl);
 	pthread_mutex_destroy(&s.pub_lock);
