@@ -113,6 +113,43 @@ int path_ep_same_addr(const struct path_ep *a, const struct path_ep *b);
 int path_ep_any(const struct path_ep *ep);
 int path_ep_is_v4(const struct path_ep *ep);
 
+/*
+ * The budget for opening probes that arrive from a source no path holds.
+ *
+ * Such a frame is not a stranger's by default: it is what a peer that has just
+ * moved looks like, and it is the only evidence of the move that arrives
+ * before any signalling does. So it has to be opened to find out, and opening
+ * costs a decryption, which is what an attacker would spend if the cost were
+ * unbounded. Two buckets rather than one: a shared one caps the work this end
+ * will do at all, and a per-source one stops a single address spending the
+ * whole of it and starving the peer that really did move. The per-source ring
+ * is tiny and evicts the oldest, so a flood from many addresses still reaches
+ * the shared bucket, which is the ceiling it was always meant to be. Only the
+ * thread dispatching the socket touches either.
+ */
+#define PATH_ADOPT_SRC_MAX 8		/* sources tracked at once */
+
+struct path_adopt_src {
+	uint8_t addr[16];
+	uint16_t port;
+	int used;
+	int tokens;			/* thousandths, as the shared bucket */
+	uint64_t ms;			/* last refill */
+	uint64_t seen_ms;		/* last use, for eviction */
+};
+
+struct path_adopt {
+	int tokens;			/* thousandths of a token */
+	uint64_t ms;
+	struct path_adopt_src src[PATH_ADOPT_SRC_MAX];
+};
+
+/* Whether one more probe from `ep` may be opened now: both buckets must pay,
+ * and both are charged only when they can. A zeroed budget is a full one from
+ * its first use, so a zeroed owner needs no separate initialiser. */
+int path_adopt_allow(struct path_adopt *a, const struct path_ep *ep,
+		     uint64_t now);
+
 /* One host, rather than a group: not multicast, not broadcast, not the
  * unspecified address. What a peer claims about where it is has to be
  * somewhere a session could be carried to. */

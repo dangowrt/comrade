@@ -7,6 +7,7 @@
 #include <stddef.h>
 
 #include "netmon.h"
+#include "path.h"
 
 struct cand_policy {
 	int allow_private_v4;
@@ -85,5 +86,13 @@ int cand_sdp_reaches_off_segment(const char *sdp);
  * own buffer.
  */
 void cand_sdp_ufrag(const char *sdp, char *out, size_t max);
+
+/*
+ * The endpoint out of one candidate line, in either family. Returns 0 on
+ * success. Used on the SELECTED pair, which is the only address worth acting
+ * on: it is the one that was tried and answered rather than the one somebody
+ * hoped would work.
+ */
+int cand_ep_parse(const char *cand, struct path_ep *ep);
 
 #endif

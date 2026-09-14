@@ -804,3 +804,65 @@ int path_select(struct path_table *t, uint64_t now)
 	}
 	return t->sel;
 }
+
+/* One bucket's refill and charge, in thousandths so the rate divides. */
+static int bucket_take(int *tokens, uint64_t *ms, uint64_t now)
+{
+	const int cap = PATH_ADOPT_DEPTH * 1000;
+	uint64_t gained = (now - *ms) * PATH_ADOPT_RATE;
+
+	*ms = now;
+	if (gained >= (uint64_t)cap || *tokens + (int)gained >= cap)
+		*tokens = cap;
+	else
+		*tokens += (int)gained;
+	if (*tokens < 1000)
+		return 0;
+	*tokens -= 1000;
+	return 1;
+}
+
+int path_adopt_allow(struct path_adopt *a, const struct path_ep *ep,
+		     uint64_t now)
+{
+	struct path_adopt_src *slot = NULL, *oldest = &a->src[0];
+	int i;
+
+	for (i = 0; i < PATH_ADOPT_SRC_MAX; i++) {
+		struct path_adopt_src *s = &a->src[i];
+
+		if (s->used && s->port == ep->port &&
+		    !memcmp(s->addr, ep->addr, sizeof(s->addr))) {
+			slot = s;
+			break;
+		}
+		if (!s->used) {
+			slot = s;
+			break;
+		}
+		if (s->seen_ms < oldest->seen_ms)
+			oldest = s;
+	}
+	if (!slot)
+		slot = oldest;
+	if (!slot->used || slot->port != ep->port ||
+	    memcmp(slot->addr, ep->addr, sizeof(slot->addr))) {
+		memset(slot, 0, sizeof(*slot));
+		memcpy(slot->addr, ep->addr, sizeof(slot->addr));
+		slot->port = ep->port;
+		slot->used = 1;
+		slot->tokens = PATH_ADOPT_DEPTH * 1000;
+		slot->ms = now;
+	}
+	slot->seen_ms = now;
+	/*
+	 * The source's own budget first, and the shared one only if it paid: a
+	 * source that is out of credit must not go on spending from the pool
+	 * every other source depends on. The reverse is not true and does not
+	 * need to be: a source charged for work the shared cap then refused has
+	 * lost a token it would have spent a moment later anyway.
+	 */
+	if (!bucket_take(&slot->tokens, &slot->ms, now))
+		return 0;
+	return bucket_take(&a->tokens, &a->ms, now);
+}

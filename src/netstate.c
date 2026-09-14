@@ -3,6 +3,8 @@
 
 #include <string.h>
 
+#include "wsock.h"
+
 #include "netstate.h"
 
 static int fam_idx(int family)
@@ -743,4 +745,31 @@ int netstate_anchor(const struct netstate *ns, int family, uint8_t *out,
 	if (confirmed)
 		*confirmed = anchor_proven(f);
 	return 1;
+}
+
+/* Classify a bare address string by reachability scope. */
+int net_addr_scope(const char *addr)
+{
+	unsigned char b[16];
+
+	if (strchr(addr, ':')) {
+		if (inet_pton(AF_INET6, addr, b) != 1)
+			return NET_SCOPE_GLOBAL;
+		if (b[0] == 0xfe && (b[1] & 0xc0) == 0x80)	/* fe80::/10 */
+			return NET_SCOPE_LAN;
+		if (b[0] == 0xfe && (b[1] & 0xc0) == 0xc0)	/* fec0::/10 */
+			return NET_SCOPE_LAN;
+		if ((b[0] & 0xfe) == 0xfc)			/* fc00::/7 ULA */
+			return NET_SCOPE_LAN;
+		return NET_SCOPE_GLOBAL;
+	}
+	if (inet_pton(AF_INET, addr, b) != 1)
+		return NET_SCOPE_GLOBAL;
+	if (b[0] == 10 || (b[0] == 192 && b[1] == 168) ||
+	    (b[0] == 172 && b[1] >= 16 && b[1] <= 31) ||
+	    (b[0] == 169 && b[1] == 254))
+		return NET_SCOPE_LAN;
+	if (b[0] == 100 && b[1] >= 64 && b[1] <= 127)
+		return NET_SCOPE_CGNAT;
+	return NET_SCOPE_GLOBAL;
 }

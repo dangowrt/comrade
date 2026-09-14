@@ -531,3 +531,26 @@ void netmon_drain_event(struct netmon *m)
 	if (seen)
 		m->next_check_ms = 0;
 }
+
+int netmon_addr_sockaddr(const struct netmon_addr *a, uint16_t port,
+			 struct sockaddr_storage *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (a->family == AF_INET && a->addrlen == 4) {
+		struct sockaddr_in *s4 = (struct sockaddr_in *)out;
+
+		s4->sin_family = AF_INET;
+		s4->sin_port = htons(port);
+		memcpy(&s4->sin_addr, a->addr, 4);
+		return 4;
+	}
+	if (a->family == AF_INET6 && a->addrlen == 16) {
+		struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)out;
+
+		s6->sin6_family = AF_INET6;
+		s6->sin6_port = htons(port);
+		memcpy(&s6->sin6_addr, a->addr, 16);
+		return 6;
+	}
+	return 0;
+}

@@ -518,6 +518,7 @@ target_link_libraries(comrade_netroute PUBLIC comrade_compat)
 
 add_library(comrade_netstate STATIC src/netstate.c)
 target_include_directories(comrade_netstate PUBLIC src)
+target_link_libraries(comrade_netstate PUBLIC comrade_compat)
 
 add_library(comrade_statusbar STATIC src/statusbar.c)
 target_include_directories(comrade_statusbar PUBLIC src)

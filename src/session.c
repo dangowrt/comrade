@@ -546,21 +546,6 @@ struct conn {
 	int fwd_reported;		/* main-thread only: refusal surfaced yet */
 };
 
-/*
- * One source's share of the adoption budget, kept in a small ring so a flood
- * from one address cannot spend everyone else's.
- */
-#define ADOPT_SRC_MAX 8
-
-struct adopt_src {
-	uint8_t addr[16];
-	uint16_t port;
-	int used;
-	int tokens;			/* thousandths, as the shared bucket */
-	uint64_t ms;			/* last refill */
-	uint64_t seen_ms;		/* last use, for eviction */
-};
-
 struct sess {
 	const struct session_cfg *cfg;
 
@@ -787,14 +772,12 @@ struct sess {
 	/*
 	 * Every connection this host serves, whichever transport admitted it, so
 	 * a probe from a source no path names can be matched to the claimant it
-	 * names -- and the budget that bounds what a stranger can make us open
-	 * (adopt_allow). Both belong to the thread that dispatches the shared
+	 * names -- and the budget that bounds what a stranger can make us open.
+	 * Both belong to the thread that dispatches the shared
 	 * lanlink socket, which is this one.
 	 */
 	struct conn *conns[HOST_MAX_WORKERS];
-	int adopt_tokens;			/* thousandths of a token */
-	struct adopt_src adopt_src[ADOPT_SRC_MAX];	/* and each source's own */
-	uint64_t adopt_ms;
+	struct path_adopt adopt;
 	struct conn *punching[HOST_MAX_WORKERS];	/* in-flight ICE punches */
 	char last_served_ufrag[40];
 	struct claim_served served;	/* claimants this host has served */
@@ -863,40 +846,6 @@ static int cand_addr(const char *cand, char *out, size_t n)
 	else
 		snprintf(out, n, "%s", addr);
 	return 1;
-}
-
-/*
- * The endpoint of an ICE candidate line, canonicalised. libjuice reports the
- * selected pair as two such lines, which is the only source of a remote
- * endpoint for PATH_ICE -- its receive callback carries no source address at
- * all. Right except between a re-nomination and the next report. 0 if found.
- */
-static int cand_ep(const char *cand, struct path_ep *ep)
-{
-	const char *p = strstr(cand, "candidate:");
-	struct sockaddr_in6 a6;
-	struct sockaddr_in a4;
-	char addr[64];
-	unsigned port = 0;
-
-	if (!p || sscanf(p, "candidate:%*s %*d %*s %*u %63s %u",
-			 addr, &port) != 2 || !port)
-		return -1;
-	if (strchr(addr, ':')) {
-		memset(&a6, 0, sizeof(a6));
-		a6.sin6_family = AF_INET6;
-		a6.sin6_port = htons((uint16_t)port);
-		if (inet_pton(AF_INET6, addr, &a6.sin6_addr) != 1)
-			return -1;
-		return path_ep_from_sockaddr(ep, (struct sockaddr *)&a6,
-					     sizeof(a6));
-	}
-	memset(&a4, 0, sizeof(a4));
-	a4.sin_family = AF_INET;
-	a4.sin_port = htons((uint16_t)port);
-	if (inet_pton(AF_INET, addr, &a4.sin_addr) != 1)
-		return -1;
-	return path_ep_from_sockaddr(ep, (struct sockaddr *)&a4, sizeof(a4));
 }
 
 /* Printable "addr:port" ("[v6]:port") for a sockaddr; empty on failure. */
@@ -1416,33 +1365,6 @@ static int conn_proven_paths(struct conn *c)
 	return n;
 }
 
-/* Classify a bare address string by reachability scope. */
-static int addr_scope(const char *addr)
-{
-	unsigned char b[16];
-
-	if (strchr(addr, ':')) {
-		if (inet_pton(AF_INET6, addr, b) != 1)
-			return NET_SCOPE_GLOBAL;
-		if (b[0] == 0xfe && (b[1] & 0xc0) == 0x80)	/* fe80::/10 */
-			return NET_SCOPE_LAN;
-		if (b[0] == 0xfe && (b[1] & 0xc0) == 0xc0)	/* fec0::/10 site-local */
-			return NET_SCOPE_LAN;
-		if ((b[0] & 0xfe) == 0xfc)			/* fc00::/7 ULA */
-			return NET_SCOPE_LAN;
-		return NET_SCOPE_GLOBAL;
-	}
-	if (inet_pton(AF_INET, addr, b) != 1)
-		return NET_SCOPE_GLOBAL;
-	if (b[0] == 10 || (b[0] == 192 && b[1] == 168) ||
-	    (b[0] == 172 && b[1] >= 16 && b[1] <= 31) ||
-	    (b[0] == 169 && b[1] == 254))
-		return NET_SCOPE_LAN;
-	if (b[0] == 100 && b[1] >= 64 && b[1] <= 127)
-		return NET_SCOPE_CGNAT;
-	return NET_SCOPE_GLOBAL;
-}
-
 /* How an endpoint on the shared lanlink socket is come by: one on the local
  * segment, or any other the same socket can reach. A description of the
  * endpoint and nothing more -- neither kind ranks above the other. */
@@ -1461,7 +1383,7 @@ static enum path_kind ep_kind(const struct path_ep *ep)
 		if (!inet_ntop(AF_INET6, &a6, host, sizeof(host)))
 			return PATH_ROUTED;
 	}
-	return addr_scope(host) == NET_SCOPE_LAN ? PATH_SEGMENT : PATH_ROUTED;
+	return net_addr_scope(host) == NET_SCOPE_LAN ? PATH_SEGMENT : PATH_ROUTED;
 }
 
 /*
@@ -1543,7 +1465,7 @@ static void report_candidates(struct sess *s, const char *sdp)
 			else
 				via = -1;
 			if (via >= 0) {
-				int scope = addr_scope(addr);
+				int scope = net_addr_scope(addr);
 				uint8_t raw[16];
 				int len;
 
@@ -1749,7 +1671,7 @@ static void canon_v6(const char *in, const char *src6, char *out, size_t cap)
 		if (src6[0] && !strncmp(line, "a=candidate:", 12) &&
 		    sscanf(line, "a=candidate:%*s %*d %*s %*u %63s %*d typ %15s",
 			   addr, typ) == 2 && strchr(addr, ':') &&
-		    addr_scope(addr) == NET_SCOPE_GLOBAL) {
+		    net_addr_scope(addr) == NET_SCOPE_GLOBAL) {
 			if (strcmp(typ, "host"))
 				drop = 1;	/* global v6 srflx: source covers it */
 			else if (kept6)
@@ -1877,7 +1799,7 @@ static void pool_pump(struct sess *s)
 		if (inet_ntop(AF_INET, pool[i], ip, sizeof(ip)))
 			netstate_on_candidate(&s->ns, 4,
 					      netstate_epoch(&s->ns, 4),
-					      addr_scope(ip), NET_VIA_STUN,
+					      net_addr_scope(ip), NET_VIA_STUN,
 					      pool[i], 4, ip);
 	}
 	s->pool_reported = n;
@@ -2144,7 +2066,7 @@ static void ns_drain(struct sess *s)
 		}
 		if (f[i].kind == NSF_ADDR) {
 			netstate_on_candidate(&s->ns, f[i].family, f[i].epoch,
-					      addr_scope(f[i].text),
+					      net_addr_scope(f[i].text),
 					      NET_VIA_STUN, f[i].addr,
 					      f[i].family == 6 ? 16 : 4,
 					      f[i].text);
@@ -2385,7 +2307,7 @@ static void on_ice_candidate(void *arg, const char *cand)
 			if (inet_pton(AF_INET, addr, b) == 1)
 				pool_note(s, b);
 		} else if (!strcmp(typ, "host") &&
-			   addr_scope(addr) != NET_SCOPE_GLOBAL) {
+			   net_addr_scope(addr) != NET_SCOPE_GLOBAL) {
 			__atomic_store_n(&s->have_priv4, 1, __ATOMIC_RELAXED);
 		}
 	}
@@ -3042,84 +2964,6 @@ static void probe_recv(struct conn *c, const uint8_t *data, size_t len,
 }
 
 /*
- * A source's share of the adoption budget. One bucket for the whole session
- * was one bucket for everyone: a stranger sending four plaintext bytes at the
- * refill rate kept it empty for every served connection at once, and the
- * pickup of a peer's new address -- the thing the budget exists to allow --
- * stopped working for all of them. Spend from a small per-source ring first,
- * so a flood from one address starves only itself, and keep the shared bucket
- * behind it as the ceiling on the whole socket.
- *
- * The ring is tiny and evicts the oldest: a flood from many addresses still
- * reaches the shared bucket, which is the ceiling it was always meant to be.
- * Only the thread dispatching the socket touches either.
- */
-static int adopt_allow_src(struct sess *s, const struct path_ep *ep,
-			   uint64_t now)
-{
-	struct adopt_src *slot = NULL, *oldest = &s->adopt_src[0];
-	int i;
-
-	for (i = 0; i < ADOPT_SRC_MAX; i++) {
-		struct adopt_src *a = &s->adopt_src[i];
-
-		if (a->used && a->port == ep->port &&
-		    !memcmp(a->addr, ep->addr, sizeof(a->addr))) {
-			slot = a;
-			break;
-		}
-		if (!a->used) {
-			slot = a;
-			break;
-		}
-		if (a->seen_ms < oldest->seen_ms)
-			oldest = a;
-	}
-	if (!slot)
-		slot = oldest;
-	if (!slot->used || slot->port != ep->port ||
-	    memcmp(slot->addr, ep->addr, sizeof(slot->addr))) {
-		memset(slot, 0, sizeof(*slot));
-		memcpy(slot->addr, ep->addr, sizeof(slot->addr));
-		slot->port = ep->port;
-		slot->used = 1;
-		slot->tokens = PATH_ADOPT_DEPTH * 1000;
-		slot->ms = now;
-	}
-	slot->seen_ms = now;
-	{
-		const int cap = PATH_ADOPT_DEPTH * 1000;
-		uint64_t gained = (now - slot->ms) * PATH_ADOPT_RATE;
-
-		slot->ms = now;
-		if (gained >= (uint64_t)cap || slot->tokens + (int)gained >= cap)
-			slot->tokens = cap;
-		else
-			slot->tokens += (int)gained;
-		if (slot->tokens < 1000)
-			return 0;
-		slot->tokens -= 1000;
-	}
-	return 1;
-}
-
-static int adopt_allow(struct sess *s, uint64_t now)
-{
-	const int cap = PATH_ADOPT_DEPTH * 1000;
-	uint64_t gained = (now - s->adopt_ms) * PATH_ADOPT_RATE;
-
-	s->adopt_ms = now;
-	if (gained >= (uint64_t)cap || s->adopt_tokens + (int)gained >= cap)
-		s->adopt_tokens = cap;
-	else
-		s->adopt_tokens += (int)gained;
-	if (s->adopt_tokens < 1000)
-		return 0;
-	s->adopt_tokens -= 1000;
-	return 1;
-}
-
-/*
  * May this datagram be opened? Only a frame opening with this session's probe
  * tag is a candidate for adoption at all; anything else is stream data, which
  * ikcp_input rejects for the cost of one compare. A probe from a source one of
@@ -3134,7 +2978,7 @@ static int probe_gate(struct sess *s, struct conn *c, const struct path_ep *ep,
 		return 1;
 	if (c && conn_holds_ep(c, ep, 1))
 		return 1;
-	return adopt_allow_src(s, ep, now_ms()) && adopt_allow(s, now_ms());
+	return path_adopt_allow(&s->adopt, ep, now_ms());
 }
 
 /*
@@ -3218,7 +3062,7 @@ static int conn_ice_ep(struct nat_agent *agent, struct path_ep *ep)
 		return -1;
 	if (nat_selected(agent, loc, sizeof(loc), rem, sizeof(rem)))
 		return -1;
-	return cand_ep(rem, ep);
+	return cand_ep_parse(rem, ep);
 }
 
 /*
@@ -3989,31 +3833,6 @@ static void *ssh_cli_thread(void *p)
 	return NULL;
 }
 
-/* One interface address of a netmon snapshot as a sockaddr at `port`. Returns
- * the family (4 or 6), or 0 for a record neither family names. */
-static int addr_sockaddr(const struct netmon_addr *a, uint16_t port,
-			 struct sockaddr_storage *out)
-{
-	memset(out, 0, sizeof(*out));
-	if (a->family == AF_INET && a->addrlen == 4) {
-		struct sockaddr_in *s4 = (struct sockaddr_in *)out;
-
-		s4->sin_family = AF_INET;
-		s4->sin_port = htons(port);
-		memcpy(&s4->sin_addr, a->addr, 4);
-		return 4;
-	}
-	if (a->family == AF_INET6 && a->addrlen == 16) {
-		struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)out;
-
-		s6->sin6_family = AF_INET6;
-		s6->sin6_port = htons(port);
-		memcpy(&s6->sin6_addr, a->addr, 16);
-		return 6;
-	}
-	return 0;
-}
-
 /*
  * Advertise our own local endpoints to the peer over CTLM_CAND, so it probes
  * and holds them rather than exploring only the pair admission produced. The
@@ -4044,7 +3863,7 @@ static void cand_tell(struct conn *c, uint64_t now)
 	for (i = 0; i < naddrs; i++) {
 		struct sockaddr_storage sa;
 		uint8_t pl[CTL_RDV_PLEN];
-		int fam = addr_sockaddr(&addrs[i], port, &sa);
+		int fam = netmon_addr_sockaddr(&addrs[i], port, &sa);
 
 		if (!fam)
 			continue;
@@ -5085,7 +4904,7 @@ static void net_sample_src(struct sess *s, int family, uint32_t epoch)
 	if (net_source_addr(af, text, sizeof(text), raw, &len))
 		len = 0;
 	netstate_on_src(&s->ns, family, epoch, len ? raw : NULL, len,
-			len ? addr_scope(text) : 0, len ? text : NULL,
+			len ? net_addr_scope(text) : 0, len ? text : NULL,
 			now_ms());
 }
 
@@ -5810,7 +5629,7 @@ static void update_expect(struct sess *s)
 		if (sscanf(p, "a=candidate:%*s %*d %*s %*u %63s", addr) == 1) {
 			if (!strchr(addr, ':'))
 				s->expect4 = 1;
-			else if (addr_scope(addr) == NET_SCOPE_GLOBAL)
+			else if (net_addr_scope(addr) == NET_SCOPE_GLOBAL)
 				s->expect6 = 1;
 		}
 		p += 12;

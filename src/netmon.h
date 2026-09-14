@@ -78,4 +78,12 @@ int netmon_prepare(struct netmon *m, struct pollfd *fds, int maxfds);
  * netmon_changed* samples at once rather than waiting out the poll interval. */
 void netmon_drain_event(struct netmon *m);
 
+/*
+ * One address of a snapshot as a sockaddr on `port`. Returns the family as 4
+ * or 6, or 0 for a record neither family names. A playbook that advertises
+ * where it is needs this conversion whatever it is carrying.
+ */
+int netmon_addr_sockaddr(const struct netmon_addr *a, uint16_t port,
+			 struct sockaddr_storage *out);
+
 #endif

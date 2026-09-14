@@ -306,3 +306,30 @@ void cand_sdp_ufrag(const char *sdp, char *out, size_t max)
 		out[i++] = *p++;
 	out[i] = '\0';
 }
+
+int cand_ep_parse(const char *cand, struct path_ep *ep)
+{
+	const char *p;
+	char addr[64];
+	unsigned port = 0;
+
+	if (!cand || !ep)
+		return -1;
+	p = strstr(cand, "candidate:");
+	if (!p || sscanf(p, "candidate:%*s %*d %*s %*u %63s %u",
+			 addr, &port) != 2)
+		return -1;
+	if (!port)
+		return -1;
+	/* Filled directly rather than through path_ep_from_sockaddr: this
+	 * module is reached from builds that have no reason to link the path
+	 * table, and a path_ep is sixteen bytes and a port. */
+	memset(ep, 0, sizeof(*ep));
+	ep->port = (uint16_t)port;
+	if (strchr(addr, ':'))
+		return inet_pton(AF_INET6, addr, ep->addr) == 1 ? 0 : -1;
+	ep->addr[10] = 0xff;
+	ep->addr[11] = 0xff;
+
+	return inet_pton(AF_INET, addr, ep->addr + 12) == 1 ? 0 : -1;
+}

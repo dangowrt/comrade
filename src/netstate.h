@@ -451,4 +451,11 @@ int netstate_anchor(const struct netstate *ns, int family, uint8_t *out,
 void netstate_reach(const struct netstate *ns, int family, int *conn,
 		    int *dht_acked);
 
+/*
+ * Classify a bare address string against the scopes this module defines. It
+ * is the scale netstate stores addresses on, so the reading belongs with it
+ * rather than with whichever playbook happens to hold the string.
+ */
+int net_addr_scope(const char *addr);
+
 #endif
