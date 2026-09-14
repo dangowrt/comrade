@@ -300,7 +300,8 @@ struct peering {
 	struct probeplane pp;
 	struct pathplane pl;
 	struct ctlplane cp;
-	struct ctlplane_sinks ck;	/* what carries what it says */
+	struct pathplane_sinks pk;	/* what carries its probes */
+	struct ctlplane_sinks ck;	/* and what carries what it says */
 	int id;				/* the row a watcher knows this peer by */
 	uint64_t next_rdvask_ms[2];	/* when it may be asked again about
 					 * each family; the model's thread */
@@ -374,8 +375,12 @@ void peering_reset(struct peering *pr);
  */
 void peering_absorb(struct peering *pr, uint64_t now);
 
-/* What carries what this peer says, set once after init. */
-void peering_sinks(struct peering *pr, const struct ctlplane_sinks *ck);
+/*
+ * What this playbook does for this peer, set once after init: where a frame
+ * for a path goes, and what a control message rides.
+ */
+void peering_sinks(struct peering *pr, const struct pathplane_sinks *pk,
+		   const struct ctlplane_sinks *ck);
 
 /*
  * SAY THE STANDING THINGS, on their cadences.
@@ -401,6 +406,39 @@ void peering_say(struct peering *pr, uint16_t cand_port, uint64_t now);
  * heard none of it.
  */
 void peering_owed(struct peering *pr, uint64_t now);
+
+/*
+ * KEEP THE PATHS WARM: one round of the probe cadence, on the thread that owns
+ * this peer.
+ */
+void peering_paths(struct peering *pr, uint64_t now);
+
+/*
+ * A frame that arrived on one of this peer's carriers and carries the probe
+ * tag. Returns 1 when it was this peer's and has been dealt with, 0 when it
+ * was refused, which a caller judging liveness must not count.
+ */
+int peering_recv(struct peering *pr, const uint8_t *data, size_t len,
+		 enum path_kind kind, const struct sockaddr_in6 *src,
+		 struct nat_agent *agent, uint64_t now);
+
+/*
+ * Whether a frame from a source no path of this peer's names is this peer's,
+ * and if so act on it. Returns 0 when it is not, 1 when it was acted on, and
+ * -1 when it was this peer's but had been acted on already, which is the
+ * caller's cue to stop looking rather than offer it elsewhere.
+ */
+int peering_claims(struct peering *pr, const uint8_t *data, size_t len,
+		   enum path_kind kind, const struct sockaddr_in6 *src,
+		   uint64_t now);
+
+/* Enter an endpoint as a path: one this end has been given, and one the peer
+ * advertised. */
+int peering_add_path(struct peering *pr, enum path_kind kind,
+		     const struct sockaddr_in6 *remote, char *label,
+		     size_t label_len, uint64_t now);
+void peering_offer_path(struct peering *pr, const struct sockaddr_in6 *remote,
+			uint64_t now);
 
 /* Printable "addr:port" ("[v6]:port") for a sockaddr; empty on failure. */
 void peering_sockaddr_text(const struct sockaddr *sa, socklen_t len, char *out,

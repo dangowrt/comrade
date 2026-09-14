@@ -574,9 +574,52 @@ void peering_absorb(struct peering *pr, uint64_t now)
 	rdv_ask(pr, now);
 }
 
-void peering_sinks(struct peering *pr, const struct ctlplane_sinks *ck)
+void peering_sinks(struct peering *pr, const struct pathplane_sinks *pk,
+		   const struct ctlplane_sinks *ck)
 {
+	pr->pk = *pk;
 	pr->ck = *ck;
+}
+
+void peering_paths(struct peering *pr, uint64_t now)
+{
+	pathplane_tick(&pr->pl, &pr->pk, now);
+}
+
+int peering_recv(struct peering *pr, const uint8_t *data, size_t len,
+		 enum path_kind kind, const struct sockaddr_in6 *src,
+		 struct nat_agent *agent, uint64_t now)
+{
+	return pathplane_recv(&pr->pl, &pr->pk, data, len, kind, src, agent,
+			      now);
+}
+
+int peering_claims(struct peering *pr, const uint8_t *data, size_t len,
+		   enum path_kind kind, const struct sockaddr_in6 *src,
+		   uint64_t now)
+{
+	struct path_probe probe;
+	int claimed;
+
+	claimed = pathplane_claims(&pr->pl, &pr->pk, data, len, &probe);
+	if (claimed > 0)
+		pathplane_apply(&pr->pl, &pr->pk, &probe, kind, src, NULL, now);
+
+	return claimed;
+}
+
+int peering_add_path(struct peering *pr, enum path_kind kind,
+		     const struct sockaddr_in6 *remote, char *label,
+		     size_t label_len, uint64_t now)
+{
+	return pathplane_add_ep(&pr->pl, &pr->pk, kind, remote, label,
+				label_len, now);
+}
+
+void peering_offer_path(struct peering *pr, const struct sockaddr_in6 *remote,
+			uint64_t now)
+{
+	pathplane_offer_path(&pr->pl, &pr->pk, remote, now);
 }
 
 /*

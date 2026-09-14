@@ -863,11 +863,7 @@ static int conn_add_lan_path(struct conn *c, enum path_kind kind,
 			     const struct sockaddr_in6 *remote,
 			     char *label, size_t label_len)
 {
-	struct pathplane_sinks k;
-
-	conn_sinks(c, &k);
-
-	return pathplane_add_ep(&c->pr.pl, &k, kind, remote, label, label_len,
+	return peering_add_path(&c->pr, kind, remote, label, label_len,
 				now_ms());
 }
 
@@ -1227,13 +1223,11 @@ static int conn_proven_paths(struct conn *c)
 static void conn_offer_path(struct conn *c, const struct sockaddr *sa,
 			    socklen_t len)
 {
-	struct pathplane_sinks k;
 	struct sockaddr_in6 remote;
 
 	if (lanlink_map_peer(sa, len, &remote))
 		return;
-	conn_sinks(c, &k);
-	pathplane_offer_path(&c->pr.pl, &k, &remote, now_ms());
+	peering_offer_path(&c->pr, &remote, now_ms());
 }
 
 /*
@@ -2037,8 +2031,23 @@ static void conn_ctl_sinks(struct conn *c, struct ctlplane_sinks *k)
 	k->arg = c;
 }
 
+/*
+ * What this session does for one peer, set as the peer is built: a path is
+ * entered and a probe arrives before the connection ever runs, so this cannot
+ * wait for the loop.
+ */
+static void conn_peering_sinks(struct conn *c)
+{
+	struct pathplane_sinks pk;
+	struct ctlplane_sinks ck;
+
+	conn_sinks(c, &pk);
+	conn_ctl_sinks(c, &ck);
+	peering_sinks(&c->pr, &pk, &ck);
+}
+
 /* Act on one decoded control message (a ctl_reframer callback). Runs on the
- * connection's own loop thread, the same one as path_tick. */
+ * connection's own loop thread, the same one as the probe cadence. */
 static void ctl_dispatch(void *arg, int type, const uint8_t *pl, size_t plen)
 {
 	struct ctlplane_sinks k;
@@ -2143,10 +2152,7 @@ static void probe_recv(struct conn *c, const uint8_t *data, size_t len,
 		       enum path_kind kind, const struct sockaddr_in6 *src,
 		       struct nat_agent *agent)
 {
-	struct pathplane_sinks k;
-
-	conn_sinks(c, &k);
-	pathplane_recv(&c->pr.pl, &k, data, len, kind, src, agent, now_ms());
+	peering_recv(&c->pr, data, len, kind, src, agent, now_ms());
 }
 
 /*
@@ -2174,9 +2180,7 @@ static int probe_gate(struct sess *s, struct conn *c, const struct path_ep *ep,
 static void probe_adopt(struct sess *s, const uint8_t *data, size_t len,
 			const struct sockaddr_in6 *src)
 {
-	struct pathplane_sinks k;
-	struct path_probe pr;
-	int i, claimed;
+	int i;
 
 	/*
 	 * Each connection has its own key once it has bound one, so which
@@ -2189,13 +2193,9 @@ static void probe_adopt(struct sess *s, const uint8_t *data, size_t len,
 
 		if (!c)
 			continue;
-		conn_sinks(c, &k);
-		claimed = pathplane_claims(&c->pr.pl, &k, data, len, &pr);
-		if (!claimed)
+		if (!peering_claims(&c->pr, data, len, PATH_SEGMENT, src,
+				    now_ms()))
 			continue;
-		if (claimed > 0)
-			pathplane_apply(&c->pr.pl, &k, &pr, PATH_SEGMENT, src,
-					NULL, now_ms());
 		return;
 	}
 }
@@ -2230,15 +2230,6 @@ static void deliver_stream_from(struct conn *c, const uint8_t *data, size_t len,
 		conn_heard(c, now);
 }
 
-
-/* One round of the probe cadence, on the connection's own loop thread. */
-static void path_tick(struct conn *c, uint64_t now)
-{
-	struct pathplane_sinks k;
-
-	conn_sinks(c, &k);
-	pathplane_tick(&c->pr.pl, &k, now);
-}
 
 /*
  * Is any path qualified? A host is exempt -- not for want of probing, which it
@@ -3691,7 +3682,6 @@ static void net_settle(struct sess *s)
  */
 static int conn_run(struct conn *c, int drive_sig)
 {
-	struct ctlplane_sinks ck;
 	uint64_t conn_start;
 	int done = 0, link_lost = 0;
 	struct sess *s = c->sess;
@@ -3776,8 +3766,6 @@ static int conn_run(struct conn *c, int drive_sig)
 	conn_start = now_ms();
 	/* A fresh connection is owed the whole set, whatever an earlier one on
 	 * this struct was told. */
-	conn_ctl_sinks(c, &ck);
-	peering_sinks(&c->pr, &ck);
 	peering_owed(&c->pr, conn_start);
 
 	if (drive_sig) {
@@ -3856,7 +3844,7 @@ static int conn_run(struct conn *c, int drive_sig)
 		/* Every path is kept warm for the whole session, not merely the
 		 * one carrying it, so a switch is an immediate reordering rather
 		 * than a rediscovery. */
-		path_tick(c, now_ms());
+		peering_paths(&c->pr, now_ms());
 		conn_holds_gc(c, now_ms());
 		conn_route_dedup(c);
 		if (__atomic_load_n(&c->carry_epoch, __ATOMIC_RELAXED) !=
@@ -4550,7 +4538,9 @@ static struct conn *conn_alloc(struct sess *s)
 	c->sess = s;
 	c->ctl_fd = INVALID_SOCK;
 	c->bh_kind = -1;
-	peering_init(&c->pr, &s->pm, s->keys.probe_magic, s->keys.sig_key, now_ms());
+	peering_init(&c->pr, &s->pm, s->keys.probe_magic, s->keys.sig_key,
+		     now_ms());
+	conn_peering_sinks(c);
 	pthread_mutex_init(&c->status_lock, NULL);
 	pthread_mutex_init(&c->stream_lock, NULL);
 	pthread_mutex_init(&c->claim_lock, NULL);
@@ -5875,7 +5865,9 @@ int session_run(const struct session_cfg *cfg)
 		return 1;
 	pthread_mutex_init(&s.trickle_lock, NULL);
 	pthread_mutex_init(&s.c.status_lock, NULL);	/* s.c.status zeroed = connecting */
-	peering_init(&s.c.pr, &s.pm, s.keys.probe_magic, s.keys.sig_key, now_ms());
+	peering_init(&s.c.pr, &s.pm, s.keys.probe_magic, s.keys.sig_key,
+		     now_ms());
+	conn_peering_sinks(&s.c);
 	pthread_mutex_init(&s.c.stream_lock, NULL);
 	pthread_mutex_init(&s.c.claim_lock, NULL);
 	netmon_init(&s.netmon);
@@ -6174,7 +6166,7 @@ int session_run(const struct session_cfg *cfg)
 			 * that lost back into the running.
 			 */
 			claim_watch(&s.c);
-			path_tick(&s.c, now_ms());
+			peering_paths(&s.c.pr, now_ms());
 			if (offer_moved_on(&s.c)) {
 				snprintf(s.regathered_for,
 					 sizeof(s.regathered_for), "%s",
