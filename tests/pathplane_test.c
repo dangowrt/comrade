@@ -27,6 +27,10 @@ struct end {
 	int heard;
 	int other;
 	int other_held;
+	int freed;			/* carriers this end let go */
+	struct nat_agent *last_freed;
+	void *last_ctx;
+	int fail_agents;		/* every carrier says it has given up */
 	const char *ident;
 };
 
@@ -92,6 +96,22 @@ static enum path_kind on_kind_of(void *arg, const struct path_ep *ep)
 	return PATH_SEGMENT;
 }
 
+static void on_agent_free(void *arg, struct nat_agent *a, void *ctx)
+{
+	struct end *e = arg;
+
+	e->last_freed = a;
+	e->last_ctx = ctx;
+	e->freed++;
+}
+
+static int on_agent_failed(void *arg, struct nat_agent *a)
+{
+	(void)a;
+
+	return ((struct end *)arg)->fail_agents;
+}
+
 static void end_init(struct end *e, uint8_t last, const char *ident)
 {
 	memset(e, 0, sizeof(*e));
@@ -105,6 +125,8 @@ static void end_init(struct end *e, uint8_t last, const char *ident)
 	e->k.heard = on_heard;
 	e->k.qualified = on_qualified;
 	e->k.other = on_other;
+	e->k.agent_free = on_agent_free;
+	e->k.agent_failed = on_agent_failed;
 	e->k.arg = e;
 }
 
@@ -430,9 +452,81 @@ static void the_carry_is_read_off_the_ranking(void)
 	end_done(&b);
 }
 
+/*
+ * A carrier being replaced is set aside, not destroyed: it stopped answering,
+ * which is also what a drop that ends in a moment looks like. It is let go
+ * once its time is up, and at once if it says it has given up.
+ */
+static void a_carrier_set_aside_is_kept_until_its_time_is_up(void)
+{
+	struct nat_agent *a1 = (struct nat_agent *)0x1001;
+	struct nat_agent *a2 = (struct nat_agent *)0x1002;
+	struct nat_agent *held[PATHPLANE_HOLD_MAX];
+	struct end a;
+
+	end_init(&a, 1, "abcd");
+	assert(!pathplane_has_hold(&a.pl));
+	assert(pathplane_hold_carrying(&a.pl) == -1);
+
+	pathplane_hold_add(&a.pl, &a.k, a1, (void *)0x2001, 5000);
+	pathplane_hold_add(&a.pl, &a.k, a2, (void *)0x2002, 9000);
+	assert(pathplane_has_hold(&a.pl));
+	assert(pathplane_holds_agents(&a.pl, held, PATHPLANE_HOLD_MAX) == 2);
+	assert(held[0] == a1 && held[1] == a2);
+	assert(!a.freed);
+
+	pathplane_holds_reap(&a.pl, &a.k, 4999);
+	assert(!a.freed);			/* neither is out of time */
+	pathplane_holds_reap(&a.pl, &a.k, 5000);
+	assert(a.freed == 1);
+	assert(a.last_freed == a1);
+	assert(a.last_ctx == (void *)0x2001);
+	assert(pathplane_holds_agents(&a.pl, held, PATHPLANE_HOLD_MAX) == 1);
+
+	/* One that has given up goes without waiting for its deadline. */
+	a.fail_agents = 1;
+	pathplane_holds_reap(&a.pl, &a.k, 5001);
+	assert(a.freed == 2);
+	assert(a.last_freed == a2);
+	assert(!pathplane_has_hold(&a.pl));
+	end_done(&a);
+}
+
+/* The one that carries is never the one let go. */
+static void the_carrier_that_carries_is_not_reaped(void)
+{
+	struct nat_agent *a1 = (struct nat_agent *)0x1001;
+	struct end a;
+
+	end_init(&a, 1, "abcd");
+	pathplane_add_ice(&a.pl, a1, 1000);
+	pathplane_hold_add(&a.pl, &a.k, a1, (void *)0x2001, 5000);
+	/* Rank it: with no carriers named, every path can carry. */
+	a.k.live = NULL;
+	{
+		struct pathplane_pick pick;
+
+		assert(!pathplane_pick(&a.pl, &a.k, 1000, &pick));
+		assert(pick.kind == PATH_ICE);
+	}
+	assert(pathplane_hold_carrying(&a.pl) == 0);
+
+	a.fail_agents = 1;
+	pathplane_holds_reap(&a.pl, &a.k, 9000);
+	assert(!a.freed);			/* it is the one carrying */
+	assert(pathplane_has_hold(&a.pl));
+
+	pathplane_holds_free_all(&a.pl, &a.k);
+	assert(a.freed == 1);
+	assert(!pathplane_has_hold(&a.pl));
+	end_done(&a);
+}
+
 int main(void)
 {
 	a_path_qualifies_only_once_it_answers();
+	a_carrier_set_aside_is_kept_until_its_time_is_up();
+	the_carrier_that_carries_is_not_reaped();
 	the_carry_is_read_off_the_ranking();
 	a_probe_for_another_claimant_is_refused();
 	a_probe_is_acted_on_once();

@@ -68,6 +68,15 @@ struct pathplane_sinks {
 	/* A path answered for the first time. NULL for none. */
 	void (*qualified)(void *arg);
 	/*
+	 * Give this carrier and the context its callbacks were handed back.
+	 * Called with the table unlocked and after the paths that borrowed it
+	 * have been dropped, which is the moment nothing can still be inside
+	 * those callbacks.
+	 */
+	void (*agent_free)(void *arg, struct nat_agent *a, void *ctx);
+	/* Whether this carrier has given up. NULL for "never". */
+	int (*agent_failed)(void *arg, struct nat_agent *a);
+	/*
 	 * A probe type the plane does not own, already opened and judged
 	 * fresh. `held` says the path it arrived on is one this connection is
 	 * actually carried over, which is what bounds a notice that cannot be
@@ -76,6 +85,25 @@ struct pathplane_sinks {
 	void (*other)(void *arg, const struct path_probe *pr,
 		      enum path_kind kind, int held);
 	void *arg;
+};
+
+/*
+ * A carrier set aside rather than destroyed. One being replaced is not known
+ * to be dead: it stopped answering, which is also what a drop that ends in a
+ * moment looks like. It stays with its paths in the table, so the ranking can
+ * find it alive and go on sending over it, a punch costing a round trip to
+ * rebuild and its bindings possibly still being perfectly good.
+ *
+ * Several at once, because punches launch in parallel and the ranking decides
+ * which carries. Touched only by the thread that owns the plane's peer.
+ */
+#define PATHPLANE_HOLD_MAX 16
+
+struct pathplane_hold {
+	struct nat_agent *agent;
+	void *ctx;			/* freed with it */
+	uint64_t until_ms;		/* reaped past this, with nothing
+					 * carrying it */
 };
 
 struct pathplane {
@@ -91,10 +119,50 @@ struct pathplane {
 					 * under, and the key path ids are
 					 * taken with */
 	uint64_t next_ice_ep_ms;	/* when to ask the agents again */
+	struct pathplane_hold holds[PATHPLANE_HOLD_MAX];
 };
 
 void pathplane_init(struct pathplane *pl, struct probeplane *pp);
 void pathplane_destroy(struct pathplane *pl);
+
+/*
+ * Let one carrier go, with the paths that borrowed it and the context its
+ * callbacks were handed.
+ */
+void pathplane_free_agent(struct pathplane *pl, const struct pathplane_sinks *k,
+			  struct nat_agent *agent, void *ctx);
+
+/* Set a carrier aside until `until_ms`, or let it go if there is no room. */
+void pathplane_hold_add(struct pathplane *pl, const struct pathplane_sinks *k,
+			struct nat_agent *agent, void *ctx, uint64_t until_ms);
+
+/* Whether anything is set aside, and which of them carries right now (-1 for
+ * none). */
+int pathplane_has_hold(const struct pathplane *pl);
+int pathplane_hold_carrying(struct pathplane *pl);
+
+/* The carriers set aside, for a playbook gathering the ones that can send. */
+int pathplane_holds_agents(const struct pathplane *pl, struct nat_agent **out,
+			   int max);
+
+/* Let go of everything set aside, and of whatever is past its deadline with
+ * nothing carrying it. */
+void pathplane_holds_free_all(struct pathplane *pl,
+			      const struct pathplane_sinks *k);
+void pathplane_holds_reap(struct pathplane *pl,
+			  const struct pathplane_sinks *k, uint64_t now);
+
+/*
+ * One punch per route, a route being the source and destination address pair
+ * with the port ignored, it being a pinhole over the one physical path. When
+ * two carriers this end owns nominated the same route the redundant one is let
+ * go, so only distinct routes are maintained; `live` is the carrier the
+ * playbook is using, which is never the one dropped, nor is whatever carries.
+ * A different source address, a second interface, stays a route of its own.
+ */
+void pathplane_route_dedup(struct pathplane *pl,
+			   const struct pathplane_sinks *k,
+			   const struct nat_agent *live);
 
 /* The path an agent carries. Idempotent per agent. */
 void pathplane_add_ice(struct pathplane *pl, struct nat_agent *agent,

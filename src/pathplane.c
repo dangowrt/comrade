@@ -608,3 +608,152 @@ int pathplane_proven(struct pathplane *pl)
 
 	return n;
 }
+
+void pathplane_free_agent(struct pathplane *pl, const struct pathplane_sinks *k,
+			  struct nat_agent *agent, void *ctx)
+{
+	if (agent)
+		pathplane_drop_agent(pl, agent);
+	if (k->agent_free)
+		k->agent_free(k->arg, agent, ctx);
+}
+
+static void hold_clear(struct pathplane *pl, const struct pathplane_sinks *k,
+		       int i)
+{
+	struct nat_agent *agent = pl->holds[i].agent;
+	void *ctx = pl->holds[i].ctx;
+
+	pl->holds[i].agent = NULL;
+	pl->holds[i].ctx = NULL;
+	pl->holds[i].until_ms = 0;
+	pathplane_free_agent(pl, k, agent, ctx);
+}
+
+void pathplane_hold_add(struct pathplane *pl, const struct pathplane_sinks *k,
+			struct nat_agent *agent, void *ctx, uint64_t until_ms)
+{
+	int i;
+
+	for (i = 0; i < PATHPLANE_HOLD_MAX; i++)
+		if (!pl->holds[i].agent) {
+			pl->holds[i].agent = agent;
+			pl->holds[i].ctx = ctx;
+			pl->holds[i].until_ms = until_ms;
+			return;
+		}
+	pathplane_free_agent(pl, k, agent, ctx);
+}
+
+int pathplane_has_hold(const struct pathplane *pl)
+{
+	int i;
+
+	for (i = 0; i < PATHPLANE_HOLD_MAX; i++)
+		if (pl->holds[i].agent)
+			return 1;
+
+	return 0;
+}
+
+int pathplane_hold_carrying(struct pathplane *pl)
+{
+	int sel, i, held = -1;
+
+	pthread_mutex_lock(&pl->lock);
+	sel = pl->t.sel;
+	if (sel >= 0 && pl->t.p[sel].used && pl->t.p[sel].agent)
+		for (i = 0; i < PATHPLANE_HOLD_MAX; i++)
+			if (pl->holds[i].agent == pl->t.p[sel].agent) {
+				held = i;
+				break;
+			}
+	pthread_mutex_unlock(&pl->lock);
+
+	return held;
+}
+
+int pathplane_holds_agents(const struct pathplane *pl, struct nat_agent **out,
+			   int max)
+{
+	int i, n = 0;
+
+	for (i = 0; i < PATHPLANE_HOLD_MAX && n < max; i++)
+		if (pl->holds[i].agent)
+			out[n++] = pl->holds[i].agent;
+
+	return n;
+}
+
+void pathplane_holds_free_all(struct pathplane *pl,
+			      const struct pathplane_sinks *k)
+{
+	int i;
+
+	for (i = 0; i < PATHPLANE_HOLD_MAX; i++)
+		if (pl->holds[i].agent)
+			hold_clear(pl, k, i);
+}
+
+void pathplane_holds_reap(struct pathplane *pl,
+			  const struct pathplane_sinks *k, uint64_t now)
+{
+	int carrying = pathplane_hold_carrying(pl);
+	int i;
+
+	for (i = 0; i < PATHPLANE_HOLD_MAX; i++) {
+		if (!pl->holds[i].agent || i == carrying)
+			continue;
+		if (now < pl->holds[i].until_ms &&
+		    !(k->agent_failed && k->agent_failed(k->arg,
+							 pl->holds[i].agent)))
+			continue;
+		hold_clear(pl, k, i);
+	}
+}
+
+void pathplane_route_dedup(struct pathplane *pl,
+			   const struct pathplane_sinks *k,
+			   const struct nat_agent *live)
+{
+	struct nat_agent *loser[PATHPLANE_HOLD_MAX];
+	void *loser_ctx[PATHPLANE_HOLD_MAX];
+	int nlose = 0, sel, i, j, h;
+	struct nat_agent *drop;
+
+	pthread_mutex_lock(&pl->lock);
+	sel = pl->t.sel;
+	for (i = 0; i < PATH_TABLE_MAX; i++) {
+		if (!pl->t.p[i].used || pl->t.p[i].kind != PATH_ICE ||
+		    path_ep_any(&pl->t.p[i].peer_ep))
+			continue;
+		for (j = i + 1; j < PATH_TABLE_MAX; j++) {
+			if (!pl->t.p[j].used ||
+			    pl->t.p[j].kind != PATH_ICE ||
+			    !path_ep_same_addr(&pl->t.p[i].peer_ep,
+					       &pl->t.p[j].peer_ep) ||
+			    !pl->t.p[i].have_self_ep ||
+			    !pl->t.p[j].have_self_ep ||
+			    !path_ep_same_addr(&pl->t.p[i].self_ep,
+					       &pl->t.p[j].self_ep))
+				continue;
+			drop = NULL;
+			if (pl->t.p[j].agent != live && j != sel)
+				drop = pl->t.p[j].agent;
+			else if (pl->t.p[i].agent != live && i != sel)
+				drop = pl->t.p[i].agent;
+			for (h = 0; drop && h < PATHPLANE_HOLD_MAX; h++)
+				if (pl->holds[h].agent == drop) {
+					loser[nlose] = drop;
+					loser_ctx[nlose++] = pl->holds[h].ctx;
+					pl->holds[h].agent = NULL;
+					pl->holds[h].ctx = NULL;
+					pl->holds[h].until_ms = 0;
+					break;
+				}
+		}
+	}
+	pthread_mutex_unlock(&pl->lock);
+	for (i = 0; i < nlose; i++)
+		pathplane_free_agent(pl, k, loser[i], loser_ctx[i]);
+}
