@@ -331,3 +331,17 @@ void peering_reset(struct peering *pr)
 	probeplane_reset(&pr->pp);
 	ctlplane_reset(&pr->cp);
 }
+
+void peering_model_init(struct peering_model *pm, int is_host,
+			const struct session_obs *o, uint64_t now)
+{
+	memset(pm, 0, sizeof(*pm));
+	netstate_init(&pm->ns, is_host, now);
+	obsemit_init(&pm->oe, o, &pm->ns);
+	pthread_mutex_init(&pm->pub_lock, NULL);
+}
+
+void peering_model_destroy(struct peering_model *pm)
+{
+	pthread_mutex_destroy(&pm->pub_lock);
+}

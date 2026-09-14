@@ -20,7 +20,9 @@
 #include <pthread.h>
 
 #include "ctlplane.h"
+#include "ctlproto.h"
 #include "netstate.h"
+#include "obsemit.h"
 #include "nsfacts.h"
 #include "pathplane.h"
 #include "probeplane.h"
@@ -219,6 +221,56 @@ void peering_net_halt(struct peering_net *m, int family);
 
 /* Join a round that has posted its end. Idempotent. */
 void peering_net_reap(struct peering_net *m, int family);
+
+/*
+ * ONE MAILBOX.
+ *
+ * What one side of a rendezvous holds: the reachability model, where this end
+ * is served and what it can reach as published for its peers, and the standing
+ * requests a peer has made of it. A playbook keeps one per mailbox, and every
+ * function that takes it runs on the thread that owns the mailbox.
+ *
+ * What the model has decided is published under the lock, because the peers'
+ * channels run on threads of their own: a host's worker announces exactly what
+ * the thread driving the signalling would. Only ever added to or replaced,
+ * never retracted, since a peer holding a node this end has stopped being sure
+ * of is better off than one holding none and the node keeps being served
+ * either way. Reachability is the exception, retracted as freely as it is
+ * raised, a family that has gone being exactly what the other end needs to
+ * know.
+ */
+
+/* One end's rendezvous node for one family: where its mailbox is served, and
+ * so where the other end reads it. */
+struct peering_rdv {
+	struct sockaddr_storage sa;
+	socklen_t len;
+	int have;
+	int qualified;			/* proven here, or proven for us */
+	int status;			/* CTL_RDVST_* as told to a peer */
+};
+
+struct peering_model {
+	struct netstate ns;
+	struct obsemit oe;		/* what the watcher has been told */
+
+	pthread_mutex_t pub_lock;
+	struct peering_rdv rdv[2];	/* [0] v4, [1] v6 */
+	uint32_t rdv_gen;
+	uint8_t reach[CTL_REACH_PLEN];
+	uint32_t reach_gen;
+	/*
+	 * Families a peer has asked this end to rendezvous on for it, kept here
+	 * as well as in the signaller because a rebuilt one starts with none
+	 * and the peer's request stands until it has a node.
+	 */
+	int relay_fam[2];
+	uint64_t relay_until_ms[2];	/* when an unrenewed request lapses */
+};
+
+void peering_model_init(struct peering_model *pm, int is_host,
+			const struct session_obs *o, uint64_t now);
+void peering_model_destroy(struct peering_model *pm);
 
 /*
  * ONE PEER.
