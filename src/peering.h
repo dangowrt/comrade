@@ -23,6 +23,7 @@
 #include "ctlproto.h"
 #include "netstate.h"
 #include "obsemit.h"
+#include "sig.h"
 #include "nsfacts.h"
 #include "pathplane.h"
 #include "probeplane.h"
@@ -253,6 +254,17 @@ struct peering_rdv {
 struct peering_model {
 	struct netstate ns;
 	struct obsemit oe;		/* what the watcher has been told */
+	struct sig *sig;		/* borrowed; NULL before one exists */
+	/*
+	 * Which end of the mailbox this is. Read from here and never passed
+	 * in: which end asks for a rendezvous and which end serves one is a
+	 * property of the mailbox, and two copies of that answer is how two
+	 * playbooks come to disagree about it.
+	 */
+	int is_host;
+	int dht;			/* the mailbox is served by a DHT: a
+					 * rendezvous can be named, and asked
+					 * for */
 
 	pthread_mutex_t pub_lock;
 	struct peering_rdv rdv[2];	/* [0] v4, [1] v6 */
@@ -268,7 +280,7 @@ struct peering_model {
 	uint64_t relay_until_ms[2];	/* when an unrenewed request lapses */
 };
 
-void peering_model_init(struct peering_model *pm, int is_host,
+void peering_model_init(struct peering_model *pm, int is_host, int dht,
 			const struct session_obs *o, uint64_t now);
 void peering_model_destroy(struct peering_model *pm);
 
@@ -282,9 +294,13 @@ void peering_model_destroy(struct peering_model *pm);
  * itself would have to know that.
  */
 struct peering {
+	struct peering_model *pm;
 	struct probeplane pp;
 	struct pathplane pl;
 	struct ctlplane cp;
+	int id;				/* the row a watcher knows this peer by */
+	uint64_t next_rdvask_ms[2];	/* when it may be asked again about
+					 * each family; the model's thread */
 };
 
 /*
@@ -293,8 +309,8 @@ struct peering {
  * this end's counters start, and it is the clock rather than one: see
  * probeplane_init.
  */
-void peering_init(struct peering *pr, uint32_t magic, const uint8_t key[32],
-		  uint64_t seq0);
+void peering_init(struct peering *pr, struct peering_model *pm, uint32_t magic,
+		  const uint8_t key[32], uint64_t seq0);
 void peering_destroy(struct peering *pr);
 
 /*
@@ -302,5 +318,34 @@ void peering_destroy(struct peering *pr);
  * halves that made it are spent with it.
  */
 void peering_reset(struct peering *pr);
+
+/*
+ * How often a host repeats a request that a peer rendezvous for it, and how
+ * long an unrenewed one stands at the peer that was asked. Slow, because the
+ * peer's own situation changes slowly and the request costs it a convergent
+ * store; the hold is several periods so a single lost repeat does not drop it.
+ */
+#define PEERING_RDVASK_MS 60000
+#define PEERING_RELAY_HOLD_MS (3 * PEERING_RDVASK_MS)
+
+/*
+ * TAKE WHAT THIS PEER HAS SAID, and act on it.
+ *
+ * The node it named becomes this end's anchor where the rules allow, its
+ * account of itself is noted, and whichever of the two rendezvous favours this
+ * end owes the other is decided: a host with no route to a family asks a
+ * client that has one to place its mailbox there, and a client asked to do so
+ * tells its signaller to. Which of those applies is read from the mailbox, not
+ * passed in.
+ *
+ * Runs on the thread that owns the model. What it decides to SAY is left for
+ * peering_say on the channel's own loop, because two threads writing one
+ * stream socket interleave whatever they were framing.
+ */
+void peering_absorb(struct peering *pr, uint64_t now);
+
+/* Printable "addr:port" ("[v6]:port") for a sockaddr; empty on failure. */
+void peering_sockaddr_text(const struct sockaddr *sa, socklen_t len, char *out,
+			   size_t n);
 
 #endif

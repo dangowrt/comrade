@@ -199,9 +199,12 @@ static void the_three_planes_are_wired_to_each_other(void)
 	static const uint8_t key[32] = { 7, 7, 7 };
 	static const uint8_t half_a[KEYS_HALF_LEN] = { 1 };
 	static const uint8_t half_b[KEYS_HALF_LEN] = { 2 };
+	struct peering_model pm;
 	struct peering pr;
 
-	peering_init(&pr, 0x50454552u, key, 500);
+	peering_model_init(&pm, 1, 1, NULL, 1000);
+	peering_init(&pr, &pm, 0x50454552u, key, 500);
+	assert(pr.pm == &pm);
 	assert(pr.pl.pp == &pr.pp);
 	assert(pr.cp.pp == &pr.pp);
 	assert(pr.pp.magic == 0x50454552u);
@@ -219,11 +222,154 @@ static void the_three_planes_are_wired_to_each_other(void)
 	assert(pr.pp.base_ok);
 	assert(!pr.cp.half_sent && !pr.cp.half_seen);
 	peering_destroy(&pr);
+	peering_model_destroy(&pm);
+}
+
+/* A peer's frames reach a plane with nothing to send them on. */
+static void quiet_send(void *arg, int type, const uint8_t *payload,
+		       size_t plen)
+{
+	(void)arg;
+	(void)type;
+	(void)payload;
+	(void)plen;
+}
+
+static void peer_says(struct peering *pr, int type, const uint8_t *pl,
+		      size_t plen)
+{
+	struct ctlplane_sinks k;
+
+	memset(&k, 0, sizeof(k));
+	k.send = quiet_send;
+	assert(ctlplane_on_msg(&pr->cp, &k, type, pl, plen, 0, 1000));
+}
+
+static void v6_node_said(struct peering *pr, uint8_t last, int status)
+{
+	uint8_t pl[CTL_RDVST_PLEN];
+	struct sockaddr_in6 sa;
+
+	memset(&sa, 0, sizeof(sa));
+	sa.sin6_family = AF_INET6;
+	sa.sin6_port = htons(6881);
+	sa.sin6_addr.s6_addr[0] = 0x20;
+	sa.sin6_addr.s6_addr[1] = 0x01;
+	sa.sin6_addr.s6_addr[15] = last;
+	ctl_rdv_encode(pl, 6, (struct sockaddr *)&sa);
+	pl[CTL_RDV_PLEN] = (uint8_t)status;
+	peer_says(pr, CTLM_RDV, pl, sizeof(pl));
+}
+
+static int holds_node(struct peering_model *pm, int family)
+{
+	return netstate_anchor(&pm->ns, family, NULL, NULL, NULL);
+}
+
+/*
+ * A client follows the host's word, the mailbox being the host's. A host takes
+ * a peer's node only for a family it has none of its own for: its own is what
+ * the token names and what it serves, and a client may not move it.
+ */
+static void which_end_may_adopt_is_read_from_the_mailbox(void)
+{
+	static const uint8_t key[32] = { 4 };
+	struct peering_model host, client;
+	struct peering hp, cp;
+
+	peering_model_init(&host, 1, 1, NULL, 1000);
+	peering_model_init(&client, 0, 1, NULL, 1000);
+	peering_init(&hp, &host, 1, key, 1);
+	peering_init(&cp, &client, 1, key, 1);
+
+	v6_node_said(&cp, 9, CTL_RDVST_PROVEN);
+	peering_absorb(&cp, 1000);
+	assert(holds_node(&client, 6));		/* taken as it stands */
+
+	v6_node_said(&hp, 9, CTL_RDVST_PROVEN);
+	peering_absorb(&hp, 1000);
+	assert(holds_node(&host, 6));		/* it had none of its own */
+
+	/* And now that it has one, the peer may not move it. */
+	v6_node_said(&hp, 11, CTL_RDVST_PROVEN);
+	peering_absorb(&hp, 1100);
+	{
+		uint8_t node[NETSTATE_SA_MAX];
+		uint8_t nlen = 0;
+
+		assert(netstate_anchor(&host.ns, 6, node, &nlen, NULL));
+		assert(((struct sockaddr_in6 *)node)->sin6_addr.s6_addr[15]
+		       == 9);
+	}
+	peering_destroy(&hp);
+	peering_destroy(&cp);
+	peering_model_destroy(&host);
+	peering_model_destroy(&client);
+}
+
+/*
+ * A host with no route to a family asks a peer that has one, once a period,
+ * and only a peer that says it is up.
+ */
+static void a_host_asks_a_reachable_peer_to_rendezvous(void)
+{
+	static const uint8_t key[32] = { 5 };
+	uint8_t reach[CTL_REACH_PLEN];
+	struct peering_model pm;
+	struct peering pr;
+
+	peering_model_init(&pm, 1, 1, NULL, 1000);
+	peering_init(&pr, &pm, 1, key, 1);
+
+	/* It has not spoken, so nothing is presumed of it. */
+	peering_absorb(&pr, 1000);
+	assert(!pr.cp.rdvask_out);
+
+	memset(reach, 0, sizeof(reach));
+	ctl_reach_encode(reach, 1, 0, 0);		/* v6 down */
+	peer_says(&pr, CTLM_REACH, reach, sizeof(reach));
+	peering_absorb(&pr, 1000);
+	assert(!pr.cp.rdvask_out);		/* it cannot help either */
+
+	ctl_reach_encode(reach, 1, CTL_REACH_UP, 0);
+	peer_says(&pr, CTLM_REACH, reach, sizeof(reach));
+	peering_absorb(&pr, 2000);
+	assert(pr.cp.rdvask_out & 2);		/* v6 asked for */
+
+	pr.cp.rdvask_out = 0;
+	peering_absorb(&pr, 2001);
+	assert(!pr.cp.rdvask_out);		/* and not again this period */
+	peering_absorb(&pr, 2001 + PEERING_RDVASK_MS);
+	assert(pr.cp.rdvask_out & 2);
+	peering_destroy(&pr);
+	peering_model_destroy(&pm);
+}
+
+/* A mailbox no DHT serves has no rendezvous to name or to ask for. */
+static void a_mailbox_off_the_dht_asks_nobody(void)
+{
+	static const uint8_t key[32] = { 6 };
+	uint8_t reach[CTL_REACH_PLEN];
+	struct peering_model pm;
+	struct peering pr;
+
+	peering_model_init(&pm, 1, 0, NULL, 1000);
+	peering_init(&pr, &pm, 1, key, 1);
+	memset(reach, 0, sizeof(reach));
+	ctl_reach_encode(reach, 1, CTL_REACH_UP, 0);
+	peer_says(&pr, CTLM_REACH, reach, sizeof(reach));
+	peering_absorb(&pr, 2000);
+	assert(!pr.cp.rdvask_out);
+	peering_destroy(&pr);
+	peering_model_destroy(&pm);
 }
 
 int main(void)
 {
 	what_is_posted_is_taken_once();
+	which_end_may_adopt_is_read_from_the_mailbox();
+	a_host_asks_a_reachable_peer_to_rendezvous();
+	a_mailbox_off_the_dht_asks_nobody();
 	the_three_planes_are_wired_to_each_other();
 	every_distinct_egress_address_is_kept();
 	a_round_forgets_the_samples_and_keeps_the_pool();

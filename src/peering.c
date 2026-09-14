@@ -5,6 +5,8 @@
 
 #include "wsock.h"
 
+#include <stdio.h>
+
 #include "dbg.h"
 #include "keys.h"
 #include "peering.h"
@@ -311,9 +313,13 @@ int peering_net_kick(struct peering_net *m, int family, uint32_t epoch,
 	return 1;
 }
 
-void peering_init(struct peering *pr, uint32_t magic, const uint8_t key[32],
-		  uint64_t seq0)
+void peering_init(struct peering *pr, struct peering_model *pm, uint32_t magic,
+		  const uint8_t key[32], uint64_t seq0)
 {
+	pr->pm = pm;
+	pr->id = 0;
+	pr->next_rdvask_ms[0] = 0;
+	pr->next_rdvask_ms[1] = 0;
 	probeplane_init(&pr->pp, magic, key, seq0);
 	pathplane_init(&pr->pl, &pr->pp);
 	ctlplane_init(&pr->cp, &pr->pp);
@@ -332,10 +338,12 @@ void peering_reset(struct peering *pr)
 	ctlplane_reset(&pr->cp);
 }
 
-void peering_model_init(struct peering_model *pm, int is_host,
+void peering_model_init(struct peering_model *pm, int is_host, int dht,
 			const struct session_obs *o, uint64_t now)
 {
 	memset(pm, 0, sizeof(*pm));
+	pm->is_host = is_host;
+	pm->dht = dht;
 	netstate_init(&pm->ns, is_host, now);
 	obsemit_init(&pm->oe, o, &pm->ns);
 	pthread_mutex_init(&pm->pub_lock, NULL);
@@ -344,4 +352,224 @@ void peering_model_init(struct peering_model *pm, int is_host,
 void peering_model_destroy(struct peering_model *pm)
 {
 	pthread_mutex_destroy(&pm->pub_lock);
+}
+
+void peering_sockaddr_text(const struct sockaddr *sa, socklen_t len, char *out,
+			   size_t n)
+{
+	char host[64], serv[8];		/* serv is NI_NUMERICSERV: 5 digits max */
+
+	out[0] = '\0';
+	if (getnameinfo(sa, len, host, sizeof(host), serv, sizeof(serv),
+			NI_NUMERICHOST | NI_NUMERICSERV))
+		return;
+	if (strchr(host, ':'))
+		snprintf(out, n, "[%s]:%s", host, serv);
+	else
+		snprintf(out, n, "%s:%s", host, serv);
+}
+
+/*
+ * Take this peer's announcement.
+ *
+ * A client takes it as it stands. The mailbox is the host's, and the node the
+ * host names is the only one whose copy of it the host keeps current, so
+ * following the host's word is the whole of how a client stays reachable
+ * through a rendezvous that changed under a token already handed out.
+ *
+ * A host takes one only for a family it has no node of its own for: its own is
+ * what the token names and what it serves, and a client may not move it.
+ *
+ * Adopting means the node becomes this end's anchor, pinned for the direct
+ * get, shown on the panel, seeded into the next signaller, and not a note kept
+ * aside for a reconnection.
+ */
+static void rdv_adopt(struct peering *pr, uint64_t now)
+{
+	static const int famv[2] = { 4, 6 };
+	struct peering_model *pm = pr->pm;
+	struct ctlplane_node in[2];
+	int i;
+
+	if (!ctlplane_take_nodes(&pr->cp, in))
+		return;
+	for (i = 0; i < 2; i++) {
+		uint8_t node[NETSTATE_SA_MAX], nlen = 0;
+		char b[80];
+
+		if (!in[i].have)
+			continue;
+		peering_sockaddr_text((struct sockaddr *)&in[i].sa, in[i].len,
+				      b, sizeof(b));
+		dbg_logf("rdv: peer names v%d %s", famv[i], b);
+		if (netstate_anchor(&pm->ns, famv[i], node, &nlen, NULL)) {
+			if (pm->is_host)
+				continue;
+			if (nlen == in[i].len &&
+			    !memcmp(node, &in[i].sa, nlen)) {
+				/* The same node by our own route. Nothing to
+				 * adopt, and the end state is what matters, so
+				 * say it rather than leave the two ways of
+				 * arriving at it looking different. */
+				dbg_logf("rdv: already holding the peer's v%d "
+					 "node %s", famv[i], b);
+				continue;
+			}
+		}
+		/*
+		 * Only a node the peer stands behind is a vouch. It names the
+		 * ones it has not proven as well, they being where it is
+		 * meeting and this end perhaps able to prove what it cannot,
+		 * but taking its word for one it has not got would put a claim
+		 * behind a node nobody has ever made.
+		 */
+		if (in[i].status & (CTL_RDVST_PROVEN | CTL_RDVST_VOUCHED))
+			netstate_on_rdv_vouched(&pm->ns, famv[i],
+						(const uint8_t *)&in[i].sa,
+						(int)in[i].len, now);
+		else
+			netstate_on_rdv_offered(&pm->ns, famv[i],
+						(const uint8_t *)&in[i].sa,
+						(int)in[i].len, now);
+		dbg_logf("rdv: adopted the peer's v%d node %s (%s%s)", famv[i],
+			 b, in[i].status & CTL_RDVST_PROVEN ? "proven" :
+			    in[i].status & CTL_RDVST_VOUCHED ? "vouched" :
+			    "unproven",
+			 in[i].status & CTL_RDVST_BLIND ? ", peer is blind" :
+							  "");
+	}
+}
+
+/* Take this peer's account of itself. Kept per peer, since each one is a
+ * different machine on a different network. */
+static void reach_take(struct peering *pr)
+{
+	static const int famv[2] = { 4, 6 };
+	uint8_t pl[CTL_REACH_PLEN];
+	int i;
+
+	if (!ctlplane_take_reach(&pr->cp, pl))
+		return;
+	for (i = 0; i < 2; i++) {
+		int state = 0, flags = 0;
+
+		ctl_reach_decode(pl, sizeof(pl), i, &state, &flags);
+		dbg_logf("reach: peer %d v%d state=%d dht=%d", pr->id, famv[i],
+			 state, !!(flags & CTL_REACHF_DHT));
+	}
+}
+
+/*
+ * Whether this end can look after `family`'s rendezvous itself: it reaches the
+ * DHT there, or it already holds a node. Either way there is nobody to ask.
+ */
+static int self_sufficient(struct peering_model *pm, int family)
+{
+	int conn = 0, acked = 0;
+
+	netstate_reach(&pm->ns, family, &conn, &acked);
+	if (conn != NET_CONN_UP)
+		return 0;
+
+	return acked || netstate_anchor(&pm->ns, family, NULL, NULL, NULL);
+}
+
+/*
+ * Ask this peer to establish the rendezvous this end cannot.
+ *
+ * A host with no global connectivity on a family has no way to place its
+ * mailbox where a peer arriving on that family would look, and no way to
+ * recover a node it lost when it moved. A client that still has the family has
+ * both, and is already trusted with the mailbox, holding the same key and
+ * writing to the same item. So it is asked, and what it finds comes back as an
+ * ordinary announcement.
+ *
+ * Asked, not told: the client answers with a node or it does not, and the host
+ * is no worse off either way. Repeated on a slow cadence for as long as the
+ * family is missing, since the client's own situation may improve, and stopped
+ * the moment a node arrives from anywhere at all.
+ */
+static void rdv_ask(struct peering *pr, uint64_t now)
+{
+	static const int famv[2] = { 4, 6 };
+	struct peering_model *pm = pr->pm;
+	uint8_t reach[CTL_REACH_PLEN];
+	int i;
+
+	if (!pm->is_host || !pm->dht)
+		return;
+	if (!ctlplane_peer_reach(&pr->cp, reach))
+		return;			/* it has not said, so do not presume */
+	for (i = 0; i < 2; i++) {
+		int state = 0, flags = 0;
+
+		if (now < pr->next_rdvask_ms[i])
+			continue;
+		if (self_sufficient(pm, famv[i]))
+			continue;
+		ctl_reach_decode(reach, sizeof(reach), i, &state, &flags);
+		/*
+		 * Proven reachable is enough to be worth asking. Its DHT having
+		 * already answered there would be the stronger claim, but it is
+		 * not one to wait for: a client has no reason to have exercised
+		 * the DHT over a family it was not using, so requiring it left
+		 * exactly the dual-stack client a v4-only host needs looking
+		 * unqualified, and the request was never made at all.
+		 *
+		 * Asking costs the client a convergent store and nothing if it
+		 * turns out it cannot; the flag still travels, and still says
+		 * which client to prefer once there is a choice.
+		 */
+		if (state != CTL_REACH_UP)
+			continue;
+		pr->next_rdvask_ms[i] = now + PEERING_RDVASK_MS;
+		ctlplane_ask_rdv(&pr->cp, famv[i]);
+		dbg_logf("rdv: asking peer %d to rendezvous on v%d", pr->id,
+			 famv[i]);
+	}
+}
+
+/*
+ * Act on a peer's request that this end rendezvous for it.
+ *
+ * Standing rather than one-shot, because the search runs until it succeeds and
+ * a single answer would strand a host whose first request was lost. It lapses
+ * all the same: the host repeats it only while it still lacks the family, so a
+ * peer that has recovered stops being worked for within a few periods.
+ */
+static void rdv_serve_ask(struct peering *pr, uint64_t now)
+{
+	static const int famv[2] = { 4, 6 };
+	struct peering_model *pm = pr->pm;
+	int ask, i;
+
+	if (pm->is_host || !pm->sig)
+		return;
+	ask = ctlplane_take_asks(&pr->cp);
+	for (i = 0; i < 2; i++) {
+		if (ask & (i ? 2 : 1)) {
+			pm->relay_until_ms[i] = now + PEERING_RELAY_HOLD_MS;
+			if (!pm->relay_fam[i]) {
+				pm->relay_fam[i] = 1;
+				sig_relay(pm->sig, famv[i], 1);
+				dbg_logf("rdv: rendezvousing on v%d for the "
+					 "peer", famv[i]);
+			}
+			continue;
+		}
+		if (pm->relay_fam[i] && now >= pm->relay_until_ms[i]) {
+			pm->relay_fam[i] = 0;
+			sig_relay(pm->sig, famv[i], 0);
+			dbg_logf("rdv: no longer asked to rendezvous on v%d",
+				 famv[i]);
+		}
+	}
+}
+
+void peering_absorb(struct peering *pr, uint64_t now)
+{
+	rdv_adopt(pr, now);
+	reach_take(pr);
+	rdv_serve_ask(pr, now);
+	rdv_ask(pr, now);
 }

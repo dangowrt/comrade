@@ -424,7 +424,6 @@ struct conn {
 	pthread_mutex_t status_lock;
 	struct conn_status status;
 	char status_peer[80];		/* address of the chosen pair, once live */
-	int dash_id;			/* this connection's dashboard peer-row id */
 	uint64_t next_status_ms;
 
 	/* Read-only grade (host): the ssh thread sets it once the client has
@@ -446,7 +445,6 @@ struct sess {
 
 	uint8_t auth[TOKEN_AUTH_LEN];
 
-	struct sig *sig;
 	/*
 	 * The key a claimant boxes its claim to, held here rather than by the
 	 * signaller: a signaller is rebuilt on every move, and the claim a
@@ -676,21 +674,6 @@ static int cand_addr(const char *cand, char *out, size_t n)
 }
 
 /* Printable "addr:port" ("[v6]:port") for a sockaddr; empty on failure. */
-static void fmt_sockaddr(const struct sockaddr *sa, socklen_t len,
-			 char *out, size_t n)
-{
-	char host[64], serv[8];		/* serv is NI_NUMERICSERV: 5 digits max */
-
-	out[0] = '\0';
-	if (getnameinfo(sa, len, host, sizeof(host), serv, sizeof(serv),
-			NI_NUMERICHOST | NI_NUMERICSERV))
-		return;
-	if (strchr(host, ':'))
-		snprintf(out, n, "[%s]:%s", host, serv);
-	else
-		snprintf(out, n, "%s:%s", host, serv);
-}
-
 /*
  * Our own listening endpoint: both ends of one session hold the same key, so a
  * probe sent there is answered by us and the path looks alive while carrying
@@ -1377,7 +1360,7 @@ static void fmt_rdv_fam(struct sess *s, int family, char *out, size_t n)
 
 	out[0] = '\0';
 	if (r.have)
-		fmt_sockaddr((struct sockaddr *)&r.sa, r.len, out, n);
+		peering_sockaddr_text((struct sockaddr *)&r.sa, r.len, out, n);
 	else if (family == 6 &&
 		 token_family_state(t, 6) == TOKEN_STATE_RENDEZVOUS &&
 		 inet_ntop(AF_INET6, t->ep6_addr, ip, sizeof(ip)))
@@ -1667,8 +1650,8 @@ static void pool_pump(struct sess *s)
 	}
 	if (sdp_ready(s) && n >= 2 && n > s->net.pool.posted) {
 		s->net.pool.posted = fan_local_sdp(s);
-		sig_set_claim_offer(s->sig, s->c.remote_ufrag);
-		sig_post(s->sig, (const uint8_t *)s->local_sdp,
+		sig_set_claim_offer(s->pm.sig, s->c.remote_ufrag);
+		sig_post(s->pm.sig, (const uint8_t *)s->local_sdp,
 			 strlen(s->local_sdp));
 		/* The fan is the whole answer to a carrier that picks a
 		 * different egress address per destination, and it reaches a
@@ -1689,7 +1672,7 @@ static void offer_refresh(struct sess *s)
 
 	/* The host's listener only: the client's own claim slot is posted by the
 	 * resume machinery, and re-posting it from here races that. */
-	if (!s->sig || !s->offer_conn || s->offer_conn == &s->c ||
+	if (!s->pm.sig || !s->offer_conn || s->offer_conn == &s->c ||
 	    !s->offer_conn->nat)
 		return;
 	if (nat_local_description(s->offer_conn->nat, raw, sizeof(raw)))
@@ -1703,7 +1686,7 @@ static void offer_refresh(struct sess *s)
 	sdp_filter(s->local_sdp, s->cfg->family, filtered, sizeof(filtered));
 	snprintf(s->local_sdp, sizeof(s->local_sdp), "%s", filtered);
 	fan_local_sdp(s);
-	sig_post(s->sig, (const uint8_t *)s->local_sdp, strlen(s->local_sdp));
+	sig_post(s->pm.sig, (const uint8_t *)s->local_sdp, strlen(s->local_sdp));
 }
 
 /* A late local candidate reached the model: re-post it to the mailbox (so the
@@ -1801,9 +1784,9 @@ static void seed_rendezvous(struct sess *s)
 		if (seed_node_for(s, famv[i], &sa, &sl))
 			continue;
 		if (s->cfg->is_host)
-			sig_reinforce(s->sig, famv[i], (struct sockaddr *)&sa,
+			sig_reinforce(s->pm.sig, famv[i], (struct sockaddr *)&sa,
 				      sl);
-		else if (sig_seed_node(s->sig, (struct sockaddr *)&sa, sl))
+		else if (sig_seed_node(s->pm.sig, (struct sockaddr *)&sa, sl))
 			continue;
 		/* Adopted, not confirmed: whoever minted this node did so on
 		 * another network, and report_rendezvous says so until it has
@@ -2345,7 +2328,7 @@ static int offer_moved_on(struct conn *c)
 		return 0;
 	/* A higher generation than primed us is a move, not a pickup rotation:
 	 * the offer's candidates are new, so re-claim at once with no floor. */
-	if (sig_peer_gen(s->sig) > c->remote_gen)
+	if (sig_peer_gen(s->pm.sig) > c->remote_gen)
 		return strcmp(s->cur_offer_ufrag, s->regathered_for) != 0;
 	/* The long floor is only for a client being punched, whose claim was
 	 * taken up; one never picked up, never in the slot or queued over by a
@@ -2373,7 +2356,7 @@ static void claim_watch(struct conn *c)
 
 	if (c->sess->cfg->is_host)
 		return;
-	st = sig_claim_status(c->sess->sig);
+	st = sig_claim_status(c->sess->pm.sig);
 	if (st == SIG_CLAIM_HELD) {
 		c->claim_held_seen = 1;
 		c->claim_lost = 0;
@@ -2847,14 +2830,14 @@ static void pump_once(struct sess *s, int timeout_cap_ms)
 	int timeout, nfds, lnf = 0, mnf;
 	struct pollfd fds[7];
 
-	nfds = sig_prepare(s->sig, fds, 5, &timeout);
+	nfds = sig_prepare(s->pm.sig, fds, 5, &timeout);
 	if (s->lan)
 		lnf = lanlink_prepare(s->lan, fds + nfds, 6 - nfds, &timeout);
 	mnf = netmon_prepare(&s->netmon, fds + nfds + lnf, 7 - nfds - lnf);
 	if (timeout > timeout_cap_ms)
 		timeout = timeout_cap_ms;
 	sock_poll(fds, (nfds_t)(nfds + lnf + mnf), timeout);
-	sig_dispatch(s->sig, fds, nfds);
+	sig_dispatch(s->pm.sig, fds, nfds);
 	if (s->lan)
 		lanlink_dispatch(s->lan, fds + nfds, lnf);
 	netmon_drain_event(&s->netmon);
@@ -3036,10 +3019,10 @@ static void rdv_publish(struct sess *s)
 		b4[0] = b6[0] = '\0';
 		pthread_mutex_lock(&s->pm.pub_lock);
 		if (s->pm.rdv[0].have)
-			fmt_sockaddr((struct sockaddr *)&s->pm.rdv[0].sa,
+			peering_sockaddr_text((struct sockaddr *)&s->pm.rdv[0].sa,
 				     s->pm.rdv[0].len, b4, sizeof(b4));
 		if (s->pm.rdv[1].have)
-			fmt_sockaddr((struct sockaddr *)&s->pm.rdv[1].sa,
+			peering_sockaddr_text((struct sockaddr *)&s->pm.rdv[1].sa,
 				     s->pm.rdv[1].len, b6, sizeof(b6));
 		pthread_mutex_unlock(&s->pm.pub_lock);
 		dbg_logf("rdv: publishing set %u: v4 %s v6 %s",
@@ -3092,76 +3075,6 @@ static void rdv_tell(struct conn *c, uint64_t now)
 		ctlplane_tell_rdv(&c->pr.cp, &k, famv[i],
 				  (struct sockaddr *)&pub[i].sa,
 				  pub[i].status);
-	}
-}
-
-/*
- * Take this peer's announcement.
- *
- * A client takes it as it stands. The mailbox is the host's, and the node the
- * host names is the only one whose copy of it the host keeps current, so
- * following the host's word is the whole of how a client stays reachable
- * through a rendezvous that changed under a token already handed out.
- *
- * A host takes one only for a family it has no node of its own for: its own is
- * what the token names and what it serves, and a client may not move it.
- *
- * Adopting means the node becomes this end's anchor -- pinned for the direct
- * get, shown on the panel, seeded into the next sig -- not a note kept aside
- * for a reconnection. Runs on the thread that owns the model.
- */
-static void rdv_adopt(struct sess *s, struct conn *c)
-{
-	static const int famv[2] = { 4, 6 };
-	struct ctlplane_node in[2];
-	int i;
-
-	if (!c || !ctlplane_take_nodes(&c->pr.cp, in))
-		return;
-	for (i = 0; i < 2; i++) {
-		uint8_t node[NETSTATE_SA_MAX], nlen = 0;
-		char b[80];
-
-		if (!in[i].have)
-			continue;
-		fmt_sockaddr((struct sockaddr *)&in[i].sa, in[i].len, b,
-			     sizeof(b));
-		dbg_logf("rdv: peer names v%d %s", famv[i], b);
-		if (netstate_anchor(&s->pm.ns, famv[i], node, &nlen, NULL)) {
-			if (s->cfg->is_host)
-				continue;
-			if (nlen == in[i].len &&
-			    !memcmp(node, &in[i].sa, nlen)) {
-				/* The same node by our own route. Nothing to
-				 * adopt, and the end state is what matters, so
-				 * say it rather than leave the two ways of
-				 * arriving at it looking different. */
-				dbg_logf("rdv: already holding the peer's v%d "
-					 "node %s", famv[i], b);
-				continue;
-			}
-		}
-		/*
-		 * Only a node the peer stands behind is a vouch. It now names
-		 * the ones it has not proven as well -- they are where it is
-		 * meeting, and this end may be able to prove what it cannot --
-		 * but taking its word for one it has not got would put a claim
-		 * behind the node that nobody has ever made.
-		 */
-		if (in[i].status & (CTL_RDVST_PROVEN | CTL_RDVST_VOUCHED))
-			netstate_on_rdv_vouched(&s->pm.ns, famv[i],
-						(const uint8_t *)&in[i].sa,
-						(int)in[i].len, now_ms());
-		else
-			netstate_on_rdv_offered(&s->pm.ns, famv[i],
-						(const uint8_t *)&in[i].sa,
-						(int)in[i].len, now_ms());
-		dbg_logf("rdv: adopted the peer's v%d node %s (%s%s%s)", famv[i],
-			 b, in[i].status & CTL_RDVST_PROVEN ? "proven" :
-			    in[i].status & CTL_RDVST_VOUCHED ? "vouched" :
-			    "unproven",
-			 in[i].status & CTL_RDVST_BLIND ? ", peer is blind" : "",
-			 "");
 	}
 }
 
@@ -3290,113 +3203,6 @@ static void reach_tell(struct conn *c, uint64_t now)
 	ctlplane_tell_reach(&c->pr.cp, &k, pl);
 }
 
-/* Take this peer's account of itself. Kept per connection, since in a
- * multi-user host each one is a different machine on a different network. */
-static void reach_take(struct sess *s, struct conn *c)
-{
-	static const int famv[2] = { 4, 6 };
-	uint8_t pl[CTL_REACH_PLEN];
-	int i;
-
-	(void)s;
-	if (!c)
-		return;
-	if (!ctlplane_take_reach(&c->pr.cp, pl))
-		return;
-	for (i = 0; i < 2; i++) {
-		int state = 0, flags = 0;
-
-		ctl_reach_decode(pl, sizeof(pl), i, &state, &flags);
-		dbg_logf("reach: peer %d v%d state=%d dht=%d", c->dash_id,
-			 famv[i], state, !!(flags & CTL_REACHF_DHT));
-	}
-}
-
-/*
- * Whether this end can settle `family`'s rendezvous by itself: it reaches the
- * DHT there, or it already holds a node. Either way there is nobody to ask.
- */
-/*
- * Whether this end can look after `family`'s rendezvous itself.
- *
- * HOLDING A NODE IS NOT BEING ABLE TO OPERATE ONE. A node a client found for
- * us, on a family we have no route to, is an address we can neither store to,
- * read from, nor replace when it goes. Counting it as self-sufficiency stops
- * the asking; the client's standing request then lapses, it stops relaying,
- * and the rendezvous everybody has since been pointed at quietly stops being
- * served -- with nobody in a position to notice, this end least of all.
- *
- * So reachability decides. With the family up the node is ours to keep, and
- * with it down the request stands however many nodes we have been handed.
- */
-static int rdv_self_sufficient(struct sess *s, int family)
-{
-	int conn = 0, acked = 0;
-
-	netstate_reach(&s->pm.ns, family, &conn, &acked);
-	if (conn != NET_CONN_UP)
-		return 0;
-	return acked || netstate_anchor(&s->pm.ns, family, NULL, NULL, NULL);
-}
-
-/*
- * Ask a client to establish the rendezvous this host cannot.
- *
- * A host with no global connectivity on a family has no way to place its
- * mailbox where a peer arriving on that family would look, and no way to
- * recover a node it lost when it moved. A client that still has the family has
- * both, and is already trusted with the mailbox -- it holds the same key and
- * writes to the same item. So it is asked, and what it finds comes back as an
- * ordinary announcement.
- *
- * Asked, not told: the client answers with a node or it does not, and the host
- * is no worse off either way. Repeated on a slow cadence for as long as the
- * family is missing, since the client's own situation may improve, and stopped
- * the moment a node arrives from anywhere at all.
- *
- * Decides here, on the thread that owns the model, and leaves the sending to
- * the connection's own loop: the control socket belongs to that loop, and two
- * threads writing a stream socket interleave whatever they were framing.
- */
-static void rdv_ask(struct sess *s, struct conn *c, uint64_t now)
-{
-	static const int famv[2] = { 4, 6 };
-	uint8_t reach[CTL_REACH_PLEN];
-	int i;
-
-	if (!s->cfg->is_host || !c || !(s->cfg->sig_flags & SIG_DHT))
-		return;
-	if (!ctlplane_peer_reach(&c->pr.cp, reach))
-		return;			/* it has not said, so do not presume */
-	for (i = 0; i < 2; i++) {
-		int state = 0, flags = 0;
-
-		if (now < c->next_rdvask_ms[i])
-			continue;
-		if (rdv_self_sufficient(s, famv[i]))
-			continue;
-		ctl_reach_decode(reach, sizeof(reach), i, &state, &flags);
-		/*
-		 * Proven reachable is enough to be worth asking. Its DHT having
-		 * already answered there would be the stronger claim, but it is
-		 * not one to wait for: a client has no reason to have exercised
-		 * the DHT over a family it was not using, so requiring it left
-		 * exactly the dual-stack client a v4-only host needs looking
-		 * unqualified, and the request was never made at all.
-		 *
-		 * Asking costs the client a convergent store and nothing if it
-		 * turns out it cannot; the flag still travels, and still says
-		 * which client to prefer once there is a choice.
-		 */
-		if (state != CTL_REACH_UP)
-			continue;
-		c->next_rdvask_ms[i] = now + RDVASK_MS;
-		ctlplane_ask_rdv(&c->pr.cp, famv[i]);
-		dbg_logf("rdv: asking peer %d to rendezvous on v%d", c->dash_id,
-			 famv[i]);
-	}
-}
-
 /* Send what rdv_ask decided, from the loop that owns the control socket. */
 static void rdvask_tell(struct conn *c)
 {
@@ -3404,48 +3210,6 @@ static void rdvask_tell(struct conn *c)
 
 	conn_ctl_sinks(c, &k);
 	ctlplane_tell_asks(&c->pr.cp, &k);
-}
-
-/*
- * Act on a peer's request that we rendezvous for it.
- *
- * Standing rather than one-shot, because the search runs until it succeeds and
- * a single answer would strand a host whose first request was lost. It lapses
- * all the same: the host repeats it only while it still lacks the family, so a
- * request that stops being renewed is one the host no longer needs, and a
- * client that can never capture a node would otherwise store into the DHT for
- * the rest of the session on behalf of somebody long since recovered.
- *
- * Runs on the thread that owns the model.
- */
-static void rdv_serve_ask(struct sess *s, struct conn *c, uint64_t now)
-{
-	static const int famv[2] = { 4, 6 };
-	int ask = 0, i;
-
-	if (s->cfg->is_host || !s->sig)
-		return;
-	if (c) {
-		ask = ctlplane_take_asks(&c->pr.cp);
-	}
-	for (i = 0; i < 2; i++) {
-		if (ask & (i ? 2 : 1)) {
-			s->pm.relay_until_ms[i] = now + RELAY_HOLD_MS;
-			if (!s->pm.relay_fam[i]) {
-				s->pm.relay_fam[i] = 1;
-				sig_relay(s->sig, famv[i], 1);
-				dbg_logf("rdv: rendezvousing on v%d for the peer",
-					 famv[i]);
-			}
-			continue;
-		}
-		if (s->pm.relay_fam[i] && now >= s->pm.relay_until_ms[i]) {
-			s->pm.relay_fam[i] = 0;
-			sig_relay(s->sig, famv[i], 0);
-			dbg_logf("rdv: no longer asked to rendezvous on v%d",
-				 famv[i]);
-		}
-	}
 }
 
 /* Everything each served connection's peer has said about itself, drained on
@@ -3456,11 +3220,8 @@ static void peer_in_drain(struct sess *s)
 	int i;
 
 	for (i = 0; i < HOST_MAX_WORKERS; i++)
-		if (s->conns[i]) {
-			rdv_adopt(s, s->conns[i]);
-			reach_take(s, s->conns[i]);
-			rdv_ask(s, s->conns[i], now_ms());
-		}
+		if (s->conns[i])
+			peering_absorb(&s->conns[i]->pr, now_ms());
 }
 
 
@@ -3499,8 +3260,8 @@ static int sig_arm(struct sess *s)
 {
 	const struct session_cfg *cfg = s->cfg;
 
-	s->sig = sig_create(cfg->tok.rdv, cfg->sig_flags, cfg->is_host);
-	if (!s->sig)
+	s->pm.sig = sig_create(cfg->tok.rdv, cfg->sig_flags, cfg->is_host);
+	if (!s->pm.sig)
 		return -1;
 	/*
 	 * BEFORE ANYTHING IS PUBLISHED. A claimant boxes its claim to the key
@@ -3512,40 +3273,40 @@ static int sig_arm(struct sess *s)
 	 * session, which the rebuild does not replace.
 	 */
 	if (s->have_claim_sk) {
-		if (sig_use_claim_key(s->sig, s->claim_sk))
+		if (sig_use_claim_key(s->pm.sig, s->claim_sk))
 			return -1;
-	} else if (!sig_claim_key(s->sig, s->claim_sk)) {
+	} else if (!sig_claim_key(s->pm.sig, s->claim_sk)) {
 		s->have_claim_sk = 1;
 	}
 	s->dht_since_ms = now_ms();	/* a rebuild is a fresh attempt, and a
 					 * fresh grace, on the new network */
-	sig_subscribe(s->sig, on_peer_offer, s);
+	sig_subscribe(s->pm.sig, on_peer_offer, s);
 	/* A fresh signaller knows nothing, and what it drives its convergence
 	 * eagerness from is only ever published when it changes -- so a family
 	 * that came through the move still proven would sit in the slow tier
 	 * for the rest of the session, and never find its rendezvous. */
-	sig_set_family_up(s->sig, 4, netstate_conn(&s->pm.ns, 4) == NET_CONN_UP);
-	sig_set_family_up(s->sig, 6, netstate_conn(&s->pm.ns, 6) == NET_CONN_UP);
+	sig_set_family_up(s->pm.sig, 4, netstate_conn(&s->pm.ns, 4) == NET_CONN_UP);
+	sig_set_family_up(s->pm.sig, 6, netstate_conn(&s->pm.ns, 6) == NET_CONN_UP);
 	/* Our offer carries the generation of the network it was gathered on, so
 	 * a peer tells a move from a mere credential rotation. A rebuild follows
 	 * a move, so the current netgen is what this fresh signaller stamps. */
-	sig_set_gen(s->sig, __atomic_load_n(&s->netgen, __ATOMIC_RELAXED));
+	sig_set_gen(s->pm.sig, __atomic_load_n(&s->netgen, __ATOMIC_RELAXED));
 	if (s->lan) {
-		sig_set_direct_port(s->sig, lanlink_port(s->lan));
+		sig_set_direct_port(s->pm.sig, lanlink_port(s->lan));
 		if (host_is_multiuser(cfg)) {
-			sig_subscribe_direct(s->sig, on_direct_claim, s);
-			sig_set_mcast_claims(s->sig, 1);
+			sig_subscribe_direct(s->pm.sig, on_direct_claim, s);
+			sig_set_mcast_claims(s->pm.sig, 1);
 		} else {
-			sig_subscribe_direct(s->sig, on_direct_peer, &s->c);
+			sig_subscribe_direct(s->pm.sig, on_direct_peer, &s->c);
 		}
 	}
 	seed_rendezvous(s);
 	/* A peer's request that we rendezvous for it stands until it has a
 	 * node; a fresh signaller starts knowing nothing of it. */
 	if (s->pm.relay_fam[0])
-		sig_relay(s->sig, 4, 1);
+		sig_relay(s->pm.sig, 4, 1);
 	if (s->pm.relay_fam[1])
-		sig_relay(s->sig, 6, 1);
+		sig_relay(s->pm.sig, 6, 1);
 	return 0;
 }
 
@@ -3555,9 +3316,9 @@ static void report_links(struct sess *s)
 {
 	struct sig_mcast_if ifs[16];
 
-	if (!s->lan || !s->sig)
+	if (!s->lan || !s->pm.sig)
 		return;
-	obsemit_links(&s->pm.oe, ifs, sig_link_ifaces(s->sig, ifs, 16));
+	obsemit_links(&s->pm.oe, ifs, sig_link_ifaces(s->pm.sig, ifs, 16));
 }
 
 /*
@@ -3587,8 +3348,8 @@ static int net_moved(struct sess *s)
 
 static int sig_rebuild(struct sess *s, const char *why)
 {
-	sig_discard(s->sig);
-	s->sig = NULL;
+	sig_discard(s->pm.sig);
+	s->pm.sig = NULL;
 	if (sig_arm(s)) {
 		dbg_logf("sig: rebuild failed -- giving up the session");
 		return -1;
@@ -3739,7 +3500,7 @@ static void resume_tick(struct conn *c)
 		if (c->rs_state) {
 			c->rs_state = 0;
 			c->rs_backoff = 0;
-			sig_withdraw(s->sig);
+			sig_withdraw(s->pm.sig);
 			dbg_logf("resume: link back");
 		}
 		/*
@@ -3803,10 +3564,10 @@ static void resume_tick(struct conn *c)
 			snprintf(s->local_sdp, sizeof(s->local_sdp), "%s",
 				 filtered);
 			s->net.pool.posted = fan_local_sdp(s);
-			sig_set_claim_offer(s->sig, c->remote_ufrag);
-			sig_post(s->sig, (const uint8_t *)s->local_sdp,
+			sig_set_claim_offer(s->pm.sig, c->remote_ufrag);
+			sig_post(s->pm.sig, (const uint8_t *)s->local_sdp,
 				 strlen(s->local_sdp));
-			sig_redeliver(s->sig);
+			sig_redeliver(s->pm.sig);
 			dbg_logf("resume: claim posted");
 			c->rs_state = 2;
 			c->rs_deadline = now + resume_backoff(c);
@@ -3825,14 +3586,14 @@ static void resume_tick(struct conn *c)
 				cand_sdp_ufrag(s->peer_sdp, ufrag, sizeof(ufrag));
 				snprintf(c->remote_ufrag,
 					 sizeof(c->remote_ufrag), "%s", ufrag);
-				c->remote_gen = sig_peer_gen(s->sig);
+				c->remote_gen = sig_peer_gen(s->pm.sig);
 				s->remote_set = 1;
 				dbg_logf("resume: primed offer %s", ufrag);
 				/* Named, and posted only once primed: the host
 				 * punches the agent this end punches, not whatever
 				 * listener a rotation left in the slot. */
-				sig_set_claim_offer(s->sig, c->remote_ufrag);
-				sig_post(s->sig, (const uint8_t *)s->local_sdp,
+				sig_set_claim_offer(s->pm.sig, c->remote_ufrag);
+				sig_post(s->pm.sig, (const uint8_t *)s->local_sdp,
 					 strlen(s->local_sdp));
 				dbg_logf("resume: claim posted for %s", ufrag);
 			}
@@ -3844,8 +3605,8 @@ static void resume_tick(struct conn *c)
 			n = peering_pool_count(&s->net.pool);
 			if (n >= 2 && n > s->net.pool.posted) {
 				s->net.pool.posted = fan_local_sdp(s);
-				sig_set_claim_offer(s->sig, c->remote_ufrag);
-				sig_post(s->sig, (const uint8_t *)s->local_sdp,
+				sig_set_claim_offer(s->pm.sig, c->remote_ufrag);
+				sig_post(s->pm.sig, (const uint8_t *)s->local_sdp,
 					 strlen(s->local_sdp));
 				dbg_logf("resume: trickled pool -> %d", n);
 			}
@@ -3855,7 +3616,7 @@ static void resume_tick(struct conn *c)
 		 * and chasing it aborts a punch still in flight. */
 		if (s->remote_set && s->cur_offer_ufrag[0] &&
 		    offer_rotated(c->remote_ufrag, s->cur_offer_ufrag) &&
-		    sig_peer_gen(s->sig) > c->remote_gen) {
+		    sig_peer_gen(s->pm.sig) > c->remote_gen) {
 			c->rs_state = 0;
 			return;
 		}
@@ -3872,11 +3633,11 @@ static void resume_tick(struct conn *c)
 			 * the worker on a stale claim, and losing it forces a
 			 * full re-join. Same credentials, punch undisturbed. */
 			if (s->have_local_sdp) {
-				sig_set_claim_offer(s->sig, c->remote_ufrag);
-				sig_post(s->sig, (const uint8_t *)s->local_sdp,
+				sig_set_claim_offer(s->pm.sig, c->remote_ufrag);
+				sig_post(s->pm.sig, (const uint8_t *)s->local_sdp,
 					 strlen(s->local_sdp));
 			}
-			sig_redeliver(s->sig);
+			sig_redeliver(s->pm.sig);
 			c->rs_deadline = now + resume_backoff(c);
 		}
 		return;
@@ -3914,10 +3675,10 @@ static void resume_tick(struct conn *c)
  */
 static void session_entomb_start(struct sess *s)
 {
-	if (!s->sig || s->tomb_deadline)
+	if (!s->pm.sig || s->tomb_deadline)
 		return;
 	s->tomb_deadline = now_ms() + SESSION_TOMB_MS;
-	sig_end(s->sig);
+	sig_end(s->pm.sig);
 }
 
 /* A validated get proves the family, and says whether the rendezvous we hold
@@ -3927,7 +3688,7 @@ static void ns_take_acks(struct sess *s, uint64_t now)
 	static const int famv[2] = { 4, 6 };
 	int i;
 
-	if (!s->sig)
+	if (!s->pm.sig)
 		return;
 	for (i = 0; i < 2; i++) {
 		struct sockaddr_storage sa;
@@ -3937,7 +3698,7 @@ static void ns_take_acks(struct sess *s, uint64_t now)
 		 * hold and then by another holder would otherwise be read as
 		 * ours having gone quiet, which is how a live rendezvous used
 		 * to be given up seconds after being chosen. */
-		if (sig_take_anchor_seen(s->sig, famv[i]))
+		if (sig_take_anchor_seen(s->pm.sig, famv[i]))
 			netstate_on_anchor_seen(&s->pm.ns, famv[i], now);
 		/*
 		 * Rendezvousing for the peer on this family is precisely being
@@ -3949,7 +3710,7 @@ static void ns_take_acks(struct sess *s, uint64_t now)
 		netstate_set_picking(&s->pm.ns, famv[i],
 				     s->cfg->is_host || s->pm.relay_fam[i]);
 		memset(&sa, 0, sizeof(sa));
-		if (!sig_take_ack(s->sig, famv[i], (struct sockaddr *)&sa, &sl))
+		if (!sig_take_ack(s->pm.sig, famv[i], (struct sockaddr *)&sa, &sl))
 			continue;
 		netstate_on_dht_ack(&s->pm.ns, famv[i],
 				    netstate_epoch(&s->pm.ns, famv[i]),
@@ -4015,8 +3776,8 @@ static void net_apply(struct sess *s, const struct netstate_actions *a)
 		if (act & NSA_EMIT_CONN) {
 			int conn = netstate_conn(&s->pm.ns, family);
 
-			if (s->sig)
-				sig_set_family_up(s->sig, family,
+			if (s->pm.sig)
+				sig_set_family_up(s->pm.sig, family,
 						  conn == NET_CONN_UP);
 			obsemit_conn(&s->pm.oe, family, conn);
 		}
@@ -4024,19 +3785,19 @@ static void net_apply(struct sess *s, const struct netstate_actions *a)
 			uint8_t node[NETSTATE_SA_MAX];
 			uint8_t nlen = 0;
 
-			if (s->sig && netstate_anchor(&s->pm.ns, family, node,
+			if (s->pm.sig && netstate_anchor(&s->pm.ns, family, node,
 						      &nlen, NULL))
-				sig_reinforce(s->sig, family,
+				sig_reinforce(s->pm.sig, family,
 					      (const struct sockaddr *)node,
 					      (socklen_t)nlen);
 		}
 		if (act & NSA_RDV_RELOCATE) {
-			if (s->sig)
-				sig_search_again(s->sig, family);
+			if (s->pm.sig)
+				sig_search_again(s->pm.sig, family);
 		}
 		if (act & NSA_RDV_DROP) {
-			if (s->sig)
-				sig_forget(s->sig, family);
+			if (s->pm.sig)
+				sig_forget(s->pm.sig, family);
 		}
 		if (act & NSA_EMIT_RDV)
 			report_rendezvous(s);
@@ -4169,7 +3930,7 @@ static int conn_run(struct conn *c, int drive_sig)
 		/* Capture a rendezvous node per family for reconnection (the host
 		 * was already locating; ask on the client side too). */
 		if (s->cfg->sig_flags & SIG_DHT)
-			sig_locate(s->sig);
+			sig_locate(s->pm.sig);
 		/*
 		 * Now connected, a client stops advertising its answer: otherwise
 		 * it would keep re-claiming the single mailbox slot the host clears
@@ -4178,7 +3939,7 @@ static int conn_run(struct conn *c, int drive_sig)
 		 * (mcast single-connection path) keeps advertising its offer.
 		 */
 		if (!s->cfg->is_host)
-			sig_withdraw(s->sig);
+			sig_withdraw(s->pm.sig);
 	}
 
 	while (!done) {
@@ -4212,7 +3973,7 @@ static int conn_run(struct conn *c, int drive_sig)
 			dbg_logf("resume: adopted the re-punched agent");
 		}
 		if (drive_sig) {
-			nfds = sig_prepare(s->sig, fds, 5, &timeout);
+			nfds = sig_prepare(s->pm.sig, fds, 5, &timeout);
 			if (s->lan)
 				lnf = lanlink_prepare(s->lan, fds + nfds,
 						      9 - nfds - 2, &timeout);
@@ -4229,7 +3990,7 @@ static int conn_run(struct conn *c, int drive_sig)
 		fds[cidx].revents = 0;
 		sock_poll(fds, (nfds_t)(cidx + 1), timeout);
 		if (drive_sig) {
-			sig_dispatch(s->sig, fds, nfds);
+			sig_dispatch(s->pm.sig, fds, nfds);
 			if (s->lan)
 				lanlink_dispatch(s->lan, fds + nfds, lnf);
 		}
@@ -4367,10 +4128,7 @@ static int conn_run(struct conn *c, int drive_sig)
 			ns_take_acks(s, now_ms());
 			rdv_publish(s);
 			reach_publish(s);
-			rdv_adopt(s, c);
-			reach_take(s, c);
-			rdv_serve_ask(s, c, now_ms());
-			rdv_ask(s, c, now_ms());
+			peering_absorb(&c->pr, now_ms());
 			ns_drain(s);
 			netstate_tick(&s->pm.ns, now_ms());
 			net_settle(s);
@@ -4531,7 +4289,7 @@ static int client_regather(struct sess *s)
 	s->pending_sdp_set = 0;
 	pthread_mutex_unlock(&s->trickle_lock);
 	s->peer_state = SESSION_PEER_SEEN;
-	sig_redeliver(s->sig);		/* we discarded the offer we were given */
+	sig_redeliver(s->pm.sig);		/* we discarded the offer we were given */
 	return nat_setup(&s->c) ? -1 : 0;
 }
 
@@ -4591,15 +4349,15 @@ static int deadline_room(uint64_t deadline, uint64_t now, uint64_t need)
 
 static void session_entomb(struct sess *s)
 {
-	if (!s->sig)
+	if (!s->pm.sig)
 		return;
 	session_entomb_start(s);
 	while (!deadline_passed(s->tomb_deadline, now_ms())) {
 		pump_once(s, 100);
-		if (sig_end_placed(s->sig))
+		if (sig_end_placed(s->pm.sig))
 			break;
 	}
-	dbg_logf("session: tombstone %s", sig_end_placed(s->sig) ?
+	dbg_logf("session: tombstone %s", sig_end_placed(s->pm.sig) ?
 		 "placed (or nowhere to place it)" : "not placed in time");
 }
 
@@ -4662,7 +4420,7 @@ static int dht_attempt_concluded(struct sess *s, int family)
 		return 0;
 	if (now_ms() - s->dht_since_ms <= DHT_CONCLUDE_MS)
 		return 0;
-	return !sig_locating(s->sig, family);
+	return !sig_locating(s->pm.sig, family);
 }
 
 /* The tokgen facts: the model holds all but the one reaching into sig. */
@@ -4743,9 +4501,9 @@ static void report_mailbox(struct sess *s)
 {
 	struct sig_mailbox sm;
 
-	if (!s->sig)
+	if (!s->pm.sig)
 		return;
-	sig_mailbox_state(s->sig, &sm);
+	sig_mailbox_state(s->pm.sig, &sm);
 	obsemit_mailbox(&s->pm.oe, &sm, now_ms());
 }
 
@@ -4767,23 +4525,23 @@ static void maybe_announce_rendezvous(struct sess *s)
 		return;
 
 	update_expect(s);
-	have4 = sig_located(s->sig, 4, (struct sockaddr *)&a4, &l4);
-	have6 = sig_located(s->sig, 6, (struct sockaddr *)&a6, &l6);
+	have4 = sig_located(s->pm.sig, 4, (struct sockaddr *)&a4, &l4);
+	have6 = sig_located(s->pm.sig, 6, (struct sockaddr *)&a6, &l6);
 
 	/* Remember the located rendezvous endpoint for the local status line,
 	 * preferring v6 to match how the token renders it. */
 	if (have6)
-		fmt_sockaddr((struct sockaddr *)&a6, l6,
+		peering_sockaddr_text((struct sockaddr *)&a6, l6,
 			     s->status_rdv, sizeof(s->status_rdv));
 	else if (have4)
-		fmt_sockaddr((struct sockaddr *)&a4, l4,
+		peering_sockaddr_text((struct sockaddr *)&a4, l4,
 			     s->status_rdv, sizeof(s->status_rdv));
 
 	if (o && o->rdv_stage) {		/* drive the RENDEZVOUS spinner */
 		if (s->expect4)
-			o->rdv_stage(o->arg, 4, sig_rdv_stage(s->sig, 4));
+			o->rdv_stage(o->arg, 4, sig_rdv_stage(s->pm.sig, 4));
 		if (s->expect6)
-			o->rdv_stage(o->arg, 6, sig_rdv_stage(s->sig, 6));
+			o->rdv_stage(o->arg, 6, sig_rdv_stage(s->pm.sig, 6));
 	}
 	report_rendezvous(s);		/* also for a family still expected */
 }
@@ -4823,7 +4581,7 @@ static int advert_state(struct sess *s, int fam, enum tok_advert adv,
 	*port = 0;
 	switch (adv) {
 	case TOK_ADVERT_RENDEZVOUS:
-		if (!sig_located(s->sig, fam, (struct sockaddr *)&ss, &sl))
+		if (!sig_located(s->pm.sig, fam, (struct sockaddr *)&ss, &sl))
 			break;
 		b = ep_bytes((struct sockaddr *)&ss, port);
 		if (!b)
@@ -4953,7 +4711,7 @@ static struct conn *conn_alloc(struct sess *s)
 	c->sess = s;
 	c->ctl_fd = INVALID_SOCK;
 	c->bh_kind = -1;
-	peering_init(&c->pr, s->keys.probe_magic, s->keys.sig_key, now_ms());
+	peering_init(&c->pr, &s->pm, s->keys.probe_magic, s->keys.sig_key, now_ms());
 	pthread_mutex_init(&c->status_lock, NULL);
 	pthread_mutex_init(&c->stream_lock, NULL);
 	pthread_mutex_init(&c->claim_lock, NULL);
@@ -5042,7 +4800,7 @@ static void report_peer_link_one(const struct session_obs *o, struct sess *s,
 	c->rtt_told = rtt;
 	c->paths_told = np;
 	c->link_told_any = 1;
-	o->peer_link(o->arg, c->dash_id, st, rtt, np);
+	o->peer_link(o->arg, c->pr.id, st, rtt, np);
 }
 
 static void report_peer_links(struct sess *s, struct worker *ws)
@@ -5066,7 +4824,7 @@ static void emit_peer_ident(const struct session_obs *o, struct conn *c)
 	if (!o || !o->peer_ident || !c->claim_ufrag[0])
 		return;
 	snprintf(id8, sizeof(id8), "%.8s", c->claim_ufrag);
-	o->peer_ident(o->arg, c->dash_id, id8);
+	o->peer_ident(o->arg, c->pr.id, id8);
 }
 
 /* A worker runs one connected client's session on the shared command (tmux
@@ -5288,7 +5046,7 @@ static void lan_drain(struct sess *s, struct worker *ws, int *dash_seq)
 			s->have_served = 1;
 		}
 		s->admitted_n++;
-		c->dash_id = ++*dash_seq;
+		c->pr.id = ++*dash_seq;
 		snprintf(c->status_peer, sizeof(c->status_peer), "%s", addr);
 		s->lan_conns[slot] = c;
 		/* Said here too: a client whose segment path ended because one
@@ -5298,14 +5056,14 @@ static void lan_drain(struct sess *s, struct worker *ws, int *dash_seq)
 		conn_tell_fresh(c, &mapped);
 		conn_register(s, c);
 		if (o && o->peer) {
-			o->peer(o->arg, c->dash_id, SESSION_PEER_SEEN, addr);
-			o->peer(o->arg, c->dash_id, SESSION_PEER_LIVE, addr);
+			o->peer(o->arg, c->pr.id, SESSION_PEER_SEEN, addr);
+			o->peer(o->arg, c->pr.id, SESSION_PEER_LIVE, addr);
 			emit_peer_ident(o, c);
 			c->link_told_any = 0;
 		}
 		if (worker_spawn(ws, c)) {	/* worker table full */
 			if (o && o->peer)
-				o->peer(o->arg, c->dash_id, SESSION_PEER_GONE,
+				o->peer(o->arg, c->pr.id, SESSION_PEER_GONE,
 					addr);
 			s->lan_conns[slot] = NULL;
 			conn_free(c);
@@ -5410,13 +5168,13 @@ static void punch_scan(struct sess *s, struct worker *ws, int *dash_seq)
 			}
 			if (o && o->peer) {
 				/* SEEN opens this client's row, LIVE marks it up;
-				 * dash_id keys the row for updates and GONE. */
-				c->dash_id = ++*dash_seq;
+				 * pr.id keys the row for updates and GONE. */
+				c->pr.id = ++*dash_seq;
 				snprintf(c->status_peer, sizeof(c->status_peer),
 					 "%s", addr);
-				o->peer(o->arg, c->dash_id, SESSION_PEER_SEEN,
+				o->peer(o->arg, c->pr.id, SESSION_PEER_SEEN,
 					addr);
-				o->peer(o->arg, c->dash_id, SESSION_PEER_LIVE,
+				o->peer(o->arg, c->pr.id, SESSION_PEER_LIVE,
 					addr);
 				emit_peer_ident(o, c);
 				c->link_told_any = 0;
@@ -5736,9 +5494,9 @@ static int host_turnstile(struct sess *s)
 		 * through it. The network's own facts -- the egress pool, the
 		 * mapping -- are still this network's and are kept.
 		 */
-		if (sig_quiet(s->sig)) {
+		if (sig_quiet(s->pm.sig)) {
 			dbg_logf("sig: nothing back from the rendezvous for "
-				 "%ds -- rebuilding", sig_idle_s(s->sig));
+				 "%ds -- rebuilding", sig_idle_s(s->pm.sig));
 			if (listen)
 				offer_retire(s, kept, &listen,
 					     ts == TS_WAIT_CLAIM, now_ms());
@@ -5759,7 +5517,7 @@ static int host_turnstile(struct sess *s)
 			if (ws[i].used && worker_done(&ws[i])) {
 				pthread_join(ws[i].th, NULL);
 				if (o && o->peer)
-					o->peer(o->arg, ws[i].c->dash_id,
+					o->peer(o->arg, ws[i].c->pr.id,
 						SESSION_PEER_GONE,
 						ws[i].c->status_peer);
 				/* Unregister a LAN worker so a rejoining client
@@ -5843,7 +5601,7 @@ static int host_turnstile(struct sess *s)
 					snprintf(ws[i].c->status_peer,
 						 sizeof(ws[i].c->status_peer),
 						 "%s", cur);
-					o->peer(o->arg, ws[i].c->dash_id,
+					o->peer(o->arg, ws[i].c->pr.id,
 						SESSION_PEER_LIVE, cur);
 				}
 			}
@@ -5854,14 +5612,14 @@ static int host_turnstile(struct sess *s)
 					    __ATOMIC_RELAXED) &&
 			    !ws[i].c->ro_reported) {
 				ws[i].c->ro_reported = 1;
-				o->peer_ro(o->arg, ws[i].c->dash_id);
+				o->peer_ro(o->arg, ws[i].c->pr.id);
 			}
 			/* A forwarding attempt the ssh thread refused: surface
 			 * it once so the operator sees the attempted tunnel. */
 			if (o && o->peer_fwd_refused && ws[i].c->fwd_refused &&
 			    !ws[i].c->fwd_reported) {
 				ws[i].c->fwd_reported = 1;
-				o->peer_fwd_refused(o->arg, ws[i].c->dash_id);
+				o->peer_fwd_refused(o->arg, ws[i].c->pr.id);
 			}
 		}
 
@@ -5913,7 +5671,7 @@ static int host_turnstile(struct sess *s)
 				s->local_sdp[0] = '\0';
 				s->peer_sdp[0] = '\0';
 				s->offer_conn = listen;
-				sig_subscribe(s->sig, on_peer_offer, s);
+				sig_subscribe(s->pm.sig, on_peer_offer, s);
 				if (nat_setup(listen)) {
 					conn_free(listen);
 					listen = NULL;
@@ -5991,9 +5749,9 @@ static int host_turnstile(struct sess *s)
 					break;
 				}
 				s->net.pool.posted = fan_local_sdp(s);
-				sig_rotate(s->sig, (const uint8_t *)s->local_sdp,
+				sig_rotate(s->pm.sig, (const uint8_t *)s->local_sdp,
 					   strlen(s->local_sdp));
-				sig_locate(s->sig);
+				sig_locate(s->pm.sig);
 				log_offer(s->local_sdp, served, active);
 				ts = TS_WAIT_CLAIM;
 			}
@@ -6018,7 +5776,7 @@ static int host_turnstile(struct sess *s)
 				 */
 				cand_sdp_ufrag(s->peer_sdp, cu, sizeof(cu));
 				sdp_pwd(s->peer_sdp, cp);
-				sig_claim_offer(s->sig, co, sizeof(co));
+				sig_claim_offer(s->pm.sig, co, sizeof(co));
 				if (cu[0]) {
 					struct conn *w = worker_by_ufrag(ws, cu);
 					int adm = ufrag_admitted(s, cu);
@@ -6063,7 +5821,7 @@ static int host_turnstile(struct sess *s)
 						dbg_logf("host: claim %.8s already "
 							 "in hand -- leaving it",
 							 cu);
-						sig_release(s->sig);
+						sig_release(s->pm.sig);
 						s->have_peer_sdp = 0;
 						break;
 					}
@@ -6071,7 +5829,7 @@ static int host_turnstile(struct sess *s)
 					    conn_is_proven(w)) {
 						dbg_logf("host: ignore claim %.8s "
 							 "(healthy worker)", cu);
-						sig_release(s->sig);
+						sig_release(s->pm.sig);
 						s->have_peer_sdp = 0;
 						break;
 					}
@@ -6091,7 +5849,7 @@ static int host_turnstile(struct sess *s)
 				    strcmp(co, listen->ice_ufrag)) {
 					dbg_logf("host: claim %.8s names the retired "
 						 "offer %.8s -- released", cu, co);
-					sig_release(s->sig);
+					sig_release(s->pm.sig);
 					s->have_peer_sdp = 0;
 					break;
 				}
@@ -6102,7 +5860,7 @@ static int host_turnstile(struct sess *s)
 				    s->admitted_n >= cfg->host_admit_max) {
 					dbg_logf("host: admission budget spent "
 						 "-- claim ignored");
-					sig_release(s->sig);
+					sig_release(s->pm.sig);
 					s->have_peer_sdp = 0;
 					break;
 				}
@@ -6149,7 +5907,7 @@ static int host_turnstile(struct sess *s)
 						 "offer %.8s", cu, co);
 					kept[ko].c = NULL;
 					kept[ko].until_ms = 0;
-					sig_release(s->sig);
+					sig_release(s->pm.sig);
 					s->have_peer_sdp = 0;
 				} else {
 					listen = NULL;
@@ -6278,12 +6036,14 @@ int session_run(const struct session_cfg *cfg)
 		return 1;
 	pthread_mutex_init(&s.trickle_lock, NULL);
 	pthread_mutex_init(&s.c.status_lock, NULL);	/* s.c.status zeroed = connecting */
-	peering_init(&s.c.pr, s.keys.probe_magic, s.keys.sig_key, now_ms());
+	peering_init(&s.c.pr, &s.pm, s.keys.probe_magic, s.keys.sig_key, now_ms());
 	pthread_mutex_init(&s.c.stream_lock, NULL);
 	pthread_mutex_init(&s.c.claim_lock, NULL);
 	netmon_init(&s.netmon);
 	netmon_src_open(&s.netmon);
-	peering_model_init(&s.pm, cfg->is_host, cfg->obs, now_ms());
+	peering_model_init(&s.pm, cfg->is_host,
+			   (cfg->sig_flags & SIG_DHT) != 0, cfg->obs,
+			   now_ms());
 	/*
 	 * When the synthetic change is armed follows the path the session
 	 * meets over, and nothing else. A host whose rendezvous is the DHT
@@ -6395,7 +6155,7 @@ int session_run(const struct session_cfg *cfg)
 		 * spent. Either way there is nothing left to wait for, which is
 		 * the whole reason the tombstone exists.
 		 */
-		if (!cfg->is_host && sig_peer_ended(s.sig)) {
+		if (!cfg->is_host && sig_peer_ended(s.pm.sig)) {
 			ended = s.was_live ? SESSION_ENDED : SESSION_GONE;
 			break;
 		}
@@ -6431,9 +6191,9 @@ int session_run(const struct session_cfg *cfg)
 		 * claim through that instead, keeping what this network has
 		 * already told us about itself.
 		 */
-		if (st != ST_RUN && sig_quiet(s.sig)) {
+		if (st != ST_RUN && sig_quiet(s.pm.sig)) {
 			dbg_logf("sig: nothing back from the rendezvous for "
-				 "%ds -- rebuilding", sig_idle_s(s.sig));
+				 "%ds -- rebuilding", sig_idle_s(s.pm.sig));
 			if (sig_rebuild(&s, "after the rendezvous went quiet")) {
 				st = ST_FAIL;
 				break;
@@ -6501,7 +6261,7 @@ int session_run(const struct session_cfg *cfg)
 
 		switch (st) {
 		case ST_WAIT_DHT:
-			if (sig_ready(s.sig)) {
+			if (sig_ready(s.pm.sig)) {
 				if (nat_setup(&s.c))
 					st = ST_FAIL;
 				else
@@ -6515,11 +6275,11 @@ int session_run(const struct session_cfg *cfg)
 				snprintf(s.local_sdp, sizeof(s.local_sdp),
 					 "%s", filtered);
 				s.net.pool.posted = fan_local_sdp(&s);
-				sig_set_claim_offer(s.sig, s.c.remote_ufrag);
-				sig_post(s.sig, (const uint8_t *)s.local_sdp,
+				sig_set_claim_offer(s.pm.sig, s.c.remote_ufrag);
+				sig_post(s.pm.sig, (const uint8_t *)s.local_sdp,
 					 strlen(s.local_sdp));
 				if (cfg->is_host && (cfg->sig_flags & SIG_DHT))
-					sig_locate(s.sig);
+					sig_locate(s.pm.sig);
 				st = ST_SIGNAL;
 			}
 			break;
@@ -6536,7 +6296,7 @@ int session_run(const struct session_cfg *cfg)
 				cand_sdp_ufrag(s.peer_sdp, ufrag, sizeof(ufrag));
 				snprintf(s.c.remote_ufrag, sizeof(s.c.remote_ufrag),
 					 "%s", ufrag);
-				s.c.remote_gen = sig_peer_gen(s.sig);
+				s.c.remote_gen = sig_peer_gen(s.pm.sig);
 				/* The claimant a single-connection host serves is
 				 * the identity in the answer it takes up, as
 				 * lan_drain and the turnstile record theirs. */
@@ -6550,8 +6310,8 @@ int session_run(const struct session_cfg *cfg)
 				s.net.pool.posted = fan_local_sdp(&s);
 							/* members learnt since
 							 * the ST_GATHER post */
-				sig_set_claim_offer(s.sig, s.c.remote_ufrag);
-				sig_post(s.sig, (const uint8_t *)s.local_sdp,
+				sig_set_claim_offer(s.pm.sig, s.c.remote_ufrag);
+				sig_post(s.pm.sig, (const uint8_t *)s.local_sdp,
 					 strlen(s.local_sdp));
 				s.remote_set = 1;
 				s.ice_attempt_start = now_ms();
@@ -6764,7 +6524,7 @@ done:
 	conn_free_agent(&s.c, s.c.nat, s.c.nat_ctx);
 	if (s.lan)
 		lanlink_destroy(s.lan);
-	sig_destroy(s.sig);
+	sig_destroy(s.pm.sig);
 	netmon_src_close(&s.netmon);
 	/* Teardown, and the one place waiting is right: the session these
 	 * threads write into is about to go away with this frame. */
