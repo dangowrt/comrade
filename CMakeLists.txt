@@ -708,6 +708,11 @@ add_library(comrade_obsemit STATIC src/obsemit.c)
 target_include_directories(comrade_obsemit PUBLIC src)
 target_link_libraries(comrade_obsemit PUBLIC comrade_netstate comrade_compat)
 
+add_library(comrade_peering STATIC src/peering.c)
+target_include_directories(comrade_peering PUBLIC src)
+target_link_libraries(comrade_peering PUBLIC comrade_netstate comrade_nsfacts
+	comrade_compat)
+
 add_library(comrade_lanlink STATIC src/lanlink.c)
 target_include_directories(comrade_lanlink PUBLIC src)
 target_link_libraries(comrade_lanlink PUBLIC comrade_compat)
@@ -777,7 +782,8 @@ target_link_libraries(comrade_session PUBLIC
 	comrade_stunprobe comrade_conn comrade_path comrade_ctlproto comrade_dbg
 	comrade_netstate comrade_netroute comrade_nsfacts comrade_hostreap
 	comrade_claimlog comrade_hbeat comrade_replay comrade_dataauth
-	comrade_probeplane comrade_pathplane comrade_ctlplane comrade_obsemit)
+	comrade_probeplane comrade_pathplane comrade_ctlplane comrade_obsemit
+	comrade_peering)
 # session.c reads and writes two 64-bit stamps with the __atomic builtins. A
 # target whose widest lock-free atomic is 4 bytes (32-bit MIPS, ARMv5) lowers
 # those to calls into libatomic, so the probe links one and the library is
@@ -1068,6 +1074,11 @@ if(BUILD_TESTING)
 	add_executable(obsemit_test tests/obsemit_test.c)
 	target_link_libraries(obsemit_test comrade_obsemit)
 	add_test(NAME obsemit_test COMMAND obsemit_test)
+
+	# The establishment engine every playbook peers through.
+	add_executable(peering_test tests/peering_test.c)
+	target_link_libraries(peering_test comrade_peering)
+	add_test(NAME peering_test COMMAND peering_test)
 
 	add_executable(termfilter_test tests/termfilter_test.c)
 	target_link_libraries(termfilter_test comrade_termfilter)
@@ -1513,7 +1524,7 @@ if(BUILD_TESTING)
 		dhtnode_boot_test
 		connkey_test dataauth_test box_test
 		stunprobe_test path_test probeplane_test pathplane_test
-		ctlplane_test obsemit_test bep44_test
+		ctlplane_test obsemit_test peering_test bep44_test
 		bep44_pin_test bep44_store_test bep44_rl_test
 		sig_rebuild_test natstream_test stream_room_test
 		stream_cc_test sshloop_test sshfwd_test sshexit_test sshro_test

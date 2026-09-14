@@ -21,6 +21,7 @@
 #include "netroute.h"
 #include "netstate.h"
 #include "obsemit.h"
+#include "peering.h"
 #include "claimlog.h"
 #include "hbeat.h"
 #include "hostreap.h"
@@ -661,8 +662,8 @@ struct sess {
 	struct obsemit obs;		/* what the watcher has been told */
 
 	/*
-	 * Reachability per family. Producers off this thread leave facts under
-	 * ns_lock; the loop feeds them in, so nothing outside it writes the
+	 * Reachability per family. Producers off this thread leave facts in the
+	 * crossing; the loop feeds them in, so nothing outside it writes the
 	 * model or reaches the view.
 	 */
 	struct netstate ns;
@@ -672,8 +673,7 @@ struct sess {
 					 * net_ch, held until a roam's burst of
 					 * interface changes settles */
 	uint64_t net_hold_ms;		/* release once quiet this long */
-	pthread_mutex_t ns_lock;
-	struct nsfacts ns_facts;
+	struct peering_facts ns_facts;	/* what the producers left for it */
 	/* The epoch each producer was started for, stamped before it starts. */
 	/* Stamped by the loop when a round is armed and read by that round's
 	 * probe thread as it reports, so both ends are atomic. */
@@ -1981,49 +1981,31 @@ static void stun_probe6_reap(struct sess *s)
  * sig or the view. */
 static void ns_post(struct sess *s, int kind, int family, uint32_t epoch)
 {
-	pthread_mutex_lock(&s->ns_lock);
-	nsfacts_post(&s->ns_facts, kind, family, epoch);
-	pthread_mutex_unlock(&s->ns_lock);
+	peering_facts_post(&s->ns_facts, kind, family, epoch);
 }
 
 static void ns_post_addr(struct sess *s, int family, uint32_t epoch,
 			 const uint8_t *addr, const char *text)
 {
-	pthread_mutex_lock(&s->ns_lock);
-	nsfacts_post_addr(&s->ns_facts, family, epoch, addr, text);
-	pthread_mutex_unlock(&s->ns_lock);
+	peering_facts_post_addr(&s->ns_facts, family, epoch, addr, text);
 }
-
 
 static void ns_drain(struct sess *s)
 {
 	struct nsfact f[NSFACTS_OUT];
 	int n, i;
 
-	pthread_mutex_lock(&s->ns_lock);
-	n = nsfacts_take(&s->ns_facts, f, NSFACTS_OUT);
-	pthread_mutex_unlock(&s->ns_lock);
-
+	n = peering_facts_take(&s->ns_facts, f, NSFACTS_OUT);
 	for (i = 0; i < n; i++) {
-		if (f[i].kind == NSF_ROUNDTRIP) {
-			netstate_on_roundtrip(&s->ns, f[i].family, f[i].epoch);
-			continue;
+		/* A round's end is said as its last act, so this does not
+		 * wait. */
+		if (f[i].kind == NSF_PROBE_DONE) {
+			if (f[i].family == 6)
+				stun_probe6_reap(s);
+			else
+				stun_probe_reap(s);
 		}
-		if (f[i].kind == NSF_ADDR) {
-			netstate_on_candidate(&s->ns, f[i].family, f[i].epoch,
-					      net_addr_scope(f[i].text),
-					      NET_VIA_STUN, f[i].addr,
-					      f[i].family == 6 ? 16 : 4,
-					      f[i].text);
-			continue;
-		}
-		/* Said as the round's last act, so this does not wait. */
-		if (f[i].family == 6)
-			stun_probe6_reap(s);
-		else
-			stun_probe_reap(s);
-		netstate_on_probe_done(&s->ns, f[i].family, f[i].epoch,
-				       now_ms());
+		peering_facts_feed(&s->ns, &f[i], f[i].epoch, now_ms());
 	}
 }
 
@@ -6608,8 +6590,7 @@ int session_run(const struct session_cfg *cfg)
 	probeplane_init(&s.c.probe, s.keys.probe_magic, s.keys.sig_key,
 			now_ms());
 	pathplane_init(&s.c.pl, &s.c.probe);
-	pthread_mutex_init(&s.ns_lock, NULL);
-	nsfacts_init(&s.ns_facts);
+	peering_facts_init(&s.ns_facts);
 	netmon_init(&s.netmon);
 	netmon_src_open(&s.netmon);
 	netstate_init(&s.ns, cfg->is_host, now_ms());
@@ -7112,6 +7093,6 @@ done:
 	pthread_mutex_destroy(&s.c.stream_lock);
 	pathplane_destroy(&s.c.pl);
 	pthread_mutex_destroy(&s.pub_lock);
-	pthread_mutex_destroy(&s.ns_lock);
+	peering_facts_destroy(&s.ns_facts);
 	return rc;
 }
