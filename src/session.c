@@ -182,16 +182,6 @@ static int fam_idx(int family)
 #define PATH_LOST_MS 2500
 
 /*
- * The active probe that fills the pool set: this many servers asked, over one
- * socket, the moment the session starts -- so the members are on the table
- * when the first description posts, rather than trickling in one gather at a
- * time (measured: one member per STUN name per agent, far too slow for a
- * punch on the first attempt). A handful of packets, once per network.
- */
-#define STUN_PROBE_SERVERS 6
-#define STUN_PROBE_MS 3000
-
-/*
  * Post-teardown linger for the bridge. The host keeps flushing generously, to
  * land the dedicated end-of-session signal (the channel exit-status and close)
  * on the client even over a lossy link -- it returns as soon as the client
@@ -612,18 +602,11 @@ struct sess {
 	int stun_count;
 	char stun_host[128];		/* the current attempt's host, split out */
 	/*
-	 * The egress addresses this network's carrier has been seen mapping our
-	 * sockets to, which the posted description must fan across; a roam
-	 * empties it with the other per-network facts.
+	 * What belongs to this machine whichever peer it is talking to: the
+	 * crossing its producer threads post through, the egress addresses its
+	 * carrier maps it to, and the rounds that find them.
 	 */
-	struct peering_pool pool;
-	pthread_t probe_th;		/* the active pool probe (stunprobe) */
-	int probe_running;
-	volatile int probe_stop;
-	pthread_t probe6_th;		/* the v6 connectivity check (stunprobe) --
-					 * proof only, no pool/mapping use for v6 */
-	int probe6_running;
-	volatile int probe6_stop;
+	struct peering_net net;
 	pthread_t warm_th;		/* resolves the STUN pool into the cache */
 	int warm_running;
 	volatile int warm_stop;
@@ -649,11 +632,8 @@ struct sess {
 					 * net_ch, held until a roam's burst of
 					 * interface changes settles */
 	uint64_t net_hold_ms;		/* release once quiet this long */
-	struct peering_facts ns_facts;	/* what the producers left for it */
-	/* The epoch each producer was started for, stamped before it starts. */
-	/* Stamped by the loop when a round is armed and read by that round's
-	 * probe thread as it reports, so both ends are atomic. */
-	volatile uint32_t probe_epoch[2];
+	/* The epoch each gather was started for, stamped by the loop before it
+	 * starts and read by the gather thread as it reports. */
 	volatile uint32_t gather_epoch[2];
 
 	/*
@@ -1529,7 +1509,7 @@ static int fan_local_sdp(struct sess *s)
 	uint8_t pool[PEERING_POOL4_MAX][4];
 	int n, moves;
 
-	n = peering_pool_copy(&s->pool, pool);
+	n = peering_pool_copy(&s->net.pool, pool);
 	/*
 	 * A dependent mapping is the case this exists for, not a reason to skip
 	 * it: a carrier handing out an egress address per destination is
@@ -1538,7 +1518,7 @@ static int fan_local_sdp(struct sess *s)
 	 * against this description's own reflexive port, so that, and only
 	 * that, calls it off.
 	 */
-	moves = !peering_pool_port_stable(&s->pool);
+	moves = !peering_pool_port_stable(&s->net.pool);
 	if (n >= 2)
 		cand_sdp_fan_v4(s->local_sdp, sizeof(s->local_sdp), pool,
 				(size_t)n, moves);
@@ -1704,9 +1684,9 @@ static void pool_pump(struct sess *s)
 	uint8_t pool[PEERING_POOL4_MAX][4];
 	int n, i, st, rep;
 
-	n = peering_pool_copy(&s->pool, pool);
-	st = peering_pool_mapping(&s->pool);
-	for (i = s->pool.reported; i < n; i++) {
+	n = peering_pool_copy(&s->net.pool, pool);
+	st = peering_pool_mapping(&s->net.pool);
+	for (i = s->net.pool.reported; i < n; i++) {
 		char ip[64];
 
 		if (inet_ntop(AF_INET, pool[i], ip, sizeof(ip)))
@@ -1715,7 +1695,7 @@ static void pool_pump(struct sess *s)
 					      net_addr_scope(ip), NET_VIA_STUN,
 					      pool[i], 4, ip);
 	}
-	s->pool.reported = n;
+	s->net.pool.reported = n;
 	if (st != STUN_MAPPING_UNKNOWN) {
 		rep = st == STUN_MAPPING_DEPENDENT ? 2 : 1;
 		if (rep != s->mapping_reported) {
@@ -1724,8 +1704,8 @@ static void pool_pump(struct sess *s)
 				o->mapping4(o->arg, rep == 2);
 		}
 	}
-	if (sdp_ready(s) && n >= 2 && n > s->pool.posted) {
-		s->pool.posted = fan_local_sdp(s);
+	if (sdp_ready(s) && n >= 2 && n > s->net.pool.posted) {
+		s->net.pool.posted = fan_local_sdp(s);
 		sig_set_claim_offer(s->sig, s->c.remote_ufrag);
 		sig_post(s->sig, (const uint8_t *)s->local_sdp,
 			 strlen(s->local_sdp));
@@ -1929,33 +1909,11 @@ static void on_local_sdp(void *arg, const char *sdp)
 	pthread_mutex_unlock(&s->trickle_lock);
 }
 
-static void stun_probe_reap(struct sess *s)
-{
-	if (!s->probe_running)
-		return;
-	pthread_join(s->probe_th, NULL);
-	s->probe_running = 0;
-}
-
-static void stun_probe6_reap(struct sess *s)
-{
-	if (!s->probe6_running)
-		return;
-	pthread_join(s->probe6_th, NULL);
-	s->probe6_running = 0;
-}
-
 /* Leave a fact for the loop: called from threads that own none of the model,
  * sig or the view. */
 static void ns_post(struct sess *s, int kind, int family, uint32_t epoch)
 {
-	peering_facts_post(&s->ns_facts, kind, family, epoch);
-}
-
-static void ns_post_addr(struct sess *s, int family, uint32_t epoch,
-			 const uint8_t *addr, const char *text)
-{
-	peering_facts_post_addr(&s->ns_facts, family, epoch, addr, text);
+	peering_facts_post(&s->net.facts, kind, family, epoch);
 }
 
 static void ns_drain(struct sess *s)
@@ -1963,189 +1921,29 @@ static void ns_drain(struct sess *s)
 	struct nsfact f[NSFACTS_OUT];
 	int n, i;
 
-	n = peering_facts_take(&s->ns_facts, f, NSFACTS_OUT);
+	n = peering_facts_take(&s->net.facts, f, NSFACTS_OUT);
 	for (i = 0; i < n; i++) {
 		/* A round's end is said as its last act, so this does not
 		 * wait. */
 		if (f[i].kind == NSF_PROBE_DONE) {
 			if (f[i].family == 6)
-				stun_probe6_reap(s);
+				peering_net_reap(&s->net, 6);
 			else
-				stun_probe_reap(s);
+				peering_net_reap(&s->net, 4);
 		}
 		peering_facts_feed(&s->ns, &f[i], f[i].epoch, now_ms());
 	}
 }
 
-/* One more public v4 the NAT has been seen mapping us to; from the gather
- * thread and the probe thread alike. */
+/* One more public v4 the carrier has been seen mapping us to, from the gather
+ * thread; the probe round notes its own. */
 static void pool_note(struct sess *s, const uint8_t b[4])
 {
-	int added = peering_pool_note(&s->pool, b);
+	int added = peering_pool_note(&s->net.pool, b);
 
 	if (added)
 		dbg_logf("stun: egress +%u.%u.%u.%u (pool now %d)",
 			 b[0], b[1], b[2], b[3], added);
-}
-
-static void mapping_note(struct sess *s, const uint8_t addr[4], uint16_t port)
-{
-	peering_pool_sample(&s->pool, addr, port);
-}
-
-static void probe_hit(void *arg, const uint8_t addr[4], uint16_t port)
-{
-	struct sess *s = arg;
-
-	pool_note(s, addr);
-	mapping_note(s, addr, port);
-	ns_post(s, NSF_ROUNDTRIP, 4,
-		__atomic_load_n(&s->probe_epoch[0], __ATOMIC_RELAXED));
-}
-
-static void *stun_probe_thread(void *arg)
-{
-	struct sess *s = arg;
-	uint8_t seed[STUN_PROBE_TXID_LEN];
-	uint32_t epoch = __atomic_load_n(&s->probe_epoch[0], __ATOMIC_RELAXED);
-
-	/* The whole list, every round. A NAT that maps per destination shows a
-	 * different public address to each server it is asked through, and how
-	 * many that is belongs to the carrier -- so asking a subset leaves a
-	 * number of our own egress addresses undiscovered that nothing here can
-	 * predict. */
-	/*
-	 * One round, one socket, one verdict. The mapping test asks whether two
-	 * servers saw the same mapping for the SAME socket, and every round
-	 * opens a new one -- so carrying the samples across rounds compares two
-	 * sockets, which differ by construction. From the second round on the
-	 * answer was therefore always "it depends on the destination", however
-	 * well-behaved the NAT, and the fan that answers a per-destination
-	 * address was switched off by a port difference that meant nothing.
-	 *
-	 * The pool is not reset with it: which addresses this carrier maps us
-	 * to is a fact about the carrier and accumulates across rounds, where
-	 * one socket's port is a fact about that socket.
-	 */
-	peering_pool_round(&s->pool);
-	random_bytes(seed, sizeof(seed));
-	stun_probe_run(s->stun_servers, s->stun_count, STUN_PROBE_MS, seed,
-		       &s->probe_stop, probe_hit, s);
-	{
-		int st, stable, npool;
-
-		st = peering_pool_mapping(&s->pool);
-		stable = peering_pool_port_stable(&s->pool);
-		npool = peering_pool_count(&s->pool);
-		/* The verdict this round reached, and the pool it reached it
-		 * against. Which way this goes decides whether the offer names
-		 * every egress address or one of them, and until it was said
-		 * out loud the difference was visible only as a punch that
-		 * sometimes worked. */
-		dbg_logf("stun: round done -- mapping %s, port %s, "
-			 "%d egress address(es) known",
-			 st == STUN_MAPPING_DEPENDENT ? "per-destination" :
-			 st == STUN_MAPPING_INDEPENDENT ? "one for all" :
-							  "not yet known",
-			 stable ? "stable" : "moves with the destination",
-			 npool);
-	}
-	ns_post(s, NSF_PROBE_DONE, 4, epoch);
-	return NULL;
-}
-
-/* Ask the round in flight to wind up; it is reaped where it says so. */
-static void stun_probe_halt(struct sess *s)
-{
-	if (s->probe_running)
-		__atomic_store_n(&s->probe_stop, 1, __ATOMIC_RELAXED);
-}
-
-
-/*
- * Start a pool probe; an operator-pinned server is theirs alone to talk to.
- * Non-zero once a round is out. A round in flight is asked to stop and never
- * waited for: this is the loop that drives the session, and a probe can be
- * inside a name lookup with no timeout. Its answers are dropped on arrival
- * anyway, so there is nothing to wait for.
- */
-static int stun_probe_kick(struct sess *s)
-{
-	if (s->cfg->stun_host || !s->cfg->stun_auto || s->stun_count < 1)
-		return 0;
-	if (s->probe_running) {
-		__atomic_store_n(&s->probe_stop, 1, __ATOMIC_RELAXED);
-		return 0;
-	}
-	__atomic_store_n(&s->probe_stop, 0, __ATOMIC_RELAXED);
-	if (pthread_create(&s->probe_th, NULL, stun_probe_thread, s))
-		return 0;
-	s->probe_running = 1;
-	dbg_logf("stun: v4 probe round started");
-	return 1;
-}
-
-/* v6's proof and the address that carried it. Often the only v6 address
- * anything sees: ICE gathers no v6 srflx when a global host candidate
- * already exists. */
-static void probe6_hit(void *arg, const uint8_t addr[16], uint16_t port)
-{
-	struct sess *s = arg;
-	char ip[64];
-
-	(void)port;
-	ns_post(s, NSF_ROUNDTRIP, 6,
-		__atomic_load_n(&s->probe_epoch[1], __ATOMIC_RELAXED));
-	if (inet_ntop(AF_INET6, addr, ip, sizeof(ip)))
-		ns_post_addr(s, 6,
-			     __atomic_load_n(&s->probe_epoch[1],
-					     __ATOMIC_RELAXED), addr, ip);
-}
-
-static void *stun_probe6_thread(void *arg)
-{
-	struct sess *s = arg;
-	char *targets[STUN_PROBE_SERVERS];
-	uint8_t seed[STUN_PROBE_TXID_LEN];
-	uint32_t epoch = __atomic_load_n(&s->probe_epoch[1], __ATOMIC_RELAXED);
-	int n = 0, i, attempt;
-
-	attempt = __atomic_load_n(&s->ice_attempt, __ATOMIC_RELAXED);
-	for (i = 0; i < s->stun_count && n < STUN_PROBE_SERVERS; i++)
-		targets[n++] = s->stun_servers[(attempt + i) % s->stun_count];
-	random_bytes(seed, sizeof(seed));
-	stun_probe_check(targets, n, AF_INET6, STUN_PROBE_MS, seed,
-			 &s->probe6_stop, probe6_hit, s);
-	ns_post(s, NSF_PROBE_DONE, 6, epoch);
-	return NULL;
-}
-
-static void stun_probe6_halt(struct sess *s)
-{
-	if (s->probe6_running)
-		__atomic_store_n(&s->probe6_stop, 1, __ATOMIC_RELAXED);
-}
-
-
-/* v6's own connectivity proof: the same pool of servers, tried over a v6
- * socket, independent of whether ICE ever bothers to gather a v6 srflx
- * candidate (it does not when a global host candidate already exists, so
- * relying on that alone misses real NAT66/filtered hosts and, worse, the
- * ordinary case of a global address that just goes unconfirmed). Never waits
- * on a round in flight -- see stun_probe_kick. */
-static int stun_probe6_kick(struct sess *s)
-{
-	if (s->cfg->stun_host || !s->cfg->stun_auto || s->stun_count < 1)
-		return 0;
-	if (s->probe6_running) {
-		__atomic_store_n(&s->probe6_stop, 1, __ATOMIC_RELAXED);
-		return 0;
-	}
-	__atomic_store_n(&s->probe6_stop, 0, __ATOMIC_RELAXED);
-	if (pthread_create(&s->probe6_th, NULL, stun_probe6_thread, s))
-		return 0;
-	s->probe6_running = 1;
-	return 1;
 }
 
 /* libjuice gather thread: a candidate is ready. Append it for the main loop,
@@ -3926,7 +3724,7 @@ static void net_change_reset(struct sess *s)
 	__atomic_store_n(&s->trickle_dirty, 0, __ATOMIC_RELAXED);
 	s->pending_sdp_set = 0;
 	pthread_mutex_unlock(&s->trickle_lock);
-	peering_pool_reset(&s->pool);
+	peering_pool_reset(&s->net.pool);
 	s->stun_rotations = 0;
 	/* a fresh index: the per-session walk can leave a stale one on a dead
 	 * server, whose offer then carries no reflexive address */
@@ -3940,8 +3738,8 @@ static void net_change_reset(struct sess *s)
 	}
 	__atomic_store_n(&s->have_priv4, 0, __ATOMIC_RELAXED);
 	__atomic_store_n(&s->have_srflx4, 0, __ATOMIC_RELAXED);
-	s->pool.reported = 0;
-	s->pool.posted = 0;
+	s->net.pool.reported = 0;
+	s->net.pool.posted = 0;
 	s->mapping_reported = 0;
 }
 
@@ -4043,7 +3841,7 @@ static void resume_tick(struct conn *c)
 				   sizeof(filtered));
 			snprintf(s->local_sdp, sizeof(s->local_sdp), "%s",
 				 filtered);
-			s->pool.posted = fan_local_sdp(s);
+			s->net.pool.posted = fan_local_sdp(s);
 			sig_set_claim_offer(s->sig, c->remote_ufrag);
 			sig_post(s->sig, (const uint8_t *)s->local_sdp,
 				 strlen(s->local_sdp));
@@ -4082,9 +3880,9 @@ static void resume_tick(struct conn *c)
 		 * through a re-post under the same credentials (a fresh gather
 		 * would mint a password and abort the punch). */
 		if (s->remote_set && s->have_local_sdp) {
-			n = peering_pool_count(&s->pool);
-			if (n >= 2 && n > s->pool.posted) {
-				s->pool.posted = fan_local_sdp(s);
+			n = peering_pool_count(&s->net.pool);
+			if (n >= 2 && n > s->net.pool.posted) {
+				s->net.pool.posted = fan_local_sdp(s);
 				sig_set_claim_offer(s->sig, c->remote_ufrag);
 				sig_post(s->sig, (const uint8_t *)s->local_sdp,
 					 strlen(s->local_sdp));
@@ -4243,9 +4041,10 @@ static void net_apply(struct sess *s, const struct netstate_actions *a)
 		if (act & NSA_KICK_PROBE) {
 			int started;
 
-			__atomic_store_n(&s->probe_epoch[i], a->epoch[i],
-					 __ATOMIC_RELAXED);
-			started = i ? stun_probe6_kick(s) : stun_probe_kick(s);
+			started = peering_net_kick(&s->net, family, a->epoch[i],
+						   __atomic_load_n(
+						   &s->ice_attempt,
+						   __ATOMIC_RELAXED));
 			if (started)
 				netstate_on_probe_started(&s->ns, family,
 							  a->epoch[i], now_ms());
@@ -6235,7 +6034,7 @@ static int host_turnstile(struct sess *s)
 							    HOST_REGATHER_MS;
 					break;
 				}
-				s->pool.posted = fan_local_sdp(s);
+				s->net.pool.posted = fan_local_sdp(s);
 				sig_rotate(s->sig, (const uint8_t *)s->local_sdp,
 					   strlen(s->local_sdp));
 				sig_locate(s->sig);
@@ -6530,8 +6329,6 @@ int session_run(const struct session_cfg *cfg)
 	probeplane_init(&s.c.probe, s.keys.probe_magic, s.keys.sig_key,
 			now_ms());
 	pathplane_init(&s.c.pl, &s.c.probe);
-	peering_facts_init(&s.ns_facts);
-	peering_pool_init(&s.pool);
 	netmon_init(&s.netmon);
 	netmon_src_open(&s.netmon);
 	netstate_init(&s.ns, cfg->is_host, now_ms());
@@ -6551,6 +6348,10 @@ int session_run(const struct session_cfg *cfg)
 		? 0 : now_ms() + (uint64_t)cfg->test_roam_ms;
 	if (cfg->stun_auto)
 		s.stun_servers = stunlist_load(&s.stun_count);
+	/* An operator-pinned STUN server is theirs alone to talk to, so the
+	 * machine is told whether it may ask the list at all. */
+	peering_net_init(&s.net, s.stun_servers, s.stun_count,
+			 !cfg->stun_host && cfg->stun_auto);
 	/* Start the rotation at a random server: it spreads the install base
 	 * across the community pool instead of hammering whoever is listed
 	 * first, and one dead head entry no longer disables STUN for
@@ -6762,7 +6563,7 @@ int session_run(const struct session_cfg *cfg)
 					   sizeof(filtered));
 				snprintf(s.local_sdp, sizeof(s.local_sdp),
 					 "%s", filtered);
-				s.pool.posted = fan_local_sdp(&s);
+				s.net.pool.posted = fan_local_sdp(&s);
 				sig_set_claim_offer(s.sig, s.c.remote_ufrag);
 				sig_post(s.sig, (const uint8_t *)s.local_sdp,
 					 strlen(s.local_sdp));
@@ -6795,7 +6596,7 @@ int session_run(const struct session_cfg *cfg)
 						 ufrag);
 					pthread_mutex_unlock(&s.c.claim_lock);
 				}
-				s.pool.posted = fan_local_sdp(&s);
+				s.net.pool.posted = fan_local_sdp(&s);
 							/* members learnt since
 							 * the ST_GATHER post */
 				sig_set_claim_offer(s.sig, s.c.remote_ufrag);
@@ -7016,10 +6817,7 @@ done:
 	netmon_src_close(&s.netmon);
 	/* Teardown, and the one place waiting is right: the session these
 	 * threads write into is about to go away with this frame. */
-	stun_probe_halt(&s);
-	stun_probe6_halt(&s);
-	stun_probe_reap(&s);
-	stun_probe6_reap(&s);
+	peering_net_stop(&s.net);
 	if (s.warm_running) {
 		__atomic_store_n(&s.warm_stop, 1, __ATOMIC_RELAXED);
 		pthread_join(s.warm_th, NULL);
@@ -7034,7 +6832,6 @@ done:
 	pthread_mutex_destroy(&s.c.stream_lock);
 	pathplane_destroy(&s.c.pl);
 	pthread_mutex_destroy(&s.pub_lock);
-	peering_facts_destroy(&s.ns_facts);
-	peering_pool_destroy(&s.pool);
+	peering_net_destroy(&s.net);
 	return rc;
 }

@@ -139,4 +139,82 @@ void peering_pool_round(struct peering_pool *p);
 /* A move: every address seen before it belongs to the network we have left. */
 void peering_pool_reset(struct peering_pool *p);
 
+/*
+ * THE ROUNDS THAT FIND OUT.
+ *
+ * The v4 round asks every STUN server on the list through ONE socket: a
+ * carrier that maps per destination shows a different public address to each
+ * server, so the answers ARE the pool, and asking a subset leaves egress
+ * addresses undiscovered that nothing can predict. Every answer is a round
+ * trip and proves the family; the round's end is posted last, so the model
+ * hears both.
+ *
+ * The v6 round asks a few of the same servers over a v6 socket, deliberately
+ * independent of whether ICE ever gathers a v6 reflexive candidate: it does
+ * not when a global host candidate already exists, so relying on that alone
+ * misses real NAT66 and filtered hosts, and, more ordinarily, a global address
+ * that simply goes unconfirmed.
+ */
+/*
+ * The rounds run the moment a network is entered, so the members are on the
+ * table when the first description posts rather than trickling in one gather
+ * at a time (measured: one member per STUN name per agent, far too slow for a
+ * punch on the first attempt). A handful of packets, once per network.
+ */
+#define PEERING_PROBE6_SERVERS 6	/* asked in one v6 round */
+#define PEERING_PROBE_MS 3000		/* a round's whole budget */
+
+struct peering_probe {
+	pthread_t th;
+	int running;
+	volatile int stop;
+	volatile uint32_t epoch;	/* stamped by the loop, read by the
+					 * round as it reports */
+	int start;			/* v6: where in the list it begins */
+};
+
+/* What belongs to this machine, whichever peer it is talking to. */
+struct peering_net {
+	struct peering_facts facts;
+	struct peering_pool pool;
+	struct peering_probe probe;	/* fills the pool, proves v4 */
+	struct peering_probe probe6;	/* proves v6 */
+	char *const *servers;		/* the STUN list, "host:port" each */
+	int nservers;
+	int auto_probe;			/* the list may be asked at all: an
+					 * operator-pinned server is theirs
+					 * alone to talk to */
+};
+
+/*
+ * `servers` is borrowed and must outlive the machine. `auto_probe` says the
+ * rounds may run at all; a playbook whose operator pinned one STUN server
+ * passes 0, and no round of either kind ever starts.
+ */
+void peering_net_init(struct peering_net *m, char *const *servers,
+		      int nservers, int auto_probe);
+
+/* Ask both rounds to wind up and wait for them: teardown, before the machine
+ * or anything a round posts into goes away. */
+void peering_net_stop(struct peering_net *m);
+void peering_net_destroy(struct peering_net *m);
+
+/*
+ * Stamp a family's epoch and start its round if one is not already running.
+ * Returns non-zero if a round really started, which is what lets the model
+ * tell a probe that is running from one that could not be. A round in flight
+ * is asked to stop and never waited for: this is the loop that drives the
+ * session, and a probe can be inside a name lookup with no timeout, and its
+ * answers are dropped on arrival anyway. `start6` is where in the list the v6
+ * round begins, so it walks in step with the agent's own rotation.
+ */
+int peering_net_kick(struct peering_net *m, int family, uint32_t epoch,
+		     int start6);
+
+/* Ask a family's round to wind up, without waiting. */
+void peering_net_halt(struct peering_net *m, int family);
+
+/* Join a round that has posted its end. Idempotent. */
+void peering_net_reap(struct peering_net *m, int family);
+
 #endif
