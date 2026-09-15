@@ -1231,23 +1231,7 @@ static void sdp_filter(const char *in, int family, char *out, size_t outlen)
  */
 static int fan_local_sdp(struct sess *s)
 {
-	uint8_t pool[PEERING_POOL4_MAX][4];
-	int n, moves;
-
-	n = peering_pool_copy(&s->net.pool, pool);
-	/*
-	 * A dependent mapping is the case this exists for, not a reason to skip
-	 * it: a carrier handing out an egress address per destination is
-	 * exactly why naming one of them is a guess. What the fan cannot
-	 * survive is the PORT moving too, since it names the pool's addresses
-	 * against this description's own reflexive port, so that, and only
-	 * that, calls it off.
-	 */
-	moves = !peering_pool_port_stable(&s->net.pool);
-	if (n >= 2)
-		cand_sdp_fan_v4(s->local_sdp, sizeof(s->local_sdp), pool,
-				(size_t)n, moves);
-	return n;
+	return peering_net_fan(&s->net, s->local_sdp, sizeof(s->local_sdp));
 }
 
 /*

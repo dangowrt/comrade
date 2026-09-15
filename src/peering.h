@@ -16,6 +16,7 @@
 #ifndef COMRADE_PEERING_H
 #define COMRADE_PEERING_H
 
+#include <stddef.h>
 #include <stdint.h>
 #include <pthread.h>
 
@@ -148,6 +149,7 @@ void peering_pool_round(struct peering_pool *p);
 /* A move: every address seen before it belongs to the network we have left. */
 void peering_pool_reset(struct peering_pool *p);
 
+
 /*
  * THE ROUNDS THAT FIND OUT.
  *
@@ -239,6 +241,18 @@ void peering_net_reap(struct peering_net *m, int family);
  */
 int peering_net_stun_pick(const struct peering_net *m, unsigned attempt,
 			  char *host, size_t hostlen, uint16_t *port);
+/*
+ * Widen a description with the egress addresses this carrier maps us to, and
+ * say how many the pool holds. Fewer than two is not a fan, so nothing is
+ * written.
+ *
+ * A dependent mapping is the case this exists for, not a reason to skip it: a
+ * carrier handing out an address per destination is exactly why naming one of
+ * them is a guess. What the fan cannot survive is the PORT moving too, since
+ * it names the pool's addresses against this description's own reflexive port,
+ * so that, and only that, calls it off.
+ */
+int peering_net_fan(struct peering_net *m, char *sdp, size_t cap);
 
 /*
  * Mint an identity to gather under. Fixed by this end rather than left to the

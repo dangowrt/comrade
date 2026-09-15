@@ -8,6 +8,7 @@
 
 #include <stdio.h>
 
+#include "candpolicy.h"
 #include "dbg.h"
 #include "hbeat.h"
 #include "netroute.h"
@@ -1095,4 +1096,17 @@ void peering_ice_stop(struct peering *pr, const struct pathplane_sinks *k)
 	pr->ice.ctx = NULL;
 	pathplane_drop_ice(&pr->pl);
 	pathplane_free_agent(&pr->pl, k, agent, ctx);
+}
+
+int peering_net_fan(struct peering_net *m, char *sdp, size_t cap)
+{
+	uint8_t pool[PEERING_POOL4_MAX][4];
+	int n, moves;
+
+	n = peering_pool_copy(&m->pool, pool);
+	moves = !peering_pool_port_stable(&m->pool);
+	if (n >= 2)
+		cand_sdp_fan_v4(sdp, cap, pool, (size_t)n, moves);
+
+	return n;
 }
