@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 /* Copyright (C) 2026 Daniel Golle <daniel@makrotopia.org> */
 
+#include <stdlib.h>
 #include <string.h>
 
 #include "wsock.h"
@@ -987,4 +988,56 @@ int peering_model_sig(struct peering_model *pm, struct sig *sig, uint64_t now)
 	}
 
 	return 0;
+}
+
+int peering_net_stun_pick(const struct peering_net *m, unsigned attempt,
+			  char *host, size_t hostlen, uint16_t *port)
+{
+	const char *cand, *colon, *e;
+	int i, picked = 0;
+	char ip[64];
+	size_t hl;
+
+	if (m->nservers < 1)
+		return -1;
+	e = m->servers[attempt % (unsigned)m->nservers];
+	for (i = 0; i < m->nservers && !picked; i++) {
+		cand = m->servers[(attempt + (unsigned)i) %
+				  (unsigned)m->nservers];
+		if (stun_server_ip4(cand, ip, sizeof(ip), 0)) {
+			e = cand;
+			picked = 1;
+		}
+	}
+	colon = strrchr(e, ':');
+	*port = colon ? (uint16_t)atoi(colon + 1) : 3478;
+	if (!*port)
+		*port = 3478;
+	if (picked) {
+		snprintf(host, hostlen, "%s", ip);
+		return 0;
+	}
+	hl = colon ? (size_t)(colon - e) : strlen(e);
+	if (hl >= hostlen)
+		hl = hostlen - 1;
+	memcpy(host, e, hl);
+	host[hl] = '\0';
+
+	return 0;
+}
+
+void peering_ice_gen(char *ufrag, size_t uflen, char *pwd, size_t pwlen)
+{
+	static const char hx[] = "0123456789abcdef";
+	uint8_t rb[16];
+	size_t i;
+
+	random_bytes(rb, 4);
+	for (i = 0; i + 1 < uflen && i < 8; i++)
+		ufrag[i] = hx[i & 1 ? (rb[i / 2] & 0xf) : (rb[i / 2] >> 4)];
+	ufrag[i] = '\0';
+	random_bytes(rb, 16);
+	for (i = 0; i + 1 < pwlen && i < 32; i++)
+		pwd[i] = hx[i & 1 ? (rb[i / 2] & 0xf) : (rb[i / 2] >> 4)];
+	pwd[i] = '\0';
 }

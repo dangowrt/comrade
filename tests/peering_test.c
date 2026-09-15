@@ -364,9 +364,72 @@ static void a_mailbox_off_the_dht_asks_nobody(void)
 	peering_model_destroy(&pm);
 }
 
+/*
+ * Which server an attempt gathers through, split into storage that outlives
+ * the agent because the traversal library keeps the pointer. With nothing in
+ * the resolver cache the name itself is handed over, which is the cold-start
+ * path.
+ */
+static void the_server_an_attempt_asks_walks_the_list(void)
+{
+	static char *servers[] = { (char *)"a.invalid:1234",
+				   (char *)"b.invalid",
+				   (char *)"c.invalid:0" };
+	struct peering_net m;
+	char host[128];
+	uint16_t port;
+
+	peering_net_init(&m, NULL, 0, 1);
+	assert(peering_net_stun_pick(&m, 0, host, sizeof(host), &port) == -1);
+	peering_net_destroy(&m);
+
+	peering_net_init(&m, servers, 3, 1);
+	assert(!peering_net_stun_pick(&m, 0, host, sizeof(host), &port));
+	assert(!strcmp(host, "a.invalid"));
+	assert(port == 1234);
+
+	/* No port named is the well-known one, and so is a nonsense one. */
+	assert(!peering_net_stun_pick(&m, 1, host, sizeof(host), &port));
+	assert(!strcmp(host, "b.invalid"));
+	assert(port == 3478);
+	assert(!peering_net_stun_pick(&m, 2, host, sizeof(host), &port));
+	assert(!strcmp(host, "c.invalid"));
+	assert(port == 3478);
+
+	/* The rotation wraps, so one that does not answer is not the only one
+	 * ever asked. */
+	assert(!peering_net_stun_pick(&m, 3, host, sizeof(host), &port));
+	assert(!strcmp(host, "a.invalid"));
+	peering_net_destroy(&m);
+}
+
+/* An identity this end fixes itself, so it survives a re-gather and the peer
+ * keeps hammering one target. */
+static void an_identity_is_minted_to_gather_under(void)
+{
+	char uf[16], uf2[16], pwd[40];
+	size_t i;
+
+	memset(uf, 'x', sizeof(uf));
+	memset(pwd, 'x', sizeof(pwd));
+	peering_ice_gen(uf, sizeof(uf), pwd, sizeof(pwd));
+	assert(strlen(uf) == 8);
+	assert(strlen(pwd) == 32);
+	for (i = 0; i < strlen(uf); i++)
+		assert(strchr("0123456789abcdef", uf[i]));
+	for (i = 0; i < strlen(pwd); i++)
+		assert(strchr("0123456789abcdef", pwd[i]));
+
+	/* A fresh one is a different one. */
+	peering_ice_gen(uf2, sizeof(uf2), pwd, sizeof(pwd));
+	assert(strcmp(uf, uf2));
+}
+
 int main(void)
 {
 	what_is_posted_is_taken_once();
+	the_server_an_attempt_asks_walks_the_list();
+	an_identity_is_minted_to_gather_under();
 	which_end_may_adopt_is_read_from_the_mailbox();
 	a_host_asks_a_reachable_peer_to_rendezvous();
 	a_mailbox_off_the_dht_asks_nobody();
