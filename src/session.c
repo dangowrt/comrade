@@ -1458,68 +1458,38 @@ static void sdp_filter_peer(const char *in, int family, char *out, size_t outlen
  * token minted long ago can name a node that has since gone. Returns 0 and
  * fills sa/len, -1 when neither has one for this family.
  */
-static int seed_node_for(struct sess *s, int family, struct sockaddr_storage *sa,
-			 socklen_t *len)
+static void token_seed(const struct token *t, int family,
+		       struct peering_seed *out)
 {
-	const struct token *t = &s->cfg->tok;
-	uint8_t node[NETSTATE_SA_MAX], nlen = 0;
+	struct sockaddr_in6 a6;
+	struct sockaddr_in a4;
 
-	if (netstate_anchor(&s->pm.ns, family, node, &nlen, NULL) && nlen) {
-		memcpy(sa, node, nlen);
-		*len = nlen;
-		return 0;
-	}
 	if (family == 6 && token_family_state(t, 6) == TOKEN_STATE_RENDEZVOUS) {
-		struct sockaddr_in6 *a = (struct sockaddr_in6 *)sa;
-
-		memset(a, 0, sizeof(*a));
-		a->sin6_family = AF_INET6;
-		memcpy(&a->sin6_addr, t->ep6_addr, TOKEN_EP6_LEN);
-		a->sin6_port = htons(t->ep6_port);
-		*len = sizeof(*a);
-		return 0;
+		memset(&a6, 0, sizeof(a6));
+		a6.sin6_family = AF_INET6;
+		memcpy(&a6.sin6_addr, t->ep6_addr, TOKEN_EP6_LEN);
+		a6.sin6_port = htons(t->ep6_port);
+		memcpy(out->sa, &a6, sizeof(a6));
+		out->len = (int)sizeof(a6);
 	}
 	if (family == 4 && token_family_state(t, 4) == TOKEN_STATE_RENDEZVOUS) {
-		struct sockaddr_in *a = (struct sockaddr_in *)sa;
-
-		memset(a, 0, sizeof(*a));
-		a->sin_family = AF_INET;
-		memcpy(&a->sin_addr, t->ep4_addr, TOKEN_EP4_LEN);
-		a->sin_port = htons(t->ep4_port);
-		*len = sizeof(*a);
-		return 0;
+		memset(&a4, 0, sizeof(a4));
+		a4.sin_family = AF_INET;
+		memcpy(&a4.sin_addr, t->ep4_addr, TOKEN_EP4_LEN);
+		a4.sin_port = htons(t->ep4_port);
+		memcpy(out->sa, &a4, sizeof(a4));
+		out->len = (int)sizeof(a4);
 	}
-	return -1;
 }
 
-/*
- * Plant a rendezvous node per family into a newly created sig: a client seeds
- * it as a sticky DHT hint, queried before the global DHT has converged, while a
- * host adopts and reinforces it as its anchor, so a token already in somebody's
- * clipboard keeps naming a node that serves this mailbox.
- */
 static void seed_rendezvous(struct sess *s)
 {
-	static const int famv[2] = { 4, 6 };
-	int i;
+	struct peering_seed seed[2];
 
-	for (i = 0; i < 2; i++) {
-		struct sockaddr_storage sa;
-		socklen_t sl = 0;
-
-		if (seed_node_for(s, famv[i], &sa, &sl))
-			continue;
-		if (s->cfg->is_host)
-			sig_reinforce(s->pm.sig, famv[i], (struct sockaddr *)&sa,
-				      sl);
-		else if (sig_seed_node(s->pm.sig, (struct sockaddr *)&sa, sl))
-			continue;
-		/* Adopted, not confirmed: whoever minted this node did so on
-		 * another network, and report_rendezvous says so until it has
-		 * answered here. */
-		netstate_on_rdv_offered(&s->pm.ns, famv[i], (const uint8_t *)&sa,
-					(int)sl, now_ms());
-	}
+	memset(seed, 0, sizeof(seed));
+	token_seed(&s->cfg->tok, 4, &seed[0]);
+	token_seed(&s->cfg->tok, 6, &seed[1]);
+	peering_seed_rendezvous(&s->pm, seed, now_ms());
 }
 
 /*
