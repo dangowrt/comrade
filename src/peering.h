@@ -255,6 +255,37 @@ int peering_net_stun_pick(const struct peering_net *m, unsigned attempt,
 int peering_net_fan(struct peering_net *m, char *sdp, size_t cap);
 
 /*
+ * If a gather has held a private or CGNAT v4 this long with no reflexive one,
+ * the server this attempt drew is written off and the next is tried, but only
+ * while no peer has answered yet: from then on the retry path owns rotation.
+ * Bounded, so a network that filters all STUN settles rather than churning
+ * offers for ever.
+ */
+#define PEERING_ROTATE_MS 3000
+#define PEERING_ROTATE_MAX 3
+
+/*
+ * Whether rotating is permitted at all, leaving aside whether it is time:
+ * there has to be somewhere to rotate TO, the budget for this network has to
+ * be unspent, and a private address has to have been gathered. Without one the
+ * attempt has not got far enough for the STUN server to be what is wrong with
+ * it, and the next one would fail the same way.
+ */
+int peering_rotate_allowed(const struct peering_net *m, int rotations,
+			   int have_priv4);
+
+/*
+ * Whether this attempt has stalled and should be gathered again through the
+ * next server. A carrier mapping per destination is the case this exists for:
+ * one agent asking one server learns one reflexive address, and the pool only
+ * grows ACROSS attempts. An attempt that already has a public address does not
+ * rotate, having nothing left to look for.
+ */
+int peering_rotate_wanted(const struct peering_net *m, int rotations,
+			  int have_priv4, int have_srflx4, uint64_t since_ms,
+			  uint64_t now);
+
+/*
  * Mint an identity to gather under. Fixed by this end rather than left to the
  * traversal library, so it survives a re-gather after a failed punch and the
  * peer keeps hammering one target.

@@ -1110,3 +1110,24 @@ int peering_net_fan(struct peering_net *m, char *sdp, size_t cap)
 
 	return n;
 }
+
+int peering_rotate_allowed(const struct peering_net *m, int rotations,
+			   int have_priv4)
+{
+	if (!m->auto_probe || m->nservers < 2)
+		return 0;
+	if (!have_priv4)
+		return 0;
+
+	return rotations < PEERING_ROTATE_MAX;
+}
+
+int peering_rotate_wanted(const struct peering_net *m, int rotations,
+			  int have_priv4, int have_srflx4, uint64_t since_ms,
+			  uint64_t now)
+{
+	if (!peering_rotate_allowed(m, rotations, have_priv4) || have_srflx4)
+		return 0;
+
+	return now - since_ms > PEERING_ROTATE_MS;
+}

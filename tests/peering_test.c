@@ -466,9 +466,50 @@ static void the_link_verdict_follows_the_evidence(void)
 	peering_model_destroy(&pm);
 }
 
+/*
+ * Rotating to the next server is for an attempt that has got far enough for
+ * the server to be what is wrong with it, and it is bounded, so a network that
+ * filters all STUN settles rather than churning offers for ever.
+ */
+static void rotating_to_the_next_server_is_earned_and_bounded(void)
+{
+	static char *servers[] = { (char *)"a.invalid", (char *)"b.invalid" };
+	struct peering_net one, two, pinned;
+
+	peering_net_init(&one, servers, 1, 1);
+	peering_net_init(&two, servers, 2, 1);
+	peering_net_init(&pinned, servers, 2, 0);	/* an operator's own */
+
+	/* Nowhere to rotate to, and nobody else's server to rotate through. */
+	assert(!peering_rotate_allowed(&one, 0, 1));
+	assert(!peering_rotate_allowed(&pinned, 0, 1));
+
+	/* Without a private address the attempt has not got far enough for the
+	 * server to be the thing that is wrong. */
+	assert(!peering_rotate_allowed(&two, 0, 0));
+	assert(peering_rotate_allowed(&two, 0, 1));
+
+	/* And the budget is spent eventually. */
+	assert(peering_rotate_allowed(&two, PEERING_ROTATE_MAX - 1, 1));
+	assert(!peering_rotate_allowed(&two, PEERING_ROTATE_MAX, 1));
+
+	/* Wanted only once it has stalled, and never once a public address has
+	 * arrived, there being nothing left to look for. */
+	assert(!peering_rotate_wanted(&two, 0, 1, 0, 1000,
+				      1000 + PEERING_ROTATE_MS));
+	assert(peering_rotate_wanted(&two, 0, 1, 0, 1000,
+				     1001 + PEERING_ROTATE_MS));
+	assert(!peering_rotate_wanted(&two, 0, 1, 1, 1000,
+				      1001 + PEERING_ROTATE_MS));
+	peering_net_destroy(&one);
+	peering_net_destroy(&two);
+	peering_net_destroy(&pinned);
+}
+
 int main(void)
 {
 	what_is_posted_is_taken_once();
+	rotating_to_the_next_server_is_earned_and_bounded();
 	the_link_verdict_follows_the_evidence();
 	the_server_an_attempt_asks_walks_the_list();
 	an_identity_is_minted_to_gather_under();
