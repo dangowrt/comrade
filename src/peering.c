@@ -1061,3 +1061,19 @@ int peering_link(struct peering *pr, unsigned netgen, int carrier_up,
 
 	return CONN_LIVE;
 }
+
+void peering_ice_ident(struct peering *pr)
+{
+	peering_ice_gen(pr->ice.ufrag, sizeof(pr->ice.ufrag), pr->ice.pwd,
+			sizeof(pr->ice.pwd));
+}
+
+struct nat_agent *peering_ice_agent(struct peering *pr)
+{
+	return pr->ice.agent;
+}
+
+int peering_ice_up(const struct peering *pr)
+{
+	return __atomic_load_n(&pr->ice.up, __ATOMIC_RELAXED);
+}

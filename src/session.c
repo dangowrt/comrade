@@ -200,7 +200,7 @@ struct ice_ctx {
 	struct conn *shell;
 };
 
-/* Agents this connection maintains beyond c->nat: a resume sets one aside
+/* Agents this connection maintains beyond c->pr.ice.agent: a resume sets one aside
  * rather than destroy it, punches launch more in parallel, and the path
  * ranking decides which carries. Allocated as needed up to the ceiling. */
 #define ICE_HOLD_MAX 16
@@ -216,8 +216,6 @@ struct conn {
 	/* This connection's ICE identity. A fresh one per host offer (single-use
 	 * per join, so two clients never share credentials); the client keeps its
 	 * one identity for the session. */
-	char ice_ufrag[16];
-	char ice_pwd[40];
 	/* The peer ICE identity that primed this agent. Candidate trickles from
 	 * a rotated offer must not be sent to an agent for an older offer. */
 	char remote_ufrag[40];
@@ -234,8 +232,6 @@ struct conn {
 	 */
 	struct peering pr;
 
-	struct nat_agent *nat;
-	struct ice_ctx *nat_ctx;
 	/*
 	 * Agents set aside rather than destroyed. Each path stays in the table
 	 * and is probed like any other, so the ranking decides which carries;
@@ -284,8 +280,8 @@ struct conn {
 	 * host, the turnstile hands the punched agent to the worker's own
 	 * thread, under the contract below.
 	 *
-	 * WHO OWNS AN AGENT. A connection's agent and its context (c->nat and
-	 * c->nat_ctx, which always move as a pair) belong to exactly one
+	 * WHO OWNS AN AGENT. A connection's agent and its context (c->pr.ice.agent and
+	 * c->pr.ice.ctx, which always move as a pair) belong to exactly one
 	 * thread: the worker running conn_run for this connection if there is
 	 * one, and the loop otherwise. The loop never writes them for a
 	 * connection that has a worker; it hands over instead.
@@ -332,8 +328,6 @@ struct conn {
 	 */
 	char claim_ufrag[40];
 	pthread_mutex_t claim_lock;
-	volatile int ice_up;		/* the agent is connected, for readers
-					 * that may not touch the agent */
 	volatile uint32_t carry_epoch;	/* ++ on a qualified carry switch (roam) */
 	int bh_done;			/* the test hook has fired once, so a
 					 * lift does not re-arm it */
@@ -726,8 +720,8 @@ static int conn_live_agents(void *arg, struct nat_agent **live, int max)
 	struct nat_agent *held[PATHPLANE_HOLD_MAX];
 	int nheld;
 
-	if (c->nat && nat_connected(c->nat) && n < max)
-		live[n++] = c->nat;
+	if (c->pr.ice.agent && nat_connected(c->pr.ice.agent) && n < max)
+		live[n++] = c->pr.ice.agent;
 	nheld = pathplane_holds_agents(&c->pr.pl, held, PATHPLANE_HOLD_MAX);
 	for (i = 0; i < nheld && n < max; i++)
 		if (nat_connected(held[i]))
@@ -876,7 +870,7 @@ static int conn_add_lan_path(struct conn *c, enum path_kind kind,
 
 static void conn_add_ice_path(struct conn *c)
 {
-	pathplane_add_ice(&c->pr.pl, c->nat, now_ms());
+	pathplane_add_ice(&c->pr.pl, c->pr.ice.agent, now_ms());
 }
 
 static void conn_drop_ice_path(struct conn *c)
@@ -925,7 +919,7 @@ static void conn_route_dedup(struct conn *c)
 	struct pathplane_sinks k;
 
 	conn_sinks(c, &k);
-	pathplane_route_dedup(&c->pr.pl, &k, c->nat);
+	pathplane_route_dedup(&c->pr.pl, &k, c->pr.ice.agent);
 }
 
 /*
@@ -939,9 +933,9 @@ static void conn_route_dedup(struct conn *c)
 static void conn_park_ice(struct conn *c, uint64_t now)
 {
 	conn_reap_holds(c);
-	conn_hold_add(c, c->nat, c->nat_ctx, now + RESUME_ATTEMPT_MS);
-	c->nat = NULL;
-	c->nat_ctx = NULL;
+	conn_hold_add(c, c->pr.ice.agent, c->pr.ice.ctx, now + RESUME_ATTEMPT_MS);
+	c->pr.ice.agent = NULL;
+	c->pr.ice.ctx = NULL;
 }
 
 /* How many lanlink paths this connection holds; routable_only leaves out the
@@ -991,7 +985,7 @@ static int conn_pick(struct conn *c, struct pathplane_pick *out)
 	 * the pointer holds freed memory. An int can only ever be a turn out
 	 * of date, which is what a status line is anyway.
 	 */
-	c->ice_up = out->nlive > 0;
+	c->pr.ice.up = out->nlive > 0;
 	/* A path becoming the one that carries is the moment to retransmit the
 	 * stream's backlog. */
 	if (out->moved && out->qualified)
@@ -1461,9 +1455,9 @@ static void offer_refresh(struct sess *s)
 	/* The host's listener only: the client's own claim slot is posted by the
 	 * resume machinery, and re-posting it from here races that. */
 	if (!s->pm.sig || !s->offer_conn || s->offer_conn == &s->c ||
-	    !s->offer_conn->nat)
+	    !s->offer_conn->pr.ice.agent)
 		return;
-	if (nat_local_description(s->offer_conn->nat, raw, sizeof(raw)))
+	if (nat_local_description(s->offer_conn->pr.ice.agent, raw, sizeof(raw)))
 		return;
 	pthread_mutex_lock(&s->trickle_lock);
 	snprintf(s->pending_sdp, sizeof(s->pending_sdp), "%s", raw);
@@ -1957,8 +1951,8 @@ static void conn_tell_fresh(struct conn *c, const struct sockaddr_in6 *lan_to)
 	o = conn_probe_seal(c, &pr, out);
 	if (!o)
 		return;
-	if (c->nat)
-		nat_send(c->nat, out, o);
+	if (c->pr.ice.agent)
+		nat_send(c->pr.ice.agent, out, o);
 	else if (lan_to && s->lan)
 		lanlink_send(s->lan, lan_to, out, o);
 }
@@ -2059,7 +2053,7 @@ static int path_ready(struct conn *c)
 {
 	if (c->sess->cfg->is_host)
 		return conn_lan_paths(c, 0) > 0 ||
-		       (c->nat && nat_connected(c->nat));
+		       (c->pr.ice.agent && nat_connected(c->pr.ice.agent));
 
 	return pathplane_any_qualified(&c->pr.pl);
 }
@@ -2414,11 +2408,11 @@ static void conn_amend_remote(struct conn *c, struct sess *s)
 {
 	char filtered[NAT_SDP_MAX];
 
-	if (!c || !c->nat || nat_connected(c->nat))
+	if (!c || !c->pr.ice.agent || nat_connected(c->pr.ice.agent))
 		return;
 	sdp_filter_peer(s->peer_sdp, s->cfg->family, filtered,
 			sizeof(filtered));
-	nat_set_remote_description(c->nat, filtered);
+	nat_set_remote_description(c->pr.ice.agent, filtered);
 }
 
 /* True when a freshly-seen offer names a different peer identity than the one
@@ -2486,15 +2480,14 @@ static int on_stream_output(void *arg, const uint8_t *data, size_t len)
  * client keeps its one for the whole session. */
 static void conn_gen_ice(struct conn *c)
 {
-	peering_ice_gen(c->ice_ufrag, sizeof(c->ice_ufrag), c->ice_pwd,
-			sizeof(c->ice_pwd));
+	peering_ice_ident(&c->pr);
 	/* A client probes under its own identity; a host overwrites this with the
 	 * claimant it admitted (lan_drain, the turnstile at pickup, and the
 	 * single-connection state machine when it takes an answer up). */
 	if (c->sess && !c->sess->cfg->is_host) {
 		pthread_mutex_lock(&c->claim_lock);
 		snprintf(c->claim_ufrag, sizeof(c->claim_ufrag), "%s",
-			 c->ice_ufrag);
+			 c->pr.ice.ufrag);
 		pthread_mutex_unlock(&c->claim_lock);
 	}
 	/* What a probe proved was proved for one claimant identity, so a fresh
@@ -2522,8 +2515,8 @@ static int nat_setup(struct conn *c)
 				   s->stun_host, sizeof(s->stun_host),
 				   &cfg.stun_port))
 		cfg.stun_host = s->stun_host;
-	cfg.ice_ufrag = c->ice_ufrag;
-	cfg.ice_pwd = c->ice_pwd;
+	cfg.ice_ufrag = c->pr.ice.ufrag;
+	cfg.ice_pwd = c->pr.ice.pwd;
 	cfg.on_local_sdp = on_local_sdp;
 	cfg.on_recv = on_transport_recv;
 	cfg.on_candidate = on_ice_candidate;
@@ -2540,15 +2533,15 @@ static int nat_setup(struct conn *c)
 			 __ATOMIC_RELAXED);
 	__atomic_store_n(&s->gather_epoch[1], netstate_epoch(&s->pm.ns, 6),
 			 __ATOMIC_RELAXED);
-	c->nat = nat_create(&cfg);
-	ctx->agent = c->nat;
-	c->nat_ctx = ctx;
-	if (!c->nat) {
-		c->nat_ctx = NULL;
+	c->pr.ice.agent = nat_create(&cfg);
+	ctx->agent = c->pr.ice.agent;
+	c->pr.ice.ctx = ctx;
+	if (!c->pr.ice.agent) {
+		c->pr.ice.ctx = NULL;
 		free(ctx);
 		return -1;
 	}
-	if (nat_gather(c->nat))
+	if (nat_gather(c->pr.ice.agent))
 		return -1;
 	s->stun_since_ms = now_ms();
 	conn_add_ice_path(c);
@@ -2763,10 +2756,10 @@ static void conn_fresh_pwd(struct conn *c)
 
 	random_bytes(rb, 16);
 	for (j = 0; j < 16; j++) {
-		c->ice_pwd[j * 2] = hx[rb[j] >> 4];
-		c->ice_pwd[j * 2 + 1] = hx[rb[j] & 0xf];
+		c->pr.ice.pwd[j * 2] = hx[rb[j] >> 4];
+		c->pr.ice.pwd[j * 2 + 1] = hx[rb[j] & 0xf];
 	}
-	c->ice_pwd[32] = '\0';
+	c->pr.ice.pwd[32] = '\0';
 }
 
 static int host_is_multiuser(const struct session_cfg *cfg)
@@ -3004,8 +2997,8 @@ static void resume_tick(struct conn *c)
 			dbg_logf("resume: link back");
 		}
 		conn_sinks(c, &k);
-		settled = pathplane_holds_settle(&c->pr.pl, &k, &c->nat,
-						 (void **)&c->nat_ctx);
+		settled = pathplane_holds_settle(&c->pr.pl, &k, &c->pr.ice.agent,
+						 (void **)&c->pr.ice.ctx);
 		if (settled > 0)
 			dbg_logf("resume: carried by the agent set aside");
 		else if (settled < 0)
@@ -3066,7 +3059,7 @@ static void resume_tick(struct conn *c)
 
 			sdp_filter_peer(s->peer_sdp, s->cfg->family, filtered,
 					sizeof(filtered));
-			if (!nat_set_remote_description(c->nat, filtered)) {
+			if (!nat_set_remote_description(c->pr.ice.agent, filtered)) {
 				cand_sdp_ufrag(s->peer_sdp, ufrag, sizeof(ufrag));
 				snprintf(c->remote_ufrag,
 					 sizeof(c->remote_ufrag), "%s", ufrag);
@@ -3109,7 +3102,7 @@ static void resume_tick(struct conn *c)
 			 * pair until it proves one or gives the pair up; re-gather
 			 * only when this end moved or the agent is spent, not on a
 			 * clock that would abort a punch still landing. */
-			if (!s->remote_set || s->net_ch || nat_failed(c->nat)) {
+			if (!s->remote_set || s->net_ch || nat_failed(c->pr.ice.agent)) {
 				c->rs_state = 0;
 				return;
 			}
@@ -3329,7 +3322,7 @@ static int conn_run(struct conn *c, int drive_sig)
 		int timeout = 10, nfds = 0, lnf = 0, bidx, cidx;
 
 		/* A re-punched agent the turnstile grafted for us: adopt it
-		 * here, on the one thread that owns c->nat. Its callbacks were
+		 * here, on the one thread that owns c->pr.ice.agent. Its callbacks were
 		 * re-pointed at this connection before it was parked, so its
 		 * packets have been landing in the stream all along; this
 		 * makes it the sending agent too. */
@@ -3341,11 +3334,11 @@ static int conn_run(struct conn *c, int drive_sig)
 					 __ATOMIC_RELAXED);
 			/* Keep the incumbent as a hold; the ranking decides
 			 * which agent carries, a silent one ages out. */
-			if (c->nat)
-				conn_hold_add(c, c->nat, c->nat_ctx,
+			if (c->pr.ice.agent)
+				conn_hold_add(c, c->pr.ice.agent, c->pr.ice.ctx,
 					      now_ms() + RESUME_ATTEMPT_MS);
-			c->nat = got->agent;	/* bound to it for life */
-			c->nat_ctx = got;
+			c->pr.ice.agent = got->agent;	/* bound to it for life */
+			c->pr.ice.ctx = got;
 			conn_add_ice_path(c);
 			pathplane_blackhole_mute(&c->pr.pl, 0);
 			/* The resumed link earns a full liveness window; without
@@ -3625,9 +3618,9 @@ static int client_regather(struct sess *s)
 					 * verdict; neither has actually moved */
 	s->established_fired = 0;
 	conn_drop_ice_path(&s->c);
-	conn_free_agent(&s->c, s->c.nat, s->c.nat_ctx);
-	s->c.nat = NULL;
-	s->c.nat_ctx = NULL;
+	conn_free_agent(&s->c, s->c.pr.ice.agent, s->c.pr.ice.ctx);
+	s->c.pr.ice.agent = NULL;
+	s->c.pr.ice.ctx = NULL;
 	conn_gen_ice(&s->c);
 	s->have_local_sdp = 0;
 	s->have_peer_sdp = 0;
@@ -3802,7 +3795,7 @@ static int conn_link_state(const struct sess *s, struct conn *c)
 {
 	return peering_link(&c->pr,
 			    __atomic_load_n(&s->netgen, __ATOMIC_RELAXED),
-			    c->ice_up, now_ms());
+			    peering_ice_up(&c->pr), now_ms());
 }
 
 /*
@@ -4049,7 +4042,7 @@ static void conn_dissolve(struct conn *c)
 	conn_unregister(c->sess, c);
 	conn_reap_holds(c);
 	conn_drop_ice_path(c);
-	conn_free_agent(c, c->nat, c->nat_ctx);
+	conn_free_agent(c, c->pr.ice.agent, c->pr.ice.ctx);
 	/* A re-punch grafted for a worker that left its loop before adopting
 	 * it: nobody else will. */
 	for (i = 0; i < ICE_HOLD_MAX; i++) {
@@ -4347,7 +4340,7 @@ static void lan_drain(struct sess *s, struct worker *ws, int *dash_seq)
 		c = conn_alloc(s);
 		if (!c)
 			break;
-		/* c->nat stays NULL: this worker is lanlink only. */
+		/* c->pr.ice.agent stays NULL: this worker is lanlink only. */
 		if (conn_add_lan_path(c, PATH_SEGMENT, &mapped, addr,
 				      sizeof(addr))) {
 			conn_free(c);
@@ -4418,6 +4411,7 @@ static void punch_scan(struct sess *s, struct worker *ws, int *dash_seq)
 {
 	const struct session_obs *o = s->cfg->obs;
 	char loc[192], rem[192], addr[80];
+	struct ice_ctx *ictx;
 	struct conn *c;
 	struct conn *t;
 	int i;
@@ -4426,7 +4420,7 @@ static void punch_scan(struct sess *s, struct worker *ws, int *dash_seq)
 		c = s->punching[i];
 		if (!c)
 			continue;
-		if (!c->punch_stuck && nat_connected(c->nat)) {
+		if (!c->punch_stuck && nat_connected(c->pr.ice.agent)) {
 			snprintf(s->last_served_ufrag, sizeof(s->last_served_ufrag),
 				 "%.39s", c->punch_ufrag);
 			s->have_served = 1;
@@ -4436,7 +4430,7 @@ static void punch_scan(struct sess *s, struct worker *ws, int *dash_seq)
 			 * re-pointed first, so packets land in the worker's
 			 * stream from this instant; the worker's own thread
 			 * adopts it as the sending agent on its next pass
-			 * (c->nat belongs to that thread). The punch shell is
+			 * (c->pr.ice.agent belongs to that thread). The punch shell is
 			 * dissolved without a worker, a dashboard row, or a
 			 * registration of its own.
 			 */
@@ -4446,18 +4440,19 @@ static void punch_scan(struct sess *s, struct worker *ws, int *dash_seq)
 			if (t) {
 				dbg_logf("host: punch connected -> resume "
 					 "worker");
-				if (c->nat_ctx) {
+				if (c->pr.ice.ctx) {
 					/* Re-pointed before it is published:
 					 * the release below is what makes both
 					 * of these visible to the worker. */
-					c->nat_ctx->shell = c;
-					__atomic_store_n(&c->nat_ctx->c, t,
+					ictx = c->pr.ice.ctx;
+					ictx->shell = c;
+					__atomic_store_n(&ictx->c, t,
 							 __ATOMIC_RELAXED);
-					nat_rebind(c->nat, c->nat_ctx);
-					resume_q_publish(t, c->nat_ctx);
+					nat_rebind(c->pr.ice.agent, ictx);
+					resume_q_publish(t, ictx);
 				}
-				c->nat = NULL;
-				c->nat_ctx = NULL;
+				c->pr.ice.agent = NULL;
+				c->pr.ice.ctx = NULL;
 				snprintf(t->remote_pwd, sizeof(t->remote_pwd),
 					 "%s", c->remote_pwd);
 				if (c->punch_resume)
@@ -4478,7 +4473,7 @@ static void punch_scan(struct sess *s, struct worker *ws, int *dash_seq)
 				continue;
 			}
 			addr[0] = '\0';
-			if (!nat_selected(c->nat, loc, sizeof(loc), rem,
+			if (!nat_selected(c->pr.ice.agent, loc, sizeof(loc), rem,
 					  sizeof(rem))) {
 				cand_addr(rem, addr, sizeof(addr));
 				dbg_logf("host: punch connected -> spawn worker "
@@ -4526,7 +4521,7 @@ static void punch_scan(struct sess *s, struct worker *ws, int *dash_seq)
 		} else if (now_ms() - c->punch_start_ms >
 			   ((c->punch_resume && conn_is_proven(c->punch_resume)) ?
 			    ICE_ATTEMPT_MS : HOST_PUNCH_MS) ||
-			   (!c->punch_stuck && nat_failed(c->nat))) {
+			   (!c->punch_stuck && nat_failed(c->pr.ice.agent))) {
 			dbg_logf("host: punch %s -> drop",
 				 c->punch_stuck ? "wedged (test)" : "failed");
 			if (c->punch_resume) {
@@ -4669,7 +4664,7 @@ static void offer_gc(struct kept_offer *ring, uint64_t now)
 	for (i = 0; i < OFFER_KEEP_MAX; i++) {
 		if (!ring[i].c)
 			continue;
-		if (now < ring[i].until_ms && !nat_failed(ring[i].c->nat))
+		if (now < ring[i].until_ms && !nat_failed(ring[i].c->pr.ice.agent))
 			continue;
 		conn_free(ring[i].c);
 		ring[i].c = NULL;
@@ -4695,7 +4690,7 @@ static int offer_find(struct kept_offer *ring, const char *uf)
 	if (!uf || !uf[0])
 		return -1;
 	for (i = 0; i < OFFER_KEEP_MAX; i++)
-		if (ring[i].c && !strcmp(ring[i].c->ice_ufrag, uf))
+		if (ring[i].c && !strcmp(ring[i].c->pr.ice.ufrag, uf))
 			return i;
 	return -1;
 }
@@ -4704,7 +4699,7 @@ static int punch_take(struct sess *s, struct conn *pc, struct conn *resume,
 		      int pslot, const char *cu, const char *cp,
 		      const char *filtered, int stuck)
 {
-	if (nat_set_remote_description(pc->nat, filtered))
+	if (nat_set_remote_description(pc->pr.ice.agent, filtered))
 		return -1;
 	snprintf(pc->remote_ufrag, sizeof(pc->remote_ufrag), "%s", cu);
 	snprintf(pc->remote_pwd, sizeof(pc->remote_pwd), "%s", cp);
@@ -5166,7 +5161,7 @@ static int host_turnstile(struct sess *s)
 				 * credentials are not the ones it primed, so a
 				 * punch cannot land. */
 				if (co[0] && offer_find(kept, co) < 0 &&
-				    strcmp(co, listen->ice_ufrag)) {
+				    strcmp(co, listen->pr.ice.ufrag)) {
 					dbg_logf("host: claim %.8s names the retired "
 						 "offer %.8s -- released", cu, co);
 					sig_release(s->pm.sig);
@@ -5493,11 +5488,11 @@ int session_run(const struct session_cfg *cfg)
 				st = ST_FAIL;
 				break;
 			}
-			if (s.c.nat) {
+			if (s.c.pr.ice.agent) {
 				conn_drop_ice_path(&s.c);
-				conn_free_agent(&s.c, s.c.nat, s.c.nat_ctx);
-				s.c.nat = NULL;
-				s.c.nat_ctx = NULL;
+				conn_free_agent(&s.c, s.c.pr.ice.agent, s.c.pr.ice.ctx);
+				s.c.pr.ice.agent = NULL;
+				s.c.pr.ice.ctx = NULL;
 			}
 			conn_gen_ice(&s.c);
 			pathplane_clear(&s.c.pr.pl);
@@ -5608,7 +5603,7 @@ int session_run(const struct session_cfg *cfg)
 
 				sdp_filter_peer(s.peer_sdp, cfg->family, filtered,
 					   sizeof(filtered));
-				if (nat_set_remote_description(s.c.nat, filtered)) {
+				if (nat_set_remote_description(s.c.pr.ice.agent, filtered)) {
 					st = ST_FAIL;
 					break;
 				}
@@ -5682,8 +5677,8 @@ int session_run(const struct session_cfg *cfg)
 					char loc[192], rem[192];
 
 					s.c.status_peer[0] = '\0';
-					if (nat_connected(s.c.nat) &&
-					    !nat_selected(s.c.nat, loc, sizeof(loc),
+					if (nat_connected(s.c.pr.ice.agent) &&
+					    !nat_selected(s.c.pr.ice.agent, loc, sizeof(loc),
 							  rem, sizeof(rem))) {
 						dbg_logf("client: ice connected "
 							 "loc=[%s] rem=[%s]",
@@ -5704,13 +5699,13 @@ int session_run(const struct session_cfg *cfg)
 				st = ST_RUN;
 				break;
 			}
-			if (nat_failed(s.c.nat) ||
+			if (nat_failed(s.c.pr.ice.agent) ||
 			    now_ms() - s.ice_attempt_start > ICE_ATTEMPT_MS) {
 				__atomic_add_fetch(&s.ice_attempt, 1, __ATOMIC_RELAXED);
 				conn_drop_ice_path(&s.c);
-				conn_free_agent(&s.c, s.c.nat, s.c.nat_ctx);
-				s.c.nat = NULL;
-				s.c.nat_ctx = NULL;
+				conn_free_agent(&s.c, s.c.pr.ice.agent, s.c.pr.ice.ctx);
+				s.c.pr.ice.agent = NULL;
+				s.c.pr.ice.ctx = NULL;
 				if (nat_setup(&s.c))
 					st = ST_FAIL;
 				else
@@ -5838,7 +5833,7 @@ done:
 		stream_destroy(st_done);
 	conn_reap_holds(&s.c);
 	conn_drop_ice_path(&s.c);
-	conn_free_agent(&s.c, s.c.nat, s.c.nat_ctx);
+	conn_free_agent(&s.c, s.c.pr.ice.agent, s.c.pr.ice.ctx);
 	if (s.lan)
 		lanlink_destroy(s.lan);
 	sig_destroy(s.pm.sig);

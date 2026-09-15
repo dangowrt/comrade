@@ -395,11 +395,30 @@ void peering_publish(struct peering_model *pm);
  * each of the last two holds the first, and a playbook that assembled them
  * itself would have to know that.
  */
+/*
+ * This end's traversal to one peer: the identity it gathers under, fixed by
+ * this end rather than left to the traversal library so it survives a
+ * re-gather after a failed punch and the peer keeps hammering one target; the
+ * carrier doing the gathering; and the context that carrier's callbacks were
+ * handed, which is the playbook's own type and is only ever passed back to it.
+ */
+struct peering_ice {
+	char ufrag[16];
+	char pwd[40];
+	struct nat_agent *agent;
+	void *ctx;			/* freed with the agent */
+	volatile int up;		/* the carrier is connected: published
+					 * for threads that may not touch it,
+					 * a turn out of date at most, which is
+					 * what a status line is anyway */
+};
+
 struct peering {
 	struct peering_model *pm;
 	struct probeplane pp;
 	struct pathplane pl;
 	struct ctlplane cp;
+	struct peering_ice ice;
 	struct pathplane_sinks pk;	/* what carries its probes */
 	struct ctlplane_sinks ck;	/* and what carries what it says */
 	int id;				/* the row a watcher knows this peer by */
@@ -553,6 +572,11 @@ int peering_claims(struct peering *pr, const uint8_t *data, size_t len,
 
 int peering_link(struct peering *pr, unsigned netgen, int carrier_up,
 		 uint64_t now);
+
+/* This end's identity for this peer, and the carrier gathering under it. */
+void peering_ice_ident(struct peering *pr);
+struct nat_agent *peering_ice_agent(struct peering *pr);
+int peering_ice_up(const struct peering *pr);
 
 /* Which path carries this peer right now. */
 int peering_pick(struct peering *pr, uint64_t now,
