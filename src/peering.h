@@ -575,6 +575,19 @@ int peering_link(struct peering *pr, unsigned netgen, int carrier_up,
 
 /* This end's identity for this peer, and the carrier gathering under it. */
 void peering_ice_ident(struct peering *pr);
+
+/*
+ * Take a carrier as this peer's, and give the one it holds back.
+ *
+ * Building it is the playbook's, since the callbacks and the context they are
+ * handed are; what the engine owns is the bookkeeping around it, which is the
+ * part that goes wrong: the path the carrier borrows has to appear with it and
+ * be retired before it, and the context has to outlive every callback that
+ * could still name it.
+ */
+void peering_ice_adopt(struct peering *pr, struct nat_agent *agent, void *ctx,
+		       uint64_t now);
+void peering_ice_stop(struct peering *pr, const struct pathplane_sinks *k);
 struct nat_agent *peering_ice_agent(struct peering *pr);
 int peering_ice_up(const struct peering *pr);
 

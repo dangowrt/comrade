@@ -1077,3 +1077,22 @@ int peering_ice_up(const struct peering *pr)
 {
 	return __atomic_load_n(&pr->ice.up, __ATOMIC_RELAXED);
 }
+
+void peering_ice_adopt(struct peering *pr, struct nat_agent *agent, void *ctx,
+		       uint64_t now)
+{
+	pr->ice.agent = agent;
+	pr->ice.ctx = ctx;
+	pathplane_add_ice(&pr->pl, agent, now);
+}
+
+void peering_ice_stop(struct peering *pr, const struct pathplane_sinks *k)
+{
+	struct nat_agent *agent = pr->ice.agent;
+	void *ctx = pr->ice.ctx;
+
+	pr->ice.agent = NULL;
+	pr->ice.ctx = NULL;
+	pathplane_drop_ice(&pr->pl);
+	pathplane_free_agent(&pr->pl, k, agent, ctx);
+}
