@@ -387,6 +387,26 @@ void peering_net_stop(struct peering_net *m)
 	peering_net_reap(m, 6);
 }
 
+void peering_net_renew(struct peering_net *m)
+{
+	uint8_t rb[2];
+
+	peering_desc_clear(&m->desc);
+	peering_pool_reset(&m->pool);
+	m->pool.reported = 0;
+	m->pool.posted = 0;
+	m->rotations = 0;
+	if (m->nservers > 0) {
+		random_bytes(rb, 2);
+		__atomic_store_n(&m->ice_attempt,
+				 ((rb[0] << 8) | rb[1]) % m->nservers,
+				 __ATOMIC_RELAXED);
+	}
+	__atomic_store_n(&m->have_priv4, 0, __ATOMIC_RELAXED);
+	__atomic_store_n(&m->have_srflx4, 0, __ATOMIC_RELAXED);
+	m->mapping_reported = 0;
+}
+
 void peering_net_destroy(struct peering_net *m)
 {
 	peering_facts_destroy(&m->facts);
@@ -1308,22 +1328,21 @@ int peering_net_fan(struct peering_net *m, char *sdp, size_t cap)
 	return n;
 }
 
-int peering_rotate_allowed(const struct peering_net *m, int rotations,
-			   int have_priv4)
+int peering_rotate_allowed(const struct peering_net *m)
 {
 	if (!m->auto_probe || m->nservers < 2)
 		return 0;
-	if (!have_priv4)
+	if (!__atomic_load_n(&m->have_priv4, __ATOMIC_RELAXED))
 		return 0;
 
-	return rotations < PEERING_ROTATE_MAX;
+	return m->rotations < PEERING_ROTATE_MAX;
 }
 
-int peering_rotate_wanted(const struct peering_net *m, int rotations,
-			  int have_priv4, int have_srflx4, uint64_t since_ms,
+int peering_rotate_wanted(const struct peering_net *m, uint64_t since_ms,
 			  uint64_t now)
 {
-	if (!peering_rotate_allowed(m, rotations, have_priv4) || have_srflx4)
+	if (!peering_rotate_allowed(m) ||
+	    __atomic_load_n(&m->have_srflx4, __ATOMIC_RELAXED))
 		return 0;
 
 	return now - since_ms > PEERING_ROTATE_MS;

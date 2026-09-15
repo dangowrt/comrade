@@ -247,7 +247,28 @@ struct peering_net {
 	int auto_probe;			/* the list may be asked at all: an
 					 * operator-pinned server is theirs
 					 * alone to talk to */
+	/* Which server this attempt starts from. The loop advances it while a
+	 * probe thread is indexing with it, so both ends are atomic and each
+	 * thread takes one snapshot for the round it is running. */
+	int ice_attempt;
+	int rotations;			/* servers written off this network */
+	/* Set from the gather thread as candidates arrive and cleared by the
+	 * loop on a re-gather, so every access is a relaxed atomic: the reader
+	 * wants the latest answer, not a synchronised one. */
+	volatile int have_priv4;	/* a private or CGNAT v4 host candidate,
+					 * which is what needs STUN */
+	volatile int have_srflx4;	/* STUN gave us a public v4 */
+	int mapping_reported;		/* 0 not yet, 1 independent, 2 dependent */
 };
+
+/*
+ * A move: everything this machine worked out about the network it has left is
+ * now about somewhere else. The description and the egress pool go, the
+ * rotation budget is given back, and the walk over the server list restarts at
+ * a fresh index, since a per-session walk can otherwise leave every move
+ * beginning on the same dead server and offering no reflexive address at all.
+ */
+void peering_net_renew(struct peering_net *m);
 
 /*
  * `servers` is borrowed and must outlive the machine. `auto_probe` says the
@@ -321,10 +342,10 @@ int peering_net_fan(struct peering_net *m, char *sdp, size_t cap);
  * there has to be somewhere to rotate TO, the budget for this network has to
  * be unspent, and a private address has to have been gathered. Without one the
  * attempt has not got far enough for the STUN server to be what is wrong with
- * it, and the next one would fail the same way.
+ * it, and the next one would fail the same way. All three are the machine's
+ * own, so nothing is passed in.
  */
-int peering_rotate_allowed(const struct peering_net *m, int rotations,
-			   int have_priv4);
+int peering_rotate_allowed(const struct peering_net *m);
 
 /*
  * Whether this attempt has stalled and should be gathered again through the
@@ -333,8 +354,7 @@ int peering_rotate_allowed(const struct peering_net *m, int rotations,
  * grows ACROSS attempts. An attempt that already has a public address does not
  * rotate, having nothing left to look for.
  */
-int peering_rotate_wanted(const struct peering_net *m, int rotations,
-			  int have_priv4, int have_srflx4, uint64_t since_ms,
+int peering_rotate_wanted(const struct peering_net *m, uint64_t since_ms,
 			  uint64_t now);
 
 /*

@@ -483,26 +483,32 @@ static void rotating_to_the_next_server_is_earned_and_bounded(void)
 	peering_net_init(&pinned, servers, 2, 0);	/* an operator's own */
 
 	/* Nowhere to rotate to, and nobody else's server to rotate through. */
-	assert(!peering_rotate_allowed(&one, 0, 1));
-	assert(!peering_rotate_allowed(&pinned, 0, 1));
+	one.have_priv4 = 1;
+	two.have_priv4 = 1;
+	pinned.have_priv4 = 1;
+	assert(!peering_rotate_allowed(&one));
+	assert(!peering_rotate_allowed(&pinned));
 
 	/* Without a private address the attempt has not got far enough for the
 	 * server to be the thing that is wrong. */
-	assert(!peering_rotate_allowed(&two, 0, 0));
-	assert(peering_rotate_allowed(&two, 0, 1));
+	two.have_priv4 = 0;
+	assert(!peering_rotate_allowed(&two));
+	two.have_priv4 = 1;
+	assert(peering_rotate_allowed(&two));
 
 	/* And the budget is spent eventually. */
-	assert(peering_rotate_allowed(&two, PEERING_ROTATE_MAX - 1, 1));
-	assert(!peering_rotate_allowed(&two, PEERING_ROTATE_MAX, 1));
+	two.rotations = PEERING_ROTATE_MAX - 1;
+	assert(peering_rotate_allowed(&two));
+	two.rotations = PEERING_ROTATE_MAX;
+	assert(!peering_rotate_allowed(&two));
+	two.rotations = 0;
 
 	/* Wanted only once it has stalled, and never once a public address has
 	 * arrived, there being nothing left to look for. */
-	assert(!peering_rotate_wanted(&two, 0, 1, 0, 1000,
-				      1000 + PEERING_ROTATE_MS));
-	assert(peering_rotate_wanted(&two, 0, 1, 0, 1000,
-				     1001 + PEERING_ROTATE_MS));
-	assert(!peering_rotate_wanted(&two, 0, 1, 1, 1000,
-				      1001 + PEERING_ROTATE_MS));
+	assert(!peering_rotate_wanted(&two, 1000, 1000 + PEERING_ROTATE_MS));
+	assert(peering_rotate_wanted(&two, 1000, 1001 + PEERING_ROTATE_MS));
+	two.have_srflx4 = 1;
+	assert(!peering_rotate_wanted(&two, 1000, 1001 + PEERING_ROTATE_MS));
 	peering_net_destroy(&one);
 	peering_net_destroy(&two);
 	peering_net_destroy(&pinned);
