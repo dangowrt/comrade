@@ -868,14 +868,13 @@ static int conn_add_lan_path(struct conn *c, enum path_kind kind,
 				now_ms());
 }
 
-static void conn_add_ice_path(struct conn *c)
+/* Give this connection's carrier back, with the path that borrowed it. */
+static void conn_ice_stop(struct conn *c)
 {
-	pathplane_add_ice(&c->pr.pl, c->pr.ice.agent, now_ms());
-}
+	struct pathplane_sinks k;
 
-static void conn_drop_ice_path(struct conn *c)
-{
-	pathplane_drop_ice(&c->pr.pl);
+	conn_sinks(c, &k);
+	peering_ice_stop(&c->pr, &k);
 }
 
 /* Every one of these is the path plane's, over the carriers it has set aside;
@@ -2544,7 +2543,8 @@ static int nat_setup(struct conn *c)
 	if (nat_gather(c->pr.ice.agent))
 		return -1;
 	s->stun_since_ms = now_ms();
-	conn_add_ice_path(c);
+	peering_ice_adopt(&c->pr, c->pr.ice.agent, c->pr.ice.ctx, now_ms());
+
 	return 0;
 }
 
@@ -3337,9 +3337,8 @@ static int conn_run(struct conn *c, int drive_sig)
 			if (c->pr.ice.agent)
 				conn_hold_add(c, c->pr.ice.agent, c->pr.ice.ctx,
 					      now_ms() + RESUME_ATTEMPT_MS);
-			c->pr.ice.agent = got->agent;	/* bound to it for life */
-			c->pr.ice.ctx = got;
-			conn_add_ice_path(c);
+			/* bound to it for life */
+			peering_ice_adopt(&c->pr, got->agent, got, now_ms());
 			pathplane_blackhole_mute(&c->pr.pl, 0);
 			/* The resumed link earns a full liveness window; without
 			 * this it is judged by silence that predates it. */
@@ -3617,10 +3616,7 @@ static int client_regather(struct sess *s)
 	netstate_resync(&s->pm.ns);	/* the reset above cleared rows and the
 					 * verdict; neither has actually moved */
 	s->established_fired = 0;
-	conn_drop_ice_path(&s->c);
-	conn_free_agent(&s->c, s->c.pr.ice.agent, s->c.pr.ice.ctx);
-	s->c.pr.ice.agent = NULL;
-	s->c.pr.ice.ctx = NULL;
+	conn_ice_stop(&s->c);
 	conn_gen_ice(&s->c);
 	s->have_local_sdp = 0;
 	s->have_peer_sdp = 0;
@@ -4041,8 +4037,7 @@ static void conn_dissolve(struct conn *c)
 
 	conn_unregister(c->sess, c);
 	conn_reap_holds(c);
-	conn_drop_ice_path(c);
-	conn_free_agent(c, c->pr.ice.agent, c->pr.ice.ctx);
+	conn_ice_stop(c);
 	/* A re-punch grafted for a worker that left its loop before adopting
 	 * it: nobody else will. */
 	for (i = 0; i < ICE_HOLD_MAX; i++) {
@@ -5488,12 +5483,8 @@ int session_run(const struct session_cfg *cfg)
 				st = ST_FAIL;
 				break;
 			}
-			if (s.c.pr.ice.agent) {
-				conn_drop_ice_path(&s.c);
-				conn_free_agent(&s.c, s.c.pr.ice.agent, s.c.pr.ice.ctx);
-				s.c.pr.ice.agent = NULL;
-				s.c.pr.ice.ctx = NULL;
-			}
+			if (s.c.pr.ice.agent)
+				conn_ice_stop(&s.c);
 			conn_gen_ice(&s.c);
 			pathplane_clear(&s.c.pr.pl);
 			net_change_reset(&s);
@@ -5702,10 +5693,7 @@ int session_run(const struct session_cfg *cfg)
 			if (nat_failed(s.c.pr.ice.agent) ||
 			    now_ms() - s.ice_attempt_start > ICE_ATTEMPT_MS) {
 				__atomic_add_fetch(&s.ice_attempt, 1, __ATOMIC_RELAXED);
-				conn_drop_ice_path(&s.c);
-				conn_free_agent(&s.c, s.c.pr.ice.agent, s.c.pr.ice.ctx);
-				s.c.pr.ice.agent = NULL;
-				s.c.pr.ice.ctx = NULL;
+				conn_ice_stop(&s.c);
 				if (nat_setup(&s.c))
 					st = ST_FAIL;
 				else
@@ -5832,8 +5820,7 @@ done:
 	if (st_done)
 		stream_destroy(st_done);
 	conn_reap_holds(&s.c);
-	conn_drop_ice_path(&s.c);
-	conn_free_agent(&s.c, s.c.pr.ice.agent, s.c.pr.ice.ctx);
+	conn_ice_stop(&s.c);
 	if (s.lan)
 		lanlink_destroy(s.lan);
 	sig_destroy(s.pm.sig);
