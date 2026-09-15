@@ -2486,22 +2486,8 @@ static int on_stream_output(void *arg, const uint8_t *data, size_t len)
  * client keeps its one for the whole session. */
 static void conn_gen_ice(struct conn *c)
 {
-	static const char hx[] = "0123456789abcdef";
-	uint8_t rb[16];
-	int j;
-
-	random_bytes(rb, 4);
-	for (j = 0; j < 4; j++) {
-		c->ice_ufrag[j * 2] = hx[rb[j] >> 4];
-		c->ice_ufrag[j * 2 + 1] = hx[rb[j] & 0xf];
-	}
-	c->ice_ufrag[8] = '\0';
-	random_bytes(rb, 16);
-	for (j = 0; j < 16; j++) {
-		c->ice_pwd[j * 2] = hx[rb[j] >> 4];
-		c->ice_pwd[j * 2 + 1] = hx[rb[j] & 0xf];
-	}
-	c->ice_pwd[32] = '\0';
+	peering_ice_gen(c->ice_ufrag, sizeof(c->ice_ufrag), c->ice_pwd,
+			sizeof(c->ice_pwd));
 	/* A client probes under its own identity; a host overwrites this with the
 	 * claimant it admitted (lan_drain, the turnstile at pickup, and the
 	 * single-connection state machine when it takes an answer up). */
@@ -2525,46 +2511,17 @@ static int nat_setup(struct conn *c)
 	struct sess *s = c->sess;
 	struct nat_config cfg;
 	struct ice_ctx *ctx;
-	const char *colon;
-	const char *cand;
-	const char *e;
-	int i, picked;
-	char ip[64];
-	size_t hl;
 
 	memset(&cfg, 0, sizeof(cfg));
 	cfg.stun_host = s->cfg->stun_host;
 	cfg.stun_port = s->cfg->stun_port;
-	if (!cfg.stun_host && s->cfg->stun_auto && s->stun_count > 0) {
-		/* Feed libjuice a pre-resolved pool IP: a hostname is re-resolved
-		 * per agent, and a dead name stalls the gather a roam can least
-		 * afford. The prober warms the cache; fall back to the name only
-		 * for a cold start. */
-		picked = 0;
-		e = s->stun_servers[s->ice_attempt % s->stun_count];
-		for (i = 0; i < s->stun_count && !picked; i++) {
-			cand = s->stun_servers[(s->ice_attempt + i) %
-					       s->stun_count];
-			if (stun_server_ip4(cand, ip, sizeof(ip), 0)) {
-				e = cand;
-				picked = 1;
-			}
-		}
-		colon = strrchr(e, ':');
-		cfg.stun_port = colon ? (uint16_t)atoi(colon + 1) : 3478;
-		if (!cfg.stun_port)
-			cfg.stun_port = 3478;
-		if (picked) {
-			memcpy(s->stun_host, ip, strlen(ip) + 1);
-		} else {
-			hl = colon ? (size_t)(colon - e) : strlen(e);
-			if (hl >= sizeof(s->stun_host))
-				hl = sizeof(s->stun_host) - 1;
-			memcpy(s->stun_host, e, hl);
-			s->stun_host[hl] = '\0';
-		}
+	if (!cfg.stun_host && s->cfg->stun_auto &&
+	    !peering_net_stun_pick(&s->net,
+				   (unsigned)__atomic_load_n(&s->ice_attempt,
+							     __ATOMIC_RELAXED),
+				   s->stun_host, sizeof(s->stun_host),
+				   &cfg.stun_port))
 		cfg.stun_host = s->stun_host;
-	}
 	cfg.ice_ufrag = c->ice_ufrag;
 	cfg.ice_pwd = c->ice_pwd;
 	cfg.on_local_sdp = on_local_sdp;

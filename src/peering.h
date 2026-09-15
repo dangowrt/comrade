@@ -226,6 +226,26 @@ void peering_net_halt(struct peering_net *m, int family);
 void peering_net_reap(struct peering_net *m, int family);
 
 /*
+ * Name the server an attempt gathers through, splitting host from port into
+ * caller-owned storage that must outlive the agent, since a traversal library
+ * keeps the pointer. `attempt` is the rotation count, so a server that does
+ * not answer is not the only one ever asked.
+ *
+ * Only ever a pre-resolved address, never the name: a name is resolved inside
+ * the agent on a thread its teardown joins, so one that does not resolve holds
+ * the whole loop for the lookup. -1 until the warm pass has cached one.
+ */
+int peering_net_stun_pick(const struct peering_net *m, unsigned attempt,
+			  char *host, size_t hostlen, uint16_t *port);
+
+/*
+ * Mint an identity to gather under. Fixed by this end rather than left to the
+ * traversal library, so it survives a re-gather after a failed punch and the
+ * peer keeps hammering one target.
+ */
+void peering_ice_gen(char *ufrag, size_t uflen, char *pwd, size_t pwlen);
+
+/*
  * ONE MAILBOX.
  *
  * What one side of a rendezvous holds: the reachability model, where this end
