@@ -795,6 +795,26 @@ int peering_ice_rotated(const struct peering *pr, const char *offer_ufrag);
 
 /* Whether the carrier has given up on this peer. */
 int peering_ice_failed(const struct peering *pr);
+
+/* Whether the peer is publishing under a later network generation than the
+ * one that primed this carrier, which is the peer having moved rather than
+ * its own pickup rotating credentials. */
+int peering_ice_moved(const struct peering *pr, uint32_t peer_gen);
+
+/*
+ * A description has arrived for this peer. It is copied into `out` bounded,
+ * the identity it carries is named in `ufrag`, and the return says whether
+ * this carrier should take it at all.
+ *
+ * 0 means it belongs to an offer that replaced the one already primed here:
+ * a peer that rotates on pickup mints a fresh identity at once, so a
+ * description from the successor can still arrive, and feeding it to a
+ * primed carrier churns a punch that was about to land. The arrival is
+ * staged rather than adopted in place, so a refused one cannot have
+ * overwritten what is held.
+ */
+int peering_offer_judge(struct peering *pr, const uint8_t *data, size_t len,
+			char *out, size_t cap, char *ufrag, size_t uflen);
 struct nat_agent *peering_ice_agent(struct peering *pr);
 int peering_ice_up(const struct peering *pr);
 

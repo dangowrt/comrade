@@ -1960,7 +1960,7 @@ static int offer_moved_on(struct conn *c)
 		return 0;
 	/* A higher generation than primed us is a move, not a pickup rotation:
 	 * the offer's candidates are new, so re-claim at once with no floor. */
-	if (sig_peer_gen(s->pm.sig) > c->pr.ice.remote_gen)
+	if (peering_ice_moved(&c->pr, sig_peer_gen(s->pm.sig)))
 		return strcmp(s->cur_offer_ufrag, s->regathered_for) != 0;
 	/* The long floor is only for a client being punched, whose claim was
 	 * taken up; one never picked up, never in the slot or queued over by a
@@ -2276,27 +2276,18 @@ static void conn_amend_remote(struct conn *c, struct sess *s)
 
 static void on_peer_offer(void *arg, const uint8_t *data, size_t len)
 {
-	struct sess *s = arg;
-	struct conn *c = s->offer_conn;
+	struct conn *c = ((struct sess *)arg)->offer_conn;
 	char incoming[NAT_SDP_MAX];
+	struct sess *s = arg;
 	char ufrag[40];
+	int take;
 
 	if (!c)
 		return;
-	/*
-	 * Stage the arrival before adopting it. The host rotates a fresh offer the
-	 * instant it picks a claim up, so a description belonging to the offer that
-	 * replaced this agent's can still arrive; it names a different peer identity
-	 * and feeding it to an agent already primed with another would churn the
-	 * punch. Whatever is rejected here must not have overwritten peer_sdp.
-	 */
-	if (len >= sizeof(incoming))
-		len = sizeof(incoming) - 1;
-	memcpy(incoming, data, len);
-	incoming[len] = '\0';
-	cand_sdp_ufrag(incoming, ufrag, sizeof(ufrag));
+	take = peering_offer_judge(&c->pr, data, len, incoming,
+				   sizeof(incoming), ufrag, sizeof(ufrag));
 	snprintf(s->cur_offer_ufrag, sizeof(s->cur_offer_ufrag), "%s", ufrag);
-	if (peering_ice_rotated(&c->pr, ufrag)) {
+	if (!take) {
 		dbg_logf("session: ignore rotated offer while punching");
 		return;
 	}
@@ -2914,7 +2905,7 @@ static void resume_tick(struct conn *c)
 		 * and chasing it aborts a punch still in flight. */
 		if (s->remote_set && s->cur_offer_ufrag[0] &&
 		    peering_ice_rotated(&c->pr, s->cur_offer_ufrag) &&
-		    sig_peer_gen(s->pm.sig) > c->pr.ice.remote_gen) {
+		    peering_ice_moved(&c->pr, sig_peer_gen(s->pm.sig))) {
 			c->rs_state = 0;
 			return;
 		}

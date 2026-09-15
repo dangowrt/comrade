@@ -737,9 +737,58 @@ static void a_rotation_is_read_against_what_primed_us(void)
 	peering_model_destroy(&pm);
 }
 
+/*
+ * An arriving description is staged, not adopted: one belonging to the offer
+ * that replaced what this carrier is primed against is refused, and refusing
+ * it must not have disturbed what is already held.
+ */
+static void an_offer_is_staged_before_it_is_taken(void)
+{
+	static const char first[] =
+		"v=0\na=ice-ufrag:aaaa\na=candidate:1 1 udp 1 10.0.0.1 1 typ host\n";
+	static const char next[] =
+		"v=0\na=ice-ufrag:bbbb\na=candidate:1 1 udp 1 10.0.0.2 1 typ host\n";
+	static const uint8_t key[32] = { 4 };
+	struct peering_model pm;
+	char got[NAT_SDP_MAX];
+	struct peering pr;
+	char ufrag[40];
+
+	peering_model_init(&pm, 0, 1, NULL, 1000);
+	peering_init(&pr, &pm, 1, key, 1000);
+
+	/* Nothing primed yet, so the first one is taken and named. */
+	assert(peering_offer_judge(&pr, (const uint8_t *)first, strlen(first),
+				   got, sizeof(got), ufrag, sizeof(ufrag)));
+	assert(!strcmp(ufrag, "aaaa"));
+	assert(!strcmp(got, first));
+
+	snprintf(pr.ice.remote_ufrag, sizeof(pr.ice.remote_ufrag), "aaaa");
+
+	/* The primed offer's own later candidates are still taken. */
+	assert(peering_offer_judge(&pr, (const uint8_t *)first, strlen(first),
+				   got, sizeof(got), ufrag, sizeof(ufrag)));
+
+	/* Its successor is refused, but is still named so the caller can see
+	 * which offer is current. */
+	memset(got, 0, sizeof(got));
+	assert(!peering_offer_judge(&pr, (const uint8_t *)next, strlen(next),
+				    got, sizeof(got), ufrag, sizeof(ufrag)));
+	assert(!strcmp(ufrag, "bbbb"));
+
+	/* A generation beyond the one that primed us is the peer having moved. */
+	pr.ice.remote_gen = 7;
+	assert(!peering_ice_moved(&pr, 7));
+	assert(peering_ice_moved(&pr, 8));
+
+	peering_destroy(&pr);
+	peering_model_destroy(&pm);
+}
+
 int main(void)
 {
 	what_is_posted_is_taken_once();
+	an_offer_is_staged_before_it_is_taken();
 	a_rotation_is_read_against_what_primed_us();
 	a_datagram_is_the_engine_s_until_it_says_otherwise();
 	the_anchor_outranks_the_name_we_started_with();

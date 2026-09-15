@@ -1315,6 +1315,23 @@ int peering_ice_failed(const struct peering *pr)
 	return nat_failed(pr->ice.agent);
 }
 
+int peering_ice_moved(const struct peering *pr, uint32_t peer_gen)
+{
+	return peer_gen > pr->ice.remote_gen;
+}
+
+int peering_offer_judge(struct peering *pr, const uint8_t *data, size_t len,
+			char *out, size_t cap, char *ufrag, size_t uflen)
+{
+	if (len >= cap)
+		len = cap - 1;
+	memcpy(out, data, len);
+	out[len] = '\0';
+	cand_sdp_ufrag(out, ufrag, uflen);
+
+	return !peering_ice_rotated(pr, ufrag);
+}
+
 int peering_net_fan(struct peering_net *m, char *sdp, size_t cap)
 {
 	uint8_t pool[PEERING_POOL4_MAX][4];
