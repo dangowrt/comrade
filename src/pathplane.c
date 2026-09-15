@@ -841,3 +841,26 @@ void pathplane_clear(struct pathplane *pl)
 	path_table_clear(&pl->t);
 	pthread_mutex_unlock(&pl->lock);
 }
+
+int pathplane_holds_settle(struct pathplane *pl,
+			   const struct pathplane_sinks *k,
+			   struct nat_agent **live, void **live_ctx)
+{
+	struct nat_agent *spare;
+	void *spare_ctx;
+	int hi;
+
+	hi = pathplane_hold_carrying(pl);
+	if (hi >= 0) {
+		spare = *live;
+		spare_ctx = *live_ctx;
+		*live = pathplane_hold_take(pl, hi, live_ctx);
+		pathplane_free_agent(pl, k, spare, spare_ctx);
+		return 1;
+	}
+	if (!pathplane_has_hold(pl))
+		return 0;
+	pathplane_holds_free_all(pl, k);
+
+	return -1;
+}

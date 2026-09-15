@@ -2979,12 +2979,11 @@ static void net_change_reset(struct sess *s)
  */
 static void resume_tick(struct conn *c)
 {
+	struct pathplane_sinks k;
 	struct ctlplane_live live;
-	struct ice_ctx *spare_ctx;
-	struct nat_agent *spare;
 	struct sess *s;
 	uint64_t now;
-	int lost, hi;
+	int lost, settled;
 	int moved;
 	int n;
 
@@ -3004,27 +3003,14 @@ static void resume_tick(struct conn *c)
 			sig_withdraw(s->pm.sig);
 			dbg_logf("resume: link back");
 		}
-		/*
-		 * It came back on the agent set aside, so that is the one
-		 * carrying: it takes the current role and the punch being
-		 * built in its place is let go.
-		 */
-		hi = pathplane_hold_carrying(&c->pr.pl);
-		if (hi >= 0) {
-			spare = c->nat;
-			spare_ctx = c->nat_ctx;
-			c->nat = pathplane_hold_take(&c->pr.pl, hi,
-						     (void **)&c->nat_ctx);
-			conn_free_agent(c, spare, spare_ctx);
+		conn_sinks(c, &k);
+		settled = pathplane_holds_settle(&c->pr.pl, &k, &c->nat,
+						 (void **)&c->nat_ctx);
+		if (settled > 0)
 			dbg_logf("resume: carried by the agent set aside");
-		} else if (pathplane_has_hold(&c->pr.pl)) {
-			/* A non-held path carries, so free the set-aside agents
-			 * now, not at their deadline: a second punch would else
-			 * ride along on its own port for the whole span. */
-			conn_reap_holds(c);
+		else if (settled < 0)
 			dbg_logf("resume: the agent set aside answered "
 				 "nothing");
-		}
 		return;
 	}
 	conn_holds_gc(c, now);
