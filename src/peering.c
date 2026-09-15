@@ -699,6 +699,26 @@ int peering_recv(struct peering *pr, const uint8_t *data, size_t len,
 			      now);
 }
 
+void peering_ctl(struct peering *pr, int type, const uint8_t *pl, size_t plen,
+		 unsigned netgen, uint64_t now)
+{
+	ctlplane_on_msg(&pr->cp, &pr->ck, type, pl, plen, netgen, now);
+}
+
+int peering_datagram(struct peering *pr, const uint8_t *data, size_t *len,
+		     enum path_kind kind, const struct sockaddr_in6 *src,
+		     struct nat_agent *agent, uint64_t now)
+{
+	if (pathplane_muted(&pr->pl))
+		return 1;
+	if (pathplane_is_probe(&pr->pl, data, *len)) {
+		peering_recv(pr, data, *len, kind, src, agent, now);
+		return 1;
+	}
+
+	return probeplane_unwrap(&pr->pp, data, len) ? 1 : 0;
+}
+
 int peering_claims(struct peering *pr, const uint8_t *data, size_t len,
 		   enum path_kind kind, const struct sockaddr_in6 *src,
 		   uint64_t now)

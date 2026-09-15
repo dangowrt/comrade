@@ -672,6 +672,28 @@ int peering_recv(struct peering *pr, const uint8_t *data, size_t len,
 		 struct nat_agent *agent, uint64_t now);
 
 /*
+ * A control message this peer sent, handed over as read. The sink table the
+ * engine was given answers it, so a playbook never assembles a second one at
+ * the point of delivery.
+ */
+void peering_ctl(struct peering *pr, int type, const uint8_t *pl, size_t plen,
+		 unsigned netgen, uint64_t now);
+
+/*
+ * A datagram that arrived on one of this peer's paths. Returns 1 when the
+ * engine took it, either as a probe of its own or because a staged outage is
+ * swallowing receives, and 0 when what is left in `data` and `len` is the
+ * playbook's payload to carry.
+ *
+ * The probe wrapper is stripped by then, which is why the return has to be
+ * obeyed: a caller that carried the frame regardless would feed this end's
+ * own path probes into its stream.
+ */
+int peering_datagram(struct peering *pr, const uint8_t *data, size_t *len,
+		     enum path_kind kind, const struct sockaddr_in6 *src,
+		     struct nat_agent *agent, uint64_t now);
+
+/*
  * Whether a frame from a source no path of this peer's names is this peer's,
  * and if so act on it. Returns 0 when it is not, 1 when it was acted on, and
  * -1 when it was this peer's but had been acted on already, which is the

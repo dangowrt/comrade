@@ -669,9 +669,48 @@ static void the_anchor_outranks_the_name_we_started_with(void)
 	peering_model_destroy(&pm);
 }
 
+/*
+ * What arrives on a path is the engine's until it says otherwise: a wrapped
+ * payload comes back unwrapped as the playbook's to carry, and a staged
+ * outage swallows everything.
+ */
+static void a_datagram_is_the_engine_s_until_it_says_otherwise(void)
+{
+	static const uint8_t body[5] = { 'h', 'e', 'l', 'l', 'o' };
+	static const uint8_t key[32] = { 9, 9 };
+	struct peering_model pm;
+	uint8_t wrapped[256];
+	struct peering pr;
+	size_t len;
+
+	peering_model_init(&pm, 1, 1, NULL, 1000);
+	peering_init(&pr, &pm, 0x50454552u, key, 500);
+
+	len = probeplane_wrap(&pr.pp, wrapped, sizeof(wrapped), body,
+			      sizeof(body));
+	assert(len > sizeof(body));
+	assert(!peering_datagram(&pr, wrapped, &len, PATH_SEGMENT, NULL, NULL,
+				 1000));
+	assert(len == sizeof(body));
+	assert(!memcmp(wrapped, body, sizeof(body)));
+
+	len = probeplane_wrap(&pr.pp, wrapped, sizeof(wrapped), body,
+			      sizeof(body));
+	pathplane_blackhole_mute(&pr.pl, 1);
+	assert(pathplane_muted(&pr.pl));
+	assert(peering_datagram(&pr, wrapped, &len, PATH_SEGMENT, NULL, NULL,
+				1000) == 1);
+	pathplane_blackhole_lift(&pr.pl);
+	assert(!pathplane_muted(&pr.pl));
+
+	peering_destroy(&pr);
+	peering_model_destroy(&pm);
+}
+
 int main(void)
 {
 	what_is_posted_is_taken_once();
+	a_datagram_is_the_engine_s_until_it_says_otherwise();
 	the_anchor_outranks_the_name_we_started_with();
 	a_gathered_description_is_taken_once();
 	the_local_copy_may_be_rewritten_in_place();
