@@ -3812,42 +3812,11 @@ static void net_pump(struct sess *s, uint64_t now)
 	session_advance(s);
 }
 
-/*
- * A peer's link, on the same scale the status bar uses.
- *
- * The distinctions are about evidence, not about hope. Traffic arriving is the
- * only thing that proves a path, and it proves it for the network it arrived
- * on -- so a move puts every peer back to unknown rather than leaving the last
- * network's verdict on screen, where it reads as a working link that simply is
- * not there. Between live and lost sits a stretch where the last thing heard
- * is old enough to notice and not old enough to give up on; showing that as
- * live is how a link that stopped looks fine until it is suddenly gone.
- */
-#define LINK_LAG_MS 1200
-
 static int conn_link_state(const struct sess *s, struct conn *c)
 {
-	uint64_t now = now_ms(), last;
-	struct ctlplane_live live;
-	int seen, lost, rtt;
-	unsigned gen;
-
-	ctlplane_liveness(&c->pr.cp, &live);
-	last = live.last_pong_ms;
-	seen = live.pong_seen;
-	gen = live.live_gen;
-	rtt = live.rtt_ms;
-	lost = live.lost_since_ms != 0;
-
-	if (!seen)
-		return c->ice_up ? CONN_PUNCHING : CONN_CONNECTING;
-	if (lost && now - last >= hb_lost_ms(rtt))
-		return CONN_LOST;
-	if (gen != __atomic_load_n(&s->netgen, __ATOMIC_RELAXED))
-		return CONN_UNKNOWN;	/* proven, but somewhere else */
-	if (now - last >= LINK_LAG_MS)
-		return CONN_LAGGED;
-	return CONN_LIVE;
+	return peering_link(&c->pr,
+			    __atomic_load_n(&s->netgen, __ATOMIC_RELAXED),
+			    c->ice_up, now_ms());
 }
 
 /*
