@@ -538,6 +538,11 @@ static void drain_messages(struct pump_ctx *c)
 
 /* How long the pump keeps running once the session is over, before it closes
  * the channel toward the client: see the comment on pump(). */
+/* A peer that stops talking mid-handshake must not be waited on for ever:
+ * without a deadline the blocking ssh_message_get() spins on a hung-up socket
+ * at the cost of a whole core. The worker is reaped at HOST_HANDSHAKE_MS. */
+#define SSHD_HANDSHAKE_S 10
+
 #define SSHD_END_DRAIN_MS 400
 
 /* After the served command exits with no end-fd signal, how long to give the
@@ -711,6 +716,7 @@ out:
 
 int sshd_serve_fd(sock_t fd, const struct sshd_opts *o)
 {
+	long grace = SSHD_HANDSHAKE_S;
 	char password[64];
 	char password_ro[64];
 	int read_only = 0;
@@ -742,6 +748,8 @@ int sshd_serve_fd(sock_t fd, const struct sshd_opts *o)
 
 	s = ssh_new();
 	if (!s)
+		goto out;
+	if (ssh_options_set(s, SSH_OPTIONS_TIMEOUT, &grace) != SSH_OK)
 		goto out;
 	if (ssh_bind_accept_fd(bind, s, fd) != SSH_OK)
 		goto out;
