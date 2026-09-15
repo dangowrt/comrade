@@ -12,6 +12,7 @@ void pathplane_init(struct pathplane *pl, struct probeplane *pp)
 {
 	memset(pl, 0, sizeof(*pl));
 	pl->pp = pp;
+	pl->bh_kind = -1;
 	path_table_init(&pl->t);
 	pthread_mutex_init(&pl->lock, NULL);
 }
@@ -205,10 +206,63 @@ void pathplane_desc(const struct path *p, char *out, size_t n)
 		 path_loss_ppt(p), p->peer_loss_ppt);
 }
 
-static int blackholed(const struct pathplane_sinks *k, int kind,
+/* Called with the table locked, which is what the hook is armed under too. */
+static int blackholed(struct pathplane *pl, int kind,
 		      const struct sockaddr_in6 *to)
 {
-	return k->blackholed ? k->blackholed(k->arg, kind, to) : 0;
+	struct path_ep ep;
+
+	if (__atomic_load_n(&pl->bh_mute, __ATOMIC_RELAXED))
+		return 1;
+	if (pl->bh_kind < 0 || kind != pl->bh_kind)
+		return 0;
+	if (kind == PATH_ICE)
+		return 1;
+	if (!to || path_ep_from_sockaddr(&ep, (const struct sockaddr *)to,
+					 sizeof(*to)))
+		return 0;
+
+	return path_ep_eq(&ep, &pl->bh_ep);
+}
+
+void pathplane_blackhole_arm(struct pathplane *pl, int kind,
+			     const struct sockaddr_in6 *to)
+{
+	pthread_mutex_lock(&pl->lock);
+	memset(&pl->bh_ep, 0, sizeof(pl->bh_ep));
+	if (to)
+		path_ep_from_sockaddr(&pl->bh_ep, (const struct sockaddr *)to,
+				      sizeof(*to));
+	pl->bh_kind = kind;
+	pthread_mutex_unlock(&pl->lock);
+}
+
+void pathplane_blackhole_mute(struct pathplane *pl, int on)
+{
+	__atomic_store_n(&pl->bh_mute, on, __ATOMIC_RELAXED);
+}
+
+void pathplane_blackhole_lift(struct pathplane *pl)
+{
+	pthread_mutex_lock(&pl->lock);
+	pl->bh_kind = -1;
+	pthread_mutex_unlock(&pl->lock);
+	__atomic_store_n(&pl->bh_mute, 0, __ATOMIC_RELAXED);
+}
+
+int pathplane_muted(const struct pathplane *pl)
+{
+	return __atomic_load_n(&pl->bh_mute, __ATOMIC_RELAXED);
+}
+
+int pathplane_blackhole_kind(const struct pathplane *pl)
+{
+	return pl->bh_kind;
+}
+
+int pathplane_blackhole_armed(const struct pathplane *pl)
+{
+	return pl->bh_kind >= 0 || pathplane_muted(pl);
 }
 
 static int agent_listed(struct nat_agent *const *live, int n,
@@ -318,7 +372,7 @@ void pathplane_tick(struct pathplane *pl, const struct pathplane_sinks *k,
 		path_probe_sent(p, nonce[i], now);
 		kind[m] = (int)p->kind;
 		agent[m] = p->agent;
-		drop[m] = blackholed(k, kind[m], &p->remote);
+		drop[m] = blackholed(pl, kind[m], &p->remote);
 		to[m] = p->remote;
 		m++;
 	}
@@ -390,7 +444,7 @@ static void apply_ping(struct pathplane *pl, const struct pathplane_sinks *k,
 		if (p)
 			snprintf(added, sizeof(added), "%s", p->label);
 	}
-	drop = blackholed(k, (int)(p ? p->kind : srck), src);
+	drop = blackholed(pl, (int)(p ? p->kind : srck), src);
 	if (p) {
 		if (path_ep_any(&from))
 			from = p->peer_ep;	/* ICE: no source */
@@ -562,7 +616,7 @@ int pathplane_pick(struct pathplane *pl, const struct pathplane_sinks *k,
 		out->agent = p->agent;
 		out->qualified = p->qualified;
 		out->srtt_ms = path_srtt_ms(p);
-		out->blackholed = blackholed(k, out->kind, &p->remote);
+		out->blackholed = blackholed(pl, out->kind, &p->remote);
 		snprintf(out->label, sizeof(out->label), "%s", p->label);
 		if (sel != prev) {
 			pathplane_desc(p, to, sizeof(to));
@@ -756,4 +810,34 @@ void pathplane_route_dedup(struct pathplane *pl,
 	pthread_mutex_unlock(&pl->lock);
 	for (i = 0; i < nlose; i++)
 		pathplane_free_agent(pl, k, loser[i], loser_ctx[i]);
+}
+
+struct nat_agent *pathplane_hold_take(struct pathplane *pl, int i, void **ctx)
+{
+	struct nat_agent *agent;
+
+	if (i < 0 || i >= PATHPLANE_HOLD_MAX)
+		return NULL;
+	agent = pl->holds[i].agent;
+	if (ctx)
+		*ctx = pl->holds[i].ctx;
+	pl->holds[i].agent = NULL;
+	pl->holds[i].ctx = NULL;
+	pl->holds[i].until_ms = 0;
+
+	return agent;
+}
+
+void pathplane_reset_stats(struct pathplane *pl, uint64_t now)
+{
+	pthread_mutex_lock(&pl->lock);
+	path_table_reset_stats(&pl->t, now);
+	pthread_mutex_unlock(&pl->lock);
+}
+
+void pathplane_clear(struct pathplane *pl)
+{
+	pthread_mutex_lock(&pl->lock);
+	path_table_clear(&pl->t);
+	pthread_mutex_unlock(&pl->lock);
 }

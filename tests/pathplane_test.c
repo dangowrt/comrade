@@ -522,9 +522,55 @@ static void the_carrier_that_carries_is_not_reaped(void)
 	end_done(&a);
 }
 
+/*
+ * A path cannot be removed for real without CAP_NET_ADMIN, so the hook stops
+ * this end sending on it: the probes that keep a path warm are ours, so it
+ * falls silent at both ends.
+ */
+static void a_blackholed_path_stops_being_probed(void)
+{
+	struct pathplane_pick pick;
+	struct end a, b;
+
+	end_init(&a, 1, "abcd");
+	end_init(&b, 2, "abcd");
+	assert(pathplane_blackhole_kind(&a.pl) == -1);
+	assert(!pathplane_blackhole_armed(&a.pl));
+	assert(!pathplane_muted(&a.pl));
+
+	assert(!pathplane_add_ep(&a.pl, &a.k, PATH_SEGMENT, &b.here, NULL, 0,
+				 1000));
+	pathplane_tick(&a.pl, &a.k, 1000);
+	assert(a.sends == 1);
+
+	pathplane_blackhole_arm(&a.pl, PATH_SEGMENT, &b.here);
+	assert(pathplane_blackhole_kind(&a.pl) == PATH_SEGMENT);
+	assert(pathplane_blackhole_armed(&a.pl));
+	pathplane_tick(&a.pl, &a.k, 1000 + PATH_KEEP_MS);
+	assert(a.sends == 1);			/* the probe was not sent */
+	assert(!pathplane_pick(&a.pl, &a.k, 1000, &pick));
+	assert(pick.blackholed);
+
+	pathplane_blackhole_lift(&a.pl);
+	assert(!pathplane_blackhole_armed(&a.pl));
+	pathplane_tick(&a.pl, &a.k, 1000 + 2 * PATH_KEEP_MS);
+	assert(a.sends == 2);
+
+	/* Muting takes every path away, whatever kind it is. */
+	pathplane_blackhole_mute(&a.pl, 1);
+	assert(pathplane_muted(&a.pl));
+	assert(pathplane_blackhole_armed(&a.pl));
+	assert(pathplane_blackhole_kind(&a.pl) == -1);	/* none by path */
+	pathplane_tick(&a.pl, &a.k, 1000 + 3 * PATH_KEEP_MS);
+	assert(a.sends == 2);
+	end_done(&a);
+	end_done(&b);
+}
+
 int main(void)
 {
 	a_path_qualifies_only_once_it_answers();
+	a_blackholed_path_stops_being_probed();
 	a_carrier_set_aside_is_kept_until_its_time_is_up();
 	the_carrier_that_carries_is_not_reaped();
 	the_carry_is_read_off_the_ranking();
