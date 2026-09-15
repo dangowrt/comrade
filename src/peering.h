@@ -535,6 +535,16 @@ void peering_publish(struct peering_model *pm);
 struct peering_ice {
 	char ufrag[16];
 	char pwd[40];
+	/*
+	 * The peer identity this carrier was primed against. A candidate
+	 * trickle belonging to an offer that has since been rotated away must
+	 * not reach a carrier primed for the older one, and the generation
+	 * says which of the two a fresh offer is: a higher one is the peer
+	 * having moved, the same one is its pickup rotating credentials.
+	 */
+	char remote_ufrag[40];
+	char remote_pwd[40];
+	uint32_t remote_gen;
 	struct nat_agent *agent;
 	void *ctx;			/* freed with the agent */
 	volatile int up;		/* the carrier is connected: published
@@ -740,6 +750,31 @@ void peering_ice_ident(struct peering *pr);
 void peering_ice_adopt(struct peering *pr, struct nat_agent *agent, void *ctx,
 		       uint64_t now);
 void peering_ice_stop(struct peering *pr, const struct pathplane_sinks *k);
+
+/*
+ * Prime this carrier with what the peer published and record whose offer it
+ * was, which is one act: a carrier holding a description without the identity
+ * that produced it cannot tell a later trickle from a rotation. `pwd` may be
+ * NULL where the playbook does not track the peer's attempt. Returns -1 when
+ * the carrier would not take the description, and records nothing then.
+ */
+int peering_ice_prime(struct peering *pr, const char *sdp, const char *ufrag,
+		      const char *pwd);
+
+/*
+ * The peer's later candidates for the offer already primed, added under the
+ * credentials the carrier holds. Nothing is recorded, since a trickle names
+ * no new identity, and it is skipped once the carrier is connected, where a
+ * redelivered duplicate would only churn the candidate table.
+ */
+void peering_ice_amend(struct peering *pr, const char *sdp);
+
+/* Whether a freshly seen offer names a peer other than the one this carrier
+ * was primed against; false before anything has primed it. */
+int peering_ice_rotated(const struct peering *pr, const char *offer_ufrag);
+
+/* Whether the carrier has given up on this peer. */
+int peering_ice_failed(const struct peering *pr);
 struct nat_agent *peering_ice_agent(struct peering *pr);
 int peering_ice_up(const struct peering *pr);
 

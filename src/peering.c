@@ -421,10 +421,8 @@ int peering_net_kick(struct peering_net *m, int family, uint32_t epoch,
 void peering_init(struct peering *pr, struct peering_model *pm, uint32_t magic,
 		  const uint8_t key[32], uint64_t seq0)
 {
+	memset(pr, 0, sizeof(*pr));
 	pr->pm = pm;
-	pr->id = 0;
-	pr->next_rdvask_ms[0] = 0;
-	pr->next_rdvask_ms[1] = 0;
 	probeplane_init(&pr->pp, magic, key, seq0);
 	pathplane_init(&pr->pl, &pr->pp);
 	ctlplane_init(&pr->cp, &pr->pp);
@@ -1263,6 +1261,38 @@ void peering_ice_stop(struct peering *pr, const struct pathplane_sinks *k)
 	pr->ice.ctx = NULL;
 	pathplane_drop_ice(&pr->pl);
 	pathplane_free_agent(&pr->pl, k, agent, ctx);
+}
+
+int peering_ice_prime(struct peering *pr, const char *sdp, const char *ufrag,
+		      const char *pwd)
+{
+	if (nat_set_remote_description(pr->ice.agent, sdp))
+		return -1;
+	snprintf(pr->ice.remote_ufrag, sizeof(pr->ice.remote_ufrag), "%s",
+		 ufrag);
+	if (pwd)
+		snprintf(pr->ice.remote_pwd, sizeof(pr->ice.remote_pwd), "%s",
+			 pwd);
+
+	return 0;
+}
+
+void peering_ice_amend(struct peering *pr, const char *sdp)
+{
+	if (!pr->ice.agent || nat_connected(pr->ice.agent))
+		return;
+	nat_set_remote_description(pr->ice.agent, sdp);
+}
+
+int peering_ice_rotated(const struct peering *pr, const char *offer_ufrag)
+{
+	return pr->ice.remote_ufrag[0] &&
+	       strcmp(offer_ufrag, pr->ice.remote_ufrag) != 0;
+}
+
+int peering_ice_failed(const struct peering *pr)
+{
+	return nat_failed(pr->ice.agent);
 }
 
 int peering_net_fan(struct peering_net *m, char *sdp, size_t cap)

@@ -207,15 +207,6 @@ struct conn {
 	/* This connection's ICE identity. A fresh one per host offer (single-use
 	 * per join, so two clients never share credentials); the client keeps its
 	 * one identity for the session. */
-	/* The peer ICE identity that primed this agent. Candidate trickles from
-	 * a rotated offer must not be sent to an agent for an older offer. */
-	char remote_ufrag[40];
-	char remote_pwd[40];		/* which attempt of that peer, so a later
-					 * one can take this punch's place */
-	uint32_t remote_gen;		/* the offer's network generation when it
-					 * primed us: a higher one now is a move,
-					 * not a mere pickup rotation */
-
 	/*
 	 * The three planes this connection peers through: what its probes and
 	 * stream datagrams are sealed under, the paths that carry them, and the
@@ -1382,7 +1373,7 @@ static void pool_pump(struct sess *s)
 	}
 	if (sdp_ready(s) && n >= 2 && n > s->net.pool.posted) {
 		s->net.pool.posted = fan_local_sdp(s);
-		sig_set_claim_offer(s->pm.sig, s->c.remote_ufrag);
+		sig_set_claim_offer(s->pm.sig, s->c.pr.ice.remote_ufrag);
 		sig_post(s->pm.sig, (const uint8_t *)local_sdp(s),
 			 strlen(local_sdp(s)));
 		/* The fan is the whole answer to a carrier that picks a
@@ -1975,13 +1966,13 @@ static int offer_moved_on(struct conn *c)
 
 	if (s->cfg->is_host || path_ready(c))
 		return 0;
-	if (!c->remote_ufrag[0] || !s->cur_offer_ufrag[0])
+	if (!c->pr.ice.remote_ufrag[0] || !s->cur_offer_ufrag[0])
 		return 0;
-	if (!strcmp(s->cur_offer_ufrag, c->remote_ufrag))
+	if (!strcmp(s->cur_offer_ufrag, c->pr.ice.remote_ufrag))
 		return 0;
 	/* A higher generation than primed us is a move, not a pickup rotation:
 	 * the offer's candidates are new, so re-claim at once with no floor. */
-	if (sig_peer_gen(s->pm.sig) > c->remote_gen)
+	if (sig_peer_gen(s->pm.sig) > c->pr.ice.remote_gen)
 		return strcmp(s->cur_offer_ufrag, s->regathered_for) != 0;
 	/* The long floor is only for a client being punched, whose claim was
 	 * taken up; one never picked up, never in the slot or queued over by a
@@ -2284,26 +2275,15 @@ static void host_lan_recv(void *arg, const struct sockaddr *src, socklen_t srcle
 		probe_adopt(s, data, len, &mapped);
 }
 
-/* Trickle the peer's latest candidates into an agent still punching; same
- * credentials let libjuice add the new lines and ignore repeats. Skipped once
- * connected, when redelivered dups only churn the candidate table. */
 static void conn_amend_remote(struct conn *c, struct sess *s)
 {
 	char filtered[NAT_SDP_MAX];
 
-	if (!c || !c->pr.ice.agent || nat_connected(c->pr.ice.agent))
+	if (!c)
 		return;
 	sdp_filter_peer(s->peer_sdp, s->cfg->family, filtered,
 			sizeof(filtered));
-	nat_set_remote_description(c->pr.ice.agent, filtered);
-}
-
-/* True when a freshly-seen offer names a different peer identity than the one
- * this end primed against: a rotation or a move, not the primed offer's own
- * later candidates. */
-static int offer_rotated(const char *primed_ufrag, const char *offer_ufrag)
-{
-	return primed_ufrag[0] && strcmp(offer_ufrag, primed_ufrag) != 0;
+	peering_ice_amend(&c->pr, filtered);
 }
 
 static void on_peer_offer(void *arg, const uint8_t *data, size_t len)
@@ -2328,7 +2308,7 @@ static void on_peer_offer(void *arg, const uint8_t *data, size_t len)
 	incoming[len] = '\0';
 	cand_sdp_ufrag(incoming, ufrag, sizeof(ufrag));
 	snprintf(s->cur_offer_ufrag, sizeof(s->cur_offer_ufrag), "%s", ufrag);
-	if (offer_rotated(c->remote_ufrag, ufrag)) {
+	if (peering_ice_rotated(&c->pr, ufrag)) {
 		dbg_logf("session: ignore rotated offer while punching");
 		return;
 	}
@@ -2379,7 +2359,7 @@ static void conn_gen_ice(struct conn *c)
 	c->claim_held_seen = 0;
 	c->claim_lost = 0;
 	c->claim_released_ms = 0;
-	c->remote_ufrag[0] = '\0';
+	c->pr.ice.remote_ufrag[0] = '\0';
 }
 
 static int nat_setup(struct conn *c)
@@ -2897,7 +2877,7 @@ static void resume_tick(struct conn *c)
 		conn_fresh_pwd(c);
 		s->have_peer_sdp = 0;
 		s->remote_set = 0;
-		c->remote_ufrag[0] = '\0';
+		c->pr.ice.remote_ufrag[0] = '\0';
 		peering_desc_clear(&s->net.desc);
 		if (nat_setup(c))
 			return;
@@ -2913,7 +2893,7 @@ static void resume_tick(struct conn *c)
 				   sizeof(filtered));
 			peering_desc_set(&s->net.desc, filtered);
 			s->net.pool.posted = fan_local_sdp(s);
-			sig_set_claim_offer(s->pm.sig, c->remote_ufrag);
+			sig_set_claim_offer(s->pm.sig, c->pr.ice.remote_ufrag);
 			sig_post(s->pm.sig, (const uint8_t *)local_sdp(s),
 				 strlen(local_sdp(s)));
 			sig_redeliver(s->pm.sig);
@@ -2931,17 +2911,15 @@ static void resume_tick(struct conn *c)
 
 			sdp_filter_peer(s->peer_sdp, s->cfg->family, filtered,
 					sizeof(filtered));
-			if (!nat_set_remote_description(c->pr.ice.agent, filtered)) {
-				cand_sdp_ufrag(s->peer_sdp, ufrag, sizeof(ufrag));
-				snprintf(c->remote_ufrag,
-					 sizeof(c->remote_ufrag), "%s", ufrag);
-				c->remote_gen = sig_peer_gen(s->pm.sig);
+			cand_sdp_ufrag(s->peer_sdp, ufrag, sizeof(ufrag));
+			if (!peering_ice_prime(&c->pr, filtered, ufrag, NULL)) {
+				c->pr.ice.remote_gen = sig_peer_gen(s->pm.sig);
 				s->remote_set = 1;
 				dbg_logf("resume: primed offer %s", ufrag);
 				/* Named, and posted only once primed: the host
 				 * punches the agent this end punches, not whatever
 				 * listener a rotation left in the slot. */
-				sig_set_claim_offer(s->pm.sig, c->remote_ufrag);
+				sig_set_claim_offer(s->pm.sig, c->pr.ice.remote_ufrag);
 				sig_post(s->pm.sig, (const uint8_t *)local_sdp(s),
 					 strlen(local_sdp(s)));
 				dbg_logf("resume: claim posted for %s", ufrag);
@@ -2954,7 +2932,7 @@ static void resume_tick(struct conn *c)
 			n = peering_pool_count(&s->net.pool);
 			if (n >= 2 && n > s->net.pool.posted) {
 				s->net.pool.posted = fan_local_sdp(s);
-				sig_set_claim_offer(s->pm.sig, c->remote_ufrag);
+				sig_set_claim_offer(s->pm.sig, c->pr.ice.remote_ufrag);
 				sig_post(s->pm.sig, (const uint8_t *)local_sdp(s),
 					 strlen(local_sdp(s)));
 				dbg_logf("resume: trickled pool -> %d", n);
@@ -2964,8 +2942,8 @@ static void resume_tick(struct conn *c)
 		 * gone: re-gather. A same-generation rotation is pickup churn,
 		 * and chasing it aborts a punch still in flight. */
 		if (s->remote_set && s->cur_offer_ufrag[0] &&
-		    offer_rotated(c->remote_ufrag, s->cur_offer_ufrag) &&
-		    sig_peer_gen(s->pm.sig) > c->remote_gen) {
+		    peering_ice_rotated(&c->pr, s->cur_offer_ufrag) &&
+		    sig_peer_gen(s->pm.sig) > c->pr.ice.remote_gen) {
 			c->rs_state = 0;
 			return;
 		}
@@ -2974,7 +2952,7 @@ static void resume_tick(struct conn *c)
 			 * pair until it proves one or gives the pair up; re-gather
 			 * only when this end moved or the agent is spent, not on a
 			 * clock that would abort a punch still landing. */
-			if (!s->remote_set || s->net_ch || nat_failed(c->pr.ice.agent)) {
+			if (!s->remote_set || s->net_ch || peering_ice_failed(&c->pr)) {
 				c->rs_state = 0;
 				return;
 			}
@@ -2982,7 +2960,7 @@ static void resume_tick(struct conn *c)
 			 * the worker on a stale claim, and losing it forces a
 			 * full re-join. Same credentials, punch undisturbed. */
 			if (peering_desc_have(&s->net.desc)) {
-				sig_set_claim_offer(s->pm.sig, c->remote_ufrag);
+				sig_set_claim_offer(s->pm.sig, c->pr.ice.remote_ufrag);
 				sig_post(s->pm.sig, (const uint8_t *)local_sdp(s),
 					 strlen(local_sdp(s)));
 			}
@@ -4106,7 +4084,7 @@ static int punch_tried_again(const struct sess *s, const char *ufrag,
 	for (i = 0; i < HOST_MAX_WORKERS; i++)
 		if (s->punching[i] &&
 		    !strcmp(s->punching[i]->punch_ufrag, ufrag))
-			return strcmp(s->punching[i]->remote_pwd, pwd) != 0;
+			return strcmp(s->punching[i]->pr.ice.remote_pwd, pwd) != 0;
 	return 0;
 }
 
@@ -4128,7 +4106,7 @@ static void punch_amend_repost(struct sess *s, const char *ufrag,
 {
 	struct conn *pc = punch_by_ufrag(s, ufrag);
 
-	if (pc && !strcmp(pc->remote_pwd, pwd))
+	if (pc && !strcmp(pc->pr.ice.remote_pwd, pwd))
 		conn_amend_remote(pc, s);
 }
 
@@ -4141,7 +4119,7 @@ static int punch_dup(const struct sess *s, const char *ufrag, const char *pwd)
 	for (i = 0; i < HOST_MAX_WORKERS; i++)
 		if (s->punching[i] &&
 		    !strcmp(s->punching[i]->punch_ufrag, ufrag) &&
-		    !strcmp(s->punching[i]->remote_pwd, pwd))
+		    !strcmp(s->punching[i]->pr.ice.remote_pwd, pwd))
 			return 1;
 	return 0;
 }
@@ -4314,8 +4292,8 @@ static void punch_scan(struct sess *s, struct worker *ws, int *dash_seq)
 				}
 				c->pr.ice.agent = NULL;
 				c->pr.ice.ctx = NULL;
-				snprintf(t->remote_pwd, sizeof(t->remote_pwd),
-					 "%s", c->remote_pwd);
+				snprintf(t->pr.ice.remote_pwd, sizeof(t->pr.ice.remote_pwd),
+					 "%s", c->pr.ice.remote_pwd);
 				if (c->punch_resume)
 					__atomic_sub_fetch(&t->resume_pending, 1,
 							   __ATOMIC_RELAXED);
@@ -4366,7 +4344,7 @@ static void punch_scan(struct sess *s, struct worker *ws, int *dash_seq)
 			if (claim_served_has(&s->served, c->punch_ufrag))
 				conn_tell_fresh(c, NULL);
 			claim_served_note(&s->served, c->punch_ufrag,
-					  c->remote_pwd);
+					  c->pr.ice.remote_pwd);
 			conn_register(s, c);
 			if (worker_spawn(ws, c))
 				conn_free(c);		/* table full */
@@ -4382,7 +4360,7 @@ static void punch_scan(struct sess *s, struct worker *ws, int *dash_seq)
 		} else if (now_ms() - c->punch_start_ms >
 			   ((c->punch_resume && conn_is_proven(c->punch_resume)) ?
 			    ICE_ATTEMPT_MS : HOST_PUNCH_MS) ||
-			   (!c->punch_stuck && nat_failed(c->pr.ice.agent))) {
+			   (!c->punch_stuck && peering_ice_failed(&c->pr))) {
 			dbg_logf("host: punch %s -> drop",
 				 c->punch_stuck ? "wedged (test)" : "failed");
 			if (c->punch_resume) {
@@ -4520,7 +4498,7 @@ static void offer_gc(struct kept_offer *ring, uint64_t now)
 	for (i = 0; i < OFFER_KEEP_MAX; i++) {
 		if (!ring[i].c)
 			continue;
-		if (now < ring[i].until_ms && !nat_failed(ring[i].c->pr.ice.agent))
+		if (now < ring[i].until_ms && !peering_ice_failed(&ring[i].c->pr))
 			continue;
 		conn_free(ring[i].c);
 		ring[i].c = NULL;
@@ -4555,10 +4533,8 @@ static int punch_take(struct sess *s, struct conn *pc, struct conn *resume,
 		      int pslot, const char *cu, const char *cp,
 		      const char *filtered, int stuck)
 {
-	if (nat_set_remote_description(pc->pr.ice.agent, filtered))
+	if (peering_ice_prime(&pc->pr, filtered, cu, cp))
 		return -1;
-	snprintf(pc->remote_ufrag, sizeof(pc->remote_ufrag), "%s", cu);
-	snprintf(pc->remote_pwd, sizeof(pc->remote_pwd), "%s", cp);
 	if (resume) {
 		__atomic_add_fetch(&resume->resume_pending, 1, __ATOMIC_RELAXED);
 		__atomic_store_n(&resume->resume_last_ms, now_ms(),
@@ -4951,7 +4927,7 @@ static int host_turnstile(struct sess *s)
 					int just = s->have_served &&
 						   !strcmp(cu,
 							   s->last_served_ufrag);
-					int made = w && claim_made(w->remote_pwd,
+					int made = w && claim_made(w->pr.ice.remote_pwd,
 								   cp);
 
 					again = punch_tried_again(s, cu, cp);
@@ -5435,7 +5411,7 @@ int session_run(const struct session_cfg *cfg)
 					   sizeof(filtered));
 				peering_desc_set(&s.net.desc, filtered);
 				s.net.pool.posted = fan_local_sdp(&s);
-				sig_set_claim_offer(s.pm.sig, s.c.remote_ufrag);
+				sig_set_claim_offer(s.pm.sig, s.c.pr.ice.remote_ufrag);
 				sig_post(s.pm.sig,
 					 (const uint8_t *)local_sdp(&s),
 					 strlen(local_sdp(&s)));
@@ -5450,14 +5426,13 @@ int session_run(const struct session_cfg *cfg)
 
 				sdp_filter_peer(s.peer_sdp, cfg->family, filtered,
 					   sizeof(filtered));
-				if (nat_set_remote_description(s.c.pr.ice.agent, filtered)) {
+				cand_sdp_ufrag(s.peer_sdp, ufrag, sizeof(ufrag));
+				if (peering_ice_prime(&s.c.pr, filtered, ufrag,
+						      NULL)) {
 					st = ST_FAIL;
 					break;
 				}
-				cand_sdp_ufrag(s.peer_sdp, ufrag, sizeof(ufrag));
-				snprintf(s.c.remote_ufrag, sizeof(s.c.remote_ufrag),
-					 "%s", ufrag);
-				s.c.remote_gen = sig_peer_gen(s.pm.sig);
+				s.c.pr.ice.remote_gen = sig_peer_gen(s.pm.sig);
 				/* The claimant a single-connection host serves is
 				 * the identity in the answer it takes up, as
 				 * lan_drain and the turnstile record theirs. */
@@ -5471,7 +5446,7 @@ int session_run(const struct session_cfg *cfg)
 				s.net.pool.posted = fan_local_sdp(&s);
 							/* members learnt since
 							 * the ST_GATHER post */
-				sig_set_claim_offer(s.pm.sig, s.c.remote_ufrag);
+				sig_set_claim_offer(s.pm.sig, s.c.pr.ice.remote_ufrag);
 				sig_post(s.pm.sig,
 					 (const uint8_t *)local_sdp(&s),
 					 strlen(local_sdp(&s)));
@@ -5547,7 +5522,7 @@ int session_run(const struct session_cfg *cfg)
 				st = ST_RUN;
 				break;
 			}
-			if (nat_failed(s.c.pr.ice.agent) ||
+			if (peering_ice_failed(&s.c.pr) ||
 			    now_ms() - s.ice_attempt_start > ICE_ATTEMPT_MS) {
 				__atomic_add_fetch(&s.ice_attempt, 1, __ATOMIC_RELAXED);
 				conn_ice_stop(&s.c);

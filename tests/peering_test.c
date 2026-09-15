@@ -707,9 +707,34 @@ static void a_datagram_is_the_engine_s_until_it_says_otherwise(void)
 	peering_model_destroy(&pm);
 }
 
+/*
+ * A rotation is read against the identity that primed this carrier, so the
+ * primed offer's own later candidates are not mistaken for a peer that has
+ * moved on, and nothing counts as a rotation before anything has primed it.
+ */
+static void a_rotation_is_read_against_what_primed_us(void)
+{
+	static const uint8_t key[32] = { 3 };
+	struct peering_model pm;
+	struct peering pr;
+
+	peering_model_init(&pm, 0, 1, NULL, 1000);
+	peering_init(&pr, &pm, 1, key, 1000);
+
+	assert(!peering_ice_rotated(&pr, "abcd"));
+
+	snprintf(pr.ice.remote_ufrag, sizeof(pr.ice.remote_ufrag), "abcd");
+	assert(!peering_ice_rotated(&pr, "abcd"));
+	assert(peering_ice_rotated(&pr, "efgh"));
+
+	peering_destroy(&pr);
+	peering_model_destroy(&pm);
+}
+
 int main(void)
 {
 	what_is_posted_is_taken_once();
+	a_rotation_is_read_against_what_primed_us();
 	a_datagram_is_the_engine_s_until_it_says_otherwise();
 	the_anchor_outranks_the_name_we_started_with();
 	a_gathered_description_is_taken_once();
