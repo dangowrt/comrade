@@ -1093,6 +1093,52 @@ int peering_model_sig(struct peering_model *pm, struct sig *sig, uint64_t now)
 	return 0;
 }
 
+int peering_seed_pick(struct peering_model *pm, int family,
+		      const struct peering_seed *fallback,
+		      uint8_t *out, size_t cap)
+{
+	uint8_t node[NETSTATE_SA_MAX];
+	uint8_t nlen = 0;
+
+	if (netstate_anchor(&pm->ns, family, node, &nlen, NULL) && nlen &&
+	    (size_t)nlen <= cap) {
+		memcpy(out, node, nlen);
+		return nlen;
+	}
+	if (fallback && fallback->len > 0 && (size_t)fallback->len <= cap) {
+		memcpy(out, fallback->sa, (size_t)fallback->len);
+		return fallback->len;
+	}
+	return 0;
+}
+
+void peering_seed_rendezvous(struct peering_model *pm,
+			     const struct peering_seed fallback[2],
+			     uint64_t now)
+{
+	static const int famv[2] = { 4, 6 };
+	int i;
+
+	for (i = 0; i < 2; i++) {
+		struct sockaddr_storage ss;
+		int len;
+
+		len = peering_seed_pick(pm, famv[i],
+					fallback ? &fallback[i] : NULL,
+					(uint8_t *)&ss, sizeof(ss));
+		if (!len)
+			continue;
+		if (pm->is_host)
+			sig_reinforce(pm->sig, famv[i], (struct sockaddr *)&ss,
+				      (socklen_t)len);
+		else if (sig_seed_node(pm->sig, (struct sockaddr *)&ss,
+				       (socklen_t)len))
+			continue;
+		netstate_on_rdv_offered(&pm->ns, famv[i], (const uint8_t *)&ss,
+					len, now);
+	}
+}
+
 int peering_net_stun_pick(const struct peering_net *m, unsigned attempt,
 			  char *host, size_t hostlen, uint16_t *port)
 {

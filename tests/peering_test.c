@@ -5,6 +5,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "wsock.h"
+
 #include "hbeat.h"
 #include "peering.h"
 
@@ -620,9 +622,57 @@ static void an_offer_with_nothing_to_aim_at_is_named(void)
 		"v=0\na=candidate:1 1 udp 1 10.0.0.1 1 typ host\n"));
 }
 
+/*
+ * A fresh signaller is seeded from the anchor the model holds; the name the
+ * playbook was started with is taken only where it holds none, since one
+ * minted long ago can point at a node that has since gone.
+ */
+static void the_anchor_outranks_the_name_we_started_with(void)
+{
+	struct sockaddr_in tokn, anch;
+	struct peering_seed seed[2];
+	uint8_t out[NETSTATE_SA_MAX];
+	struct peering_model pm;
+
+	memset(seed, 0, sizeof(seed));
+	memset(&tokn, 0, sizeof(tokn));
+	tokn.sin_family = AF_INET;
+	tokn.sin_port = htons(6881);
+	assert(inet_pton(AF_INET, "198.51.100.7", &tokn.sin_addr) == 1);
+	memcpy(seed[0].sa, &tokn, sizeof(tokn));
+	seed[0].len = (int)sizeof(tokn);
+
+	peering_model_init(&pm, 0, 1, NULL, 1000);
+
+	/* Neither: nothing to plant, and v6 has nothing either way. */
+	assert(!peering_seed_pick(&pm, 6, &seed[1], out, sizeof(out)));
+
+	/* Only the name we were started with. */
+	assert(peering_seed_pick(&pm, 4, &seed[0], out, sizeof(out)) ==
+	       (int)sizeof(tokn));
+	assert(!memcmp(out, &tokn, sizeof(tokn)));
+
+	memset(&anch, 0, sizeof(anch));
+	anch.sin_family = AF_INET;
+	anch.sin_port = htons(6882);
+	assert(inet_pton(AF_INET, "198.51.100.9", &anch.sin_addr) == 1);
+	netstate_on_rdv_offered(&pm.ns, 4, (const uint8_t *)&anch,
+				(int)sizeof(anch), 1000);
+
+	/* Now the model holds one, and it wins. */
+	assert(peering_seed_pick(&pm, 4, &seed[0], out, sizeof(out)) ==
+	       (int)sizeof(anch));
+	assert(!memcmp(out, &anch, sizeof(anch)));
+
+	/* A destination too small is refused outright, never half-filled. */
+	assert(!peering_seed_pick(&pm, 4, &seed[0], out, 1));
+	peering_model_destroy(&pm);
+}
+
 int main(void)
 {
 	what_is_posted_is_taken_once();
+	the_anchor_outranks_the_name_we_started_with();
 	a_gathered_description_is_taken_once();
 	the_local_copy_may_be_rewritten_in_place();
 	candidates_accumulate_until_drained();

@@ -447,6 +447,39 @@ struct peering_settle {
 int peering_model_sig(struct peering_model *pm, struct sig *sig, uint64_t now);
 
 /*
+ * A node to seed a fresh signaller with for one family, where the model holds
+ * no anchor of its own: the playbook's, out of whatever named it to this end.
+ * A zero length is a family it has nothing for.
+ */
+struct peering_seed {
+	uint8_t sa[NETSTATE_SA_MAX];	/* opaque sockaddr bytes */
+	int len;
+};
+
+/*
+ * Plant a rendezvous node per family into a newly built signaller, so a name
+ * already in somebody's hands keeps pointing at a node that serves this
+ * mailbox.
+ *
+ * The anchor the model holds wins, whether this end found it or a peer handed
+ * it over the channel; `fallback` ([0] v4, [1] v6) is taken only where it has
+ * none, since a name minted long ago can point at a node that has since gone.
+ * A host reinforces what it plants and a client seeds it as a hint to query
+ * before the DHT has converged: which of the two applies is read from the
+ * mailbox, not passed in. What is planted counts as offered and not
+ * confirmed until it has answered here.
+ */
+void peering_seed_rendezvous(struct peering_model *pm,
+			     const struct peering_seed fallback[2],
+			     uint64_t now);
+
+/* Which node that rule picks for one family, as opaque sockaddr bytes into
+ * `out`; the length, or 0 where neither the model nor the playbook has one. */
+int peering_seed_pick(struct peering_model *pm, int family,
+		      const struct peering_seed *fallback,
+		      uint8_t *out, size_t cap);
+
+/*
  * ONE PASS OVER THE MODEL, in the only order the three model phases run in.
  *
  * Every peer's peering_absorb belongs immediately before this, so that what a
