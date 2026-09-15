@@ -174,6 +174,105 @@ void peering_pool_reset(struct peering_pool *p)
 	pthread_mutex_unlock(&p->lock);
 }
 
+void peering_desc_init(struct peering_desc *d)
+{
+	memset(d, 0, sizeof(*d));
+	pthread_mutex_init(&d->lock, NULL);
+}
+
+void peering_desc_destroy(struct peering_desc *d)
+{
+	pthread_mutex_destroy(&d->lock);
+}
+
+void peering_desc_gathered(struct peering_desc *d, const char *sdp)
+{
+	pthread_mutex_lock(&d->lock);
+	snprintf(d->pending, sizeof(d->pending), "%s", sdp);
+	d->pending_set = 1;
+	pthread_mutex_unlock(&d->lock);
+}
+
+void peering_desc_candidate(struct peering_desc *d, const char *cand)
+{
+	size_t used, room, n = strlen(cand);
+
+	pthread_mutex_lock(&d->lock);
+	used = strlen(d->trickle);
+	room = sizeof(d->trickle) - used - 1;
+	if (n + 1 <= room) {
+		memcpy(d->trickle + used, cand, n);
+		d->trickle[used + n] = '\n';
+		d->trickle[used + n + 1] = '\0';
+		__atomic_store_n(&d->dirty, 1, __ATOMIC_RELAXED);
+	}
+	pthread_mutex_unlock(&d->lock);
+}
+
+int peering_desc_take(struct peering_desc *d, char *raw, size_t cap)
+{
+	int staged;
+
+	pthread_mutex_lock(&d->lock);
+	staged = d->pending_set;
+	if (staged) {
+		snprintf(raw, cap, "%s", d->pending);
+		d->pending_set = 0;
+	}
+	pthread_mutex_unlock(&d->lock);
+	return staged;
+}
+
+void peering_desc_set(struct peering_desc *d, const char *sdp)
+{
+	if (sdp != d->local)
+		snprintf(d->local, sizeof(d->local), "%s", sdp);
+	d->have_local = 1;
+}
+
+int peering_desc_drain(struct peering_desc *d, char *out, size_t cap)
+{
+	if (!__atomic_load_n(&d->dirty, __ATOMIC_RELAXED))
+		return 0;
+	pthread_mutex_lock(&d->lock);
+	snprintf(out, cap, "%s", d->trickle);
+	d->trickle[0] = '\0';
+	__atomic_store_n(&d->dirty, 0, __ATOMIC_RELAXED);
+	pthread_mutex_unlock(&d->lock);
+	return 1;
+}
+
+char *peering_desc_local(struct peering_desc *d)
+{
+	return d->local;
+}
+
+int peering_desc_have(const struct peering_desc *d)
+{
+	return d->have_local;
+}
+
+void peering_desc_drop(struct peering_desc *d)
+{
+	d->have_local = 0;
+	d->local[0] = '\0';
+}
+
+void peering_desc_clear(struct peering_desc *d)
+{
+	peering_desc_drop(d);
+	pthread_mutex_lock(&d->lock);
+	d->trickle[0] = '\0';
+	__atomic_store_n(&d->dirty, 0, __ATOMIC_RELAXED);
+	d->pending_set = 0;
+	pthread_mutex_unlock(&d->lock);
+}
+
+int peering_sdp_has_candidate(const char *sdp)
+{
+	return strstr(sdp, "a=candidate:") != NULL;
+}
+
 static void probe_hit(void *arg, const uint8_t addr[4], uint16_t port)
 {
 	struct peering_net *m = arg;
@@ -258,6 +357,7 @@ void peering_net_init(struct peering_net *m, char *const *servers,
 	m->nservers = nservers;
 	m->auto_probe = auto_probe;
 	peering_facts_init(&m->facts);
+	peering_desc_init(&m->desc);
 	peering_pool_init(&m->pool);
 }
 
@@ -290,6 +390,7 @@ void peering_net_stop(struct peering_net *m)
 void peering_net_destroy(struct peering_net *m)
 {
 	peering_facts_destroy(&m->facts);
+	peering_desc_destroy(&m->desc);
 	peering_pool_destroy(&m->pool);
 }
 

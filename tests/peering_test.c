@@ -506,9 +506,129 @@ static void rotating_to_the_next_server_is_earned_and_bounded(void)
 	peering_net_destroy(&pinned);
 }
 
+/*
+ * The gather thread stages a description, the loop takes it exactly once.
+ * Taking it does not make it the loop's copy: that happens when the caller
+ * hands the canonicalised text back.
+ */
+static void a_gathered_description_is_taken_once(void)
+{
+	struct peering_desc d;
+	char raw[NAT_SDP_MAX];
+
+	peering_desc_init(&d);
+	assert(!peering_desc_have(&d));
+	assert(!peering_desc_take(&d, raw, sizeof(raw)));
+
+	peering_desc_gathered(&d, "v=0\na=candidate:1 1 udp 1 10.0.0.1 1 typ host\n");
+	assert(peering_desc_take(&d, raw, sizeof(raw)) == 1);
+	assert(!strncmp(raw, "v=0\n", 4));
+	assert(!peering_desc_take(&d, raw, sizeof(raw)));
+	assert(!peering_desc_have(&d));
+
+	peering_desc_set(&d, raw);
+	assert(peering_desc_have(&d));
+	assert(!strcmp(peering_desc_local(&d), raw));
+	peering_desc_destroy(&d);
+}
+
+/* Canonicalising in place is what the loop does, and marking it must survive
+ * the description and the buffer being one and the same. */
+static void the_local_copy_may_be_rewritten_in_place(void)
+{
+	struct peering_desc d;
+
+	peering_desc_init(&d);
+	peering_desc_gathered(&d, "v=0\n");
+	assert(peering_desc_take(&d, peering_desc_local(&d), NAT_SDP_MAX));
+	peering_desc_set(&d, peering_desc_local(&d));
+	assert(peering_desc_have(&d));
+	assert(!strcmp(peering_desc_local(&d), "v=0\n"));
+	peering_desc_destroy(&d);
+}
+
+/* Candidates accumulate as they arrive and drain in one go, one per line. */
+static void candidates_accumulate_until_drained(void)
+{
+	struct peering_desc d;
+	char out[NAT_SDP_MAX];
+
+	peering_desc_init(&d);
+	assert(!peering_desc_drain(&d, out, sizeof(out)));
+
+	peering_desc_candidate(&d, "a=candidate:1 1 udp 1 10.0.0.1 1 typ host");
+	peering_desc_candidate(&d, "a=candidate:2 1 udp 1 10.0.0.2 1 typ srflx");
+	assert(peering_desc_drain(&d, out, sizeof(out)) == 1);
+	assert(strstr(out, "10.0.0.1") && strstr(out, "10.0.0.2"));
+	assert(strchr(out, '\n'));
+	assert(!peering_desc_drain(&d, out, sizeof(out)));
+	peering_desc_destroy(&d);
+}
+
+/* A candidate that does not fit is dropped whole, never half-written: the
+ * drain would otherwise hand a peer a truncated line to aim at. */
+static void a_candidate_that_does_not_fit_is_dropped(void)
+{
+	char line[NAT_SDP_MAX / 2 + 8];
+	struct peering_desc d;
+	char out[NAT_SDP_MAX];
+	size_t first;
+
+	memset(line, 'c', sizeof(line) - 1);
+	line[sizeof(line) - 1] = '\0';
+	peering_desc_init(&d);
+	peering_desc_candidate(&d, line);
+	peering_desc_candidate(&d, line);
+	peering_desc_candidate(&d, line);
+	assert(peering_desc_drain(&d, out, sizeof(out)) == 1);
+	first = strlen(line) + 1;
+	assert(strlen(out) == first || strlen(out) == first * 2);
+	peering_desc_destroy(&d);
+}
+
+/* Dropping forgets the description; clearing forgets what the old agent's
+ * gather thread had left staged as well. */
+static void a_move_forgets_the_staged_work_too(void)
+{
+	struct peering_desc d;
+	char buf[NAT_SDP_MAX];
+
+	peering_desc_init(&d);
+	peering_desc_set(&d, "v=0\n");
+	peering_desc_gathered(&d, "v=0\nstaged\n");
+	peering_desc_candidate(&d, "a=candidate:1 1 udp 1 10.0.0.1 1 typ host");
+
+	peering_desc_drop(&d);
+	assert(!peering_desc_have(&d));
+	assert(!peering_desc_local(&d)[0]);
+	assert(peering_desc_take(&d, buf, sizeof(buf)) == 1);
+	peering_desc_gathered(&d, "v=0\nstaged\n");
+
+	peering_desc_clear(&d);
+	assert(!peering_desc_have(&d));
+	assert(!peering_desc_take(&d, buf, sizeof(buf)));
+	assert(!peering_desc_drain(&d, buf, sizeof(buf)));
+	peering_desc_destroy(&d);
+}
+
+/* An offer with nothing to aim at is what must never reach the mailbox. */
+static void an_offer_with_nothing_to_aim_at_is_named(void)
+{
+	assert(!peering_sdp_has_candidate("v=0\no=- 0 0 IN IP4 0.0.0.0\n"));
+	assert(!peering_sdp_has_candidate(""));
+	assert(peering_sdp_has_candidate(
+		"v=0\na=candidate:1 1 udp 1 10.0.0.1 1 typ host\n"));
+}
+
 int main(void)
 {
 	what_is_posted_is_taken_once();
+	a_gathered_description_is_taken_once();
+	the_local_copy_may_be_rewritten_in_place();
+	candidates_accumulate_until_drained();
+	a_candidate_that_does_not_fit_is_dropped();
+	a_move_forgets_the_staged_work_too();
+	an_offer_with_nothing_to_aim_at_is_named();
 	rotating_to_the_next_server_is_earned_and_bounded();
 	the_link_verdict_follows_the_evidence();
 	the_server_an_attempt_asks_walks_the_list();
