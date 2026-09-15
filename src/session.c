@@ -4941,6 +4941,18 @@ static int host_turnstile(struct sess *s)
 					}
 					resume = w;
 				}
+				/* Naming no offer means the claimant had primed
+				 * none when it posted, and a pickup rotates this
+				 * one away, so the agent spent here is one it can
+				 * never answer: nat_connected() on such a punch is
+				 * guaranteed by RFC 8445 s7.3 rather than earned. */
+				if (!co[0]) {
+					dbg_logf("host: claim %.8s names no offer "
+						 "-- released", cu);
+					sig_release(s->pm.sig);
+					s->have_peer_sdp = 0;
+					break;
+				}
 				/* Neither listening nor kept: the listener's
 				 * credentials are not the ones it primed, so a
 				 * punch cannot land. */
