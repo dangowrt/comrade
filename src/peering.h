@@ -25,6 +25,7 @@
 #include "ctlproto.h"
 #include "netstate.h"
 #include "hbeat.h"
+#include "nat.h"
 #include "netmon.h"
 #include "obsemit.h"
 #include "sig.h"
@@ -184,9 +185,60 @@ struct peering_probe {
 	int start;			/* v6: where in the list it begins */
 };
 
+/*
+ * The description this end gathered, and the candidates still arriving.
+ *
+ * Two threads meet here. The carrier's gather thread leaves a description in
+ * `pending` and appends candidate lines to `trickle`; the loop takes both and
+ * keeps its own copy in `local`, which no callback ever touches. A playbook
+ * that shared one buffer between them would have the loop rewriting a
+ * description while the gather thread replaced it.
+ */
+struct peering_desc {
+	char local[NAT_SDP_MAX];	/* the loop's, canonical and posted */
+	char pending[NAT_SDP_MAX];	/* staged by the gather thread */
+	char trickle[NAT_SDP_MAX];	/* candidate lines since the last drain */
+	pthread_mutex_t lock;		/* pending and trickle */
+	volatile int dirty;		/* trickle has something in it */
+	int pending_set;
+	int have_local;
+};
+
+void peering_desc_init(struct peering_desc *d);
+void peering_desc_destroy(struct peering_desc *d);
+
+/* Gather thread: the description is ready, and one more candidate for it. */
+void peering_desc_gathered(struct peering_desc *d, const char *sdp);
+void peering_desc_candidate(struct peering_desc *d, const char *cand);
+
+/*
+ * Loop thread: take the staged description into `raw`, 1 when there was one.
+ * The caller canonicalises it and hands it back with peering_desc_set(), which
+ * is where this end owns both the description and the source address it is
+ * canonicalised against.
+ */
+int peering_desc_take(struct peering_desc *d, char *raw, size_t cap);
+void peering_desc_set(struct peering_desc *d, const char *sdp);
+
+/* Loop thread: the candidates that arrived since the last call, 1 when any. */
+int peering_desc_drain(struct peering_desc *d, char *out, size_t cap);
+
+char *peering_desc_local(struct peering_desc *d);
+int peering_desc_have(const struct peering_desc *d);
+
+/* Forget the description: the agent that gathered it is gone. */
+void peering_desc_drop(struct peering_desc *d);
+
+/* That, and everything the old agent's gather thread had left staged. */
+void peering_desc_clear(struct peering_desc *d);
+
+/* Whether a description has anything in it for a peer to aim at. */
+int peering_sdp_has_candidate(const char *sdp);
+
 /* What belongs to this machine, whichever peer it is talking to. */
 struct peering_net {
 	struct peering_facts facts;
+	struct peering_desc desc;
 	struct peering_pool pool;
 	struct peering_probe probe;	/* fills the pool, proves v4 */
 	struct peering_probe probe6;	/* proves v6 */

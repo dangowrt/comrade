@@ -393,32 +393,10 @@ struct sess {
 	uint64_t next_roam_ms;		/* next synthetic change (test_roam_ms) */
 	int roams;			/* synthetic changes reported so far */
 
-	char local_sdp[NAT_SDP_MAX];
-	int have_local_sdp;
-	/*
-	 * The description libjuice hands back, staged for the loop. The
-	 * callback runs on libjuice's thread while the loop is reading
-	 * local_sdp and rewriting it (fan_local_sdp), so the two cannot share
-	 * that buffer: the callback leaves the description here under
-	 * trickle_lock and pool_pump takes it, which is the same shape as the
-	 * candidates trickling in below. local_sdp and have_local_sdp are the
-	 * loop's alone.
-	 */
-	char pending_sdp[NAT_SDP_MAX];
-	int pending_sdp_set;
 	/* Some peer, at some point, got all the way through the control
 	 * handshake here. Written by whichever connection's thread sees the
 	 * first pong; only ever set, so a stale read costs one round. */
 	volatile int handshake_seen;
-	/*
-	 * Candidates as they trickle in (libjuice's gather thread appends here
-	 * under trickle_lock; the main loop drains and reports them), so the local
-	 * addresses show at once instead of waiting for gathering -- which can
-	 * stall behind a slow STUN server -- to finish.
-	 */
-	char trickle_sdp[NAT_SDP_MAX];
-	pthread_mutex_t trickle_lock;
-	volatile int trickle_dirty;
 	char peer_sdp[NAT_SDP_MAX];
 	volatile int have_peer_sdp;
 	int remote_set;
@@ -1050,6 +1028,11 @@ static void conn_offer_path(struct conn *c, const struct sockaddr *sa,
 	peering_offer_path(&c->pr, &remote, now_ms());
 }
 
+static char *local_sdp(struct sess *s)
+{
+	return peering_desc_local(&s->net.desc);
+}
+
 /*
  * Hand each local ICE candidate to the model, classified by scope and how it
  * was learnt. Re-run as they trickle in; the model de-duplicates.
@@ -1111,7 +1094,7 @@ static void report_candidates(struct sess *s, const char *sdp)
 
 static void obs_report_net(struct sess *s)
 {
-	report_candidates(s, s->local_sdp);
+	report_candidates(s, local_sdp(s));
 }
 
 /*
@@ -1222,7 +1205,7 @@ static void sdp_filter(const char *in, int family, char *out, size_t outlen)
  */
 static int fan_local_sdp(struct sess *s)
 {
-	return peering_net_fan(&s->net, s->local_sdp, sizeof(s->local_sdp));
+	return peering_net_fan(&s->net, local_sdp(s), NAT_SDP_MAX);
 }
 
 /*
@@ -1360,22 +1343,15 @@ static void log_offer(const char *sdp, int served, int active)
  */
 static int sdp_ready(struct sess *s)
 {
+	char *local = peering_desc_local(&s->net.desc);
 	char raw[NAT_SDP_MAX];
-	int staged;
 
-	pthread_mutex_lock(&s->trickle_lock);
-	staged = s->pending_sdp_set;
-	if (staged) {
-		memcpy(raw, s->pending_sdp, sizeof(raw));
-		s->pending_sdp_set = 0;
+	if (peering_desc_take(&s->net.desc, raw, sizeof(raw))) {
+		canon_v6(raw, netstate_src_text(&s->pm.ns, 6), local,
+			 NAT_SDP_MAX);
+		peering_desc_set(&s->net.desc, local);
 	}
-	pthread_mutex_unlock(&s->trickle_lock);
-	if (staged) {
-		canon_v6(raw, netstate_src_text(&s->pm.ns, 6), s->local_sdp,
-			 sizeof(s->local_sdp));
-		s->have_local_sdp = 1;
-	}
-	return s->have_local_sdp;
+	return peering_desc_have(&s->net.desc);
 }
 
 static void pool_pump(struct sess *s)
@@ -1407,14 +1383,14 @@ static void pool_pump(struct sess *s)
 	if (sdp_ready(s) && n >= 2 && n > s->net.pool.posted) {
 		s->net.pool.posted = fan_local_sdp(s);
 		sig_set_claim_offer(s->pm.sig, s->c.remote_ufrag);
-		sig_post(s->pm.sig, (const uint8_t *)s->local_sdp,
-			 strlen(s->local_sdp));
+		sig_post(s->pm.sig, (const uint8_t *)local_sdp(s),
+			 strlen(local_sdp(s)));
 		/* The fan is the whole answer to a carrier that picks a
 		 * different egress address per destination, and it reaches a
 		 * peer only through this re-post -- which is not the publish
 		 * the offer log reports, so without this the one thing that
 		 * makes such a network work is invisible. */
-		log_offer(s->local_sdp, -1, n);
+		log_offer(local_sdp(s), -1, n);
 	}
 }
 
@@ -1433,16 +1409,15 @@ static void offer_refresh(struct sess *s)
 		return;
 	if (nat_local_description(s->offer_conn->pr.ice.agent, raw, sizeof(raw)))
 		return;
-	pthread_mutex_lock(&s->trickle_lock);
-	snprintf(s->pending_sdp, sizeof(s->pending_sdp), "%s", raw);
-	s->pending_sdp_set = 1;
-	pthread_mutex_unlock(&s->trickle_lock);
+	peering_desc_gathered(&s->net.desc, raw);
 	if (!sdp_ready(s))
 		return;
-	sdp_filter(s->local_sdp, s->cfg->family, filtered, sizeof(filtered));
-	snprintf(s->local_sdp, sizeof(s->local_sdp), "%s", filtered);
+	sdp_filter(peering_desc_local(&s->net.desc), s->cfg->family, filtered,
+		   sizeof(filtered));
+	peering_desc_set(&s->net.desc, filtered);
 	fan_local_sdp(s);
-	sig_post(s->pm.sig, (const uint8_t *)s->local_sdp, strlen(s->local_sdp));
+	sig_post(s->pm.sig, (const uint8_t *)peering_desc_local(&s->net.desc),
+		 strlen(peering_desc_local(&s->net.desc)));
 }
 
 /* A late local candidate reached the model: re-post it to the mailbox (so the
@@ -1453,13 +1428,8 @@ static void trickle_flush(struct sess *s, const struct session_obs *o, int repos
 {
 	char buf[NAT_SDP_MAX];
 
-	if (!__atomic_load_n(&s->trickle_dirty, __ATOMIC_RELAXED))
+	if (!peering_desc_drain(&s->net.desc, buf, sizeof(buf)))
 		return;
-	pthread_mutex_lock(&s->trickle_lock);
-	memcpy(buf, s->trickle_sdp, sizeof(buf));
-	s->trickle_sdp[0] = '\0';
-	__atomic_store_n(&s->trickle_dirty, 0, __ATOMIC_RELAXED);
-	pthread_mutex_unlock(&s->trickle_lock);
 	if (repost)
 		offer_refresh(s);
 	if (o && o->net)
@@ -1603,10 +1573,7 @@ static void on_local_sdp(void *arg, const char *sdp)
 	 * through netstate_on_src while this read it. The loop canonicalises
 	 * when it takes the description, where it owns both sides.
 	 */
-	pthread_mutex_lock(&s->trickle_lock);
-	snprintf(s->pending_sdp, sizeof(s->pending_sdp), "%s", sdp);
-	s->pending_sdp_set = 1;
-	pthread_mutex_unlock(&s->trickle_lock);
+	peering_desc_gathered(&s->net.desc, sdp);
 }
 
 /* Leave a fact for the loop: called from threads that own none of the model,
@@ -1635,7 +1602,6 @@ static void on_ice_candidate(void *arg, const char *cand)
 	struct conn *cc = __atomic_load_n(&((struct ice_ctx *)arg)->c,
 					  __ATOMIC_ACQUIRE);
 	struct sess *s = cc->sess;
-	size_t used, room, n = strlen(cand);
 	const char *p = strstr(cand, "candidate:");
 	char addr[64], typ[16];
 
@@ -1660,16 +1626,7 @@ static void on_ice_candidate(void *arg, const char *cand)
 			__atomic_store_n(&s->have_priv4, 1, __ATOMIC_RELAXED);
 		}
 	}
-	pthread_mutex_lock(&s->trickle_lock);
-	used = strlen(s->trickle_sdp);
-	room = sizeof(s->trickle_sdp) - used - 1;
-	if (n + 1 <= room) {
-		memcpy(s->trickle_sdp + used, cand, n);
-		s->trickle_sdp[used + n] = '\n';
-		s->trickle_sdp[used + n + 1] = '\0';
-		__atomic_store_n(&s->trickle_dirty, 1, __ATOMIC_RELAXED);
-	}
-	pthread_mutex_unlock(&s->trickle_lock);
+	peering_desc_candidate(&s->net.desc, cand);
 }
 
 
@@ -2905,16 +2862,10 @@ static void net_watch(struct sess *s, uint64_t now)
 
 static void net_change_reset(struct sess *s)
 {
-	s->have_local_sdp = 0;
 	s->have_peer_sdp = 0;
 	s->remote_set = 0;
-	s->local_sdp[0] = '\0';
 	s->peer_sdp[0] = '\0';
-	pthread_mutex_lock(&s->trickle_lock);
-	s->trickle_sdp[0] = '\0';
-	__atomic_store_n(&s->trickle_dirty, 0, __ATOMIC_RELAXED);
-	s->pending_sdp_set = 0;
-	pthread_mutex_unlock(&s->trickle_lock);
+	peering_desc_clear(&s->net.desc);
 	peering_pool_reset(&s->net.pool);
 	s->stun_rotations = 0;
 	/* a fresh index: the per-session walk can leave a stale one on a dead
@@ -2992,15 +2943,10 @@ static void resume_tick(struct conn *c)
 	case 0:
 		conn_park_ice(c, now);
 		conn_fresh_pwd(c);
-		s->have_local_sdp = 0;
 		s->have_peer_sdp = 0;
 		s->remote_set = 0;
 		c->remote_ufrag[0] = '\0';
-		pthread_mutex_lock(&s->trickle_lock);
-		s->trickle_sdp[0] = '\0';
-		__atomic_store_n(&s->trickle_dirty, 0, __ATOMIC_RELAXED);
-		s->pending_sdp_set = 0;
-		pthread_mutex_unlock(&s->trickle_lock);
+		peering_desc_clear(&s->net.desc);
 		if (nat_setup(c))
 			return;
 		c->rs_state = 1;
@@ -3011,14 +2957,13 @@ static void resume_tick(struct conn *c)
 		if (sdp_ready(s)) {
 			char filtered[NAT_SDP_MAX];
 
-			sdp_filter(s->local_sdp, s->cfg->family, filtered,
+			sdp_filter(local_sdp(s), s->cfg->family, filtered,
 				   sizeof(filtered));
-			snprintf(s->local_sdp, sizeof(s->local_sdp), "%s",
-				 filtered);
+			peering_desc_set(&s->net.desc, filtered);
 			s->net.pool.posted = fan_local_sdp(s);
 			sig_set_claim_offer(s->pm.sig, c->remote_ufrag);
-			sig_post(s->pm.sig, (const uint8_t *)s->local_sdp,
-				 strlen(s->local_sdp));
+			sig_post(s->pm.sig, (const uint8_t *)local_sdp(s),
+				 strlen(local_sdp(s)));
 			sig_redeliver(s->pm.sig);
 			dbg_logf("resume: claim posted");
 			c->rs_state = 2;
@@ -3045,21 +2990,21 @@ static void resume_tick(struct conn *c)
 				 * punches the agent this end punches, not whatever
 				 * listener a rotation left in the slot. */
 				sig_set_claim_offer(s->pm.sig, c->remote_ufrag);
-				sig_post(s->pm.sig, (const uint8_t *)s->local_sdp,
-					 strlen(s->local_sdp));
+				sig_post(s->pm.sig, (const uint8_t *)local_sdp(s),
+					 strlen(local_sdp(s)));
 				dbg_logf("resume: claim posted for %s", ufrag);
 			}
 		}
 		/* Late pool addresses reach the host's in-flight punch only
 		 * through a re-post under the same credentials (a fresh gather
 		 * would mint a password and abort the punch). */
-		if (s->remote_set && s->have_local_sdp) {
+		if (s->remote_set && peering_desc_have(&s->net.desc)) {
 			n = peering_pool_count(&s->net.pool);
 			if (n >= 2 && n > s->net.pool.posted) {
 				s->net.pool.posted = fan_local_sdp(s);
 				sig_set_claim_offer(s->pm.sig, c->remote_ufrag);
-				sig_post(s->pm.sig, (const uint8_t *)s->local_sdp,
-					 strlen(s->local_sdp));
+				sig_post(s->pm.sig, (const uint8_t *)local_sdp(s),
+					 strlen(local_sdp(s)));
 				dbg_logf("resume: trickled pool -> %d", n);
 			}
 		}
@@ -3084,10 +3029,10 @@ static void resume_tick(struct conn *c)
 			/* Re-post the claim, not only the offer: the host reaps
 			 * the worker on a stale claim, and losing it forces a
 			 * full re-join. Same credentials, punch undisturbed. */
-			if (s->have_local_sdp) {
+			if (peering_desc_have(&s->net.desc)) {
 				sig_set_claim_offer(s->pm.sig, c->remote_ufrag);
-				sig_post(s->pm.sig, (const uint8_t *)s->local_sdp,
-					 strlen(s->local_sdp));
+				sig_post(s->pm.sig, (const uint8_t *)local_sdp(s),
+					 strlen(local_sdp(s)));
 			}
 			sig_redeliver(s->pm.sig);
 			c->rs_deadline = now + resume_backoff(c);
@@ -3593,16 +3538,10 @@ static int client_regather(struct sess *s)
 	s->established_fired = 0;
 	conn_ice_stop(&s->c);
 	conn_gen_ice(&s->c);
-	s->have_local_sdp = 0;
 	s->have_peer_sdp = 0;
 	s->remote_set = 0;
-	s->local_sdp[0] = '\0';
 	s->peer_sdp[0] = '\0';
-	pthread_mutex_lock(&s->trickle_lock);
-	s->trickle_sdp[0] = '\0';	/* drop the old agent's trickle */
-	__atomic_store_n(&s->trickle_dirty, 0, __ATOMIC_RELAXED);
-	s->pending_sdp_set = 0;
-	pthread_mutex_unlock(&s->trickle_lock);
+	peering_desc_clear(&s->net.desc);	/* the old agent's trickle too */
 	s->peer_state = SESSION_PEER_SEEN;
 	sig_redeliver(s->pm.sig);		/* we discarded the offer we were given */
 	return nat_setup(&s->c) ? -1 : 0;
@@ -3688,7 +3627,7 @@ static int run_ssh(struct sess *s)
  * global scope, since the v6 DHT is not reachable from a ULA or link-local. */
 static void update_expect(struct sess *s)
 {
-	const char *p = s->local_sdp;
+	const char *p = local_sdp(s);
 	char addr[64];
 
 	/* Recomputed, not accumulated: otherwise a family lost in a move is
@@ -4551,11 +4490,6 @@ static void punch_reap_oldest(struct sess *s, const char *ufrag)
  * sequential re-serve state machine instead.
  */
 
-/* Whether an offer has anything in it at all for a peer to aim at. */
-static int sdp_has_candidate(const char *sdp)
-{
-	return strstr(sdp, "a=candidate:") != NULL;
-}
 
 
 
@@ -4939,8 +4873,7 @@ static int host_turnstile(struct sess *s)
 			__atomic_add_fetch(&s->ice_attempt, 1, __ATOMIC_RELAXED);
 			s->stun_rotations++;
 			offer_retire(s, kept, &listen, 1, now_ms());
-			s->have_local_sdp = 0;
-			s->local_sdp[0] = '\0';
+			peering_desc_drop(&s->net.desc);
 			ts = TS_GATHER;
 		}
 
@@ -4950,11 +4883,10 @@ static int host_turnstile(struct sess *s)
 				listen = conn_alloc(s);
 				if (!listen)
 					break;
-				s->have_local_sdp = 0;
 				s->have_peer_sdp = 0;
 				s->remote_set = 0;
-				s->local_sdp[0] = '\0';
 				s->peer_sdp[0] = '\0';
+				peering_desc_drop(&s->net.desc);
 				s->offer_conn = listen;
 				sig_subscribe(s->pm.sig, on_peer_offer, s);
 				if (nat_setup(listen)) {
@@ -4965,10 +4897,9 @@ static int host_turnstile(struct sess *s)
 				}
 			}
 			if (sdp_ready(s)) {
-				sdp_filter(s->local_sdp, cfg->family, filtered,
+				sdp_filter(local_sdp(s), cfg->family, filtered,
 					   sizeof(filtered));
-				snprintf(s->local_sdp, sizeof(s->local_sdp),
-					 "%s", filtered);
+				peering_desc_set(&s->net.desc, filtered);
 				/*
 				 * Gathering finished and found nothing -- the
 				 * interfaces were still coming up when this
@@ -4987,14 +4918,13 @@ static int host_turnstile(struct sess *s)
 				 * published alone until there is something
 				 * better to say.
 				 */
-				if (!sdp_has_candidate(s->local_sdp)) {
+				if (!peering_sdp_has_candidate(local_sdp(s))) {
 					dbg_logf("host: gathered no candidates "
 						 "-- not offering, regathering");
 					conn_free(listen);
 					listen = NULL;
 					s->offer_conn = NULL;
-					s->have_local_sdp = 0;
-					s->local_sdp[0] = '\0';
+					peering_desc_drop(&s->net.desc);
 					s->next_gather_ms = now_ms() +
 							    HOST_REGATHER_MS;
 					break;
@@ -5013,7 +4943,7 @@ static int host_turnstile(struct sess *s)
 				 * segment-only offer is still better than
 				 * none, and the peer may well be on it.
 				 */
-				if (!cand_sdp_reaches_off_segment(s->local_sdp) &&
+				if (!cand_sdp_reaches_off_segment(local_sdp(s)) &&
 				    stun_rotate_ok(s)) {
 					dbg_logf("host: nothing off-segment to "
 						 "offer through pool server %d "
@@ -5027,17 +4957,17 @@ static int host_turnstile(struct sess *s)
 					conn_free(listen);
 					listen = NULL;
 					s->offer_conn = NULL;
-					s->have_local_sdp = 0;
-					s->local_sdp[0] = '\0';
+					peering_desc_drop(&s->net.desc);
 					s->next_gather_ms = now_ms() +
 							    HOST_REGATHER_MS;
 					break;
 				}
 				s->net.pool.posted = fan_local_sdp(s);
-				sig_rotate(s->pm.sig, (const uint8_t *)s->local_sdp,
-					   strlen(s->local_sdp));
+				sig_rotate(s->pm.sig,
+					   (const uint8_t *)local_sdp(s),
+					   strlen(local_sdp(s)));
 				sig_locate(s->pm.sig);
-				log_offer(s->local_sdp, served, active);
+				log_offer(local_sdp(s), served, active);
 				ts = TS_WAIT_CLAIM;
 			}
 			break;
@@ -5318,7 +5248,6 @@ int session_run(const struct session_cfg *cfg)
 	s.tok_state[1] = token_family_state(&cfg->tok, 6);
 	if (keys_derive(&s.keys, cfg->tok.rdv))
 		return 1;
-	pthread_mutex_init(&s.trickle_lock, NULL);
 	pthread_mutex_init(&s.c.status_lock, NULL);	/* s.c.status zeroed = connecting */
 	peering_init(&s.c.pr, &s.pm, s.keys.probe_magic, s.keys.sig_key,
 		     now_ms());
@@ -5550,14 +5479,14 @@ int session_run(const struct session_cfg *cfg)
 			break;
 		case ST_GATHER:
 			if (sdp_ready(&s)) {
-				sdp_filter(s.local_sdp, cfg->family, filtered,
+				sdp_filter(local_sdp(&s), cfg->family, filtered,
 					   sizeof(filtered));
-				snprintf(s.local_sdp, sizeof(s.local_sdp),
-					 "%s", filtered);
+				peering_desc_set(&s.net.desc, filtered);
 				s.net.pool.posted = fan_local_sdp(&s);
 				sig_set_claim_offer(s.pm.sig, s.c.remote_ufrag);
-				sig_post(s.pm.sig, (const uint8_t *)s.local_sdp,
-					 strlen(s.local_sdp));
+				sig_post(s.pm.sig,
+					 (const uint8_t *)local_sdp(&s),
+					 strlen(local_sdp(&s)));
 				if (cfg->is_host && (cfg->sig_flags & SIG_DHT))
 					sig_locate(s.pm.sig);
 				st = ST_SIGNAL;
@@ -5591,8 +5520,9 @@ int session_run(const struct session_cfg *cfg)
 							/* members learnt since
 							 * the ST_GATHER post */
 				sig_set_claim_offer(s.pm.sig, s.c.remote_ufrag);
-				sig_post(s.pm.sig, (const uint8_t *)s.local_sdp,
-					 strlen(s.local_sdp));
+				sig_post(s.pm.sig,
+					 (const uint8_t *)local_sdp(&s),
+					 strlen(local_sdp(&s)));
 				s.remote_set = 1;
 				s.ice_attempt_start = now_ms();
 				if (o && o->peer &&
@@ -5809,7 +5739,6 @@ done:
 		s.warm_running = 0;
 	}
 	stunlist_free(s.stun_servers, s.stun_count);
-	pthread_mutex_destroy(&s.trickle_lock);
 	pthread_mutex_destroy(&s.c.status_lock);
 	peering_destroy(&s.c.pr);
 	pthread_mutex_destroy(&s.c.claim_lock);
