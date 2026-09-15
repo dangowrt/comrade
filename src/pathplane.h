@@ -57,8 +57,6 @@ struct pathplane_sinks {
 	int (*live)(void *arg, struct nat_agent **out, int max);
 	/* The pair this agent has nominated, 0 on success. NULL for none. */
 	int (*ice_ep)(void *arg, struct nat_agent *a, struct path_ep *ep);
-	/* The test hook that takes a path away. NULL for none. */
-	int (*blackholed)(void *arg, int kind, const struct sockaddr_in6 *to);
 	/* Whether an endpoint is one of this node's own. NULL for "no". */
 	int (*is_self)(void *arg, const struct path_ep *ep);
 	/* How to classify a source off ICE. NULL for PATH_ROUTED. */
@@ -120,9 +118,34 @@ struct pathplane {
 					 * taken with */
 	uint64_t next_ice_ep_ms;	/* when to ask the agents again */
 	struct pathplane_hold holds[PATHPLANE_HOLD_MAX];
+	/*
+	 * The path deliberately made to die. A path cannot be removed for real
+	 * on a machine without CAP_NET_ADMIN, so this simply stops the plane
+	 * sending on the one that was carrying: the probes that keep a path
+	 * warm are this end's, so it falls silent at both ends. Armed and
+	 * lifted under the table's lock; `mute` is read on the receive threads
+	 * as well, so it is touched atomically.
+	 */
+	int bh_kind;			/* -1 while none is armed */
+	struct path_ep bh_ep;
+	volatile int bh_mute;		/* swallow receives too */
 };
 
 void pathplane_init(struct pathplane *pl, struct probeplane *pp);
+
+/*
+ * The test hook that takes a path away: arm it on one path, or on everything
+ * this plane would receive, and lift it again. `pathplane_muted` is what a
+ * playbook asks before handing the plane anything it received.
+ */
+void pathplane_blackhole_arm(struct pathplane *pl, int kind,
+			     const struct sockaddr_in6 *to);
+void pathplane_blackhole_mute(struct pathplane *pl, int on);
+void pathplane_blackhole_lift(struct pathplane *pl);
+int pathplane_muted(const struct pathplane *pl);
+/* The kind armed on one path, or -1; and whether anything is armed at all. */
+int pathplane_blackhole_kind(const struct pathplane *pl);
+int pathplane_blackhole_armed(const struct pathplane *pl);
 void pathplane_destroy(struct pathplane *pl);
 
 /*
@@ -163,6 +186,22 @@ void pathplane_holds_reap(struct pathplane *pl,
 void pathplane_route_dedup(struct pathplane *pl,
 			   const struct pathplane_sinks *k,
 			   const struct nat_agent *live);
+
+/*
+ * Take a held carrier back as the one in use, handing over its context with
+ * it. `i` is what pathplane_hold_carrying answered.
+ */
+struct nat_agent *pathplane_hold_take(struct pathplane *pl, int i, void **ctx);
+
+/*
+ * Forget what every path measured, keeping the endpoints. What a probe proved
+ * was proved for one identity, so a fresh one voids every measurement.
+ */
+void pathplane_reset_stats(struct pathplane *pl, uint64_t now);
+
+/* Forget the paths themselves: none of them belongs to the network we are on
+ * now. */
+void pathplane_clear(struct pathplane *pl);
 
 /* The path an agent carries. Idempotent per agent. */
 void pathplane_add_ice(struct pathplane *pl, struct nat_agent *agent,

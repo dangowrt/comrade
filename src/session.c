@@ -335,14 +335,8 @@ struct conn {
 	volatile int ice_up;		/* the agent is connected, for readers
 					 * that may not touch the agent */
 	volatile uint32_t carry_epoch;	/* ++ on a qualified carry switch (roam) */
-	/* The path deliberately made to die (test_blackhole_ms); bh_kind is -1
-	 * while none is, bh_done once one has been (so a lift does not re-arm
-	 * it). */
-	int bh_kind;
-	int bh_done;
-	volatile int bh_mute;		/* test_blackhole_all: drop receives too,
-					 * read on the receive threads */
-	struct path_ep bh_ep;
+	int bh_done;			/* the test hook has fired once, so a
+					 * lift does not re-arm it */
 
 	sock_t ssh_fd;			/* the ssh thread's socketpair end */
 	sock_t ssh_ctl_fd;		/* the ssh thread's comrade-ctl end */
@@ -765,31 +759,6 @@ static int conn_ice_ep(void *arg, struct nat_agent *agent, struct path_ep *ep)
 }
 
 /*
- * Is this the path the test hook has taken away (test_blackhole_ms)? A path
- * cannot be removed for real on a machine without CAP_NET_ADMIN, so the hook
- * simply stops this end sending on the one that was carrying the session: the
- * probes that keep a path warm are ours, so it falls silent at both ends.
- */
-static int conn_path_blackholed(void *arg, int kind,
-				const struct sockaddr_in6 *to)
-{
-	const struct conn *c = arg;
-	struct path_ep ep;
-
-	if (__atomic_load_n(&c->bh_mute, __ATOMIC_RELAXED))
-		return 1;
-	if (c->bh_kind < 0 || kind != c->bh_kind)
-		return 0;
-	if (kind == PATH_ICE)
-		return 1;
-	if (!to || path_ep_from_sockaddr(&ep, (const struct sockaddr *)to,
-					 sizeof(*to)))
-		return 0;
-
-	return path_ep_eq(&ep, &c->bh_ep);
-}
-
-/*
  * Something arrived that this end could make sense of. Liveness is the whole
  * traffic and not the pong alone -- a pong crosses the same queues as bulk
  * data and arrives late on a busy link -- but it has to be traffic that
@@ -887,7 +856,6 @@ static void conn_sinks(struct conn *c, struct pathplane_sinks *k)
 	k->ident = conn_ident;
 	k->live = conn_live_agents;
 	k->ice_ep = conn_ice_ep;
-	k->blackholed = conn_path_blackholed;
 	k->is_self = conn_ep_is_self;
 	k->kind_of = conn_ep_kind;
 	k->heard = conn_heard;
@@ -2065,7 +2033,7 @@ static void deliver_stream_from(struct conn *c, const uint8_t *data, size_t len,
 	uint64_t now = now_ms();
 	int took = 0;
 
-	if (__atomic_load_n(&c->bh_mute, __ATOMIC_RELAXED))
+	if (pathplane_muted(&c->pr.pl))
 				/* a staged total outage swallows receives */
 		return;
 	if (pathplane_is_probe(&c->pr.pl, data, len)) {
@@ -2548,9 +2516,7 @@ static void conn_gen_ice(struct conn *c)
 	}
 	/* What a probe proved was proved for one claimant identity, so a fresh
 	 * one voids every measurement; the endpoints themselves stand. */
-	pthread_mutex_lock(&c->pr.pl.lock);
-	path_table_reset_stats(&c->pr.pl.t, now_ms());
-	pthread_mutex_unlock(&c->pr.pl.lock);
+	pathplane_reset_stats(&c->pr.pl, now_ms());
 	c->claim_held_seen = 0;
 	c->claim_lost = 0;
 	c->claim_released_ms = 0;
@@ -3117,11 +3083,8 @@ static void resume_tick(struct conn *c)
 		if (hi >= 0) {
 			spare = c->nat;
 			spare_ctx = c->nat_ctx;
-			c->nat = c->pr.pl.holds[hi].agent;
-			c->nat_ctx = c->pr.pl.holds[hi].ctx;
-			c->pr.pl.holds[hi].agent = NULL;
-			c->pr.pl.holds[hi].ctx = NULL;
-			c->pr.pl.holds[hi].until_ms = 0;
+			c->nat = pathplane_hold_take(&c->pr.pl, hi,
+						     (void **)&c->nat_ctx);
 			conn_free_agent(c, spare, spare_ctx);
 			dbg_logf("resume: carried by the agent set aside");
 		} else if (pathplane_has_hold(&c->pr.pl)) {
@@ -3468,7 +3431,7 @@ static int conn_run(struct conn *c, int drive_sig)
 			c->nat = got->agent;	/* bound to it for life */
 			c->nat_ctx = got;
 			conn_add_ice_path(c);
-			__atomic_store_n(&c->bh_mute, 0, __ATOMIC_RELAXED);
+			pathplane_blackhole_mute(&c->pr.pl, 0);
 			/* The resumed link earns a full liveness window; without
 			 * this it is judged by silence that predates it. */
 			ctlplane_heard(&c->pr.cp, now_ms());
@@ -3515,39 +3478,29 @@ static int conn_run(struct conn *c, int drive_sig)
 		}
 		peering_say(&c->pr, s->lan ? lanlink_port(s->lan) : 0,
 			    now_ms());
-		if (s->cfg->test_blackhole_ms > 0 && c->bh_kind < 0 &&
-		    !c->bh_done &&
+		if (s->cfg->test_blackhole_ms > 0 &&
+		    pathplane_blackhole_kind(&c->pr.pl) < 0 && !c->bh_done &&
 		    now_ms() - conn_start >
 		    (uint64_t)s->cfg->test_blackhole_ms) {
 			struct pathplane_pick pick;
 
 			if (s->cfg->test_blackhole_all) {
-				__atomic_store_n(&c->bh_mute, 1,
-						 __ATOMIC_RELAXED);
+				pathplane_blackhole_mute(&c->pr.pl, 1);
 				c->bh_done = 1;
 				dbg_logf("path blackholed: all");
 			} else if (!conn_pick(c, &pick)) {
-				pthread_mutex_lock(&c->pr.pl.lock);
-				memset(&c->bh_ep, 0, sizeof(c->bh_ep));
-				path_ep_from_sockaddr(&c->bh_ep,
-					(struct sockaddr *)&pick.remote,
-					sizeof(pick.remote));
-				c->bh_kind = pick.kind;
+				pathplane_blackhole_arm(&c->pr.pl, pick.kind,
+							&pick.remote);
 				c->bh_done = 1;
-				pthread_mutex_unlock(&c->pr.pl.lock);
 				dbg_logf("path blackholed: %s",
 					 pick.label[0] ? pick.label : "ICE");
 			}
 		}
-		if ((c->bh_kind >= 0 ||
-		     __atomic_load_n(&c->bh_mute, __ATOMIC_RELAXED)) &&
+		if (pathplane_blackhole_armed(&c->pr.pl) &&
 		    s->cfg->test_blackhole_lift_ms > 0 &&
 		    now_ms() - conn_start >
 		    (uint64_t)s->cfg->test_blackhole_lift_ms) {
-			pthread_mutex_lock(&c->pr.pl.lock);
-			c->bh_kind = -1;
-			pthread_mutex_unlock(&c->pr.pl.lock);
-			__atomic_store_n(&c->bh_mute, 0, __ATOMIC_RELAXED);
+			pathplane_blackhole_lift(&c->pr.pl);
 			dbg_logf("path blackhole lifted");
 		}
 
@@ -4189,7 +4142,6 @@ static struct conn *conn_alloc(struct sess *s)
 		return NULL;
 	c->sess = s;
 	c->ctl_fd = INVALID_SOCK;
-	c->bh_kind = -1;
 	peering_init(&c->pr, &s->pm, s->keys.probe_magic, s->keys.sig_key,
 		     now_ms());
 	conn_peering_sinks(c);
@@ -4963,8 +4915,8 @@ static int host_turnstile(struct sess *s)
 			if (cfg->test_roam_hard)
 				for (i = 0; i < HOST_MAX_WORKERS; i++)
 					if (ws[i].used)
-						__atomic_store_n(&ws[i].c->bh_mute,
-								 1, __ATOMIC_RELAXED);
+						pathplane_blackhole_mute(
+							&ws[i].c->pr.pl, 1);
 			if (sig_rebuild(s, "on the new network"))
 				break;
 			net_change_reset(s);
@@ -5509,7 +5461,6 @@ int session_run(const struct session_cfg *cfg)
 	s.cfg = cfg;
 	s.c.sess = &s;
 	s.c.ctl_fd = INVALID_SOCK;		/* no control channel until run_ssh */
-	s.c.bh_kind = -1;
 	memcpy(s.auth, cfg->tok.auth, TOKEN_AUTH_LEN);
 	/* Seed each family from the token handed in, so a re-serve carries the
 	 * anchor it already published forward instead of wiping the slot. */
@@ -5664,9 +5615,7 @@ int session_run(const struct session_cfg *cfg)
 				s.c.nat_ctx = NULL;
 			}
 			conn_gen_ice(&s.c);
-			pthread_mutex_lock(&s.c.pr.pl.lock);
-			path_table_clear(&s.c.pr.pl.t);
-			pthread_mutex_unlock(&s.c.pr.pl.lock);
+			pathplane_clear(&s.c.pr.pl);
 			net_change_reset(&s);
 			st = ST_WAIT_DHT;
 		}
@@ -5940,9 +5889,7 @@ int session_run(const struct session_cfg *cfg)
 				net_pump(&s, now_ms());
 				if (net_moved(&s)) {
 					net_change_reset(&s);
-					pthread_mutex_lock(&s.c.pr.pl.lock);
-					path_table_clear(&s.c.pr.pl.t);
-					pthread_mutex_unlock(&s.c.pr.pl.lock);
+					pathplane_clear(&s.c.pr.pl);
 					if (sig_rebuild(&s,
 							"on the new network")) {
 						st = ST_FAIL;
