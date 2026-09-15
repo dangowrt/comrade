@@ -1762,13 +1762,11 @@ static void conn_peering_sinks(struct conn *c)
  * connection's own loop thread, the same one as the probe cadence. */
 static void ctl_dispatch(void *arg, int type, const uint8_t *pl, size_t plen)
 {
-	struct ctlplane_sinks k;
 	struct conn *c = arg;
 
-	conn_ctl_sinks(c, &k);
-	ctlplane_on_msg(&c->pr.cp, &k, type, pl, plen,
-			__atomic_load_n(&c->sess->netgen, __ATOMIC_RELAXED),
-			now_ms());
+	peering_ctl(&c->pr, type, pl, plen,
+		    __atomic_load_n(&c->sess->netgen, __ATOMIC_RELAXED),
+		    now_ms());
 }
 
 /* Drain the comrade-ctl fd and dispatch each complete message the read yields
@@ -1858,15 +1856,6 @@ static void conn_tell_fresh(struct conn *c, const struct sockaddr_in6 *lan_to)
 		lanlink_send(s->lan, lan_to, out, o);
 }
 
-/* Unseal a probe and act on it, if it names the claimant this connection
- * serves. Anything else is dropped in silence. */
-static void probe_recv(struct conn *c, const uint8_t *data, size_t len,
-		       enum path_kind kind, const struct sockaddr_in6 *src,
-		       struct nat_agent *agent)
-{
-	peering_recv(&c->pr, data, len, kind, src, agent, now_ms());
-}
-
 /*
  * May this datagram be opened? Only a frame opening with this session's probe
  * tag is a candidate for adoption at all; anything else is stream data, which
@@ -1914,9 +1903,9 @@ static void probe_adopt(struct sess *s, const uint8_t *data, size_t len,
 
 /* Deliver received transport bytes into the conn's KCP stream, under the lock
  * that guards a concurrent teardown clearing c->stream from another thread.
- * A probe is split off first: it is not stream data (see probe_recv). Stream
- * data is accepted on every path this end holds, not only the one it sends on,
- * so selection is never a negotiation. */
+ * A probe is split off first: it is not stream data. Stream data is accepted
+ * on every path this end holds, not only the one it sends on, so selection is
+ * never a negotiation. */
 static void deliver_stream_from(struct conn *c, const uint8_t *data, size_t len,
 				enum path_kind kind,
 				const struct sockaddr_in6 *src,
@@ -1925,14 +1914,7 @@ static void deliver_stream_from(struct conn *c, const uint8_t *data, size_t len,
 	uint64_t now = now_ms();
 	int took = 0;
 
-	if (pathplane_muted(&c->pr.pl))
-				/* a staged total outage swallows receives */
-		return;
-	if (pathplane_is_probe(&c->pr.pl, data, len)) {
-		probe_recv(c, data, len, kind, src, agent);
-		return;
-	}
-	if (probeplane_unwrap(&c->pr.pp, data, &len))
+	if (peering_datagram(&c->pr, data, &len, kind, src, agent, now))
 		return;
 	pthread_mutex_lock(&c->stream_lock);
 	if (c->stream)
