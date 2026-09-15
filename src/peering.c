@@ -962,3 +962,29 @@ void peering_advance(struct peering_model *pm, struct peering_net *net,
 	peering_settle(pm, net, cfg, now);
 	peering_publish(pm);
 }
+
+int peering_model_sig(struct peering_model *pm, struct sig *sig, uint64_t now)
+{
+	static const int famv[2] = { 4, 6 };
+	int i;
+
+	pm->sig = sig;
+	if (!sig)
+		return 0;
+	if (pm->have_claim_sk) {
+		if (sig_use_claim_key(sig, pm->claim_sk))
+			return -1;
+	} else if (!sig_claim_key(sig, pm->claim_sk)) {
+		pm->have_claim_sk = 1;
+	}
+	pm->dht_since_ms = now;
+	for (i = 0; i < 2; i++) {
+		sig_set_family_up(sig, famv[i],
+				  netstate_conn(&pm->ns, famv[i]) ==
+				  NET_CONN_UP);
+		if (pm->relay_fam[i])
+			sig_relay(sig, famv[i], 1);
+	}
+
+	return 0;
+}

@@ -401,8 +401,6 @@ struct sess {
 	 * signaller: a signaller is rebuilt on every move, and the claim a
 	 * client had in flight when the host roamed is boxed to the old one.
 	 */
-	uint8_t claim_sk[32];
-	int have_claim_sk;
 	struct lanlink *lan;
 	struct session_keys keys;	/* sig_key, for sealing transport probes */
 
@@ -472,7 +470,6 @@ struct sess {
 	int tok_told[2];		/* the state has been reported at least once */
 	int noconn_warned;		/* operator told no family can be advertised */
 	uint64_t next_tok_ms;		/* throttle the per-family advert decision */
-	uint64_t dht_since_ms;		/* this DHT attempt started (armed with sig) */
 
 	uint64_t start_ms;		/* observer: session start, for escalation */
 	int escalated;			/* observer: client warned of DHT warm */
@@ -2830,34 +2827,15 @@ static int host_is_multiuser(const struct session_cfg *cfg)
 static int sig_arm(struct sess *s)
 {
 	const struct session_cfg *cfg = s->cfg;
+	struct sig *sig;
 
-	s->pm.sig = sig_create(cfg->tok.rdv, cfg->sig_flags, cfg->is_host);
-	if (!s->pm.sig)
+	sig = sig_create(cfg->tok.rdv, cfg->sig_flags, cfg->is_host);
+	if (!sig)
 		return -1;
-	/*
-	 * BEFORE ANYTHING IS PUBLISHED. A claimant boxes its claim to the key
-	 * it read in the offer, and this is a REBUILD as often as it is a
-	 * first arming -- every move makes one. A fresh key would strand the
-	 * claim in flight: the host cannot open it, calls the slot unreadable
-	 * and RELEASES it, erasing a claim that was perfectly good, and the
-	 * claimant answers the new offer instead. So the key belongs to the
-	 * session, which the rebuild does not replace.
-	 */
-	if (s->have_claim_sk) {
-		if (sig_use_claim_key(s->pm.sig, s->claim_sk))
-			return -1;
-	} else if (!sig_claim_key(s->pm.sig, s->claim_sk)) {
-		s->have_claim_sk = 1;
-	}
-	s->dht_since_ms = now_ms();	/* a rebuild is a fresh attempt, and a
-					 * fresh grace, on the new network */
+	/* What the model already holds, before anything is published. */
+	if (peering_model_sig(&s->pm, sig, now_ms()))
+		return -1;
 	sig_subscribe(s->pm.sig, on_peer_offer, s);
-	/* A fresh signaller knows nothing, and what it drives its convergence
-	 * eagerness from is only ever published when it changes -- so a family
-	 * that came through the move still proven would sit in the slow tier
-	 * for the rest of the session, and never find its rendezvous. */
-	sig_set_family_up(s->pm.sig, 4, netstate_conn(&s->pm.ns, 4) == NET_CONN_UP);
-	sig_set_family_up(s->pm.sig, 6, netstate_conn(&s->pm.ns, 6) == NET_CONN_UP);
 	/* Our offer carries the generation of the network it was gathered on, so
 	 * a peer tells a move from a mere credential rotation. A rebuild follows
 	 * a move, so the current netgen is what this fresh signaller stamps. */
@@ -2872,12 +2850,7 @@ static int sig_arm(struct sess *s)
 		}
 	}
 	seed_rendezvous(s);
-	/* A peer's request that we rendezvous for it stands until it has a
-	 * node; a fresh signaller starts knowing nothing of it. */
-	if (s->pm.relay_fam[0])
-		sig_relay(s->pm.sig, 4, 1);
-	if (s->pm.relay_fam[1])
-		sig_relay(s->pm.sig, 6, 1);
+
 	return 0;
 }
 
@@ -2920,7 +2893,7 @@ static int net_moved(struct sess *s)
 static int sig_rebuild(struct sess *s, const char *why)
 {
 	sig_discard(s->pm.sig);
-	s->pm.sig = NULL;
+	peering_model_sig(&s->pm, NULL, 0);
 	if (sig_arm(s)) {
 		dbg_logf("sig: rebuild failed -- giving up the session");
 		return -1;
@@ -3853,7 +3826,7 @@ static int dht_attempt_concluded(struct sess *s, int family)
 	 * the screen is worse than saying it is still being checked. */
 	if (netstate_anchor(&s->pm.ns, family, NULL, NULL, NULL))
 		return 0;
-	if (now_ms() - s->dht_since_ms <= DHT_CONCLUDE_MS)
+	if (now_ms() - s->pm.dht_since_ms <= DHT_CONCLUDE_MS)
 		return 0;
 	return !sig_locating(s->pm.sig, family);
 }
