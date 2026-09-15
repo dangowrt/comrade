@@ -106,15 +106,6 @@ static int fam_idx(int family)
  */
 #define STUN_WARN_MS 8000
 
-/*
- * If a gather has held a private/CGNAT IPv4 this long with no reflexive one,
- * the pool server this attempt drew is written off and the next one is tried
- * -- but only while no peer has answered yet: from then on the ICE retry path
- * owns rotation. Bounded, so a network that filters all STUN settles for the
- * STUN_WARN_MS escalation instead of churning offers forever.
- */
-#define STUN_ROTATE_MS 3000
-#define STUN_ROTATE_MAX 3
 
 /*
  * A path is qualified when an authenticated probe has round-tripped on it; the
@@ -3630,19 +3621,19 @@ static int client_regather(struct sess *s)
  */
 static int stun_rotate_ok(const struct sess *s)
 {
-	if (s->cfg->stun_host || !s->cfg->stun_auto || s->stun_count < 2)
-		return 0;
-	if (!__atomic_load_n(&s->have_priv4, __ATOMIC_RELAXED))
-		return 0;
-	return s->stun_rotations < STUN_ROTATE_MAX;
+	return peering_rotate_allowed(&s->net, s->stun_rotations,
+				      __atomic_load_n(&s->have_priv4,
+						      __ATOMIC_RELAXED));
 }
 
 static int stun_stall(struct sess *s)
 {
-	if (!stun_rotate_ok(s) ||
-	    __atomic_load_n(&s->have_srflx4, __ATOMIC_RELAXED))
-		return 0;
-	return now_ms() - s->stun_since_ms > STUN_ROTATE_MS;
+	return peering_rotate_wanted(&s->net, s->stun_rotations,
+				     __atomic_load_n(&s->have_priv4,
+						     __ATOMIC_RELAXED),
+				     __atomic_load_n(&s->have_srflx4,
+						     __ATOMIC_RELAXED),
+				     s->stun_since_ms, now_ms());
 }
 
 /*
@@ -4944,7 +4935,7 @@ static int host_turnstile(struct sess *s)
 			dbg_logf("host: no public v4 through pool server %d "
 				 "-- offering through the next (%d of %d)",
 				 s->ice_attempt % s->stun_count,
-				 s->stun_rotations + 1, STUN_ROTATE_MAX);
+				 s->stun_rotations + 1, PEERING_ROTATE_MAX);
 			__atomic_add_fetch(&s->ice_attempt, 1, __ATOMIC_RELAXED);
 			s->stun_rotations++;
 			offer_retire(s, kept, &listen, 1, now_ms());
@@ -5030,7 +5021,7 @@ static int host_turnstile(struct sess *s)
 						 "(%d of %d)",
 						 s->ice_attempt % s->stun_count,
 						 s->stun_rotations + 1,
-						 STUN_ROTATE_MAX);
+						 PEERING_ROTATE_MAX);
 					__atomic_add_fetch(&s->ice_attempt, 1, __ATOMIC_RELAXED);
 					s->stun_rotations++;
 					conn_free(listen);
