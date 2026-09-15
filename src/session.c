@@ -411,10 +411,6 @@ struct sess {
 
 	uint64_t next_gather_ms;	/* backoff after a gather found nothing */
 	uint64_t ice_attempt_start;
-	/* Which STUN server this attempt starts from. The loop advances it
-	 * while a probe thread is indexing with it, so both ends are atomic
-	 * and each thread takes one snapshot for the round it is running. */
-	int ice_attempt;
 	int expect4, expect6;		/* host has DHT reach on this family */
 	int tok_state[2];
 	uint8_t tok_ep[2][TOKEN_EP6_LEN];	/* client: the node last told,
@@ -443,15 +439,8 @@ struct sess {
 					 * invitation leads nowhere from now on */
 	uint64_t tomb_deadline;		/* host: how long the end of the session
 					 * is published for before we go */
-	/* Set from libjuice's gather thread as candidates arrive and cleared
-	 * by the loop on a regather, so every access is a relaxed atomic: the
-	 * reader wants the latest answer, not a synchronised one. */
-	volatile int have_priv4;	/* a private/CGNAT v4 host candidate (needs
-					 * STUN); set from the gather thread */
-	volatile int have_srflx4;	/* STUN gave us a public v4 (reflexive) */
 	int stun_warned;		/* warned once that STUN produced nothing */
 	uint64_t stun_since_ms;		/* current agent started gathering */
-	int stun_rotations;		/* pool servers written off this network */
 
 	char status_rdv[80];		/* located rendezvous endpoint (host side) */
 
@@ -481,7 +470,6 @@ struct sess {
 					 * it is only ever compared for
 					 * equality, which needs no ordering
 					 * against anything else. */
-	int mapping_reported;		/* 0 not yet, 1 sent independent, 2 sent dependent */
 
 	/*
 	 * Reachability per family. Producers off this thread leave facts in the
@@ -1062,11 +1050,11 @@ static void report_candidates(struct sess *s, const char *sdp)
 
 				fam = strchr(addr, ':') ? 6 : 4;
 				if (fam == 4 && via == NET_VIA_STUN)
-					__atomic_store_n(&s->have_srflx4, 1,
+					__atomic_store_n(&s->net.have_srflx4, 1,
 							 __ATOMIC_RELAXED);
 				else if (fam == 4 && via == NET_VIA_DIRECT &&
 					 scope != NET_SCOPE_GLOBAL)
-					__atomic_store_n(&s->have_priv4, 1,
+					__atomic_store_n(&s->net.have_priv4, 1,
 							 __ATOMIC_RELAXED);
 				len = fam == 6 ? 16 : 4;
 				if (inet_pton(fam == 6 ? AF_INET6 : AF_INET,
@@ -1365,8 +1353,8 @@ static void pool_pump(struct sess *s)
 	s->net.pool.reported = n;
 	if (st != STUN_MAPPING_UNKNOWN) {
 		rep = st == STUN_MAPPING_DEPENDENT ? 2 : 1;
-		if (rep != s->mapping_reported) {
-			s->mapping_reported = rep;
+		if (rep != s->net.mapping_reported) {
+			s->net.mapping_reported = rep;
 			if (o && o->mapping4)
 				o->mapping4(o->arg, rep == 2);
 		}
@@ -1576,7 +1564,7 @@ static void on_ice_candidate(void *arg, const char *cand)
 		} else if (!strcmp(typ, "srflx")) {
 			uint8_t b[4];
 
-			__atomic_store_n(&s->have_srflx4, 1, __ATOMIC_RELAXED);
+			__atomic_store_n(&s->net.have_srflx4, 1, __ATOMIC_RELAXED);
 			ns_post(s, NSF_ROUNDTRIP, 4,
 				__atomic_load_n(&s->gather_epoch[0],
 						__ATOMIC_RELAXED));
@@ -1584,7 +1572,7 @@ static void on_ice_candidate(void *arg, const char *cand)
 				pool_note(s, b);
 		} else if (!strcmp(typ, "host") &&
 			   net_addr_scope(addr) != NET_SCOPE_GLOBAL) {
-			__atomic_store_n(&s->have_priv4, 1, __ATOMIC_RELAXED);
+			__atomic_store_n(&s->net.have_priv4, 1, __ATOMIC_RELAXED);
 		}
 	}
 	peering_desc_candidate(&s->net.desc, cand);
@@ -2373,7 +2361,7 @@ static int nat_setup(struct conn *c)
 	cfg.stun_port = s->cfg->stun_port;
 	if (!cfg.stun_host && s->cfg->stun_auto &&
 	    !peering_net_stun_pick(&s->net,
-				   (unsigned)__atomic_load_n(&s->ice_attempt,
+				   (unsigned)__atomic_load_n(&s->net.ice_attempt,
 							     __ATOMIC_RELAXED),
 				   s->stun_host, sizeof(s->stun_host),
 				   &cfg.stun_port))
@@ -2797,24 +2785,7 @@ static void net_change_reset(struct sess *s)
 	s->have_peer_sdp = 0;
 	s->remote_set = 0;
 	s->peer_sdp[0] = '\0';
-	peering_desc_clear(&s->net.desc);
-	peering_pool_reset(&s->net.pool);
-	s->stun_rotations = 0;
-	/* a fresh index: the per-session walk can leave a stale one on a dead
-	 * server, whose offer then carries no reflexive address */
-	if (s->stun_count > 0) {
-		uint8_t rb[2];
-
-		random_bytes(rb, 2);
-		__atomic_store_n(&s->ice_attempt,
-				 ((rb[0] << 8) | rb[1]) % s->stun_count,
-				 __ATOMIC_RELAXED);
-	}
-	__atomic_store_n(&s->have_priv4, 0, __ATOMIC_RELAXED);
-	__atomic_store_n(&s->have_srflx4, 0, __ATOMIC_RELAXED);
-	s->net.pool.reported = 0;
-	s->net.pool.posted = 0;
-	s->mapping_reported = 0;
+	peering_net_renew(&s->net);
 }
 
 /*
@@ -3027,7 +2998,7 @@ static void session_entomb_start(struct sess *s)
 static void session_settle_cfg(struct sess *s, struct peering_settle *cfg)
 {
 	memset(cfg, 0, sizeof(*cfg));
-	cfg->start6 = __atomic_load_n(&s->ice_attempt, __ATOMIC_RELAXED);
+	cfg->start6 = __atomic_load_n(&s->net.ice_attempt, __ATOMIC_RELAXED);
 	cfg->expect4 = s->cfg->is_host && s->expect4;
 	cfg->expect6 = s->cfg->is_host && s->expect6;
 }
@@ -3490,19 +3461,12 @@ static int client_regather(struct sess *s)
  */
 static int stun_rotate_ok(const struct sess *s)
 {
-	return peering_rotate_allowed(&s->net, s->stun_rotations,
-				      __atomic_load_n(&s->have_priv4,
-						      __ATOMIC_RELAXED));
+	return peering_rotate_allowed(&s->net);
 }
 
 static int stun_stall(struct sess *s)
 {
-	return peering_rotate_wanted(&s->net, s->stun_rotations,
-				     __atomic_load_n(&s->have_priv4,
-						     __ATOMIC_RELAXED),
-				     __atomic_load_n(&s->have_srflx4,
-						     __ATOMIC_RELAXED),
-				     s->stun_since_ms, now_ms());
+	return peering_rotate_wanted(&s->net, s->stun_since_ms, now_ms());
 }
 
 /*
@@ -4796,10 +4760,10 @@ static int host_turnstile(struct sess *s)
 			 * which pool server it was gathered through. */
 			dbg_logf("host: no public v4 through pool server %d "
 				 "-- offering through the next (%d of %d)",
-				 s->ice_attempt % s->stun_count,
-				 s->stun_rotations + 1, PEERING_ROTATE_MAX);
-			__atomic_add_fetch(&s->ice_attempt, 1, __ATOMIC_RELAXED);
-			s->stun_rotations++;
+				 s->net.ice_attempt % s->stun_count,
+				 s->net.rotations + 1, PEERING_ROTATE_MAX);
+			__atomic_add_fetch(&s->net.ice_attempt, 1, __ATOMIC_RELAXED);
+			s->net.rotations++;
 			offer_retire(s, kept, &listen, 1, now_ms());
 			peering_desc_drop(&s->net.desc);
 			ts = TS_GATHER;
@@ -4877,11 +4841,12 @@ static int host_turnstile(struct sess *s)
 						 "offer through pool server %d "
 						 "-- gathering through the next "
 						 "(%d of %d)",
-						 s->ice_attempt % s->stun_count,
-						 s->stun_rotations + 1,
+						 s->net.ice_attempt % s->stun_count,
+						 s->net.rotations + 1,
 						 PEERING_ROTATE_MAX);
-					__atomic_add_fetch(&s->ice_attempt, 1, __ATOMIC_RELAXED);
-					s->stun_rotations++;
+					__atomic_add_fetch(&s->net.ice_attempt, 1,
+							   __ATOMIC_RELAXED);
+					s->net.rotations++;
 					conn_free(listen);
 					listen = NULL;
 					s->offer_conn = NULL;
@@ -5214,7 +5179,7 @@ int session_run(const struct session_cfg *cfg)
 		uint8_t rb[2];
 
 		random_bytes(rb, 2);
-		__atomic_store_n(&s.ice_attempt,
+		__atomic_store_n(&s.net.ice_attempt,
 				 ((rb[0] << 8) | rb[1]) % s.stun_count,
 				 __ATOMIC_RELAXED);
 	}
@@ -5343,8 +5308,8 @@ int session_run(const struct session_cfg *cfg)
 		 * answer is in play the ICE retry path below owns rotation.
 		 */
 		if ((st == ST_GATHER || st == ST_SIGNAL) && stun_stall(&s)) {
-			__atomic_add_fetch(&s.ice_attempt, 1, __ATOMIC_RELAXED);
-			s.stun_rotations++;
+			__atomic_add_fetch(&s.net.ice_attempt, 1, __ATOMIC_RELAXED);
+			s.net.rotations++;
 			st = client_regather(&s) ? ST_FAIL : ST_GATHER;
 		}
 		pool_pump(&s);
@@ -5368,8 +5333,10 @@ int session_run(const struct session_cfg *cfg)
 				s.escalated = 1;
 			}
 			if (o->escalate && !s.stun_warned &&
-			    (cfg->sig_flags & SIG_DHT) && __atomic_load_n(&s.have_priv4, __ATOMIC_RELAXED) &&
-			    !__atomic_load_n(&s.have_srflx4, __ATOMIC_RELAXED) &&
+			    (cfg->sig_flags & SIG_DHT) &&
+			    __atomic_load_n(&s.net.have_priv4,
+					    __ATOMIC_RELAXED) &&
+			    !__atomic_load_n(&s.net.have_srflx4, __ATOMIC_RELAXED) &&
 			    s.stun_count > 0 &&
 			    now_ms() - s.start_ms > STUN_WARN_MS) {
 				o->escalate(o->arg, "no public IPv4 from STUN -- "
@@ -5380,7 +5347,7 @@ int session_run(const struct session_cfg *cfg)
 			/* The fact the warning reported has stopped being true:
 			 * a reflexive v4 did arrive, just late. */
 			if (s.stun_warned &&
-			    __atomic_load_n(&s.have_srflx4, __ATOMIC_RELAXED)) {
+			    __atomic_load_n(&s.net.have_srflx4, __ATOMIC_RELAXED)) {
 				s.stun_warned = 0;
 				if (o->escalate_clear)
 					o->escalate_clear(o->arg);
@@ -5524,7 +5491,7 @@ int session_run(const struct session_cfg *cfg)
 			}
 			if (peering_ice_failed(&s.c.pr) ||
 			    now_ms() - s.ice_attempt_start > ICE_ATTEMPT_MS) {
-				__atomic_add_fetch(&s.ice_attempt, 1, __ATOMIC_RELAXED);
+				__atomic_add_fetch(&s.net.ice_attempt, 1, __ATOMIC_RELAXED);
 				conn_ice_stop(&s.c);
 				if (nat_setup(&s.c))
 					st = ST_FAIL;
