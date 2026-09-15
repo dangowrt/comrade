@@ -19,6 +19,7 @@
 #include <stdint.h>
 #include <pthread.h>
 
+#include "conn.h"
 #include "ctlplane.h"
 #include "ctlproto.h"
 #include "netstate.h"
@@ -530,6 +531,28 @@ int peering_recv(struct peering *pr, const uint8_t *data, size_t len,
 int peering_claims(struct peering *pr, const uint8_t *data, size_t len,
 		   enum path_kind kind, const struct sockaddr_in6 *src,
 		   uint64_t now);
+
+/*
+ * THIS PEER'S LINK, on the scale a watcher shows.
+ *
+ * The distinctions are about evidence, not about hope. Traffic arriving is the
+ * only thing that proves a path, and it proves it for the network it arrived
+ * on, so a move puts every peer back to unknown rather than leaving the last
+ * network's verdict on screen, where it reads as a working link that simply is
+ * not there. Between live and lost sits a stretch where the last thing heard
+ * is old enough to notice and not old enough to give up on; showing that as
+ * live is how a link that stopped looks fine until it is suddenly gone.
+ *
+ * `netgen` is the machine's generation now, and `carrier_up` whether a carrier
+ * exists at all, which is what tells a peer being punched from one that has
+ * not been reached yet. Returns a CONN_* state.
+ */
+/* The stretch between live and lost: old enough to notice, not old enough to
+ * give up on. */
+#define PEERING_LINK_LAG_MS 1200
+
+int peering_link(struct peering *pr, unsigned netgen, int carrier_up,
+		 uint64_t now);
 
 /* Which path carries this peer right now. */
 int peering_pick(struct peering *pr, uint64_t now,

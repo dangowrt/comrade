@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "hbeat.h"
 #include "peering.h"
 
 /* What a producer thread posts, the loop takes, and nothing is left behind. */
@@ -425,9 +426,50 @@ static void an_identity_is_minted_to_gather_under(void)
 	assert(strcmp(uf, uf2));
 }
 
+/*
+ * The link verdict is about evidence: nothing proves a path but traffic
+ * arriving, and it proves it only for the network it arrived on.
+ */
+static void the_link_verdict_follows_the_evidence(void)
+{
+	static const uint8_t key[32] = { 8 };
+	struct peering_model pm;
+	struct peering pr;
+
+	peering_model_init(&pm, 1, 1, NULL, 1000);
+	peering_init(&pr, &pm, 1, key, 1);
+
+	/* Nothing has answered: being punched and not being reached at all are
+	 * told apart by whether a carrier exists. */
+	assert(peering_link(&pr, 1, 0, 1000) == CONN_CONNECTING);
+	assert(peering_link(&pr, 1, 1, 1000) == CONN_PUNCHING);
+
+	/* A pong on generation 1. */
+	pr.cp.live.pong_seen = 1;
+	pr.cp.live.last_pong_ms = 1000;
+	pr.cp.live.rtt_ms = 10;
+	pr.cp.live.live_gen = 1;
+	assert(peering_link(&pr, 1, 1, 1000) == CONN_LIVE);
+
+	/* Old enough to notice, not old enough to give up on. */
+	assert(peering_link(&pr, 1, 1, 1000 + PEERING_LINK_LAG_MS) ==
+	       CONN_LAGGED);
+
+	/* Proven, but somewhere else: a move puts it back to unknown rather
+	 * than leaving the last network's verdict standing. */
+	assert(peering_link(&pr, 2, 1, 1000) == CONN_UNKNOWN);
+
+	/* Latched lost, and quiet for longer than the round trip earns it. */
+	pr.cp.live.lost_since_ms = 1500;
+	assert(peering_link(&pr, 1, 1, 1000 + hb_lost_ms(10)) == CONN_LOST);
+	peering_destroy(&pr);
+	peering_model_destroy(&pm);
+}
+
 int main(void)
 {
 	what_is_posted_is_taken_once();
+	the_link_verdict_follows_the_evidence();
 	the_server_an_attempt_asks_walks_the_list();
 	an_identity_is_minted_to_gather_under();
 	which_end_may_adopt_is_read_from_the_mailbox();

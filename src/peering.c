@@ -9,6 +9,7 @@
 #include <stdio.h>
 
 #include "dbg.h"
+#include "hbeat.h"
 #include "netroute.h"
 #include "keys.h"
 #include "peering.h"
@@ -1040,4 +1041,23 @@ void peering_ice_gen(char *ufrag, size_t uflen, char *pwd, size_t pwlen)
 	for (i = 0; i + 1 < pwlen && i < 32; i++)
 		pwd[i] = hx[i & 1 ? (rb[i / 2] & 0xf) : (rb[i / 2] >> 4)];
 	pwd[i] = '\0';
+}
+
+int peering_link(struct peering *pr, unsigned netgen, int carrier_up,
+		 uint64_t now)
+{
+	struct ctlplane_live live;
+
+	ctlplane_liveness(&pr->cp, &live);
+	if (!live.pong_seen)
+		return carrier_up ? CONN_PUNCHING : CONN_CONNECTING;
+	if (live.lost_since_ms &&
+	    now - live.last_pong_ms >= hb_lost_ms(live.rtt_ms))
+		return CONN_LOST;
+	if (live.live_gen != netgen)
+		return CONN_UNKNOWN;	/* proven, but somewhere else */
+	if (now - live.last_pong_ms >= PEERING_LINK_LAG_MS)
+		return CONN_LAGGED;
+
+	return CONN_LIVE;
 }
