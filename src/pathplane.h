@@ -176,6 +176,24 @@ void pathplane_holds_reap(struct pathplane *pl,
 			  const struct pathplane_sinks *k, uint64_t now);
 
 /*
+ * Settle which carrier is the one in use, after a link has come back.
+ *
+ * A carrier set aside that turns out to be the one carrying becomes the one in
+ * use, and whatever was in use is let go: it came back on the agent set aside,
+ * so that is the one that works and the punch being built in its place is
+ * spent. If something else carries, nothing set aside is answering, and the
+ * whole set is let go now rather than at its deadline, since a second punch
+ * would otherwise ride along on its own port for the whole span.
+ *
+ * `live` and `live_ctx` are the carrier the playbook is using, updated in
+ * place. Returns 1 when a set-aside carrier took over, -1 when the set was let
+ * go, and 0 when there was nothing to settle.
+ */
+int pathplane_holds_settle(struct pathplane *pl,
+			   const struct pathplane_sinks *k,
+			   struct nat_agent **live, void **live_ctx);
+
+/*
  * One punch per route, a route being the source and destination address pair
  * with the port ignored, it being a pinhole over the one physical path. When
  * two carriers this end owns nominated the same route the redundant one is let

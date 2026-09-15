@@ -567,9 +567,80 @@ static void a_blackholed_path_stops_being_probed(void)
 	end_done(&b);
 }
 
+/*
+ * A link coming back settles which carrier is the one in use: the set-aside
+ * one if that is what carries, and otherwise none of them, since nothing set
+ * aside is answering.
+ */
+static void a_link_coming_back_settles_which_carrier_is_used(void)
+{
+	struct nat_agent *held = (struct nat_agent *)0x1001;
+	struct nat_agent *used = (struct nat_agent *)0x1002;
+	struct nat_agent *live;
+	struct end a;
+	void *live_ctx;
+
+	end_init(&a, 1, "abcd");
+	live = used;
+	live_ctx = (void *)0x2002;
+	assert(!pathplane_holds_settle(&a.pl, &a.k, &live, &live_ctx));
+	assert(live == used);			/* nothing set aside */
+
+	/* The set-aside carrier is the one carrying: it takes over, and what
+	 * was in use is let go. */
+	pathplane_add_ice(&a.pl, held, 1000);
+	pathplane_hold_add(&a.pl, &a.k, held, (void *)0x2001, 5000);
+	a.k.live = NULL;			/* every path can carry */
+	{
+		struct pathplane_pick pick;
+
+		assert(!pathplane_pick(&a.pl, &a.k, 1000, &pick));
+	}
+	assert(pathplane_holds_settle(&a.pl, &a.k, &live, &live_ctx) == 1);
+	assert(live == held);
+	assert(live_ctx == (void *)0x2001);
+	assert(a.freed == 1 && a.last_freed == used);
+	assert(!pathplane_has_hold(&a.pl));
+	end_done(&a);
+}
+
+/* Something else carries, so nothing set aside is answering and the whole set
+ * goes now rather than at its deadline. */
+static void a_set_aside_carrier_that_answers_nothing_is_let_go(void)
+{
+	struct nat_agent *held = (struct nat_agent *)0x1001;
+	struct nat_agent *used = (struct nat_agent *)0x1002;
+	struct nat_agent *live = used;
+	void *live_ctx = (void *)0x2002;
+	struct end a, b;
+
+	end_init(&a, 1, "abcd");
+	end_init(&b, 2, "abcd");
+	/* A path off ICE carries, and a carrier is set aside beside it. */
+	assert(!pathplane_add_ep(&a.pl, &a.k, PATH_SEGMENT, &b.here, NULL, 0,
+				 1000));
+	pathplane_hold_add(&a.pl, &a.k, held, (void *)0x2001, 5000);
+	a.k.live = NULL;
+	{
+		struct pathplane_pick pick;
+
+		assert(!pathplane_pick(&a.pl, &a.k, 1000, &pick));
+		assert(pick.kind == PATH_SEGMENT);
+	}
+	assert(pathplane_holds_settle(&a.pl, &a.k, &live, &live_ctx) == -1);
+	assert(live == used);			/* the one in use is untouched */
+	assert(live_ctx == (void *)0x2002);
+	assert(a.freed == 1 && a.last_freed == held);
+	assert(!pathplane_has_hold(&a.pl));
+	end_done(&a);
+	end_done(&b);
+}
+
 int main(void)
 {
 	a_path_qualifies_only_once_it_answers();
+	a_link_coming_back_settles_which_carrier_is_used();
+	a_set_aside_carrier_that_answers_nothing_is_let_go();
 	a_blackholed_path_stops_being_probed();
 	a_carrier_set_aside_is_kept_until_its_time_is_up();
 	the_carrier_that_carries_is_not_reaped();
