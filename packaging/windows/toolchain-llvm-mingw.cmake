@@ -40,11 +40,20 @@ else()
 	set(CMAKE_SYSTEM_PROCESSOR AMD64)
 endif()
 
-set(CMAKE_C_COMPILER   "${LLVM_MINGW_ROOT}/bin/${LLVM_MINGW_TRIPLE}-clang.exe")
-set(CMAKE_CXX_COMPILER "${LLVM_MINGW_ROOT}/bin/${LLVM_MINGW_TRIPLE}-clang++.exe")
-set(CMAKE_RC_COMPILER  "${LLVM_MINGW_ROOT}/bin/${LLVM_MINGW_TRIPLE}-windres.exe")
-set(CMAKE_AR           "${LLVM_MINGW_ROOT}/bin/llvm-ar.exe")
-set(CMAKE_RANLIB       "${LLVM_MINGW_ROOT}/bin/llvm-ranlib.exe")
+# llvm-mingw ships the same toolchain for a Windows and a Linux host, and only
+# the Windows one suffixes its programs, so the suffix follows the host rather
+# than the target: a Linux host cross-builds the Windows target with this file.
+if(CMAKE_HOST_WIN32)
+	set(_llvm_mingw_exe ".exe")
+else()
+	set(_llvm_mingw_exe "")
+endif()
+
+set(CMAKE_C_COMPILER   "${LLVM_MINGW_ROOT}/bin/${LLVM_MINGW_TRIPLE}-clang${_llvm_mingw_exe}")
+set(CMAKE_CXX_COMPILER "${LLVM_MINGW_ROOT}/bin/${LLVM_MINGW_TRIPLE}-clang++${_llvm_mingw_exe}")
+set(CMAKE_RC_COMPILER  "${LLVM_MINGW_ROOT}/bin/${LLVM_MINGW_TRIPLE}-windres${_llvm_mingw_exe}")
+set(CMAKE_AR           "${LLVM_MINGW_ROOT}/bin/llvm-ar${_llvm_mingw_exe}")
+set(CMAKE_RANLIB       "${LLVM_MINGW_ROOT}/bin/llvm-ranlib${_llvm_mingw_exe}")
 set(CMAKE_C_COMPILER_TARGET   "${LLVM_MINGW_TRIPLE}")
 set(CMAKE_CXX_COMPILER_TARGET "${LLVM_MINGW_TRIPLE}")
 
