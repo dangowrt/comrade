@@ -150,9 +150,21 @@ static struct stun_cache_entry stun_cache[STUN_CACHE_MAX];
 static int stun_cache_n;
 static pthread_mutex_t stun_cache_lock = PTHREAD_MUTEX_INITIALIZER;
 
-/* Names that failed to resolve, skipped for the life of the process so a dead
- * pool entry is not handed to libjuice to stall the gather on. */
-static char stun_neg[STUN_CACHE_MAX][128];
+/*
+ * Names the resolver has said do not exist, skipped so a dead pool entry is
+ * not handed to libjuice to stall the gather on. Held with an expiry rather
+ * than for the life of the process: a resolver that answers NXDOMAIN for
+ * everything, a captive portal among them, would otherwise write the pool off
+ * permanently for a session that merely passed through it.
+ */
+#define STUN_NEG_MS (10 * 60 * 1000)
+
+struct stun_neg_entry {
+	char name[128];
+	uint64_t until_ms;
+};
+
+static struct stun_neg_entry stun_neg[STUN_CACHE_MAX];
 static int stun_neg_n;
 
 /* Every address held for `name`, in insertion order; how many were written. */
@@ -249,12 +261,13 @@ static void cache_replace(const char *name, const struct sockaddr_storage *sa,
 
 static int neg_has(const char *name)
 {
+	uint64_t now = os_mono_ms();
 	int i, hit = 0;
 
 	pthread_mutex_lock(&stun_cache_lock);
 	for (i = 0; i < stun_neg_n; i++)
-		if (!strcmp(stun_neg[i], name)) {
-			hit = 1;
+		if (!strcmp(stun_neg[i].name, name)) {
+			hit = now < stun_neg[i].until_ms;
 			break;
 		}
 	pthread_mutex_unlock(&stun_cache_lock);
@@ -263,16 +276,19 @@ static int neg_has(const char *name)
 
 static void neg_put(const char *name)
 {
+	uint64_t until = os_mono_ms() + STUN_NEG_MS;
 	int i;
 
-	if (strlen(name) >= sizeof(stun_neg[0]))
+	if (strlen(name) >= sizeof(stun_neg[0].name))
 		return;
 	pthread_mutex_lock(&stun_cache_lock);
 	for (i = 0; i < stun_neg_n; i++)
-		if (!strcmp(stun_neg[i], name))
+		if (!strcmp(stun_neg[i].name, name))
 			break;
 	if (i == stun_neg_n && stun_neg_n < STUN_CACHE_MAX)
-		strcpy(stun_neg[stun_neg_n++], name);
+		strcpy(stun_neg[stun_neg_n++].name, name);
+	if (i < stun_neg_n)
+		stun_neg[i].until_ms = until;
 	pthread_mutex_unlock(&stun_cache_lock);
 }
 
@@ -288,14 +304,15 @@ static void neg_put(const char *name)
 
 static int resolve4_all(const char *server, struct sockaddr_in *out, int max)
 {
+	const char *colon = strrchr(server, ':');
 	struct addrinfo hints, *res, *ai;
 	struct sockaddr_storage ss;
-	const char *colon = strrchr(server, ':');
-	char host[128];
 	const char *port = "3478";
-	size_t hl = colon ? (size_t)(colon - server) : strlen(server);
-	int n, i;
+	char host[128];
+	int n, i, rc;
+	size_t hl;
 
+	hl = colon ? (size_t)(colon - server) : strlen(server);
 	n = cache_get_all(server, AF_INET, out, max);
 	if (n)
 		return n;
@@ -311,8 +328,13 @@ static int resolve4_all(const char *server, struct sockaddr_in *out, int max)
 	memset(&hints, 0, sizeof(hints));
 	hints.ai_family = AF_INET;
 	hints.ai_socktype = SOCK_DGRAM;
-	if (getaddrinfo(host, port, &hints, &res) || !res) {
-		neg_put(server);
+	rc = getaddrinfo(host, port, &hints, &res);
+	if (rc || !res) {
+		/* A resolver that could not be reached is about the uplink,
+		 * not about the name: writing the pool off for that leaves a
+		 * roam onto a dead link with no STUN once it recovers. */
+		if (rc == EAI_NONAME)
+			neg_put(server);
 		return 0;
 	}
 	for (ai = res; ai && n < max; ai = ai->ai_next) {
