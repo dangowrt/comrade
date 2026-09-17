@@ -348,7 +348,7 @@ static int resolve_name(const char *server, int family,
 		    (size_t)ai->ai_addrlen > sizeof(out[0]))
 			continue;
 		for (i = 0; i < n; i++)	/* getaddrinfo may repeat one */
-			if (outlen[i] == ai->ai_addrlen &&
+			if ((size_t)outlen[i] == (size_t)ai->ai_addrlen &&
 			    !memcmp(&out[i], ai->ai_addr, (size_t)outlen[i]))
 				break;
 		if (i < n)
