@@ -273,81 +273,101 @@ int peering_sdp_has_candidate(const char *sdp)
 	return strstr(sdp, "a=candidate:") != NULL;
 }
 
-static void probe_hit(void *arg, const uint8_t addr[4], uint16_t port)
+static void probe_hit(void *arg, int family, const uint8_t addr[16],
+		      uint16_t port)
 {
+	int fam = family == AF_INET6 ? 6 : 4;
 	struct peering_net *m = arg;
-	int added = peering_pool_note(&m->pool, addr);
+	struct peering_probe *p;
+	uint32_t epoch;
+	char ip[64];
+	int added;
 
+	p = family == AF_INET6 ? &m->probe6 : &m->probe;
+	epoch = __atomic_load_n(&p->epoch, __ATOMIC_RELAXED);
+	peering_facts_post(&m->facts, NSF_ROUNDTRIP, fam, epoch);
+	if (family == AF_INET6) {
+		/* No pool: v6 is not behind a carrier that maps per
+		 * destination, so the address it is seen at is a candidate. */
+		if (inet_ntop(AF_INET6, addr, ip, sizeof(ip)))
+			peering_facts_post_addr(&m->facts, 6, epoch, addr, ip);
+		return;
+	}
+	added = peering_pool_note(&m->pool, addr);
 	if (added)
 		dbg_logf("stun: egress +%u.%u.%u.%u (pool now %d)", addr[0],
 			 addr[1], addr[2], addr[3], added);
 	peering_pool_sample(&m->pool, addr, port);
-	peering_facts_post(&m->facts, NSF_ROUNDTRIP, 4,
-			   __atomic_load_n(&m->probe.epoch, __ATOMIC_RELAXED));
 }
 
-static void *probe_thread(void *arg)
+/* The verdict this round reached, and the pool it reached it against. Which
+ * way this goes decides whether the offer names every egress address or one
+ * of them, and until it was said out loud the difference was visible only as
+ * a punch that sometimes worked. */
+static void probe_verdict(struct peering_net *m)
 {
-	struct peering_net *m = arg;
-	uint8_t seed[STUN_PROBE_TXID_LEN];
-	uint32_t epoch = __atomic_load_n(&m->probe.epoch, __ATOMIC_RELAXED);
-	int st, stable, npool;
+	int stable = peering_pool_port_stable(&m->pool);
+	int npool = peering_pool_count(&m->pool);
+	int st = peering_pool_mapping(&m->pool);
 
-	peering_pool_round(&m->pool);
-	random_bytes(seed, sizeof(seed));
-	stun_probe_run(m->servers, m->nservers, PEERING_PROBE_MS, seed,
-		       &m->probe.stop, probe_hit, m);
-	st = peering_pool_mapping(&m->pool);
-	stable = peering_pool_port_stable(&m->pool);
-	npool = peering_pool_count(&m->pool);
-	/* The verdict this round reached, and the pool it reached it against.
-	 * Which way this goes decides whether the offer names every egress
-	 * address or one of them, and until it was said out loud the difference
-	 * was visible only as a punch that sometimes worked. */
 	dbg_logf("stun: round done -- mapping %s, port %s, "
 		 "%d egress address(es) known",
 		 st == STUN_MAPPING_DEPENDENT ? "per-destination" :
 		 st == STUN_MAPPING_INDEPENDENT ? "one for all" :
 						  "not yet known",
 		 stable ? "stable" : "moves with the destination", npool);
-	peering_facts_post(&m->facts, NSF_PROBE_DONE, 4, epoch);
+}
 
+/*
+ * One round for either family. The v4 half builds the egress pool and the
+ * mapping verdict out of the answers, which is the whole of what the families
+ * do differently; the v6 half asks a few of the same servers, since without a
+ * pool to fill one answer is proof enough of reachability.
+ */
+static void probe_round(struct peering_net *m, int family)
+{
+	struct peering_probe *p = family == AF_INET6 ? &m->probe6 : &m->probe;
+	char *targets[PEERING_PROBE6_SERVERS];
+	int fam = family == AF_INET6 ? 6 : 4;
+	uint8_t seed[STUN_PROBE_TXID_LEN];
+	char *const *list = m->servers;
+	int n = m->nservers;
+	uint32_t epoch;
+	int i;
+
+	epoch = __atomic_load_n(&p->epoch, __ATOMIC_RELAXED);
+	if (family == AF_INET6) {
+		for (n = 0, i = 0; i < m->nservers &&
+		     n < PEERING_PROBE6_SERVERS; i++)
+			targets[n++] = m->servers[(p->start + i) % m->nservers];
+		list = targets;
+	} else {
+		peering_pool_round(&m->pool);
+	}
+	random_bytes(seed, sizeof(seed));
+	stun_probe_run(family, list, n, PEERING_PROBE_MS, seed, &p->stop,
+		       probe_hit, m);
+	if (family == AF_INET)
+		probe_verdict(m);
+	peering_facts_post(&m->facts, NSF_PROBE_DONE, fam, epoch);
+}
+
+static void *probe_thread(void *arg)
+{
+	probe_round(arg, AF_INET);
+	return NULL;
+}
+
+static void *probe6_thread(void *arg)
+{
+	probe_round(arg, AF_INET6);
 	return NULL;
 }
 
 /* v6's proof and the address that carried it. Often the only v6 address
  * anything sees, ICE gathering no v6 reflexive candidate when a global host
  * candidate already exists. */
-static void probe6_hit(void *arg, const uint8_t addr[16], uint16_t port)
-{
-	struct peering_net *m = arg;
-	uint32_t epoch;
-	char ip[64];
 
-	(void)port;
-	epoch = __atomic_load_n(&m->probe6.epoch, __ATOMIC_RELAXED);
-	peering_facts_post(&m->facts, NSF_ROUNDTRIP, 6, epoch);
-	if (inet_ntop(AF_INET6, addr, ip, sizeof(ip)))
-		peering_facts_post_addr(&m->facts, 6, epoch, addr, ip);
-}
-
-static void *probe6_thread(void *arg)
-{
-	struct peering_net *m = arg;
-	char *targets[PEERING_PROBE6_SERVERS];
-	uint8_t seed[STUN_PROBE_TXID_LEN];
-	uint32_t epoch = __atomic_load_n(&m->probe6.epoch, __ATOMIC_RELAXED);
-	int n = 0, i;
-
-	for (i = 0; i < m->nservers && n < PEERING_PROBE6_SERVERS; i++)
-		targets[n++] = m->servers[(m->probe6.start + i) % m->nservers];
-	random_bytes(seed, sizeof(seed));
-	stun_probe_check(targets, n, AF_INET6, PEERING_PROBE_MS, seed,
-			 &m->probe6.stop, probe6_hit, m);
-	peering_facts_post(&m->facts, NSF_PROBE_DONE, 6, epoch);
-
-	return NULL;
-}
 
 void peering_net_init(struct peering_net *m, char *const *servers,
 		      int nservers, int auto_probe)
