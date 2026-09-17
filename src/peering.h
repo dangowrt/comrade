@@ -295,6 +295,10 @@ void peering_net_destroy(struct peering_net *m);
 int peering_net_kick(struct peering_net *m, int family, uint32_t epoch,
 		     int start6);
 
+/* stun_pool_warm_start's `more` callback, with this net as its arg: runs on a
+ * resolver thread, so it only queues the fact the session thread drains. */
+void peering_net_more(void *arg, int family);
+
 /* Ask a family's round to wind up, without waiting. */
 void peering_net_halt(struct peering_net *m, int family);
 

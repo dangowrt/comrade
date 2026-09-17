@@ -4,6 +4,7 @@
 #include <assert.h>
 #include <string.h>
 
+#include "wsock.h"
 #include "stunprobe.h"
 
 static const uint8_t seed[STUN_PROBE_TXID_LEN] =
@@ -239,11 +240,43 @@ static void parse6_check(void)
 	assert(stun_probe_mapped_fam(resp, n, seed, 0x01, addr, &port) != 0);
 }
 
+/* Numeric names resolve without a resolver, which is how the cache is seeded
+ * here. */
+static void askable_check(void)
+{
+	static char *const pool[5] = {
+		(char *)"127.0.0.1:3478", (char *)"192.0.2.1:3478",
+		(char *)"127.0.0.2:3478", (char *)"192.0.2.2:3478",
+		(char *)"192.0.2.3:3478"
+	};
+	char *out[5], *first;
+	char ip[64];
+	int start;
+
+	assert(!wsock_init());
+	assert(stun_server_ip4(pool[0], ip, sizeof(ip), 1) == 1);
+	assert(stun_server_ip4(pool[2], ip, sizeof(ip), 1) == 1);
+	assert(stun_pool_askable(pool, 5, AF_INET6, 0, out, 5) == 0);
+
+	for (start = 0; start < 5; start++) {
+		first = start == 1 || start == 2 ? pool[2] : pool[0];
+		assert(stun_pool_askable(pool, 5, AF_INET, start, out, 5) == 2);
+		assert(out[0] == first);
+		assert(out[1] == (first == pool[0] ? pool[2] : pool[0]));
+	}
+
+	assert(stun_pool_askable(pool, 5, AF_INET, 0, out, 1) == 1);
+	assert(stun_pool_askable(pool, 5, AF_INET, 0, NULL, 5) == 2);
+	assert(stun_pool_askable(pool, 0, AF_INET, 0, out, 5) == 0);
+	wsock_fini();
+}
+
 int main(void)
 {
 	build_check();
 	parse_check();
 	parse6_check();
 	mapping_check();
+	askable_check();
 	return 0;
 }

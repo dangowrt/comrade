@@ -26,18 +26,29 @@ int stun_probe_mapped4(const uint8_t *pkt, size_t len,
 		       const uint8_t seed[STUN_PROBE_TXID_LEN],
 		       uint8_t addr[4], uint16_t *port);
 
-typedef void stun_probe_hit(void *arg, const uint8_t addr[4], uint16_t port);
+/*
+ * One response: `addr` is four bytes for AF_INET and sixteen for AF_INET6,
+ * the family the caller asked stun_probe_run for.
+ */
+/* A family's server set grew: what was unresolved when a round last asked is
+ * resolvable now. */
+typedef void stun_more_fn(void *arg, int family);
+
+typedef void stun_probe_hit(void *arg, int family, const uint8_t addr[16],
+			    uint16_t port);
 
 /*
- * Ask up to `nservers` "host:port" STUN servers for this network's mapping of
- * one socket, calling `hit` for each response's mapped v4 address and port as
- * it arrives; run for at most `total_ms`, or until *stop goes nonzero.
- * Blocking (resolution included) -- meant for a thread of its own. The seed's
- * last byte is overwritten per server.
+ * Ask up to `nservers` "host[:port]" STUN servers of `family` (AF_INET or
+ * AF_INET6) for this network's mapping of one socket, over every cached
+ * address each name carries, calling `hit` for each response as it arrives;
+ * run for at most `total_ms`, or until *stop goes nonzero. The egress pool
+ * and the NAT classification a v4 carrier needs are the caller's to build out
+ * of the hits, and are what the two families do differently. Blocking -- meant
+ * for a thread of its own. The seed's last byte is overwritten per target.
  */
-void stun_probe_run(char *const *servers, int nservers, int total_ms,
-		    uint8_t seed[STUN_PROBE_TXID_LEN], volatile int *stop,
-		    stun_probe_hit *hit, void *arg);
+void stun_probe_run(int family, char *const *servers, int nservers,
+		    int total_ms, uint8_t seed[STUN_PROBE_TXID_LEN],
+		    volatile int *stop, stun_probe_hit *hit, void *arg);
 
 /*
  * The mapped address a validated reply carries for the wire-format family byte
@@ -48,36 +59,27 @@ int stun_probe_mapped_fam(const uint8_t *pkt, size_t len,
 			  const uint8_t seed[STUN_PROBE_TXID_LEN], int want_fam,
 			  uint8_t addr[16], uint16_t *port);
 
-/*
- * addr[0..3] for a v4 reply, addr[0..15] for a v6 one -- the caller already
- * knows which, having asked stun_probe_check for that family.
- */
-typedef void stun_probe_check_hit(void *arg, const uint8_t addr[16],
-				  uint16_t port);
-
-/*
- * Ask up to `nservers` "host:port" STUN servers of `family` (AF_INET or
- * AF_INET6) for a binding response, calling `hit` once real proof arrives --
- * a validated reply to this exact request -- with the address it says we are
- * seen as. No pool and no NAT classification: stun_probe_run is still where
- * those come from for v4. Runs for at most `total_ms`, or until *stop goes
- * nonzero, calling `hit` at most once. Blocking (resolution included) -- meant
- * for a thread of its own.
- */
-void stun_probe_check(char *const *servers, int nservers, int family,
-		      int total_ms, uint8_t seed[STUN_PROBE_TXID_LEN],
-		      volatile int *stop, stun_probe_check_hit *hit, void *arg);
-
 /* First cached IPv4 address for `server` ("host[:port]") as a dotted string in
  * out (outn >= 16). allow_net resolves and caches on a miss (blocking); 0 uses
  * the cache only. Returns 1 on success, 0 if not (yet) known. */
 int stun_server_ip4(const char *server, char *out, size_t outn, int allow_net);
 
+/* The servers of `family` a round can ask, walked from `start` and wrapping:
+ * up to `max` of the caller's own pointers into `out` (NULL counts alone), and
+ * how many. A round reads the cache, so an unresolved name is unaskable. */
+int stun_pool_askable(char *const *servers, int nservers, int family, int start,
+		      char **out, int max);
+
 /* Background thread: resolve every server's v4 and v6 addresses into the cache
  * (so the probe threads never block on DNS), refreshed periodically. *stop ends
  * it; the thread lands in *th to join. Returns 0 on success. */
 int stun_pool_warm_start(char *const *servers, int nservers, volatile int *stop,
-			 pthread_t *th);
+			 pthread_t *th, stun_more_fn *more, void *arg);
+
+/* Retire the callback and wait out any resolver thread inside one. A name
+ * lookup has no timeout, so those threads are detached and outlive the loop
+ * thread the caller joins; `arg` must stay alive until this returns. */
+void stun_pool_warm_forget(void);
 
 /*
  * RFC 4787 mapping-behaviour classification, built incrementally from the

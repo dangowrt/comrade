@@ -32,6 +32,9 @@ void nsfacts_post(struct nsfacts *f, int kind, int family, uint32_t epoch)
 	} else if (kind == NSF_PROBE_DONE) {
 		f->done[i] = 1;
 		f->done_epoch[i] = epoch;
+	} else if (kind == NSF_SERVERS) {
+		f->more[i] = 1;
+		f->more_epoch[i] = epoch;
 	}
 }
 
@@ -77,6 +80,12 @@ int nsfacts_take(struct nsfacts *f, struct nsfact *out, int max)
 			continue;
 		emit(&out[n++], NSF_ROUNDTRIP, i, f->rt_epoch[i]);
 		f->rt[i] = 0;
+	}
+	for (i = 0; i < 2; i++) {
+		if (!f->more[i] || n >= max)
+			continue;
+		emit(&out[n++], NSF_SERVERS, i, f->more_epoch[i]);
+		f->more[i] = 0;
 	}
 	for (i = 0; i < f->n && n < max; i++)
 		out[n++] = f->q[i];

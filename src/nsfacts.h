@@ -33,7 +33,8 @@
 enum {
 	NSF_ROUNDTRIP,			/* something answered us */
 	NSF_PROBE_DONE,			/* a probe round ended, proving nothing */
-	NSF_ADDR			/* and the address it said we are seen as */
+	NSF_ADDR,			/* and the address it said we are seen as */
+	NSF_SERVERS			/* a family has somewhere new to ask */
 };
 
 #define NSFACTS_MAX 16			/* observations queued at once */
@@ -59,6 +60,8 @@ struct nsfacts {
 	uint32_t rt_epoch[2];
 	int done[2];			/* a probe round has ended */
 	uint32_t done_epoch[2];
+	int more[2];			/* the resolver found somewhere to ask */
+	uint32_t more_epoch[2];
 };
 
 void nsfacts_init(struct nsfacts *f);

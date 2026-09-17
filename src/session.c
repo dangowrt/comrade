@@ -5190,7 +5190,7 @@ int session_run(const struct session_cfg *cfg)
 	 * addresses instead of blocking on a name lookup after a move. */
 	if (cfg->stun_auto && s.stun_count > 0 &&
 	    !stun_pool_warm_start(s.stun_servers, s.stun_count, &s.warm_stop,
-				  &s.warm_th))
+				  &s.warm_th, peering_net_more, &s.net))
 		s.warm_running = 1;
 	/* The probes are scheduled by the reachability model, which asks for the
 	 * first round on its first tick. */
@@ -5633,6 +5633,7 @@ done:
 	if (s.warm_running) {
 		__atomic_store_n(&s.warm_stop, 1, __ATOMIC_RELAXED);
 		pthread_join(s.warm_th, NULL);
+		stun_pool_warm_forget();
 		s.warm_running = 0;
 	}
 	stunlist_free(s.stun_servers, s.stun_count);
