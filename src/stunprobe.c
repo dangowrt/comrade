@@ -138,6 +138,10 @@ int stun_probe_mapped4(const uint8_t *pkt, size_t len,
 #define STUN_WARM_ADDRS 16	/* cache every A record a name carries, not one */
 #define STUN_WARM_REFRESH_S (6 * 3600)	/* re-resolve, so a server that moves
 					 * does not bite a very long session */
+#define STUN_WARM_SETTLE_S 10		/* long enough for a pass to fail: a
+					 * resolver with no uplink times out */
+#define STUN_WARM_RETRY_S 15		/* first retry while nothing resolved */
+#define STUN_WARM_RETRY_MAX_S 300
 
 struct stun_cache_entry {
 	char name[128];
@@ -201,6 +205,17 @@ static int cache_get(const char *name, int family,
 	}
 	pthread_mutex_unlock(&stun_cache_lock);
 	return hit;
+}
+
+/* Whether anything at all has resolved: the warm pass judges itself on this. */
+static int cache_any(void)
+{
+	int n;
+
+	pthread_mutex_lock(&stun_cache_lock);
+	n = stun_cache_n;
+	pthread_mutex_unlock(&stun_cache_lock);
+	return n > 0;
 }
 
 static void cache_put(const char *name, int family,
@@ -431,14 +446,32 @@ struct stun_warm {
 	int n;
 };
 
+/* Interruptible; 1 when asked to stop. */
+static int warm_sleep(const struct stun_warm *w, int secs)
+{
+	int slept;
+
+	for (slept = 0; slept < secs; slept++) {
+		if (sb_flag(w->stop))
+			return 1;
+		os_msleep(1000);
+	}
+	return 0;
+}
+
 /* Warm the whole pool at once (a dead name cannot hold up the rest), then
- * re-resolve every STUN_WARM_REFRESH_S so a moved server is picked up. */
+ * re-resolve every STUN_WARM_REFRESH_S so a moved server is picked up.
+ *
+ * Until something resolves there are no STUN destinations at all, for either
+ * family, since this is the only thing that fills the cache the rounds read.
+ * An uplink that is down fails every name, so a pass that resolved nothing is
+ * retried on a short backoff instead of sitting out the refresh interval. */
 static void *stun_warm_loop(void *arg)
 {
 	struct stun_warm *w = arg;
 	struct stun_warm_one *j;
+	int i, wait, back = 0;
 	pthread_t th;
-	int i, slept;
 
 	for (;;) {
 		for (i = 0; i < w->n; i++) {
@@ -454,13 +487,20 @@ static void *stun_warm_loop(void *arg)
 			}
 			pthread_detach(th);
 		}
-		for (slept = 0; slept < STUN_WARM_REFRESH_S; slept++) {
-			if (sb_flag(w->stop))
-				goto done;
-			os_msleep(1000);
+		if (warm_sleep(w, STUN_WARM_SETTLE_S))
+			break;
+		if (cache_any()) {
+			back = 0;
+			wait = STUN_WARM_REFRESH_S - STUN_WARM_SETTLE_S;
+		} else {
+			back = back ? back * 2 : STUN_WARM_RETRY_S;
+			if (back > STUN_WARM_RETRY_MAX_S)
+				back = STUN_WARM_RETRY_MAX_S;
+			wait = back;
 		}
+		if (warm_sleep(w, wait))
+			break;
 	}
-done:
 	free(w);
 	return NULL;
 }
