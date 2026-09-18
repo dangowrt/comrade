@@ -322,6 +322,20 @@ void sig_discard(struct sig *s)
 	sig_free(s, 0);
 }
 
+unsigned sig_routes_open(int node_ready, int rdv_held)
+{
+	if (node_ready)
+		return SIG_ROUTE_DIRECT | SIG_ROUTE_WIDE;
+	return rdv_held ? SIG_ROUTE_DIRECT : 0u;
+}
+
+/* The same against this signaller; only valid once the DHT is engaged. */
+static unsigned routes_now(struct sig *s)
+{
+	return sig_routes_open(dhtnode_ready(s->node),
+			       bep44_direct_nodes(s->engine) > 0);
+}
+
 int sig_prepare(struct sig *s, struct pollfd *fds, int maxfds, int *timeout_ms)
 {
 	int nfds = 0, t;
@@ -338,7 +352,7 @@ int sig_ready(struct sig *s)
 {
 	if (s->mc)
 		return 1;
-	return s->dht_engaged && dhtnode_ready(s->node);
+	return s->dht_engaged && routes_now(s) != 0;
 }
 
 /* The ICE ufrag an sdp names, "" when absent. */
@@ -1451,9 +1465,11 @@ static int claim_current(const struct sig *s)
 
 static void dht_pump(struct sig *s, uint64_t now)
 {
-	if (!dhtnode_ready(s->node))
+	unsigned routes = routes_now(s);
+
+	if (!routes)
 		return;
-	if (s->rdv_stage < 1)
+	if ((routes & SIG_ROUTE_WIDE) && s->rdv_stage < 1)
 		s->rdv_stage = 1;		/* DHT warm: nodes found near key */
 	if (now >= s->next_get_ms) {
 		/*
@@ -1472,7 +1488,7 @@ static void dht_pump(struct sig *s, uint64_t now)
 	 * to a node we never pinned is still found. The nodes that answer are
 	 * retained, so the direct route takes over as soon as there is one.
 	 */
-	if (now >= s->next_wide_get_ms) {
+	if ((routes & SIG_ROUTE_WIDE) && now >= s->next_wide_get_ms) {
 		const uint8_t *slot;
 
 		bep44_get(s->engine, s->keys.bep44_pk, SIG_SALT, on_dht_get, s);
@@ -1514,7 +1530,7 @@ static void dht_pump(struct sig *s, uint64_t now)
 			bep44_update_direct(s->engine, s->keys.bep44_sk,
 					    s->keys.bep44_pk, SIG_SALT,
 					    sig_merge, s, on_tomb_direct, s);
-		} else if (!s->end_placed_wide) {
+		} else if ((routes & SIG_ROUTE_WIDE) && !s->end_placed_wide) {
 			sig_note_put(s);
 			bep44_update(s->engine, s->keys.bep44_sk,
 				     s->keys.bep44_pk, SIG_SALT, sig_merge, s,
@@ -1539,7 +1555,8 @@ static void dht_pump(struct sig *s, uint64_t now)
 		int missing = !s->rnode4_len || !s->rnode6_len ||
 			      s->relocate4 || s->relocate6;
 
-		if (s->mb.have_mine && missing && !s->put_inflight) {
+		if (s->mb.have_mine && missing && (routes & SIG_ROUTE_WIDE) &&
+		    !s->put_inflight) {
 			int eager = ((!s->rnode4_len || s->relocate4) && s->up4) ||
 				    ((!s->rnode6_len || s->relocate6) && s->up6);
 
@@ -1552,8 +1569,8 @@ static void dht_pump(struct sig *s, uint64_t now)
 				s->put_inflight = 0;
 			s->next_put_ms = now +
 				(eager ? SIG_DHT_PUT_MS : SIG_DHT_PUT_SLOW_MS);
-		} else if (s->mb.have_mine && now >= s->next_wide_put_ms &&
-			   !s->put_inflight) {
+		} else if (s->mb.have_mine && (routes & SIG_ROUTE_WIDE) &&
+			   now >= s->next_wide_put_ms && !s->put_inflight) {
 			/*
 			 * The value where the key says it belongs, not only
 			 * where it first landed. Which nodes are closest drifts
@@ -1610,6 +1627,8 @@ static void dht_pump(struct sig *s, uint64_t now)
 		 */
 		int wide = s->next_wide_put_ms && now >= s->next_wide_put_ms;
 
+		if (!(routes & SIG_ROUTE_WIDE))
+			wide = 0;
 		dbg_logf("sig: writing claim to the rendezvous%s",
 			 wide ? " (convergent)" : "");
 		sig_note_put(s);
@@ -1653,7 +1672,7 @@ static void dht_pump(struct sig *s, uint64_t now)
 		 * see the family for itself.
 		 */
 		sig_note_put(s);
-		if (relay_locating(s)) {
+		if (relay_locating(s) && (routes & SIG_ROUTE_WIDE)) {
 			bep44_update(s->engine, s->keys.bep44_sk,
 				     s->keys.bep44_pk, SIG_SALT,
 				     sig_relay_merge, s, NULL, NULL);

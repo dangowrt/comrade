@@ -98,6 +98,9 @@ int bep44_update_direct(struct bep44_engine *e, const uint8_t sk[64],
 			const uint8_t pk[32], const char *salt,
 			bep44_merge_fn *merge, void *merge_arg,
 			bep44_put_cb *cb, void *arg);
+/* How many nodes those two would address, so a caller can tell a direct route
+ * that goes somewhere from one that goes nowhere. */
+int bep44_direct_nodes(struct bep44_engine *e);
 
 /*
  * Serve BEP 44 to the network: hold items other peers store here and answer

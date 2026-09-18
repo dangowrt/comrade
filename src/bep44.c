@@ -2703,6 +2703,16 @@ void bep44_pin_del(struct bep44_engine *e, const struct sockaddr *sa,
 	}
 }
 
+int bep44_direct_nodes(struct bep44_engine *e)
+{
+	int n = e->npinned, i;
+
+	for (i = 0; i < B44_RETAINED_MAX; i++)
+		if (e->retained[i].in_use)
+			n++;
+	return n;
+}
+
 int bep44_put(struct bep44_engine *e, const uint8_t sk[64], const uint8_t pk[32],
 	      const char *salt, const uint8_t *v, size_t v_len, int64_t seq,
 	      int64_t cas, bep44_put_cb *cb, void *arg)
