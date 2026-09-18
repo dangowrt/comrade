@@ -38,6 +38,8 @@
 #define ROUND_MAX_MS 250	/* generous: a clean round is ~1 ms, a waiting
 				 * one is STALL_MS x the router count */
 
+static int resolves;		/* names this run has been asked to resolve */
+
 int getaddrinfo(const char *node, const char *service,
 		const struct addrinfo *hints, struct addrinfo **res)
 {
@@ -46,6 +48,7 @@ int getaddrinfo(const char *node, const char *service,
 	(void)node;
 	(void)service;
 	(void)hints;
+	__atomic_add_fetch(&resolves, 1, __ATOMIC_RELAXED);
 	ts.tv_sec = STALL_MS / 1000;
 	ts.tv_nsec = (long)(STALL_MS % 1000) * 1000000L;
 	nanosleep(&ts, NULL);
@@ -64,6 +67,23 @@ static uint64_t now_ms(void)
 
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return (uint64_t)ts.tv_sec * 1000 + (uint64_t)(ts.tv_nsec / 1000000);
+}
+
+/* Whether a pass is in flight at all: a prompt discard proves nothing about
+ * the resolver unless one was left behind by it. */
+static int resolve_started(void)
+{
+	struct timespec ts;
+	int i;
+
+	ts.tv_sec = 0;
+	ts.tv_nsec = 10 * 1000000L;
+	for (i = 0; i < 100; i++) {
+		if (__atomic_load_n(&resolves, __ATOMIC_RELAXED))
+			return 1;
+		nanosleep(&ts, NULL);
+	}
+	return 0;
 }
 
 int main(void)
@@ -117,17 +137,24 @@ int main(void)
 			/* What the session does across its own rebuild. */
 			sig_use_claim_key(s, k0);
 			assert(!sig_claim_key(s, k) && !memcmp(k, k0, 32));
-			assert(sig_prepare(s, fds, 8, &timeout_ms) > 0);
+			nfds = sig_prepare(s, fds, 8, &timeout_ms);
+			assert(nfds > 0);
+			/* The bootstrap round is what starts a resolve, so a
+			 * pump is what puts one in flight to be left behind. */
+			sig_dispatch(s, fds, nfds);
 			sig_discard(s);
 			assert(now_ms() - t0 < ROUND_MAX_MS);
 		}
+		assert(resolve_started());
 	}
 
 	/* The session's own teardown, which persists the node cache. */
 	t0 = now_ms();
 	s = sig_create(rdv, SIG_DHT, 1);
 	assert(s);
-	assert(sig_prepare(s, fds, 8, &timeout_ms) > 0);
+	nfds = sig_prepare(s, fds, 8, &timeout_ms);
+	assert(nfds > 0);
+	sig_dispatch(s, fds, nfds);
 	sig_destroy(s);
 	assert(now_ms() - t0 < ROUND_MAX_MS);
 
