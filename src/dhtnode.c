@@ -152,7 +152,7 @@ struct dhtnode {
 	uint64_t next_cache_ms;		/* next warm-up cache-write check */
 	int no_bootstrap;		/* rendezvous-only: never ping the routers */
 	int cache_enabled;		/* persist/restore good nodes across runs */
-	int cache_was_empty;		/* no on-disk cache at start */
+	int cache_was_empty;		/* no on-disk cache seen yet */
 	int cache_primed;		/* the one warm-up write has been done */
 	struct netmon netmon;
 	unsigned netgen;
@@ -416,7 +416,9 @@ static int cache_load_family(struct dhtnode *n, int af)
 	return loaded;
 }
 
-static void dhtcache_load(struct dhtnode *n)
+/* Ping every node on disk; how many there were. Asked on every bootstrap round
+ * while a family still wants nodes, since this needs no name server at all. */
+static int dhtcache_load(struct dhtnode *n)
 {
 	int loaded = 0;
 
@@ -424,7 +426,9 @@ static void dhtcache_load(struct dhtnode *n)
 		loaded += cache_load_family(n, AF_INET);
 	if (sock_valid(n->s6))
 		loaded += cache_load_family(n, AF_INET6);
-	n->cache_was_empty = loaded == 0;
+	if (loaded)
+		n->cache_was_empty = 0;
+	return loaded;
 }
 
 /* Write one family's nodes; returns 1 if a file was written, 0 otherwise. */
@@ -561,7 +565,7 @@ static struct dhtnode *dhtnode_create_impl(int do_bootstrap)
 	if (do_bootstrap) {
 		/* Cached nodes seed alongside the curated routers, not instead. */
 		n->cache_enabled = 1;
-		dhtcache_load(n);
+		n->cache_was_empty = 1;		/* until a round finds records */
 		n->next_bootstrap_ms = now_ms();
 		n->next_cache_ms = now_ms() + DHTNODE_WARMCHECK_MS;
 	} else {
@@ -752,6 +756,7 @@ static void housekeep(struct dhtnode *n)
 {
 	uint64_t now = now_ms();
 	int b44_timeout = 1000;
+	int sent;
 
 	if (netmon_changed(&n->netmon, now))
 		netchange(n);
@@ -781,13 +786,14 @@ static void housekeep(struct dhtnode *n)
 			n->next_bootstrap_ms = now + DHTNODE_BOOTSTRAP_FIRST_MS;
 		} else {
 			boot_resolve(now);
+			sent = bootstrap_ping(n) + dhtcache_load(n);
 			n->next_bootstrap_ms = now +
-				dhtnode_bootstrap_next(bootstrap_ping(n),
+				dhtnode_bootstrap_next(sent,
 						       &n->bootstrap_backoff_ms);
 		}
 	}
 	/*
-	 * One warm-up write, and only if we started with no cache: keep probing
+	 * One warm-up write, and only while the disk has none: keep probing
 	 * until the table is warm enough that a save actually lands (the writers
 	 * hold their per-family minimums), then stop. The other write is on
 	 * teardown. This bounds flash writes to at most two per run.
