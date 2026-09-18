@@ -188,6 +188,9 @@ struct sig {
 	int puts_ok;			/* stores that found a home */
 	uint64_t last_get_ms;		/* when either last happened, 0 = never */
 	uint64_t last_put_ms;
+	uint64_t engaged_ms;		/* when the DHT was engaged: what the
+					 * silence is measured from until a read
+					 * comes back */
 	uint64_t next_wide_get_ms;
 	uint64_t next_wide_put_ms;
 	int anchor_seen4, anchor_seen6;	/* the node we hold answered a get since
@@ -230,6 +233,7 @@ static int engage_dht(struct sig *s)
 		return -1;
 	s->engine = dhtnode_engine(s->node);
 	s->dht_engaged = 1;
+	s->engaged_ms = now_ms();
 	return 0;
 }
 
@@ -888,23 +892,37 @@ int sig_link_ifaces(struct sig *s, struct sig_mcast_if *out, int max)
 #define SIG_QUIET_GONE_MS (SIG_DHT_GET_MS * 8)
 /* A table that looks healthy but answers nothing: only time tells. */
 #define SIG_QUIET_MS 60000
+/* And one that has answered nothing at all, counted from engaging rather than
+ * from a read there has never been. */
+#define SIG_QUIET_COLD_MS 45000
 #if SIG_QUIET_GONE_MS >= SIG_QUIET_MS
 #error "an unasking node is the quicker verdict of the two"
 #endif
+#if SIG_QUIET_COLD_MS <= 3 * DHTNODE_BOOTSTRAP_FIRST_MS
+#error "a cold signaller must outlast the opening bootstrap rounds"
+#endif
 
-int sig_quiet_due(int node_ready, uint64_t idle_ms)
+int sig_quiet_due(int asking, int answered, uint64_t idle_ms)
 {
-	if (!node_ready)
+	if (!answered)
+		return idle_ms > SIG_QUIET_COLD_MS;
+	if (!asking)
 		return idle_ms > SIG_QUIET_GONE_MS;
 	return idle_ms > SIG_QUIET_MS;
 }
 
 int sig_quiet(struct sig *s)
 {
-	if (!s || !s->dht_engaged || !s->last_get_ms)
+	if (!s || !s->dht_engaged)
 		return 0;
-	return sig_quiet_due(dhtnode_ready(s->node),
-			     now_ms() - s->last_get_ms);
+	/* Never answered is a verdict only where a family is proven to carry
+	 * something: on an isolated LAN the DHT is meant to answer nothing, and
+	 * that is not a signaller to throw away. */
+	if (!s->last_get_ms && !s->up4 && !s->up6)
+		return 0;
+	return sig_quiet_due(routes_now(s) != 0, s->last_get_ms != 0,
+			     now_ms() - (s->last_get_ms ? s->last_get_ms :
+							 s->engaged_ms));
 }
 
 void sig_mailbox_state(struct sig *s, struct sig_mailbox *out)

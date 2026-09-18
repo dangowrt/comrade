@@ -332,18 +332,18 @@ unsigned sig_routes_open(int node_ready, int rdv_held);
 /*
  * Whether the mailbox has gone unanswered for long enough to give up on the
  * signaller and build a fresh one. `idle_ms` is the age of the last validated
- * read; `node_ready` is what the DHT node says about its own table.
+ * read, or of engaging where there has been none; `asking` is whether any route
+ * is open at all, and `answered` whether one ever came back.
  *
- * Two verdicts, because there are two failures: a node with no good nodes left
- * is not asking at all, so no read can come back and only a dip between
- * refreshes has to be ruled out; a node whose table is fine has a rendezvous
- * that died under it, which takes longer to tell from a slow round.
+ * Three verdicts, because there are three failures: a signaller asking nothing
+ * is one no read can come back to, so only a dip between refreshes has to be
+ * ruled out; one that is asking and was answered has a rendezvous that died
+ * under it, which takes longer to tell from a slow round; and one that has
+ * never been answered at all was built on a network that could not carry it.
  */
-int sig_quiet_due(int node_ready, uint64_t idle_ms);
+int sig_quiet_due(int asking, int answered, uint64_t idle_ms);
 
-/* The same question against this signaller's own state; 0 while it has never
- * had an answer to lose, so a fresh signaller that finds the same dead
- * network is not given up on again and again. */
+/* The same question against this signaller's own state. */
 int sig_quiet(struct sig *s);
 
 /* Rendezvous progress for `family`: 0 cold, 1 warmup, 2 store, 3 get, 4 ready

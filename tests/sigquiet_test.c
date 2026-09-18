@@ -11,22 +11,22 @@
  * DHTs and a slow round is not a dead rendezvous. */
 static void a_slow_round_is_not_a_dead_one(void)
 {
-	assert(sig_quiet_due(1, 0) == 0);
-	assert(sig_quiet_due(1, 30000) == 0);
-	assert(sig_quiet_due(1, 60000) == 0);
-	assert(sig_quiet_due(1, 60001) != 0);
+	assert(sig_quiet_due(1, 1, 0) == 0);
+	assert(sig_quiet_due(1, 1, 30000) == 0);
+	assert(sig_quiet_due(1, 1, 60000) == 0);
+	assert(sig_quiet_due(1, 1, 60001) != 0);
 }
 
-/* A node with no table is not asking at all, so waiting the long span out only
- * delays the rebuild -- but a moment between refreshes still has to pass. */
+/* A signaller with no route open is asking nothing, so waiting the long span
+ * out only delays the rebuild; a moment between refreshes still has to pass. */
 static void an_unasking_node_is_answered_sooner(void)
 {
-	assert(sig_quiet_due(0, 1000) == 0);
-	assert(sig_quiet_due(0, 8000) == 0);
-	assert(sig_quiet_due(0, 8001) != 0);
-	assert(sig_quiet_due(0, 20000) != 0);
+	assert(sig_quiet_due(0, 1, 1000) == 0);
+	assert(sig_quiet_due(0, 1, 8000) == 0);
+	assert(sig_quiet_due(0, 1, 8001) != 0);
+	assert(sig_quiet_due(0, 1, 20000) != 0);
 	/* And sooner is the point: the same age says nothing on a live node. */
-	assert(sig_quiet_due(1, 20000) == 0);
+	assert(sig_quiet_due(1, 1, 20000) == 0);
 }
 
 /*
