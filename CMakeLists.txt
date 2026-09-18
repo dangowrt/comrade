@@ -1179,6 +1179,15 @@ if(BUILD_TESTING)
 		set_tests_properties(sig_rebuild_test PROPERTIES
 			SKIP_RETURN_CODE 77 TIMEOUT 30
 			ENVIRONMENT XDG_DATA_HOME=${CMAKE_CURRENT_BINARY_DIR}/test-data)
+
+		# Answers getaddrinfo the same way, and waits out one bootstrap
+		# interval for the retry, so it is slow by construction.
+		add_executable(dhtboot_test tests/dhtboot_test.c)
+		target_link_libraries(dhtboot_test comrade_sig)
+		add_test(NAME dhtboot_test COMMAND dhtboot_test)
+		set_tests_properties(dhtboot_test PROPERTIES
+			SKIP_RETURN_CODE 77 TIMEOUT 60
+			ENVIRONMENT XDG_DATA_HOME=${CMAKE_CURRENT_BINARY_DIR}/test-data)
 	endif()
 
 	add_executable(natstream_test tests/natstream_test.c)
@@ -1528,7 +1537,7 @@ if(BUILD_TESTING)
 		stunprobe_test path_test probeplane_test pathplane_test
 		ctlplane_test obsemit_test peering_test bep44_test
 		bep44_pin_test bep44_store_test bep44_rl_test
-		sig_rebuild_test natstream_test stream_room_test
+		sig_rebuild_test dhtboot_test natstream_test stream_room_test
 		stream_cc_test sshloop_test sshfwd_test sshexit_test sshro_test
 		sshterm_test
 		sshkcp_test sshctl_test sshlinger_test uipeer_test
