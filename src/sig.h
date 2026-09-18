@@ -322,6 +322,11 @@ struct sig_mailbox {
 };
 void sig_mailbox_state(struct sig *s, struct sig_mailbox *out);
 
+/* Which network each family is on, as netstate counts it. An answer is evidence
+ * about the network its query went out on, so one that arrives after a move is
+ * not offered as proof of the network moved to. */
+void sig_set_family_epoch(struct sig *s, int family, uint32_t epoch);
+
 /* Which routes the mailbox may be worked through: a convergent store or get
  * walks the DHT and is worth nothing without a routing table, a direct one
  * addresses the rendezvous nodes already held and needs only one of them. */

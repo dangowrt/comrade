@@ -184,6 +184,8 @@ struct sig {
 	int relay4, relay6;		/* client: asked to establish a
 					 * rendezvous the peer cannot reach */
 	int up4, up6;			/* proven connectivity, see sig_set_family_up */
+	uint32_t epoch4, epoch6;	/* the network each family is on now */
+	uint32_t qep4, qep6;		/* and what the last get went out under */
 	int gets_ok;			/* validated reads of the container */
 	int puts_ok;			/* stores that found a home */
 	uint64_t last_get_ms;		/* when either last happened, 0 = never */
@@ -703,6 +705,20 @@ void sig_set_gen(struct sig *s, uint32_t gen)
 	s->my_gen = gen;
 }
 
+void sig_set_family_epoch(struct sig *s, int family, uint32_t epoch)
+{
+	int *seen = family == 6 ? &s->anchor_seen6 : &s->anchor_seen4;
+	int *have = family == 6 ? &s->ack_new6 : &s->ack_new4;
+	uint32_t *ep = family == 6 ? &s->epoch6 : &s->epoch4;
+
+	if (*ep == epoch)
+		return;
+	*ep = epoch;
+	/* Held evidence was asked for on the network being left. */
+	*seen = 0;
+	*have = 0;
+}
+
 uint32_t sig_peer_gen(const struct sig *s)
 {
 	return s->peer_gen;
@@ -1071,6 +1087,13 @@ static void deliver_peer(struct sig *s, const uint8_t *sealed, size_t len)
 		s->cb(s->arg, (const uint8_t *)sdp, (size_t)slen);
 }
 
+/* Whether an answer from this family speaks for the network it is on now: a
+ * reply to a query sent before a move says nothing about the one after it. */
+static int ack_on_net(const struct sig *s, int af)
+{
+	return af == AF_INET6 ? s->qep6 == s->epoch6 : s->qep4 == s->epoch4;
+}
+
 static void on_dht_get(void *arg, const uint8_t *v, size_t v_len, int64_t seq,
 		       const struct sockaddr *node, socklen_t node_len)
 {
@@ -1196,7 +1219,8 @@ static void on_dht_get(void *arg, const uint8_t *v, size_t v_len, int64_t seq,
 		/* It answered for itself. Nothing here is said about any other
 		 * node: the convergent store puts the value on every k-close
 		 * node, so several hold it and whichever is quickest replies. */
-		if (rl == node_len && !memcmp(r, node, node_len)) {
+		if (ack_on_net(s, node->sa_family) && rl == node_len &&
+		    !memcmp(r, node, node_len)) {
 			if (node->sa_family == AF_INET6)
 				s->anchor_seen6 = 1;
 			else
@@ -1204,20 +1228,24 @@ static void on_dht_get(void *arg, const uint8_t *v, size_t v_len, int64_t seq,
 		}
 
 		if (node->sa_family == AF_INET6) {
-			s->acked6 = 1;
-			memcpy(&s->ack_node6, node, node_len);
-			s->ack_node6_len = node_len;
-			s->ack_new6 = 1;
+			if (ack_on_net(s, AF_INET6)) {
+				s->acked6 = 1;
+				memcpy(&s->ack_node6, node, node_len);
+				s->ack_node6_len = node_len;
+				s->ack_new6 = 1;
+			}
 			if (s->locate && !s->rnode6_len) {
 				memcpy(&s->rnode6, node, node_len);
 				s->rnode6_len = node_len;
 				captured = 1;
 			}
 		} else if (node->sa_family == AF_INET) {
-			s->acked4 = 1;
-			memcpy(&s->ack_node4, node, node_len);
-			s->ack_node4_len = node_len;
-			s->ack_new4 = 1;
+			if (ack_on_net(s, AF_INET)) {
+				s->acked4 = 1;
+				memcpy(&s->ack_node4, node, node_len);
+				s->ack_node4_len = node_len;
+				s->ack_new4 = 1;
+			}
 			if (s->locate && !s->rnode4_len) {
 				memcpy(&s->rnode4, node, node_len);
 				s->rnode4_len = node_len;
@@ -1501,6 +1529,9 @@ static void dht_pump(struct sig *s, uint64_t now)
 		 * the nodes it stored to, the client from the token's pinned
 		 * node. No convergence -- the host paid that once, up front.
 		 */
+		/* What an answer to this will be evidence about. */
+		s->qep4 = s->epoch4;
+		s->qep6 = s->epoch6;
 		bep44_get_direct(s->engine, s->keys.bep44_pk, SIG_SALT,
 				 on_dht_get, s);
 		s->next_get_ms = now + SIG_DHT_GET_MS;
@@ -1515,6 +1546,8 @@ static void dht_pump(struct sig *s, uint64_t now)
 	if ((routes & SIG_ROUTE_WIDE) && now >= s->next_wide_get_ms) {
 		const uint8_t *slot;
 
+		s->qep4 = s->epoch4;
+		s->qep6 = s->epoch6;
 		bep44_get(s->engine, s->keys.bep44_pk, SIG_SALT, on_dht_get, s);
 		/*
 		 * Relaying keeps it eager: this read is not looking for the
