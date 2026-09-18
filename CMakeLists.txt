@@ -669,7 +669,7 @@ else()
 endif()
 target_compile_definitions(comrade_dht PRIVATE _GNU_SOURCE)
 target_link_libraries(comrade_dht PUBLIC comrade_bep44 comrade_crypto
-	comrade_appdir comrade_compat Threads::Threads)
+	comrade_appdir comrade_dbg comrade_compat Threads::Threads)
 message(STATUS "DHT: ${COMRADE_DHT_HOW}")
 
 add_library(comrade_sig STATIC src/sig.c src/sig_mcast.c)

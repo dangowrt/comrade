@@ -199,6 +199,7 @@ struct sig {
 					 * not erase that it did */
 	uint64_t first_locate_ms;	/* when the first family was captured */
 	int rdv_stage;			/* engine-wide progress: cold/warmup/store/get */
+	int routeless;			/* the last pump had nowhere to ask */
 
 	uint64_t next_get_ms;
 	uint64_t next_put_ms;
@@ -1485,6 +1486,11 @@ static void dht_pump(struct sig *s, uint64_t now)
 {
 	unsigned routes = routes_now(s);
 
+	if (s->routeless != !routes) {
+		s->routeless = !routes;
+		dbg_logf("sig: %s to work the mailbox through",
+			 routes ? "a route" : "no route");
+	}
 	if (!routes)
 		return;
 	if ((routes & SIG_ROUTE_WIDE) && s->rdv_stage < 1)
