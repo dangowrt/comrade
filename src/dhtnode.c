@@ -23,7 +23,6 @@
 #include "oscompat.h"
 
 #define DHTNODE_SEED_INTERVAL_MS 1000
-#define DHTNODE_RESOLVE_POLL_MS 200		/* while the resolver thread runs */
 #define DHTNODE_WARMCHECK_MS 2000		/* poll for the one warm-up cache write */
 #define DHTNODE_DHT_PORT 0
 
@@ -288,15 +287,15 @@ static void *resolver_fn(void *arg)
  * Main thread: once the resolver has produced addresses, ping the routers and
  * seed the bep44 engine from them, so its lookups have responsive entry points
  * at once. Runs on the DHT thread, as jech/dht requires. Returns whether a
- * round actually went out: until the resolver thread has finished there is
- * nothing to ping, and a round that never happened must not be counted as one
- * that was ignored.
+ * packet actually went out: a set that has not resolved, or that holds only a
+ * family this node has no socket for, pings nothing, and a round that never
+ * happened must not be counted as one that was ignored.
  */
 static int bootstrap_ping(struct dhtnode *n)
 {
 	struct sockaddr_storage addr[16];
 	socklen_t len[16];
-	int cnt, i;
+	int cnt, sent, i;
 
 	if (!n->boot)
 		return 0;
@@ -310,7 +309,7 @@ static int bootstrap_ping(struct dhtnode *n)
 	memcpy(len, n->boot->len, sizeof(len));
 	pthread_mutex_unlock(&n->boot->lock);
 
-	for (i = 0; i < cnt; i++) {
+	for (i = 0, sent = 0; i < cnt; i++) {
 		int fam = addr[i].ss_family;
 
 		if ((fam == AF_INET && !sock_valid(n->s4)) ||
@@ -319,8 +318,9 @@ static int bootstrap_ping(struct dhtnode *n)
 		dht_ping_node((struct sockaddr *)&addr[i], len[i]);
 		bep44_bootstrap_add(n->engine, (struct sockaddr *)&addr[i],
 				    len[i]);
+		sent++;
 	}
-	return 1;
+	return sent > 0;
 }
 
 /* Good nodes this family holds now. Asked per family and never summed: a table
@@ -705,6 +705,14 @@ uint64_t dhtnode_bootstrap_backoff(uint64_t prev_ms)
 	return next > DHTNODE_BOOTSTRAP_MAX_MS ? DHTNODE_BOOTSTRAP_MAX_MS : next;
 }
 
+uint64_t dhtnode_bootstrap_next(int pinged, uint64_t *backoff_ms)
+{
+	if (!pinged)
+		return DHTNODE_BOOTSTRAP_POLL_MS;
+	*backoff_ms = dhtnode_bootstrap_backoff(*backoff_ms);
+	return *backoff_ms;
+}
+
 int dhtnode_ready(struct dhtnode *n)
 {
 	int good = 0, dubious = 0;
@@ -781,14 +789,10 @@ static void housekeep(struct dhtnode *n)
 			 * later, and asking costs no packets. */
 			n->bootstrap_backoff_ms = 0;
 			n->next_bootstrap_ms = now + DHTNODE_BOOTSTRAP_FIRST_MS;
-		} else if (bootstrap_ping(n)) {
-			n->bootstrap_backoff_ms =
-				dhtnode_bootstrap_backoff(n->bootstrap_backoff_ms);
-			n->next_bootstrap_ms = now + n->bootstrap_backoff_ms;
 		} else {
-			/* The resolver has not finished. That is not a round
-			 * that went unanswered, so it must not spend one. */
-			n->next_bootstrap_ms = now + DHTNODE_RESOLVE_POLL_MS;
+			n->next_bootstrap_ms = now +
+				dhtnode_bootstrap_next(bootstrap_ping(n),
+						       &n->bootstrap_backoff_ms);
 		}
 	}
 	/*

@@ -2,7 +2,7 @@
 /* Copyright (C) 2026 Daniel Golle <daniel@makrotopia.org> */
 
 /*
- * The two rules that decide when the DHT routers are asked again.
+ * The rules that decide when the DHT routers are asked again.
  *
  * They exist because a bootstrap round is a handful of UDP packets to hosts
  * that answer when they feel like it, so whether the table ever fills is not
@@ -10,9 +10,9 @@
  * empty routing table looks exactly like a quiet network, and a node that has
  * given up looks exactly like one that is waiting.
  *
- * Neither can be exercised against a live DHT, because doing so would mean
+ * None can be exercised against a live DHT, because doing so would mean
  * arranging for the internet to fail in a particular way at a particular
- * moment, so both are pure and both are tested here -- the same reason
+ * moment, so each is pure and each is tested here, the same reason
  * sig_tomb_settled is exported.
  */
 
@@ -22,7 +22,7 @@
 
 int main(void)
 {
-	uint64_t d;
+	uint64_t b, d;
 	int i;
 
 	/*
@@ -73,5 +73,24 @@ int main(void)
 		assert(d >= DHTNODE_BOOTSTRAP_FIRST_MS);
 		assert(d <= DHTNODE_BOOTSTRAP_MAX_MS);
 	}
+
+	/* A round that sent nothing is looked at again shortly and spends none
+	 * of the budget, so an uplink that is not up yet cannot exhaust the
+	 * opening cadence before it works. */
+	assert(DHTNODE_BOOTSTRAP_POLL_MS < DHTNODE_BOOTSTRAP_FIRST_MS);
+	b = 0;
+	for (i = 0; i < 1000; i++)
+		assert(dhtnode_bootstrap_next(0, &b) ==
+		       DHTNODE_BOOTSTRAP_POLL_MS);
+	assert(b == 0);
+
+	/* A round that did send spends one, and the two interleave without the
+	 * budget ever walking backwards. */
+	assert(dhtnode_bootstrap_next(1, &b) == DHTNODE_BOOTSTRAP_FIRST_MS);
+	assert(b == DHTNODE_BOOTSTRAP_FIRST_MS);
+	assert(dhtnode_bootstrap_next(0, &b) == DHTNODE_BOOTSTRAP_POLL_MS);
+	assert(b == DHTNODE_BOOTSTRAP_FIRST_MS);
+	assert(dhtnode_bootstrap_next(1, &b) == 2 * DHTNODE_BOOTSTRAP_FIRST_MS);
+	assert(b == 2 * DHTNODE_BOOTSTRAP_FIRST_MS);
 	return 0;
 }

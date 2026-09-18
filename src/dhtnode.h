@@ -60,6 +60,7 @@ int dhtnode_ready(struct dhtnode *n);
 #define DHTNODE_BOOTSTRAP_FIRST_MS 10000	/* the first retry */
 #define DHTNODE_BOOTSTRAP_MAX_MS 600000		/* and the slowest one */
 #define DHTNODE_BOOTSTRAP_MIN_GOOD 2		/* enough nodes for a family */
+#define DHTNODE_BOOTSTRAP_POLL_MS 200		/* nothing to ping: look again */
 
 /*
  * Whether a bootstrap round is still wanted, given what each family has and
@@ -83,6 +84,9 @@ int dhtnode_bootstrap_wanted(int have4, int good4, int have6, int good6);
  * actually likely.
  */
 uint64_t dhtnode_bootstrap_backoff(uint64_t prev_ms);
+/* How long until the next round, and what the backoff becomes, given whether
+ * this one sent anything: nothing sent is nothing ignored. */
+uint64_t dhtnode_bootstrap_next(int pinged, uint64_t *backoff_ms);
 /* The UDP port this node bound for `family` (4 or 6), 0 if it has none. The
  * port is ephemeral, so a private swarm has to be told where its members
  * actually are. */
