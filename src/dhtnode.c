@@ -11,6 +11,7 @@
 #include "ccrypto.h"
 
 #include "appdir.h"
+#include "dbg.h"
 #include "dht.h"
 #include "bep44.h"
 #include "dhtnode.h"
@@ -151,6 +152,7 @@ struct dhtnode {
 	uint64_t bootstrap_backoff_ms;	/* 0 until the first round has gone out */
 	uint64_t next_cache_ms;		/* next warm-up cache-write check */
 	int no_bootstrap;		/* rendezvous-only: never ping the routers */
+	int boot_silent;		/* the last round had nothing to ping */
 	int cache_enabled;		/* persist/restore good nodes across runs */
 	int cache_was_empty;		/* no on-disk cache seen yet */
 	int cache_primed;		/* the one warm-up write has been done */
@@ -714,6 +716,7 @@ static void boot_resolve(uint64_t now)
 {
 	struct resolver *r;
 	pthread_t th;
+	int held;
 
 	pthread_mutex_lock(&boot_lock);
 	if (boot_running || now < boot_next_ms) {
@@ -721,6 +724,7 @@ static void boot_resolve(uint64_t now)
 		return;
 	}
 	boot_running = 1;
+	held = boot_n;
 	boot_backoff_ms = dhtnode_bootstrap_backoff(boot_backoff_ms);
 	boot_next_ms = now + boot_backoff_ms;
 	pthread_mutex_unlock(&boot_lock);
@@ -729,6 +733,7 @@ static void boot_resolve(uint64_t now)
 	r = calloc(1, sizeof(*r));
 	if (r && !pthread_create(&th, NULL, resolver_fn, r)) {
 		pthread_detach(th);
+		dbg_logf("dht: resolving the routers (%d held)", held);
 		return;
 	}
 	free(r);
@@ -787,6 +792,11 @@ static void housekeep(struct dhtnode *n)
 		} else {
 			boot_resolve(now);
 			sent = bootstrap_ping(n) + dhtcache_load(n);
+			if (n->boot_silent != !sent) {
+				n->boot_silent = !sent;
+				dbg_logf("dht: bootstrap has %s to ping",
+					 sent ? "somewhere" : "nowhere");
+			}
 			n->next_bootstrap_ms = now +
 				dhtnode_bootstrap_next(sent,
 						       &n->bootstrap_backoff_ms);
