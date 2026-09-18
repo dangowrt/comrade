@@ -322,6 +322,13 @@ struct sig_mailbox {
 };
 void sig_mailbox_state(struct sig *s, struct sig_mailbox *out);
 
+/* Which routes the mailbox may be worked through: a convergent store or get
+ * walks the DHT and is worth nothing without a routing table, a direct one
+ * addresses the rendezvous nodes already held and needs only one of them. */
+#define SIG_ROUTE_DIRECT (1u << 0)
+#define SIG_ROUTE_WIDE	 (1u << 1)
+unsigned sig_routes_open(int node_ready, int rdv_held);
+
 /*
  * Whether the mailbox has gone unanswered for long enough to give up on the
  * signaller and build a fresh one. `idle_ms` is the age of the last validated
