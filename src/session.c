@@ -4406,19 +4406,22 @@ static void punch_reap_oldest(struct sess *s, const char *ufrag)
  * or -1 when there is no signalling left to run the session on.
  */
 /*
- * The mailbox is engaged and nothing answers it: reads were coming back and
- * now none does. A rendezvous that died, a mapping the carrier moved, a
- * middlebox that timed the flow out -- none of which changes an address here,
- * so the move machinery never fires and the session sits on a slot nobody is
- * serving, with nothing to say so. Rebuilding is invisible to a peer -- the
- * mailbox is the same, only the socket and the node behind it are new -- so
- * the cost of being wrong is one bootstrap. sig_quiet() weighs it.
+ * The mailbox is engaged and nothing answers it: either reads were coming back
+ * and now none does, or none ever did. A rendezvous that died, a mapping the
+ * carrier moved, a middlebox that timed the flow out, a network that could not
+ * carry the DHT when this signaller was armed on it: none of which changes an
+ * address here, so the move machinery never fires and the session sits on a
+ * slot nobody is serving, with nothing to say so. Rebuilding is invisible to a
+ * peer, the mailbox being the same and only the socket and the node behind it
+ * new, so the cost of being wrong is one bootstrap. sig_quiet() weighs it.
  */
 static int sig_idle_s(struct sig *sig)
 {
 	struct sig_mailbox sm;
 
 	sig_mailbox_state(sig, &sm);
+	if (!sm.last_get_ms)
+		sm.last_get_ms = sm.engaged_ms;
 	if (!sm.last_get_ms)
 		return -1;
 	return (int)((now_ms() - sm.last_get_ms) / 1000);

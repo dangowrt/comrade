@@ -319,6 +319,8 @@ struct sig_mailbox {
 	int claim;			/* enum sig_claim for the answer slot */
 	uint64_t last_get_ms;		/* 0 = never */
 	uint64_t last_put_ms;
+	uint64_t engaged_ms;		/* what a silence is measured from while
+					 * last_get_ms is still 0 */
 };
 void sig_mailbox_state(struct sig *s, struct sig_mailbox *out);
 

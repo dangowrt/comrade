@@ -969,6 +969,7 @@ void sig_mailbox_state(struct sig *s, struct sig_mailbox *out)
 	out->claim = (int)sig_claim_status(s);
 	out->last_get_ms = s->last_get_ms;
 	out->last_put_ms = s->last_put_ms;
+	out->engaged_ms = s->engaged_ms;
 }
 
 int sig_rdv_stage(struct sig *s, int family)
