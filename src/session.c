@@ -2633,6 +2633,8 @@ static int sig_arm(struct sess *s)
 	 * a peer tells a move from a mere credential rotation. A rebuild follows
 	 * a move, so the current netgen is what this fresh signaller stamps. */
 	sig_set_gen(s->pm.sig, __atomic_load_n(&s->netgen, __ATOMIC_RELAXED));
+	sig_set_family_epoch(s->pm.sig, 4, netstate_epoch(&s->pm.ns, 4));
+	sig_set_family_epoch(s->pm.sig, 6, netstate_epoch(&s->pm.ns, 6));
 	if (s->lan) {
 		sig_set_direct_port(s->pm.sig, lanlink_port(s->lan));
 		if (host_is_multiuser(cfg)) {
@@ -2756,6 +2758,12 @@ static void net_watch(struct sess *s, uint64_t now)
 	ch |= netmon_changed_fam_fp(&s->netmon, now, fp4, fp6, fpif);
 	netstate_on_netmon(&s->pm.ns, ch, fam_usable_addr(addrs, n, 4),
 			   fam_usable_addr(addrs, n, 6), now);
+	if (s->pm.sig) {
+		/* Before the rebuild, so an answer in flight over the move is
+		 * not taken as proof of the network arrived on. */
+		sig_set_family_epoch(s->pm.sig, 4, netstate_epoch(&s->pm.ns, 4));
+		sig_set_family_epoch(s->pm.sig, 6, netstate_epoch(&s->pm.ns, 6));
+	}
 	if (ch) {
 		dbg_logf("net: change v4=%d v6=%d iface=%d",
 			 !!(ch & NETMON_CH_V4), !!(ch & NETMON_CH_V6),
