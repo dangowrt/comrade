@@ -194,17 +194,6 @@ static int cache_get_all(const char *name, int family,
 }
 
 
-/* Whether anything at all has resolved: the warm pass judges itself on this. */
-static int cache_any(void)
-{
-	int n;
-
-	pthread_mutex_lock(&stun_cache_lock);
-	n = stun_cache_n;
-	pthread_mutex_unlock(&stun_cache_lock);
-	return n > 0;
-}
-
 static void cache_put(const char *name, int family,
 		      const struct sockaddr_storage *sa, socklen_t len)
 {
@@ -298,6 +287,28 @@ static void neg_put(const char *name, int family)
 	pthread_mutex_unlock(&stun_cache_lock);
 }
 
+/* Known for this family, denied by the resolver, or neither: only the last is
+ * still worth asking about. */
+static int askable_state(const char *server, int family)
+{
+	struct sockaddr_storage sa;
+	socklen_t len;
+
+	if (cache_get_all(server, family, &sa, &len, 1) > 0)
+		return 1;
+	return neg_has(server, family) ? -1 : 0;
+}
+
+static stun_more_fn *stun_more_cb;
+static void *stun_more_arg;
+
+/* Set before the first resolver thread exists, so it needs no lock. */
+static void warm_more(int family)
+{
+	if (stun_more_cb)
+		stun_more_cb(stun_more_arg, family);
+}
+
 /*
  * Every address of `family` that "host[:port]" names, not just the first, and
  * 3478 where the port is absent or unparsable. A name behind several records
@@ -386,6 +397,7 @@ static void warm_resolve(const char *server)
 {
 	struct sockaddr_storage sa[STUN_WARM_ADDRS];
 	const char *colon = strrchr(server, ':');
+	int had4, had6, has4 = 0, has6 = 0, i;
 	struct addrinfo hints, *res, *ai;
 	socklen_t len[STUN_WARM_ADDRS];
 	const char *port = "3478";
@@ -418,8 +430,27 @@ static void warm_resolve(const char *server)
 		cnt++;
 	}
 	freeaddrinfo(res);
-	if (cnt > 0)
-		cache_replace(server, sa, len, fam, cnt);
+	if (cnt < 1)
+		return;
+	had4 = askable_state(server, AF_INET) == 1;
+	had6 = askable_state(server, AF_INET6) == 1;
+	for (i = 0; i < cnt; i++) {
+		if (fam[i] == AF_INET)
+			has4 = 1;
+		else
+			has6 = 1;
+	}
+	cache_replace(server, sa, len, fam, cnt);
+	/* The resolver answered without this family, which is an answer: asking
+	 * again before the entry expires would learn the same thing. */
+	if (!has4)
+		neg_put(server, AF_INET);
+	if (!has6)
+		neg_put(server, AF_INET6);
+	if (has4 && !had4)
+		warm_more(4);
+	if (has6 && !had6)
+		warm_more(6);
 }
 
 struct stun_warm_one {
@@ -461,6 +492,19 @@ static int warm_sleep(const struct stun_warm *w, int secs)
  * family, since this is the only thing that fills the cache the rounds read.
  * An uplink that is down fails every name, so a pass that resolved nothing is
  * retried on a short backoff instead of sitting out the refresh interval. */
+/* Whether any name is still unanswered for a family. A denied one is settled,
+ * so a pool of v4-only servers does not keep the pass retrying for ever. */
+static int pool_pending(char *const *servers, int n)
+{
+	int i;
+
+	for (i = 0; i < n; i++)
+		if (askable_state(servers[i], AF_INET) == 0 ||
+		    askable_state(servers[i], AF_INET6) == 0)
+			return 1;
+	return 0;
+}
+
 static void *stun_warm_loop(void *arg)
 {
 	struct stun_warm *w = arg;
@@ -484,7 +528,7 @@ static void *stun_warm_loop(void *arg)
 		}
 		if (warm_sleep(w, STUN_WARM_SETTLE_S))
 			break;
-		if (cache_any()) {
+		if (!pool_pending(w->servers, w->n)) {
 			back = 0;
 			wait = STUN_WARM_REFRESH_S - STUN_WARM_SETTLE_S;
 		} else {
@@ -501,12 +545,14 @@ static void *stun_warm_loop(void *arg)
 }
 
 int stun_pool_warm_start(char *const *servers, int nservers, volatile int *stop,
-			 pthread_t *th)
+			 pthread_t *th, stun_more_fn *more, void *arg)
 {
 	struct stun_warm *w;
 
 	if (nservers < 1)
 		return -1;
+	stun_more_cb = more;
+	stun_more_arg = arg;
 	w = malloc(sizeof(*w));
 	if (!w)
 		return -1;
@@ -615,10 +661,25 @@ void stun_probe_run(int family, char *const *servers, int nservers,
 	free(dlen);
 }
 
-/* A server's cached target of `family` ("host:port"); cache only, so a slow
- * name never holds the probe round open (see stun_probe_run). stun_pool_warm
- * fills the cache off this thread. */
+int stun_pool_askable(char *const *servers, int nservers, int family, int start,
+		      char **out, int max)
+{
+	unsigned i, k, ns;
+	int n = 0;
 
+	if (!servers || nservers < 1 || max < 1)
+		return 0;
+	ns = (unsigned)nservers;
+	for (i = 0; i < ns && n < max; i++) {
+		k = ((unsigned)start + i) % ns;
+		if (askable_state(servers[k], family) != 1)
+			continue;
+		if (out)
+			out[n] = servers[k];
+		n++;
+	}
+	return n;
+}
 
 void stun_mapping_reset(struct stun_mapping *m)
 {

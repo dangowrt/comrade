@@ -5201,7 +5201,7 @@ int session_run(const struct session_cfg *cfg)
 	 * addresses instead of blocking on a name lookup after a move. */
 	if (cfg->stun_auto && s.stun_count > 0 &&
 	    !stun_pool_warm_start(s.stun_servers, s.stun_count, &s.warm_stop,
-				  &s.warm_th))
+				  &s.warm_th, peering_net_more, &s.net))
 		s.warm_running = 1;
 	/* The probes are scheduled by the reachability model, which asks for the
 	 * first round on its first tick. */

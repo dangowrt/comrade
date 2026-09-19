@@ -255,6 +255,18 @@ void netstate_on_probe_done(struct netstate *ns, int family, uint32_t epoch,
 		f->probe_next_ms = now + probe_gap(f);
 }
 
+void netstate_on_servers(struct netstate *ns, int family, uint32_t epoch,
+			 uint64_t now)
+{
+	int i = fam_idx(family);
+	struct netstate_fam *f = &ns->f[i];
+
+	if (epoch != f->epoch || f->probe_running)
+		return;
+	f->probe_next_ms = now;
+	raise_act(ns, i, NSA_KICK_PROBE);
+}
+
 void netstate_on_roundtrip(struct netstate *ns, int family, uint32_t epoch)
 {
 	int i = fam_idx(family);

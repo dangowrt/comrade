@@ -1077,6 +1077,27 @@ static void probe_slows_but_never_stops(void)
 	assert(probe_round(&ns, 6));
 }
 
+/* B2a: a round is due when there is somewhere new to ask, not at the end of a
+ * gap that was begun while there was nowhere. */
+static void somewhere_new_makes_a_round_due(void)
+{
+	struct netstate ns;
+
+	start(&ns, 1);
+	assert(probe_round(&ns, 6));
+	t += 100;
+	netstate_tick(&ns, t);
+	assert(!(drain(&ns).f[1] & NSA_KICK_PROBE));
+	netstate_on_servers(&ns, 6, netstate_epoch(&ns, 6), t);
+	assert(drain(&ns).f[1] & NSA_KICK_PROBE);
+
+	/* Not from the network it was learnt on, so it says nothing here. */
+	netstate_on_netmon(&ns, NETMON_CH_V6, 1, 1, t);
+	drain(&ns);
+	netstate_on_servers(&ns, 6, netstate_epoch(&ns, 6) - 1, t);
+	assert(!(drain(&ns).f[1] & NSA_KICK_PROBE));
+}
+
 static void no_address_no_probe_no_pending(void)
 {
 	struct netstate ns;
@@ -1402,6 +1423,7 @@ int main(void)
 	host_and_client_agree_except_on_the_token();
 	only_a_host_picks_its_own_rendezvous();
 	probe_slows_but_never_stops();
+	somewhere_new_makes_a_round_due();
 	no_address_no_probe_no_pending();
 	row_merge_direct_beats_stun();
 	family_independence_lattice();

@@ -61,6 +61,10 @@ int peering_facts_feed(struct netstate *ns, const struct nsfact *q,
 		netstate_on_roundtrip(ns, q->family, epoch);
 		return 0;
 	}
+	if (q->kind == NSF_SERVERS) {
+		netstate_on_servers(ns, q->family, epoch, now);
+		return 0;
+	}
 	if (q->kind == NSF_ADDR) {
 		netstate_on_candidate(ns, q->family, epoch,
 				      net_addr_scope(q->text), NET_VIA_STUN,
@@ -333,13 +337,12 @@ static void probe_round(struct peering_net *m, int family)
 	char *const *list = m->servers;
 	int n = m->nservers;
 	uint32_t epoch;
-	int i;
 
 	epoch = __atomic_load_n(&p->epoch, __ATOMIC_RELAXED);
 	if (family == AF_INET6) {
-		for (n = 0, i = 0; i < m->nservers &&
-		     n < PEERING_PROBE6_SERVERS; i++)
-			targets[n++] = m->servers[(p->start + i) % m->nservers];
+		n = stun_pool_askable(m->servers, m->nservers, AF_INET6,
+				      p->start, targets,
+				      PEERING_PROBE6_SERVERS);
 		list = targets;
 	} else {
 		peering_pool_round(&m->pool);
@@ -350,6 +353,15 @@ static void probe_round(struct peering_net *m, int family)
 	if (family == AF_INET)
 		probe_verdict(m);
 	peering_facts_post(&m->facts, NSF_PROBE_DONE, fam, epoch);
+}
+
+void peering_net_more(void *arg, int family)
+{
+	struct peering_net *m = arg;
+	struct peering_probe *p = family == 6 ? &m->probe6 : &m->probe;
+
+	peering_facts_post(&m->facts, NSF_SERVERS, family,
+			   __atomic_load_n(&p->epoch, __ATOMIC_RELAXED));
 }
 
 static void *probe_thread(void *arg)

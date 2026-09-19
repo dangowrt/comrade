@@ -30,6 +30,10 @@ int stun_probe_mapped4(const uint8_t *pkt, size_t len,
  * One response: `addr` is four bytes for AF_INET and sixteen for AF_INET6,
  * the family the caller asked stun_probe_run for.
  */
+/* A family's server set grew: what was unresolved when a round last asked is
+ * resolvable now. */
+typedef void stun_more_fn(void *arg, int family);
+
 typedef void stun_probe_hit(void *arg, int family, const uint8_t addr[16],
 			    uint16_t port);
 
@@ -60,11 +64,17 @@ int stun_probe_mapped_fam(const uint8_t *pkt, size_t len,
  * the cache only. Returns 1 on success, 0 if not (yet) known. */
 int stun_server_ip4(const char *server, char *out, size_t outn, int allow_net);
 
+/* The servers of `family` a round can ask, walked from `start` and wrapping:
+ * up to `max` of the caller's own pointers into `out` (NULL counts alone), and
+ * how many. A round reads the cache, so an unresolved name is unaskable. */
+int stun_pool_askable(char *const *servers, int nservers, int family, int start,
+		      char **out, int max);
+
 /* Background thread: resolve every server's v4 and v6 addresses into the cache
  * (so the probe threads never block on DNS), refreshed periodically. *stop ends
  * it; the thread lands in *th to join. Returns 0 on success. */
 int stun_pool_warm_start(char *const *servers, int nservers, volatile int *stop,
-			 pthread_t *th);
+			 pthread_t *th, stun_more_fn *more, void *arg);
 
 /*
  * RFC 4787 mapping-behaviour classification, built incrementally from the

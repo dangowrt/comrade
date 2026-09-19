@@ -326,6 +326,11 @@ void netstate_on_probe_started(struct netstate *ns, int family, uint32_t epoch,
 void netstate_on_probe_done(struct netstate *ns, int family, uint32_t epoch,
 			    uint64_t now);
 
+/* Somewhere new to ask appeared: the round this family is waiting for is due
+ * now rather than at the end of a gap it began before there was anywhere. */
+void netstate_on_servers(struct netstate *ns, int family, uint32_t epoch,
+			 uint64_t now);
+
 /* A round trip COMPLETED: the only thing that may assert NET_CONN_UP. */
 void netstate_on_roundtrip(struct netstate *ns, int family, uint32_t epoch);
 
