@@ -1227,7 +1227,8 @@ static void canon_v6(const char *in, const char *src6, char *out, size_t cap)
 		char addr[64], typ[16];
 		int drop = 0, rewrite = 0, a0 = 0, a1 = 0;
 
-		if (src6[0] && !strncmp(line, "a=candidate:", 12) &&
+		if (src6[0] && net_addr_scope(src6) == NET_SCOPE_GLOBAL &&
+		    !strncmp(line, "a=candidate:", 12) &&
 		    sscanf(line, "a=candidate:%*s %*d %*s %*u %63s %*d typ %15s",
 			   addr, typ) == 2 && strchr(addr, ':') &&
 		    net_addr_scope(addr) == NET_SCOPE_GLOBAL) {
