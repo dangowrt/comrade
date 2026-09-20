@@ -416,6 +416,7 @@ struct sess {
 	 */
 	char regathered_for[40];
 	char src6_offered[64];		/* v6 source the staged description names */
+	uint32_t src6_epoch;		/* and the v6 network it was named on */
 	struct conn *offer_conn;		/* live conn the peer-offer callback feeds */
 
 	uint64_t next_gather_ms;	/* backoff after a gather found nothing */
@@ -1135,6 +1136,29 @@ static int fan_local_sdp(struct sess *s)
 }
 
 /*
+ * Whether a global v6 the offer names has been withdrawn: no address of ours,
+ * and no translation either.
+ *
+ * Judged against the epoch the description was gathered under, since one netmon
+ * has yet to sample reads exactly like one that has gone, and a later re-read
+ * of the same description must not answer differently.
+ */
+static int v6_cand_stale(struct sess *s, const char *addr)
+{
+	uint8_t raw[16];
+
+	if (net_addr_scope(addr) != NET_SCOPE_GLOBAL)
+		return 0;
+	if (netstate_epoch(&s->pm.ns, 6) ==
+	    __atomic_load_n(&s->gather_epoch[1], __ATOMIC_RELAXED))
+		return 0;
+	if (inet_pton(AF_INET6, addr, raw) != 1)
+		return 0;
+	return !netstate_has_local(&s->pm.ns, 6, raw, 16) &&
+	       !netstate_has_xlat(&s->pm.ns, 6, raw, 16);
+}
+
+/*
  * "v6 direct": a host reaches its own global v6 at the address the kernel
  * sources outbound from, which we learn without STUN via net_source_addr.
  * That is the privacy (temporary) address where RFC 4941 is enabled and
@@ -1145,7 +1169,8 @@ static int fan_local_sdp(struct sess *s)
  * candidate, and the redundant v6 srflx), leaving v4 untouched. With no global
  * v6 source, v6 is left as gathered but for what has been withdrawn since.
  */
-static void canon_v6(const char *in, const char *src6, char *out, size_t cap)
+static void canon_v6(struct sess *s, const char *in, const char *src6, char *out,
+		     size_t cap)
 {
 	int kept6 = 0, port = -1;
 	const char *line = in;
@@ -1179,6 +1204,15 @@ static void canon_v6(const char *in, const char *src6, char *out, size_t cap)
 			else
 				rewrite = 1;
 		}
+		/* Whatever the source is: an address nothing here holds and no
+		 * carrier maps is one no peer can reach, however it was
+		 * gathered, and the offer must not carry it. */
+		if (!drop && !rewrite && !strncmp(line, "a=candidate:", 12) &&
+		    sscanf(line, "a=candidate:%*s %*d %*s %*u %63s %*d typ %15s",
+			   addr, typ) == 2 && strchr(addr, ':') &&
+		    (!strcmp(typ, "host") || !strcmp(typ, "srflx")) &&
+		    v6_cand_stale(s, addr))
+			drop = 1;
 		if (drop) {
 			if (!nl)
 				break;
@@ -1279,28 +1313,32 @@ static int sdp_ready(struct sess *s)
 	char raw[NAT_SDP_MAX];
 
 	if (peering_desc_take(&s->net.desc, raw, sizeof(raw))) {
-		canon_v6(raw, src6, local, NAT_SDP_MAX);
+		canon_v6(s, raw, src6, local, NAT_SDP_MAX);
 		peering_desc_set(&s->net.desc, local);
 		snprintf(s->src6_offered, sizeof(s->src6_offered), "%s", src6);
+		s->src6_epoch = netstate_epoch(&s->pm.ns, 6);
 	}
 	return peering_desc_have(&s->net.desc);
 }
 
 /* canon_v6 drops every global v6 and names one, so running it again withdraws
- * the address that has gone rather than accumulating. */
+ * the address that has gone rather than accumulating. The v6 network counts as
+ * well as the source: an address can be lost without a source ever naming it. */
 static int v6_source_moved(struct sess *s)
 {
 	const char *src6 = netstate_src_text(&s->pm.ns, 6);
 	char *local = peering_desc_local(&s->net.desc);
+	uint32_t e = netstate_epoch(&s->pm.ns, 6);
 	char raw[NAT_SDP_MAX];
 
-	if (!strcmp(src6, s->src6_offered))
+	if (e == s->src6_epoch && !strcmp(src6, s->src6_offered))
 		return 0;
 	snprintf(s->src6_offered, sizeof(s->src6_offered), "%s", src6);
+	s->src6_epoch = e;
 	if (!peering_desc_have(&s->net.desc))
 		return 0;
 	snprintf(raw, sizeof(raw), "%s", local);
-	canon_v6(raw, src6, local, NAT_SDP_MAX);
+	canon_v6(s, raw, src6, local, NAT_SDP_MAX);
 	peering_desc_set(&s->net.desc, local);
 
 	return 1;
