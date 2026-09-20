@@ -18,19 +18,17 @@ void obsemit_init(struct obsemit *e, const struct session_obs *o,
 
 void obsemit_rows(struct obsemit *e, int family)
 {
+	struct netstate_row rows[NETSTATE_ROWS_MAX];
 	const struct session_obs *o = e->o;
-	const struct netstate_row *rows;
 	int n, k;
 
 	if (!o || !o->net_reset || !o->net)
 		return;
-	n = netstate_rows(e->ns, family, &rows);
+	n = netstate_rows(e->ns, family, rows, NETSTATE_ROWS_MAX);
 	o->net_reset(o->arg, family);
 	for (k = 0; k < n; k++)
-		if (rows[k].shown)
-			o->net(o->arg, family, rows[k].scope,
-			       netstate_row_via(e->ns, family, &rows[k]),
-			       rows[k].text);
+		o->net(o->arg, family, rows[k].scope, rows[k].via,
+		       rows[k].text);
 }
 
 void obsemit_conn(struct obsemit *e, int family, int conn)

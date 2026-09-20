@@ -15,6 +15,8 @@
 #include <stdint.h>
 #include <string.h>
 
+#include "wsock.h"
+
 #include "netstate.h"
 
 static uint64_t t;			/* the clock, advanced by hand */
@@ -36,12 +38,74 @@ static void fill(uint8_t *out, int len, uint8_t seed)
 		out[i] = (uint8_t)(seed + i);
 }
 
+/* What the kernel reports, as the cases hand it over. */
+static struct netmon_addr snap[NETMON_MAX_ADDRS];
+static size_t nsnap;
+
+static void snap_reset(void)
+{
+	memset(snap, 0, sizeof(snap));
+	nsnap = 0;
+}
+
+static void snap_add(int fam, const uint8_t *a)
+{
+	struct netmon_addr *r = &snap[nsnap++];
+
+	r->family = fam == 6 ? AF_INET6 : AF_INET;
+	r->addrlen = fam == 6 ? 16 : 4;
+	memcpy(r->addr, a, r->addrlen);
+}
+
+static void snap_drop(int fam, const uint8_t *a)
+{
+	int af = fam == 6 ? AF_INET6 : AF_INET;
+	size_t len = fam == 6 ? 16 : 4;
+	size_t i;
+
+	for (i = 0; i < nsnap; i++) {
+		if (snap[i].family != af || memcmp(snap[i].addr, a, len))
+			continue;
+		memmove(&snap[i], &snap[i + 1],
+			sizeof(snap[0]) * (nsnap - 1 - i));
+		memset(&snap[--nsnap], 0, sizeof(snap[0]));
+		return;
+	}
+}
+
+/* One address per family: what a case that says nothing about addresses gets. */
+static const uint8_t dfl4[4] = { 192, 168, 1, 2 };
+static const uint8_t dfl6[16] = {
+	0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1
+};
+
+static void snap_default(int have4, int have6)
+{
+	snap_reset();
+	if (have4)
+		snap_add(4, dfl4);
+	if (have6)
+		snap_add(6, dfl6);
+}
+
+/* The set as it stands now, without touching it. */
+static void netmon_again(struct netstate *ns, unsigned ch)
+{
+	netstate_on_netmon(ns, ch, snap, nsnap, t);
+}
+
+static void netmon(struct netstate *ns, unsigned ch, int have4, int have6)
+{
+	snap_default(have4, have6);
+	netmon_again(ns, ch);
+}
+
 /* A primed machine on a dual-stack network, nothing proven yet. */
 static void start(struct netstate *ns, int is_host)
 {
 	t = 1000;
 	netstate_init(ns, is_host, t);
-	netstate_on_netmon(ns, 0, 1, 1, t);
+	netmon(ns, 0, 1, 1);
 	drain(ns);
 }
 
@@ -95,7 +159,7 @@ static void v6_change_leaves_v4_alone(void)
 	drain(&ns);
 
 	save = ns.f[0];
-	netstate_on_netmon(&ns, NETMON_CH_V6, 1, 1, t);
+	netmon(&ns, NETMON_CH_V6, 1, 1);
 
 	assert(!memcmp(&save, &ns.f[0], sizeof(save)));
 	assert(netstate_conn(&ns, 4) == NET_CONN_UP);
@@ -123,7 +187,7 @@ static void a_confirmed_anchor_survives_a_move(void)
 	assert(netstate_anchor(&ns, 6, got, &glen, &confirmed) && confirmed);
 	drain(&ns);
 
-	netstate_on_netmon(&ns, NETMON_CH_V6, 1, 1, t);
+	netmon(&ns, NETMON_CH_V6, 1, 1);
 
 	assert(netstate_anchor(&ns, 6, got, &glen, &confirmed));
 	assert(!memcmp(got, node, 16));	/* still ours */
@@ -150,7 +214,7 @@ static void stale_roundtrip_never_marks_up(void)
 
 	start(&ns, 1);
 	old = netstate_epoch(&ns, 4);
-	netstate_on_netmon(&ns, NETMON_CH_V4, 1, 1, t);
+	netmon(&ns, NETMON_CH_V4, 1, 1);
 	give_src(&ns, 4, 10);
 
 	netstate_on_roundtrip(&ns, 4, old);
@@ -169,7 +233,7 @@ static void src_survives_the_roam_window(void)
 	int i;
 
 	start(&ns, 1);
-	netstate_on_netmon(&ns, NETMON_CH_V6, 1, 1, t);
+	netmon(&ns, NETMON_CH_V6, 1, 1);
 	assert(drain(&ns).f[1] & NSA_SAMPLE_SRC);
 	assert(netstate_src_text(&ns, 6)[0] == '\0');
 
@@ -206,7 +270,7 @@ static void an_address_that_never_comes_stops_being_hurried(void)
 	int i;
 
 	start(&ns, 1);
-	netstate_on_netmon(&ns, NETMON_CH_V6, 1, 1, t);
+	netmon(&ns, NETMON_CH_V6, 1, 1);
 	assert(drain(&ns).f[1] & NSA_SAMPLE_SRC);
 
 	for (i = 0; i < NETSTATE_SRC_FAST_TRIES; i++) {
@@ -276,42 +340,43 @@ static void a_linklocal_is_not_a_source(void)
 	assert(!strcmp(netstate_src_text(&ns, 6), "fd00::1"));
 }
 
+/* Which of the two an address is decided by membership of the kernel's set,
+ * and nothing about the source address moves either verdict. */
 static void a_shadow_address_is_not_a_translation(void)
 {
-	const struct netstate_row *rows;
-	uint8_t src[16], shadow[16];
+	struct netstate_row rows[NETSTATE_ROWS_MAX];
+	uint8_t src[16], shadow[16], nat[16];
 	struct netstate ns;
 	uint8_t ula[16];
 	int n, i;
 
-	start(&ns, 1);
 	fill(src, 16, 20);
 	fill(shadow, 16, 60);
+	fill(nat, 16, 120);
+	t = 1000;
+	netstate_init(&ns, 1, t);
+	snap_default(1, 0);
+	snap_add(6, src);
+	snap_add(6, shadow);
+	netmon_again(&ns, 0);
+	drain(&ns);
 
 	/* Enumerated, not proven: a shadow until an exchange says otherwise. */
-	netstate_on_candidate(&ns, 6, netstate_epoch(&ns, 6), NET_SCOPE_GLOBAL,
-			      NET_VIA_SHADOW, src, 16, "src");
-	netstate_on_candidate(&ns, 6, netstate_epoch(&ns, 6), NET_SCOPE_GLOBAL,
-			      NET_VIA_SHADOW, shadow, 16, "shadow");
-	drain(&ns);
-	n = netstate_rows(&ns, 6, &rows);
+	n = netstate_rows(&ns, 6, rows, NETSTATE_ROWS_MAX);
 	assert(n == 2);
 	for (i = 0; i < n; i++)
-		assert(netstate_row_via(&ns, 6, &rows[i]) == NET_VIA_SHADOW);
+		assert(rows[i].via == NET_VIA_SHADOW);
 
 	/* The round sent from src and was seen at src: nothing translated it. */
-	netstate_on_candidate(&ns, 6, netstate_epoch(&ns, 6), NET_SCOPE_GLOBAL,
-			      NET_VIA_DIRECT, src, 16, "src");
+	netstate_on_reflexive(&ns, 6, netstate_epoch(&ns, 6), src, 16);
 	drain(&ns);
-	n = netstate_rows(&ns, 6, &rows);
+	n = netstate_rows(&ns, 6, rows, NETSTATE_ROWS_MAX);
 	assert(n == 2);
 	for (i = 0; i < n; i++) {
-		int via = netstate_row_via(&ns, 6, &rows[i]);
-
 		if (!memcmp(rows[i].addr, src, 16))
-			assert(via == NET_VIA_DIRECT);
+			assert(rows[i].via == NET_VIA_DIRECT);
 		else
-			assert(via == NET_VIA_SHADOW);
+			assert(rows[i].via == NET_VIA_SHADOW);
 	}
 
 	/* Whatever the source becomes, including a ULA, the rows do not move:
@@ -321,27 +386,23 @@ static void a_shadow_address_is_not_a_translation(void)
 	netstate_on_src(&ns, 6, netstate_epoch(&ns, 6), ula, 16, NET_SCOPE_LAN,
 			"ula", t);
 	drain(&ns);
-	n = netstate_rows(&ns, 6, &rows);
+	n = netstate_rows(&ns, 6, rows, NETSTATE_ROWS_MAX);
 	assert(n == 2);
 	for (i = 0; i < n; i++) {
-		int via = netstate_row_via(&ns, 6, &rows[i]);
-
 		if (!memcmp(rows[i].addr, src, 16))
-			assert(via == NET_VIA_DIRECT);
+			assert(rows[i].via == NET_VIA_DIRECT);
 		else
-			assert(via == NET_VIA_SHADOW);
+			assert(rows[i].via == NET_VIA_SHADOW);
 	}
 
-	/* NAT66: the round was seen at an address it did not send from. */
-	netstate_on_candidate(&ns, 6, netstate_epoch(&ns, 6), NET_SCOPE_GLOBAL,
-			      NET_VIA_STUN, shadow, 16, "shadow");
+	/* NAT66: seen at an address this machine does not have. */
+	netstate_on_reflexive(&ns, 6, netstate_epoch(&ns, 6), nat, 16);
 	drain(&ns);
-	n = netstate_rows(&ns, 6, &rows);
-	assert(n == 2);
+	n = netstate_rows(&ns, 6, rows, NETSTATE_ROWS_MAX);
+	assert(n == 3);
 	for (i = 0; i < n; i++)
-		if (!memcmp(rows[i].addr, shadow, 16))
-			assert(netstate_row_via(&ns, 6, &rows[i]) ==
-			       NET_VIA_STUN);
+		if (!memcmp(rows[i].addr, nat, 16))
+			assert(rows[i].via == NET_VIA_STUN);
 }
 
 /*
@@ -383,7 +444,7 @@ static void a_peers_vouch_qualifies_what_we_cannot_reach(void)
 
 	/* A move of OURS does not take back what the peer proved: that was
 	 * about the node, not about the network we have left. */
-	netstate_on_netmon(&ns, NETMON_CH_V6, 1, 1, t);
+	netmon(&ns, NETMON_CH_V6, 1, 1);
 	drain(&ns);
 	netstate_facts(&ns, 6, &f);
 	assert(f.dht_acked);
@@ -415,42 +476,40 @@ static void a_peers_vouch_qualifies_what_we_cannot_reach(void)
 	assert(!f.dht_acked);
 }
 
-/* B6/B12, the visible half: the addresses arrive before the source does, so
- * whichever was shown first cannot be the answer. Once the source is known the
- * set is recomputed, which an append-only row list could never do. */
-static void late_src_retracts_the_wrong_row(void)
+/* The source address decides nothing about the rows: an address the kernel
+ * still has stays on the dashboard, and the one this machine happens to source
+ * from is not thereby proven. */
+static void the_source_neither_proves_nor_hides(void)
 {
-	struct netstate ns;
-	const struct netstate_row *rows;
+	struct netstate_row rows[NETSTATE_ROWS_MAX];
 	uint8_t dhcp[16], priv[16];
 	struct netstate_actions a;
-	int n, i, shown = 0;
+	struct netstate ns;
+	int n, i;
 
-	start(&ns, 1);
 	fill(dhcp, 16, 40);
 	fill(priv, 16, 80);
-	netstate_on_candidate(&ns, 6, netstate_epoch(&ns, 6), NET_SCOPE_GLOBAL,
-			      NET_VIA_DIRECT, dhcp, 16, "dhcp");
-	netstate_on_candidate(&ns, 6, netstate_epoch(&ns, 6), NET_SCOPE_GLOBAL,
-			      NET_VIA_DIRECT, priv, 16, "priv");
+	t = 1000;
+	netstate_init(&ns, 1, t);
+	snap_default(1, 0);
+	snap_add(6, dhcp);
+	snap_add(6, priv);
+	netmon_again(&ns, 0);
 	drain(&ns);
 
-	n = netstate_rows(&ns, 6, &rows);
+	n = netstate_rows(&ns, 6, rows, NETSTATE_ROWS_MAX);
 	assert(n == 2);
-	for (i = 0; i < n; i++)
-		shown += rows[i].shown;
-	assert(shown == 2);		/* nothing held back without a source */
 
 	netstate_on_src(&ns, 6, netstate_epoch(&ns, 6), priv, 16,
 			NET_SCOPE_GLOBAL, "priv", t);
 	a = drain(&ns);
-	assert(a.f[1] & NSA_EMIT_ROWS);
-	assert(!(a.f[0] & NSA_EMIT_ROWS));	/* v4 untouched */
+	assert(!(a.f[1] & NSA_EMIT_ROWS));
+	assert(!(a.f[0] & NSA_EMIT_ROWS));
 
-	n = netstate_rows(&ns, 6, &rows);
+	n = netstate_rows(&ns, 6, rows, NETSTATE_ROWS_MAX);
 	assert(n == 2);
 	for (i = 0; i < n; i++)
-		assert(rows[i].shown == !memcmp(rows[i].addr, priv, 16));
+		assert(rows[i].via == NET_VIA_SHADOW);
 }
 
 /* The offer is rewritten to the source address, so a source belonging to the
@@ -466,7 +525,7 @@ static void src_is_never_stale_on_the_wire(void)
 			NET_SCOPE_GLOBAL, "keep", t);
 	assert(netstate_src(&ns, 6, out) == 16);
 
-	netstate_on_netmon(&ns, NETMON_CH_V6, 1, 1, t);
+	netmon(&ns, NETMON_CH_V6, 1, 1);
 	assert(netstate_src(&ns, 6, out) == 0);
 	assert(netstate_src_text(&ns, 6)[0] == '\0');
 
@@ -606,7 +665,7 @@ static void only_another_answer_condemns(void)
 
 	/* and a move keeps it, proof and all: only another node answering
 	 * counts against a node, never a move. */
-	netstate_on_netmon(&ns, NETMON_CH_V6, 1, 1, t);
+	netmon(&ns, NETMON_CH_V6, 1, 1);
 	assert(netstate_anchor(&ns, 6, got, &glen, &confirmed));
 	assert(!memcmp(got, a, 16));
 	assert(confirmed);
@@ -813,7 +872,7 @@ static void a_move_gives_a_candidate_a_fresh_run(void)
 	drain(&ns);
 
 	t += NETSTATE_ANCHOR_TRY_MS - 1;
-	netstate_on_netmon(&ns, NETMON_CH_V6, 1, 1, t);
+	netmon(&ns, NETMON_CH_V6, 1, 1);
 	drain(&ns);
 
 	t += 2;				/* past the original deadline */
@@ -976,9 +1035,9 @@ static void latest_change_wins(void)
 	uint8_t addr[4];
 
 	start(&ns, 1);
-	netstate_on_netmon(&ns, NETMON_CH_V4, 1, 1, t);
+	netmon(&ns, NETMON_CH_V4, 1, 1);
 	first = netstate_epoch(&ns, 4);
-	netstate_on_netmon(&ns, NETMON_CH_V4, 1, 1, t);
+	netmon(&ns, NETMON_CH_V4, 1, 1);
 	second = netstate_epoch(&ns, 4);
 	assert(second != first);
 
@@ -1014,7 +1073,7 @@ static void host_and_client_agree_except_on_the_token(void)
 		give_src(ns, 6, 20);
 		netstate_on_rdv_offered(ns, 6, node, 16, t);
 		netstate_on_dht_ack(ns, 6, netstate_epoch(ns, 6), node, 16, t);
-		netstate_on_netmon(ns, NETMON_CH_V6, 1, 0, t);
+		netmon(ns, NETMON_CH_V6, 1, 0);
 		netstate_on_dht_concluded(ns, 4, 1);
 	}
 
@@ -1113,7 +1172,7 @@ static void probe_slows_but_never_stops(void)
 	}
 
 	/* a move is a fresh network, and may not filter: prompt again */
-	netstate_on_netmon(&ns, NETMON_CH_V6, 1, 1, t);
+	netmon(&ns, NETMON_CH_V6, 1, 1);
 	assert(drain(&ns).f[1] & NSA_KICK_PROBE);
 	netstate_on_probe_started(&ns, 6, netstate_epoch(&ns, 6), t);
 	netstate_on_probe_done(&ns, 6, netstate_epoch(&ns, 6), t);
@@ -1172,7 +1231,7 @@ static void somewhere_new_makes_a_round_due(void)
 	assert(drain(&ns).f[1] & NSA_KICK_PROBE);
 
 	/* Not from the network it was learnt on, so it says nothing here. */
-	netstate_on_netmon(&ns, NETMON_CH_V6, 1, 1, t);
+	netmon(&ns, NETMON_CH_V6, 1, 1);
 	drain(&ns);
 	netstate_on_servers(&ns, 6, netstate_epoch(&ns, 6) - 1, t);
 	assert(!(drain(&ns).f[1] & NSA_KICK_PROBE));
@@ -1185,7 +1244,7 @@ static void no_address_no_probe_no_pending(void)
 
 	t = 1000;
 	netstate_init(&ns, 1, t);
-	netstate_on_netmon(&ns, 0, 1, 0, t);	/* v4 only */
+	netmon(&ns, 0, 1, 0);	/* v4 only */
 	drain(&ns);
 
 	give_src(&ns, 6, 20);			/* even a route proves nothing */
@@ -1196,26 +1255,316 @@ static void no_address_no_probe_no_pending(void)
 	assert(!(drain(&ns).f[1] & NSA_KICK_PROBE));
 }
 
-/* The same address reaching us both ways means nothing translated it: one row,
- * and not the one marked NAT. */
-static void row_merge_direct_beats_stun(void)
+/* Membership decides, not arrival order: an address the kernel reports is
+ * proven by a reply naming it and stays proven however often it is re-offered,
+ * and the derived text is the model's, not a producer's. */
+static void membership_decides_not_arrival_order(void)
 {
+	struct netstate_row rows[NETSTATE_ROWS_MAX];
+	uint8_t theirs[4] = { 198, 51, 100, 9 };
+	uint8_t mine[4] = { 203, 0, 113, 7 };
 	struct netstate ns;
-	const struct netstate_row *rows;
-	uint8_t a[4];
 	uint32_t e;
+	int k;
+
+	for (k = 0; k < 2; k++) {
+		t = 1000;
+		netstate_init(&ns, 1, t);
+		snap_default(0, 1);
+		snap_add(4, mine);
+		netmon_again(&ns, 0);
+		drain(&ns);
+		e = netstate_epoch(&ns, 4);
+
+		/* Either order, and twice over. */
+		if (k)
+			netstate_on_reflexive(&ns, 4, e, theirs, 4);
+		netstate_on_reflexive(&ns, 4, e, mine, 4);
+		if (!k)
+			netstate_on_reflexive(&ns, 4, e, theirs, 4);
+		netstate_on_reflexive(&ns, 4, e, mine, 4);
+		netstate_on_reflexive(&ns, 4, e, theirs, 4);
+
+		assert(netstate_rows(&ns, 4, rows, NETSTATE_ROWS_MAX) == 2);
+		assert(!memcmp(rows[0].addr, mine, 4));
+		assert(rows[0].via == NET_VIA_DIRECT);
+		assert(!strcmp(rows[0].text, "203.0.113.7"));
+		assert(rows[1].via == NET_VIA_STUN);
+		assert(!strcmp(rows[1].text, "198.51.100.9"));
+	}
+}
+
+/* A move is about the network, so the proofs go and the addresses stay, and
+ * only for the family that moved. */
+static void an_epoch_bump_demotes_rather_than_empties(void)
+{
+	struct netstate_row rows[NETSTATE_ROWS_MAX];
+	uint8_t pub4[4] = { 203, 0, 113, 7 };
+	struct netstate_fam save;
+	struct netstate ns;
+
+	t = 1000;
+	netstate_init(&ns, 1, t);
+	snap_default(0, 1);
+	snap_add(4, pub4);
+	netmon_again(&ns, 0);
+	netstate_on_reflexive(&ns, 4, netstate_epoch(&ns, 4), pub4, 4);
+	netstate_on_reflexive(&ns, 6, netstate_epoch(&ns, 6), dfl6, 16);
+	drain(&ns);
+	assert(netstate_rows(&ns, 4, rows, NETSTATE_ROWS_MAX) == 1);
+	assert(rows[0].via == NET_VIA_DIRECT);
+	assert(netstate_rows(&ns, 6, rows, NETSTATE_ROWS_MAX) == 1);
+	assert(rows[0].via == NET_VIA_DIRECT);
+
+	save = ns.f[0];
+	netmon_again(&ns, NETMON_CH_V6);
+
+	assert(!memcmp(&save, &ns.f[0], sizeof(save)));
+	assert(ns.f[1].nlocals == 1);		/* the address is the kernel's */
+	assert(netstate_rows(&ns, 6, rows, NETSTATE_ROWS_MAX) == 1);
+	assert(rows[0].via == NET_VIA_SHADOW);	/* the proof was this network's */
+	assert(drain(&ns).f[1] & NSA_EMIT_ROWS);
+
+	netstate_on_reflexive(&ns, 6, netstate_epoch(&ns, 6), dfl6, 16);
+	assert(netstate_rows(&ns, 6, rows, NETSTATE_ROWS_MAX) == 1);
+	assert(rows[0].via == NET_VIA_DIRECT);
+}
+
+static void rows_say(struct netstate *ns, const uint8_t *mine, int mine_via,
+		     int theirs_seen)
+{
+	struct netstate_row rows[NETSTATE_ROWS_MAX];
+	int n, i;
+
+	n = netstate_rows(ns, 6, rows, NETSTATE_ROWS_MAX);
+	assert(n == 1 + theirs_seen);
+	for (i = 0; i < n; i++)
+		assert(rows[i].via == (!memcmp(rows[i].addr, mine, 16) ?
+				       mine_via : NET_VIA_STUN));
+}
+
+/* Within one epoch no verdict moves, over every order of a repeated snapshot,
+ * a reply naming one of ours, and a reply naming one we do not have. */
+static void no_verdict_moves_within_an_epoch(void)
+{
+	static const int pow3[4] = { 1, 3, 9, 27 };
+	int seq, step, ev, mine_via, seen;
+	uint8_t mine[16], theirs[16];
+	struct netstate ns;
+
+	fill(mine, 16, 20);
+	fill(theirs, 16, 120);
+	for (seq = 0; seq < 81; seq++) {
+		t = 1000;
+		netstate_init(&ns, 1, t);
+		snap_reset();
+		snap_add(6, mine);
+		netmon_again(&ns, 0);
+		mine_via = NET_VIA_SHADOW;
+		seen = 0;
+		for (step = 0; step < 4; step++) {
+			ev = (seq / pow3[step]) % 3;
+			if (!ev)
+				netmon_again(&ns, 0);
+			else
+				netstate_on_reflexive(&ns, 6,
+						      netstate_epoch(&ns, 6),
+						      ev == 1 ? mine : theirs,
+						      16);
+			if (ev == 1)
+				mine_via = NET_VIA_DIRECT;
+			if (ev == 2)
+				seen = 1;
+			rows_say(&ns, mine, mine_via, seen);
+		}
+	}
+}
+
+/* An address goes when the kernel stops reporting it, whether or not a family
+ * moved with it, and a translation is not one of ours to prune. */
+static void withdrawal_follows_the_kernel(void)
+{
+	struct netstate_row rows[NETSTATE_ROWS_MAX];
+	struct netstate_actions a;
+	uint8_t old6[16], nat[16];
+	struct netstate ns;
+
+	fill(old6, 16, 40);
+	fill(nat, 16, 120);
+	t = 1000;
+	netstate_init(&ns, 1, t);
+	snap_default(1, 1);
+	snap_add(6, old6);
+	netmon_again(&ns, 0);
+	netstate_on_reflexive(&ns, 6, netstate_epoch(&ns, 6), nat, 16);
+	drain(&ns);
+	assert(netstate_rows(&ns, 6, rows, NETSTATE_ROWS_MAX) == 3);
+
+	snap_drop(6, old6);
+	netmon_again(&ns, 0);
+	a = drain(&ns);
+	assert(a.f[1] & NSA_EMIT_ROWS);
+	assert(netstate_rows(&ns, 6, rows, NETSTATE_ROWS_MAX) == 2);
+	assert(!netstate_has_local(&ns, 6, old6, 16));
+	assert(ns.f[1].nxlats == 1);
+
+	/* A roam onto a network with no v6 at all takes the rest of it. */
+	netmon(&ns, NETMON_CH_V6, 1, 0);
+	assert(!netstate_rows(&ns, 6, rows, NETSTATE_ROWS_MAX));
+	assert(!netstate_has_local(&ns, 6, dfl6, 16));
+	assert(netstate_conn(&ns, 6) == 0);
+}
+
+/* The egress pool is on no interface, so no snapshot may prune it; it lives as
+ * long as the network it was measured on, and a repeated sample says nothing. */
+static void a_translation_outlives_every_snapshot(void)
+{
+	struct netstate_row rows[NETSTATE_ROWS_MAX];
+	uint8_t egress[4] = { 198, 51, 100, 9 };
+	struct netstate ns;
+	int i;
 
 	start(&ns, 1);
-	fill(a, 4, 10);
-	e = netstate_epoch(&ns, 4);
-	netstate_on_candidate(&ns, 4, e, NET_SCOPE_GLOBAL, NET_VIA_STUN, a, 4, "x");
-	netstate_on_candidate(&ns, 4, e, NET_SCOPE_GLOBAL, NET_VIA_DIRECT, a, 4, "x");
-	assert(netstate_rows(&ns, 4, &rows) == 1);
-	assert(rows[0].via == NET_VIA_DIRECT);
+	netstate_on_reflexive(&ns, 4, netstate_epoch(&ns, 4), egress, 4);
+	drain(&ns);
+	for (i = 0; i < 20; i++) {
+		netmon_again(&ns, 0);
+		assert(!drain(&ns).f[0]);
+		assert(netstate_rows(&ns, 4, rows, NETSTATE_ROWS_MAX) == 2);
+	}
+	assert(rows[0].via == NET_VIA_STUN);
+	assert(!strcmp(rows[0].text, "198.51.100.9"));
+	assert(rows[1].scope == NET_SCOPE_LAN);
+	assert(!strcmp(rows[1].text, "192.168.1.2"));
 
-	netstate_on_candidate(&ns, 4, e, NET_SCOPE_GLOBAL, NET_VIA_STUN, a, 4, "x");
-	assert(netstate_rows(&ns, 4, &rows) == 1);
-	assert(rows[0].via == NET_VIA_DIRECT);
+	netmon_again(&ns, NETMON_CH_V6);	/* not this family's network */
+	assert(netstate_rows(&ns, 4, rows, NETSTATE_ROWS_MAX) == 2);
+	netmon_again(&ns, NETMON_CH_V4);
+	assert(netstate_rows(&ns, 4, rows, NETSTATE_ROWS_MAX) == 1);
+	assert(rows[0].scope == NET_SCOPE_LAN);
+}
+
+/* The two sets are disjoint, whichever way round an address reaches them: one
+ * the kernel turns out to have stops being a translation, taking the reply that
+ * named it along as its proof, and one row is all it ever gets. */
+static void the_kernel_admitting_an_address_takes_it_back(void)
+{
+	static const uint8_t cgnat[4] = { 100, 64, 0, 1 };
+	struct netstate_row rows[NETSTATE_ROWS_MAX];
+	struct netstate ns;
+
+	t = 1000;
+	netstate_init(&ns, 1, t);
+	snap_default(1, 1);
+	netmon_again(&ns, 0);
+	netstate_on_reflexive(&ns, 4, netstate_epoch(&ns, 4), cgnat, 4);
+	drain(&ns);
+	assert(netstate_has_xlat(&ns, 4, cgnat, 4));
+	assert(!netstate_has_local(&ns, 4, cgnat, 4));
+	assert(netstate_rows(&ns, 4, rows, NETSTATE_ROWS_MAX) == 2);
+	assert(!memcmp(rows[0].addr, cgnat, 4));
+	assert(rows[0].via == NET_VIA_STUN);
+
+	/* The kernel reports it, on a sample no family moved with. */
+	snap_add(4, cgnat);
+	netmon_again(&ns, 0);
+	assert(drain(&ns).f[0] & NSA_EMIT_ROWS);
+	assert(!netstate_has_xlat(&ns, 4, cgnat, 4));
+	assert(netstate_has_local(&ns, 4, cgnat, 4));
+	assert(netstate_rows(&ns, 4, rows, NETSTATE_ROWS_MAX) == 2);
+	assert(!memcmp(rows[0].addr, cgnat, 4));
+	assert(rows[0].via == NET_VIA_DIRECT);	/* the reply proved it */
+	assert(rows[1].scope == NET_SCOPE_LAN);
+
+	/* The proof was still this network's, and ends with it. */
+	netmon_again(&ns, NETMON_CH_V4);
+	assert(netstate_rows(&ns, 4, rows, NETSTATE_ROWS_MAX) == 2);
+	assert(rows[0].scope == NET_SCOPE_LAN);
+	assert(!memcmp(rows[1].addr, cgnat, 4));
+	assert(rows[1].via == NET_VIA_SHADOW);
+}
+
+/* With less room than the model has addresses, what a view goes without is a
+ * global address no exchange has confirmed, never the segment a peer on the
+ * same link actually reaches this machine at. */
+static void a_full_view_goes_without_the_unconfirmed(void)
+{
+	static const uint8_t ula[16] = { 0xfd, 0, 0, 0, 0, 0, 0, 0,
+					 0, 0, 0, 0, 0, 0, 0, 1 };
+	struct netstate_row rows[NETSTATE_ROWS_MAX];
+	struct netstate ns;
+	int i, n, lan = 0;
+	uint8_t a[16];
+
+	t = 1000;
+	netstate_init(&ns, 1, t);
+	snap_reset();
+	for (i = 0; i < NETSTATE_ROWS_MAX + 4; i++) {
+		fill(a, 16, (uint8_t)i);
+		a[0] = 0x20;
+		snap_add(6, a);
+	}
+	snap_add(6, ula);
+	netmon_again(&ns, 0);
+
+	n = netstate_rows(&ns, 6, rows, NETSTATE_ROWS_MAX);
+	assert(n == NETSTATE_ROWS_MAX);
+	for (i = 0; i < n; i++)
+		lan += rows[i].scope == NET_SCOPE_LAN;
+	assert(lan == 1);
+}
+
+/* An address netmon leaves out of the fingerprint (APIPA, so that a DHCP
+ * handover does not read as a move) still decides whether the family has one. */
+static void an_address_with_no_change_bit_still_counts(void)
+{
+	static const uint8_t apipa[4] = { 169, 254, 3, 4 };
+	struct tokgen_facts fx;
+	struct netstate ns;
+
+	t = 1000;
+	netstate_init(&ns, 1, t);
+	snap_default(0, 1);
+	netmon_again(&ns, 0);
+	drain(&ns);
+	netstate_facts(&ns, 4, &fx);
+	assert(!fx.has_usable_addr);
+	assert(netstate_conn(&ns, 4) == 0);
+
+	snap_add(4, apipa);
+	netmon_again(&ns, 0);
+	netstate_facts(&ns, 4, &fx);
+	assert(fx.has_usable_addr);
+	assert(drain(&ns).f[0] & NSA_EMIT_ROWS);
+	assert(netstate_epoch(&ns, 4) == 1);	/* no network was entered */
+}
+
+/* Whatever netmon can report, the model holds. */
+static void every_address_the_kernel_reports_is_held(void)
+{
+	struct netstate_row rows[NETSTATE_ROWS_MAX];
+	struct netstate ns;
+	uint8_t a[16];
+	int i;
+
+	t = 1000;
+	netstate_init(&ns, 1, t);
+	snap_reset();
+	for (i = 0; i < NETMON_MAX_ADDRS; i++) {
+		fill(a, 16, (uint8_t)i);
+		a[0] = 0x20;
+		snap_add(6, a);
+	}
+	netmon_again(&ns, 0);
+	assert(ns.f[1].nlocals == NETMON_MAX_ADDRS);
+	for (i = 0; i < NETMON_MAX_ADDRS; i++) {
+		fill(a, 16, (uint8_t)i);
+		a[0] = 0x20;
+		assert(netstate_has_local(&ns, 6, a, 16));
+	}
+	/* A view is offered as many as it has room for. */
+	assert(netstate_rows(&ns, 6, rows, NETSTATE_ROWS_MAX) ==
+	       NETSTATE_ROWS_MAX);
 }
 
 /*
@@ -1225,6 +1574,7 @@ static void row_merge_direct_beats_stun(void)
 static void build(struct netstate *ns, int fam, int bits)
 {
 	uint8_t node[16];
+	uint8_t a[16];
 
 	if (bits & 1)
 		give_src(ns, fam, (uint8_t)(10 + fam));
@@ -1235,13 +1585,9 @@ static void build(struct netstate *ns, int fam, int bits)
 		netstate_on_dht_ack(ns, fam, netstate_epoch(ns, fam), node, 16, t);
 	}
 	if (bits & 8) {
-		uint8_t a[16];
-		int len = fam == 6 ? 16 : 4;
-
-		fill(a, len, (uint8_t)(90 + fam));
-		netstate_on_candidate(ns, fam, netstate_epoch(ns, fam),
-				      NET_SCOPE_GLOBAL, NET_VIA_DIRECT, a, len,
-				      "row");
+		fill(a, 16, (uint8_t)(90 + fam));
+		netstate_on_reflexive(ns, fam, netstate_epoch(ns, fam), a,
+				      fam == 6 ? 16 : 4);
 	}
 }
 
@@ -1274,7 +1620,7 @@ static void family_independence_lattice(void)
 				drain(&ns);
 				save = ns.f[other];
 
-				netstate_on_netmon(&ns, mask[m], 1, 1, t);
+				netmon(&ns, mask[m], 1, 1);
 				assert(!memcmp(&save, &ns.f[other],
 					       sizeof(save)));
 				assert(drain(&ns).f[other] == 0);
@@ -1341,11 +1687,8 @@ static void epoch_gate_exhaustive(void)
 							       t + 1);
 					break;
 				default:
-					netstate_on_candidate(&ns, fam, e,
-							      NET_SCOPE_GLOBAL,
-							      NET_VIA_DIRECT, a,
-							      fam == 6 ? 16 : 4,
-							      "z");
+					netstate_on_reflexive(&ns, fam, e, a,
+							      fam == 6 ? 16 : 4);
 					break;
 				}
 				if (delta)
@@ -1408,10 +1751,13 @@ static void laws_hold_under_churn(void)
 				else
 					h6 = 0;
 			}
-			netstate_on_netmon(&ns, m, h4, h6, t);
+			netmon(&ns, m, h4, h6);
 			k = (m == NETMON_CH_V6);
 			sh_epoch[k]++;
-			sh_has[k] = k ? h6 : h4;
+			/* Both families: the set is the kernel's whether or
+			 * not a family moved. */
+			sh_has[0] = h4;
+			sh_has[1] = h6;
 			sh_routed[k] = 0;
 			break;
 		}
@@ -1442,9 +1788,8 @@ static void laws_hold_under_churn(void)
 			}
 			break;
 		case 5:
-			netstate_on_candidate(&ns, fam, e, NET_SCOPE_GLOBAL,
-					      NET_VIA_DIRECT, a,
-					      fam == 6 ? 16 : 4, "c");
+			netstate_on_reflexive(&ns, fam, e, a,
+					      fam == 6 ? 16 : 4);
 			break;
 		default:
 			t += 250;
@@ -1475,12 +1820,15 @@ static void laws_hold_under_churn(void)
 
 int main(void)
 {
+	/* The model prints addresses through inet_ntop, and this case runs on
+	 * Windows too, where the socket library comes up before anything else. */
+	assert(!wsock_init());
 	v6_change_leaves_v4_alone();
 	a_confirmed_anchor_survives_a_move();
 	stale_roundtrip_never_marks_up();
 	src_survives_the_roam_window();
 	an_address_that_never_comes_stops_being_hurried();
-	late_src_retracts_the_wrong_row();
+	the_source_neither_proves_nor_hides();
 	a_linklocal_is_not_a_source();
 	a_shadow_address_is_not_a_translation();
 	a_peers_vouch_qualifies_what_we_cannot_reach();
@@ -1507,7 +1855,15 @@ int main(void)
 	a_deferred_round_is_due_at_once();
 	somewhere_new_makes_a_round_due();
 	no_address_no_probe_no_pending();
-	row_merge_direct_beats_stun();
+	membership_decides_not_arrival_order();
+	an_epoch_bump_demotes_rather_than_empties();
+	no_verdict_moves_within_an_epoch();
+	withdrawal_follows_the_kernel();
+	a_translation_outlives_every_snapshot();
+	the_kernel_admitting_an_address_takes_it_back();
+	a_full_view_goes_without_the_unconfirmed();
+	an_address_with_no_change_bit_still_counts();
+	every_address_the_kernel_reports_is_held();
 	family_independence_lattice();
 	epoch_gate_exhaustive();
 	laws_hold_under_churn();

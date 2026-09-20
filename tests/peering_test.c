@@ -21,7 +21,7 @@ static void what_is_posted_is_taken_once(void)
 	assert(!peering_facts_take(&f, out, NSFACTS_OUT));
 
 	peering_facts_post(&f, NSF_ROUNDTRIP, 4, 3);
-	peering_facts_post_addr(&f, 4, 3, NET_VIA_STUN, a, "198.51.100.9");
+	peering_facts_post_addr(&f, 4, 3, a);
 	assert(peering_facts_take(&f, out, NSFACTS_OUT) == 2);
 	assert(!peering_facts_take(&f, out, NSFACTS_OUT));
 	peering_facts_destroy(&f);
@@ -34,38 +34,39 @@ static void what_is_posted_is_taken_once(void)
  */
 static void a_fact_is_fed_under_the_model_s_own_epoch(void)
 {
-	const struct netstate_row *rows;
+	struct netstate_row rows[NETSTATE_ROWS_MAX];
+	uint8_t a[4] = { 198, 51, 100, 9 };
 	struct nsfact out[NSFACTS_OUT];
 	struct peering_facts f;
 	struct netstate ns;
-	uint8_t a[4] = { 198, 51, 100, 9 };
 
 	peering_facts_init(&f);
 	netstate_init(&ns, 1, 1000);
 	/* Posted under a generation of the machine's own, which is not the
 	 * epoch this model counts in. */
-	peering_facts_post_addr(&f, 4, 77, NET_VIA_STUN, a, "198.51.100.9");
+	peering_facts_post_addr(&f, 4, 77, a);
 	assert(peering_facts_take(&f, out, NSFACTS_OUT) == 1);
 
 	assert(!peering_facts_feed(&ns, &out[0], 77, 1000));
-	assert(!netstate_rows(&ns, 4, &rows));	/* not this model's epoch */
+	/* not this model's epoch */
+	assert(!netstate_rows(&ns, 4, rows, NETSTATE_ROWS_MAX));
 
 	assert(!peering_facts_feed(&ns, &out[0], netstate_epoch(&ns, 4), 1000));
-	assert(netstate_rows(&ns, 4, &rows) == 1);
+	assert(netstate_rows(&ns, 4, rows, NETSTATE_ROWS_MAX) == 1);
 	assert(!strcmp(rows[0].text, "198.51.100.9"));
 	assert(rows[0].scope == NET_SCOPE_GLOBAL);
 	peering_facts_destroy(&f);
 }
 
-/* An address is classified by scope as it is fed, since that is what the model
- * ranks it on. */
+/* An address the kernel does not report is a translation, whatever its scope,
+ * and the model reads the scope off the address bytes. */
 static void an_address_is_classified_as_it_is_fed(void)
 {
-	const struct netstate_row *rows;
-	struct peering_facts f;
-	struct nsfact q;
-	struct netstate ns;
+	struct netstate_row rows[NETSTATE_ROWS_MAX];
 	uint8_t a[4] = { 100, 64, 0, 1 };
+	struct peering_facts f;
+	struct netstate ns;
+	struct nsfact q;
 
 	peering_facts_init(&f);
 	netstate_init(&ns, 1, 1000);
@@ -73,11 +74,12 @@ static void an_address_is_classified_as_it_is_fed(void)
 	q.kind = NSF_ADDR;
 	q.family = 4;
 	memcpy(q.addr, a, 4);
-	snprintf(q.text, sizeof(q.text), "100.64.0.1");
 
 	assert(!peering_facts_feed(&ns, &q, netstate_epoch(&ns, 4), 1000));
-	assert(netstate_rows(&ns, 4, &rows) == 1);
+	assert(netstate_rows(&ns, 4, rows, NETSTATE_ROWS_MAX) == 1);
 	assert(rows[0].scope == NET_SCOPE_CGNAT);
+	assert(rows[0].via == NET_VIA_STUN);
+	assert(!strcmp(rows[0].text, "100.64.0.1"));
 	peering_facts_destroy(&f);
 }
 
@@ -118,18 +120,18 @@ static void every_distinct_egress_address_is_kept(void)
 	int i;
 
 	peering_pool_init(&p);
-	assert(!peering_pool_count(&p));
+	assert(!peering_pool_count(&p, 1));
 
-	assert(peering_pool_note(&p, a) == 1);
-	assert(!peering_pool_note(&p, a));	/* the same one, once */
-	assert(peering_pool_note(&p, b) == 2);
-	assert(peering_pool_count(&p) == 2);
+	assert(peering_pool_note(&p, a, 1) == 1);
+	assert(!peering_pool_note(&p, a, 1));	/* the same one, once */
+	assert(peering_pool_note(&p, b, 1) == 2);
+	assert(peering_pool_count(&p, 1) == 2);
 
 	/* A placeholder is nowhere a carrier maps this machine to. */
-	assert(!peering_pool_note(&p, zero));
-	assert(peering_pool_count(&p) == 2);
+	assert(!peering_pool_note(&p, zero, 1));
+	assert(peering_pool_count(&p, 1) == 2);
 
-	assert(peering_pool_copy(&p, out) == 2);
+	assert(peering_pool_copy(&p, out, 1) == 2);
 	assert(!memcmp(out[0], a, 4));
 	assert(!memcmp(out[1], b, 4));
 
@@ -138,9 +140,49 @@ static void every_distinct_egress_address_is_kept(void)
 		uint8_t x[4] = { 198, 51, 101, 0 };
 
 		x[3] = (uint8_t)(i + 1);
-		peering_pool_note(&p, x);
+		peering_pool_note(&p, x, 1);
 	}
-	assert(peering_pool_count(&p) == PEERING_POOL4_MAX);
+	assert(peering_pool_count(&p, 1) == PEERING_POOL4_MAX);
+	peering_pool_destroy(&p);
+}
+
+/*
+ * Every member is measured on one network, and the pool says which: a producer
+ * still winding up when the move landed cannot seed the network it reaches, a
+ * reader of the new one is shown nothing of the old, and the first measurement
+ * of a network takes the pool with it, samples and all.
+ */
+static void a_pool_belongs_to_the_network_it_was_measured_on(void)
+{
+	uint8_t out[PEERING_POOL4_MAX][4];
+	uint8_t old[4] = { 198, 51, 100, 1 };
+	uint8_t fresh[4] = { 203, 0, 113, 7 };
+	struct peering_pool p;
+
+	peering_pool_init(&p);
+	assert(peering_pool_note(&p, old, 1) == 1);
+	peering_pool_sample(&p, old, 4000, 1);
+	peering_pool_sample(&p, old, 4000, 1);
+	assert(peering_pool_mapping(&p) == STUN_MAPPING_INDEPENDENT);
+	assert(p.epoch == 1);
+
+	assert(!peering_pool_count(&p, 2));
+	assert(!peering_pool_copy(&p, out, 2));
+	assert(peering_pool_count(&p, 1) == 1);
+
+	assert(peering_pool_note(&p, fresh, 2) == 1);
+	assert(p.epoch == 2);
+	assert(peering_pool_count(&p, 2) == 1);
+	assert(!peering_pool_count(&p, 1));
+	assert(peering_pool_mapping(&p) == STUN_MAPPING_UNKNOWN);
+
+	/* A round of the network we have left, arriving after the move. */
+	assert(!peering_pool_note(&p, old, 1));
+	peering_pool_sample(&p, old, 4000, 1);
+	peering_pool_sample(&p, old, 4001, 1);
+	assert(peering_pool_count(&p, 2) == 1);
+	assert(!memcmp(p.v4[0], fresh, 4));
+	assert(peering_pool_mapping(&p) == STUN_MAPPING_UNKNOWN);
 	peering_pool_destroy(&p);
 }
 
@@ -157,19 +199,19 @@ static void a_round_forgets_the_samples_and_keeps_the_pool(void)
 	peering_pool_init(&p);
 	assert(peering_pool_mapping(&p) == STUN_MAPPING_UNKNOWN);
 
-	peering_pool_note(&p, a);
-	peering_pool_sample(&p, a, 4000);
-	peering_pool_sample(&p, a, 4000);
+	peering_pool_note(&p, a, 1);
+	peering_pool_sample(&p, a, 4000, 1);
+	peering_pool_sample(&p, a, 4000, 1);
 	assert(peering_pool_mapping(&p) == STUN_MAPPING_INDEPENDENT);
 	assert(peering_pool_port_stable(&p));
 
 	peering_pool_round(&p);
 	assert(peering_pool_mapping(&p) == STUN_MAPPING_UNKNOWN);
-	assert(peering_pool_count(&p) == 1);	/* the carrier's, not the socket's */
+	assert(peering_pool_count(&p, 1) == 1);	/* the carrier's, not the socket's */
 
-	peering_pool_note(&p, b);
-	peering_pool_sample(&p, a, 4000);
-	peering_pool_sample(&p, b, 4001);
+	peering_pool_note(&p, b, 1);
+	peering_pool_sample(&p, a, 4000, 1);
+	peering_pool_sample(&p, b, 4001, 1);
 	assert(peering_pool_mapping(&p) == STUN_MAPPING_DEPENDENT);
 	assert(!peering_pool_port_stable(&p));	/* and the fan cannot survive it */
 	peering_pool_destroy(&p);
@@ -182,15 +224,132 @@ static void a_move_empties_the_pool(void)
 	uint8_t a[4] = { 198, 51, 100, 1 };
 
 	peering_pool_init(&p);
-	peering_pool_note(&p, a);
-	peering_pool_sample(&p, a, 4000);
-	peering_pool_sample(&p, a, 4000);
+	peering_pool_note(&p, a, 1);
+	peering_pool_sample(&p, a, 4000, 1);
+	peering_pool_sample(&p, a, 4000, 1);
 	peering_pool_reset(&p);
-	assert(!peering_pool_count(&p));
+	assert(!peering_pool_count(&p, 1));
 	assert(peering_pool_mapping(&p) == STUN_MAPPING_UNKNOWN);
 	/* And it is the same address again on the next network, as news. */
-	assert(peering_pool_note(&p, a) == 1);
+	assert(peering_pool_note(&p, a, 2) == 1);
 	peering_pool_destroy(&p);
+}
+
+/* One private v4, for the model to have an address of this machine's own. */
+static size_t lan_snapshot(struct netmon_addr *out)
+{
+	static const uint8_t lan[4] = { 192, 168, 1, 2 };
+
+	memset(out, 0, sizeof(*out));
+	out->family = AF_INET;
+	out->addrlen = 4;
+	memcpy(out->addr, lan, 4);
+
+	return 1;
+}
+
+/*
+ * What a settle tells the model of the pool, and for how long: the members
+ * measured on this network on every pass, nothing of a network left behind, and
+ * no latch of one outliving it.
+ */
+static void the_pool_is_offered_for_its_own_network(void)
+{
+	struct netstate_row rows[NETSTATE_ROWS_MAX];
+	uint8_t a[4] = { 198, 51, 100, 1 };
+	uint8_t b[4] = { 198, 51, 100, 2 };
+	struct peering_settle cfg;
+	struct peering_model pm;
+	struct netmon_addr snap;
+	struct peering_net m;
+	size_t nsnap;
+	uint32_t e;
+
+	memset(&cfg, 0, sizeof(cfg));
+	nsnap = lan_snapshot(&snap);
+	peering_model_init(&pm, 1, 1, NULL, 1000);
+	peering_net_init(&m, NULL, 0, 1);
+	netstate_on_netmon(&pm.ns, 0, &snap, nsnap, 1000);
+	e = netstate_epoch(&pm.ns, 4);
+
+	/* Measured before the first settle of the session, which is where a
+	 * pool carrying its own epoch differs from one compared with the
+	 * model's. */
+	assert(peering_pool_note(&m.pool, a, e) == 1);
+	assert(peering_pool_note(&m.pool, b, e) == 2);
+	peering_settle(&pm, &m, &cfg, 1000);
+	assert(netstate_rows(&pm.ns, 4, rows, NETSTATE_ROWS_MAX) == 3);
+	assert(rows[0].via == NET_VIA_STUN);
+	assert(!strcmp(rows[0].text, "198.51.100.1"));
+	assert(rows[1].via == NET_VIA_STUN);
+	assert(!strcmp(rows[1].text, "198.51.100.2"));
+	assert(rows[2].scope == NET_SCOPE_LAN);
+
+	/* A snapshot prunes what the kernel reports, which the pool is not. */
+	netstate_on_netmon(&pm.ns, 0, &snap, nsnap, 1100);
+	peering_settle(&pm, &m, &cfg, 1100);
+	assert(netstate_rows(&pm.ns, 4, rows, NETSTATE_ROWS_MAX) == 3);
+
+	/* The other family moving is not this one's business. */
+	netstate_on_netmon(&pm.ns, NETMON_CH_V6, &snap, nsnap, 1200);
+	peering_settle(&pm, &m, &cfg, 1200);
+	assert(netstate_rows(&pm.ns, 4, rows, NETSTATE_ROWS_MAX) == 3);
+
+	/* This family's does, and takes what was said of the pool with it. */
+	m.pool.posted = 2;
+	m.mapping_reported = 1;
+	netstate_on_netmon(&pm.ns, NETMON_CH_V4, &snap, nsnap, 1300);
+	assert(netstate_epoch(&pm.ns, 4) != e);
+	peering_settle(&pm, &m, &cfg, 1300);
+	assert(netstate_rows(&pm.ns, 4, rows, NETSTATE_ROWS_MAX) == 1);
+	assert(rows[0].scope == NET_SCOPE_LAN);
+	assert(!m.pool.posted && !m.mapping_reported);
+
+	peering_net_destroy(&m);
+	peering_model_destroy(&pm);
+}
+
+/*
+ * A move and a measurement of the network it lands on can reach the loop in one
+ * pass, the resume path giving up the old network and gathering again before it
+ * settles anything. What was measured on the new one is the new one's, whatever
+ * was forgotten in between.
+ */
+static void a_pool_measured_after_the_move_is_kept(void)
+{
+	struct netstate_row rows[NETSTATE_ROWS_MAX];
+	uint8_t fresh[4] = { 203, 0, 113, 7 };
+	uint8_t old[4] = { 198, 51, 100, 1 };
+	struct peering_settle cfg;
+	struct peering_model pm;
+	struct netmon_addr snap;
+	struct peering_net m;
+	size_t nsnap;
+	uint32_t e;
+
+	memset(&cfg, 0, sizeof(cfg));
+	nsnap = lan_snapshot(&snap);
+	peering_model_init(&pm, 1, 1, NULL, 1000);
+	peering_net_init(&m, NULL, 0, 1);
+	netstate_on_netmon(&pm.ns, 0, &snap, nsnap, 1000);
+	peering_pool_note(&m.pool, old, netstate_epoch(&pm.ns, 4));
+	peering_settle(&pm, &m, &cfg, 1000);
+	assert(netstate_rows(&pm.ns, 4, rows, NETSTATE_ROWS_MAX) == 2);
+
+	netstate_on_netmon(&pm.ns, NETMON_CH_V4, &snap, nsnap, 1100);
+	e = netstate_epoch(&pm.ns, 4);
+	peering_net_renew(&m);
+	assert(peering_pool_note(&m.pool, fresh, e) == 1);
+	peering_settle(&pm, &m, &cfg, 1100);
+
+	assert(peering_pool_count(&m.pool, e) == 1);
+	assert(netstate_rows(&pm.ns, 4, rows, NETSTATE_ROWS_MAX) == 2);
+	assert(rows[0].via == NET_VIA_STUN);
+	assert(!strcmp(rows[0].text, "203.0.113.7"));
+	assert(rows[1].scope == NET_SCOPE_LAN);
+
+	peering_net_destroy(&m);
+	peering_model_destroy(&pm);
 }
 
 /*
@@ -787,6 +946,9 @@ static void an_offer_is_staged_before_it_is_taken(void)
 
 int main(void)
 {
+	/* The model prints the addresses these cases read, and they run on
+	 * Windows too, where the socket library comes up before anything else. */
+	assert(!wsock_init());
 	what_is_posted_is_taken_once();
 	an_offer_is_staged_before_it_is_taken();
 	a_rotation_is_read_against_what_primed_us();
@@ -807,8 +969,11 @@ int main(void)
 	a_mailbox_off_the_dht_asks_nobody();
 	the_three_planes_are_wired_to_each_other();
 	every_distinct_egress_address_is_kept();
+	a_pool_belongs_to_the_network_it_was_measured_on();
 	a_round_forgets_the_samples_and_keeps_the_pool();
 	a_move_empties_the_pool();
+	the_pool_is_offered_for_its_own_network();
+	a_pool_measured_after_the_move_is_kept();
 	a_fact_is_fed_under_the_model_s_own_epoch();
 	an_address_is_classified_as_it_is_fed();
 	only_a_round_s_end_says_so();

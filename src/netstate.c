@@ -49,35 +49,127 @@ static void facts_moved(struct netstate *ns, int i)
 		raise_act(ns, i, NSA_EMIT_TOKEN);
 }
 
-/*
- * Which of this family's addresses belong on the dashboard, recomputed over
- * the whole set: whether a global v6 is ours to show turns on the source
- * address, routinely learnt after the addresses are.
- *
- * With a source known, one globally scoped v6 we gathered is shown -- the one
- * we source from; the rest are the stable and DHCPv6 addresses ICE also
- * enumerates, which we neither listen on nor punch from. With none known
- * nothing is held back. A server-reflexive v6 is always shown: behind NAT66 it
- * is the only address a peer could use.
- */
-static int recompute_rows(struct netstate_fam *f)
+static int addr_scope_raw(const uint8_t *b, int len)
 {
-	int have_src = f->src_epoch == f->epoch && f->src_len == 16;
-	int moved = 0, i;
+	if (len == 16) {
+		if (b[0] == 0xfe && (b[1] & 0xc0) == 0x80)	/* fe80::/10 */
+			return NET_SCOPE_LAN;
+		if (b[0] == 0xfe && (b[1] & 0xc0) == 0xc0)	/* fec0::/10 */
+			return NET_SCOPE_LAN;
+		if ((b[0] & 0xfe) == 0xfc)			/* fc00::/7 ULA */
+			return NET_SCOPE_LAN;
+		return NET_SCOPE_GLOBAL;
+	}
+	if (b[0] == 10 || (b[0] == 192 && b[1] == 168) ||
+	    (b[0] == 172 && b[1] >= 16 && b[1] <= 31) ||
+	    (b[0] == 169 && b[1] == 254))
+		return NET_SCOPE_LAN;
+	if (b[0] == 100 && b[1] >= 64 && b[1] <= 127)
+		return NET_SCOPE_CGNAT;
+	return NET_SCOPE_GLOBAL;
+}
 
-	for (i = 0; i < f->nrows; i++) {
-		struct netstate_row *r = &f->rows[i];
-		int show = 1;
+static int local_idx(const struct netstate_fam *f, const uint8_t *a, int len)
+{
+	int i;
 
-		if (have_src && r->addr_len == 16 &&
-		    r->scope == NET_SCOPE_GLOBAL && r->via == NET_VIA_DIRECT)
-			show = !memcmp(r->addr, f->src, 16);
-		if (show != r->shown) {
-			r->shown = show;
-			moved = 1;
-		}
+	for (i = 0; i < f->nlocals; i++)
+		if (f->locals[i].len == (uint8_t)len &&
+		    !memcmp(f->locals[i].addr, a, (size_t)len))
+			return i;
+	return -1;
+}
+
+static int snap_has(const struct netmon_addr *addrs, size_t n, int af,
+		    const uint8_t *a, int len)
+{
+	size_t i;
+
+	for (i = 0; i < n; i++)
+		if (addrs[i].family == af && addrs[i].addrlen == (uint8_t)len &&
+		    !memcmp(addrs[i].addr, a, (size_t)len))
+			return 1;
+	return 0;
+}
+
+/* Non-zero when it was held as one: the exchange that named it stands, so the
+ * address takes its proof with it into the kernel's set. */
+static int xlat_forget(struct netstate_fam *f, const uint8_t *a, int len)
+{
+	int i;
+
+	for (i = 0; i < f->nxlats; i++) {
+		if (f->xlats[i].len != (uint8_t)len ||
+		    memcmp(f->xlats[i].addr, a, (size_t)len))
+			continue;
+		memmove(&f->xlats[i], &f->xlats[i + 1],
+			sizeof(f->xlats[0]) * (size_t)(f->nxlats - 1 - i));
+		memset(&f->xlats[--f->nxlats], 0, sizeof(f->xlats[0]));
+		return 1;
+	}
+	return 0;
+}
+
+/* The kernel's set, taken as this family's; non-zero when it moved. Removals
+ * walk down, so dropping one cannot skip an entry still to be tested. */
+static int local_sync(struct netstate_fam *f, int af,
+		      const struct netmon_addr *addrs, size_t n)
+{
+	int len = af == AF_INET6 ? 16 : 4;
+	struct netstate_local *l;
+	int moved = 0, k;
+	size_t i;
+
+	for (k = f->nlocals - 1; k >= 0; k--) {
+		if (snap_has(addrs, n, af, f->locals[k].addr, f->locals[k].len))
+			continue;
+		memmove(&f->locals[k], &f->locals[k + 1],
+			sizeof(f->locals[0]) * (size_t)(f->nlocals - 1 - k));
+		memset(&f->locals[--f->nlocals], 0, sizeof(f->locals[0]));
+		moved = 1;
+	}
+	for (i = 0; i < n && f->nlocals < NETSTATE_LOCAL_MAX; i++) {
+		if (addrs[i].family != af || addrs[i].addrlen != (uint8_t)len)
+			continue;
+		if (local_idx(f, addrs[i].addr, len) >= 0)
+			continue;
+		l = &f->locals[f->nlocals++];
+		memset(l, 0, sizeof(*l));
+		memcpy(l->addr, addrs[i].addr, (size_t)len);
+		l->len = (uint8_t)len;
+		l->scope = (uint8_t)addr_scope_raw(addrs[i].addr, len);
+		l->proven = (uint8_t)xlat_forget(f, addrs[i].addr, len);
+		moved = 1;
 	}
 	return moved;
+}
+
+static void proofs_demote(struct netstate_fam *f)
+{
+	int i;
+
+	for (i = 0; i < f->nlocals; i++)
+		f->locals[i].proven = 0;
+}
+
+/* Non-zero when it was not held already, so a producer may re-offer freely. */
+static int xlat_note(struct netstate_fam *f, const uint8_t *a, int len)
+{
+	struct netstate_xlat *x;
+	int i;
+
+	for (i = 0; i < f->nxlats; i++)
+		if (f->xlats[i].len == (uint8_t)len &&
+		    !memcmp(f->xlats[i].addr, a, (size_t)len))
+			return 0;
+	if (f->nxlats >= NETSTATE_XLAT_MAX)
+		return 0;
+	x = &f->xlats[f->nxlats++];
+	memset(x, 0, sizeof(*x));
+	memcpy(x->addr, a, (size_t)len);
+	x->len = (uint8_t)len;
+	x->scope = (uint8_t)addr_scope_raw(a, len);
+	return 1;
 }
 
 void netstate_init(struct netstate *ns, int is_host, uint64_t now)
@@ -96,28 +188,27 @@ void netstate_init(struct netstate *ns, int is_host, uint64_t now)
 	}
 }
 
-void netstate_on_netmon(struct netstate *ns, unsigned changed, int have4,
-			int have6, uint64_t now)
+void netstate_on_netmon(struct netstate *ns, unsigned changed,
+			const struct netmon_addr *addrs, size_t naddrs,
+			uint64_t now)
 {
-	int have[2], i;
+	int i;
 
-	have[0] = have4;
-	have[1] = have6;
 	for (i = 0; i < 2; i++) {
 		struct netstate_fam *f = &ns->f[i];
 		unsigned bit = i ? NETMON_CH_V6 : NETMON_CH_V4;
 
-		if (!(changed & bit)) {
-			if (!ns->primed && f->has_addr != have[i]) {
-				f->has_addr = have[i];
-				sync_conn(ns, i);
-				facts_moved(ns, i);
-			}
-			continue;
+		if (local_sync(f, i ? AF_INET6 : AF_INET, addrs, naddrs))
+			raise_act(ns, i, NSA_EMIT_ROWS);
+		if (f->has_addr != !!f->nlocals) {
+			f->has_addr = !!f->nlocals;
+			sync_conn(ns, i);
+			facts_moved(ns, i);
 		}
+		if (!(changed & bit))
+			continue;
 
 		f->epoch++;
-		f->has_addr = have[i];
 
 		/* src is kept but stops being current: "unchanged across the
 		 * move" has to stay distinguishable from "not up yet". */
@@ -148,7 +239,10 @@ void netstate_on_netmon(struct netstate *ns, unsigned changed, int have4,
 					 * for a network we have left */
 		f->probe_next_ms = now;
 
-		f->nrows = 0;
+		/* A proof is about the network it was made on; the addresses
+		 * are the kernel's and are not ours to forget. */
+		proofs_demote(f);
+		f->nxlats = 0;
 		f->conn = conn_of(f);
 
 		raise_act(ns, i, NSA_SAMPLE_SRC | NSA_KICK_PROBE |
@@ -157,16 +251,6 @@ void netstate_on_netmon(struct netstate *ns, unsigned changed, int have4,
 			raise_act(ns, i, NSA_RDV_PIN | NSA_EMIT_RDV);
 		facts_moved(ns, i);
 	}
-	ns->primed = 1;
-}
-
-int netstate_row_via(const struct netstate *ns, int family,
-		     const struct netstate_row *r)
-{
-	(void)ns;
-	(void)family;
-
-	return r ? r->via : NET_VIA_DIRECT;
 }
 
 /* fe80::/10 reaches nothing off-link, so the kernel naming it as the source for
@@ -218,8 +302,6 @@ void netstate_on_src(struct netstate *ns, int family, uint32_t epoch,
 			strncpy(f->src_text, text, sizeof(f->src_text) - 1);
 			f->src_text[sizeof(f->src_text) - 1] = '\0';
 		}
-		if (recompute_rows(f))
-			raise_act(ns, i, NSA_EMIT_ROWS);
 	}
 	if (!f->routed) {
 		f->routed = 1;
@@ -517,49 +599,25 @@ void netstate_set_picking(struct netstate *ns, int family, int on)
 		f->ncands = 0;
 }
 
-void netstate_on_candidate(struct netstate *ns, int family, uint32_t epoch,
-			   int scope, int via, const uint8_t *addr, int len,
-			   const char *text)
+void netstate_on_reflexive(struct netstate *ns, int family, uint32_t epoch,
+			   const uint8_t *addr, int len)
 {
+	struct netstate_fam *f = &ns->f[fam_idx(family)];
 	int i = fam_idx(family);
-	struct netstate_fam *f = &ns->f[i];
-	struct netstate_row *r = NULL;
 	int k;
 
-	if (epoch != f->epoch || !addr || (len != 4 && len != 16))
+	if (epoch != f->epoch || !addr || len != (family == 6 ? 16 : 4))
 		return;
 
-	for (k = 0; k < f->nrows; k++)
-		if (f->rows[k].addr_len == (uint8_t)len &&
-		    !memcmp(f->rows[k].addr, addr, (size_t)len)) {
-			r = &f->rows[k];
-			break;
-		}
-	if (!r) {
-		if (f->nrows >= NETSTATE_ROWS_MAX)
-			return;
-		r = &f->rows[f->nrows++];
-		memset(r, 0, sizeof(*r));
-		memcpy(r->addr, addr, (size_t)len);
-		r->addr_len = (uint8_t)len;
-		r->scope = scope;
-		r->via = via;
-		if (text) {
-			strncpy(r->text, text, sizeof(r->text) - 1);
-			r->text[sizeof(r->text) - 1] = '\0';
-		}
-	} else if (via == NET_VIA_DIRECT && r->via != NET_VIA_DIRECT) {
-		/* Reached us both ways, so nothing translated it. */
-		r->via = via;
-	} else if (r->via == NET_VIA_SHADOW) {
-		/* An exchange judged what had only been enumerated. Evidence
-		 * only accumulates: no verdict is ever walked back, or the row
-		 * would flap for as long as the reports keep arriving. */
-		r->via = via;
-	} else {
+	k = local_idx(f, addr, len);
+	/* A LAN address never enters the proven/unproven distinction. */
+	if (k >= 0 && (f->locals[k].proven ||
+		       f->locals[k].scope == NET_SCOPE_LAN))
 		return;
-	}
-	recompute_rows(f);
+	if (k >= 0)
+		f->locals[k].proven = 1;
+	else if (!xlat_note(f, addr, len))
+		return;
 	raise_act(ns, i, NSA_EMIT_ROWS);
 }
 
@@ -687,14 +745,67 @@ int netstate_src(const struct netstate *ns, int family, uint8_t *out16)
 	return f->src_len;
 }
 
+static void row_of(struct netstate_row *r, const uint8_t *a, int len, int scope,
+		   int via)
+{
+	memset(r, 0, sizeof(*r));
+	memcpy(r->addr, a, (size_t)len);
+	r->addr_len = (uint8_t)len;
+	r->scope = scope;
+	r->via = via;
+	if (!inet_ntop(len == 16 ? AF_INET6 : AF_INET, a, r->text,
+		       sizeof(r->text)))
+		r->text[0] = '\0';
+}
+
 int netstate_rows(const struct netstate *ns, int family,
-		  const struct netstate_row **out)
+		  struct netstate_row *out, int max)
 {
 	const struct netstate_fam *f = &ns->f[fam_idx(family)];
+	const struct netstate_local *l;
+	int n = 0, i;
 
-	if (out)
-		*out = f->rows;
-	return f->nrows;
+	for (i = 0; i < f->nlocals && n < max; i++) {
+		l = &f->locals[i];
+		if (l->scope != NET_SCOPE_LAN && l->proven)
+			row_of(&out[n++], l->addr, l->len, l->scope,
+			       NET_VIA_DIRECT);
+	}
+	for (i = 0; i < f->nxlats && n < max; i++)
+		row_of(&out[n++], f->xlats[i].addr, f->xlats[i].len,
+		       f->xlats[i].scope, NET_VIA_STUN);
+	for (i = 0; i < f->nlocals && n < max; i++) {
+		l = &f->locals[i];
+		if (l->scope == NET_SCOPE_LAN)
+			row_of(&out[n++], l->addr, l->len, l->scope,
+			       NET_VIA_DIRECT);
+	}
+	for (i = 0; i < f->nlocals && n < max; i++) {
+		l = &f->locals[i];
+		if (l->scope != NET_SCOPE_LAN && !l->proven)
+			row_of(&out[n++], l->addr, l->len, l->scope,
+			       NET_VIA_SHADOW);
+	}
+	return n;
+}
+
+int netstate_has_local(const struct netstate *ns, int family,
+		       const uint8_t *addr, int len)
+{
+	return local_idx(&ns->f[fam_idx(family)], addr, len) >= 0;
+}
+
+int netstate_has_xlat(const struct netstate *ns, int family,
+		      const uint8_t *addr, int len)
+{
+	const struct netstate_fam *f = &ns->f[fam_idx(family)];
+	int i;
+
+	for (i = 0; i < f->nxlats; i++)
+		if (f->xlats[i].len == (uint8_t)len &&
+		    !memcmp(f->xlats[i].addr, addr, (size_t)len))
+			return 1;
+	return 0;
 }
 
 void netstate_facts(const struct netstate *ns, int family,
@@ -782,26 +893,14 @@ int netstate_anchor(const struct netstate *ns, int family, uint8_t *out,
 /* Classify a bare address string by reachability scope. */
 int net_addr_scope(const char *addr)
 {
-	unsigned char b[16];
+	uint8_t b[16];
 
 	if (strchr(addr, ':')) {
 		if (inet_pton(AF_INET6, addr, b) != 1)
 			return NET_SCOPE_GLOBAL;
-		if (b[0] == 0xfe && (b[1] & 0xc0) == 0x80)	/* fe80::/10 */
-			return NET_SCOPE_LAN;
-		if (b[0] == 0xfe && (b[1] & 0xc0) == 0xc0)	/* fec0::/10 */
-			return NET_SCOPE_LAN;
-		if ((b[0] & 0xfe) == 0xfc)			/* fc00::/7 ULA */
-			return NET_SCOPE_LAN;
-		return NET_SCOPE_GLOBAL;
+		return addr_scope_raw(b, 16);
 	}
 	if (inet_pton(AF_INET, addr, b) != 1)
 		return NET_SCOPE_GLOBAL;
-	if (b[0] == 10 || (b[0] == 192 && b[1] == 168) ||
-	    (b[0] == 172 && b[1] >= 16 && b[1] <= 31) ||
-	    (b[0] == 169 && b[1] == 254))
-		return NET_SCOPE_LAN;
-	if (b[0] == 100 && b[1] >= 64 && b[1] <= 127)
-		return NET_SCOPE_CGNAT;
-	return NET_SCOPE_GLOBAL;
+	return addr_scope_raw(b, 4);
 }

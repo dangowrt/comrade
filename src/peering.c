@@ -35,11 +35,10 @@ void peering_facts_post(struct peering_facts *f, int kind, int family,
 }
 
 void peering_facts_post_addr(struct peering_facts *f, int family,
-			     uint32_t epoch, int via, const uint8_t *addr,
-			     const char *text)
+			     uint32_t epoch, const uint8_t *addr)
 {
 	pthread_mutex_lock(&f->lock);
-	nsfacts_post_addr(&f->q, family, epoch, via, addr, text);
+	nsfacts_post_addr(&f->q, family, epoch, addr);
 	pthread_mutex_unlock(&f->lock);
 }
 
@@ -66,10 +65,8 @@ int peering_facts_feed(struct netstate *ns, const struct nsfact *q,
 		return 0;
 	}
 	if (q->kind == NSF_ADDR) {
-		netstate_on_candidate(ns, q->family, epoch,
-				      net_addr_scope(q->text), q->via,
-				      q->addr, q->family == 6 ? 16 : 4,
-				      q->text);
+		netstate_on_reflexive(ns, q->family, epoch, q->addr,
+				      q->family == 6 ? 16 : 4);
 		return 0;
 	}
 	netstate_on_probe_done(ns, q->family, epoch, now);
@@ -88,7 +85,22 @@ void peering_pool_destroy(struct peering_pool *p)
 	pthread_mutex_destroy(&p->lock);
 }
 
-int peering_pool_note(struct peering_pool *p, const uint8_t addr[4])
+/* Called under the lock: non-zero when a measurement taken on `epoch` belongs
+ * here, the members of an earlier network going with it. */
+static int pool_epoch_ok(struct peering_pool *p, uint32_t epoch)
+{
+	if (epoch == p->epoch)
+		return 1;
+	if (epoch < p->epoch)
+		return 0;
+	p->epoch = epoch;
+	p->n = 0;
+	stun_mapping_reset(&p->map4);
+	return 1;
+}
+
+int peering_pool_note(struct peering_pool *p, const uint8_t addr[4],
+		      uint32_t epoch)
 {
 	static const uint8_t zero[4] = { 0 };
 	int added = 0, i;
@@ -96,6 +108,10 @@ int peering_pool_note(struct peering_pool *p, const uint8_t addr[4])
 	if (!memcmp(addr, zero, sizeof(zero)))
 		return 0;
 	pthread_mutex_lock(&p->lock);
+	if (!pool_epoch_ok(p, epoch)) {
+		pthread_mutex_unlock(&p->lock);
+		return 0;
+	}
 	for (i = 0; i < p->n; i++)
 		if (!memcmp(p->v4[i], addr, 4))
 			break;
@@ -109,12 +125,12 @@ int peering_pool_note(struct peering_pool *p, const uint8_t addr[4])
 }
 
 int peering_pool_copy(struct peering_pool *p,
-		      uint8_t out[PEERING_POOL4_MAX][4])
+		      uint8_t out[PEERING_POOL4_MAX][4], uint32_t epoch)
 {
 	int n, i;
 
 	pthread_mutex_lock(&p->lock);
-	n = p->n;
+	n = p->epoch == epoch ? p->n : 0;
 	for (i = 0; i < n; i++)
 		memcpy(out[i], p->v4[i], 4);
 	pthread_mutex_unlock(&p->lock);
@@ -122,22 +138,23 @@ int peering_pool_copy(struct peering_pool *p,
 	return n;
 }
 
-int peering_pool_count(struct peering_pool *p)
+int peering_pool_count(struct peering_pool *p, uint32_t epoch)
 {
 	int n;
 
 	pthread_mutex_lock(&p->lock);
-	n = p->n;
+	n = p->epoch == epoch ? p->n : 0;
 	pthread_mutex_unlock(&p->lock);
 
 	return n;
 }
 
 void peering_pool_sample(struct peering_pool *p, const uint8_t addr[4],
-			 uint16_t port)
+			 uint16_t port, uint32_t epoch)
 {
 	pthread_mutex_lock(&p->lock);
-	stun_mapping_add(&p->map4, addr, port);
+	if (pool_epoch_ok(p, epoch))
+		stun_mapping_add(&p->map4, addr, port);
 	pthread_mutex_unlock(&p->lock);
 }
 
@@ -277,52 +294,56 @@ int peering_sdp_has_candidate(const char *sdp)
 	return strstr(sdp, "a=candidate:") != NULL;
 }
 
+/*
+ * One round, and the network it asked on. A round is stamped once, where it
+ * starts, because the next one is armed while this one is still winding up:
+ * reading the arming point per answer would credit a reply from the network we
+ * have left to the one we have reached.
+ */
+struct probe_ctx {
+	struct peering_net *m;
+	uint32_t epoch;
+};
+
 static void probe_hit(void *arg, int family, const uint8_t addr[16],
 		      const uint8_t local[16], int locallen, uint16_t port)
 {
 	int fam = family == AF_INET6 ? 6 : 4;
-	struct peering_net *m = arg;
-	struct peering_probe *p;
-	uint32_t epoch;
-	int added, via;
+	const struct probe_ctx *ctx = arg;
+	struct peering_net *m = ctx->m;
+	uint32_t epoch = ctx->epoch;
 	char ip[64];
+	int added;
 
-	p = family == AF_INET6 ? &m->probe6 : &m->probe;
-	epoch = __atomic_load_n(&p->epoch, __ATOMIC_RELAXED);
 	peering_facts_post(&m->facts, NSF_ROUNDTRIP, fam, epoch);
 	if (family == AF_INET6) {
 		/* No pool: v6 is not behind a carrier that maps per
-		 * destination, so the address it is seen at is a candidate.
-		 * Unless the kernel named what the reply was addressed to,
-		 * this exchange proves reachability and nothing else. */
+		 * destination. Whether this is one of ours is the model's to
+		 * say, against the addresses the kernel reports. */
+		peering_facts_post_addr(&m->facts, 6, epoch, addr);
 		if (!inet_ntop(AF_INET6, addr, ip, sizeof(ip)))
 			return;
-		if (locallen != 16) {
-			dbg_logf("stun: v6 seen at %s, local address unknown "
-				 "-- not judged", ip);
-			return;
-		}
-		via = !memcmp(addr, local, 16) ? NET_VIA_DIRECT : NET_VIA_STUN;
 		dbg_logf("stun: v6 seen at %s, sent from %s", ip,
-			 via == NET_VIA_DIRECT ? "the same" : "another address");
-		peering_facts_post_addr(&m->facts, 6, epoch, via, addr, ip);
+			 locallen != 16 ? "an address the kernel did not name" :
+			 !memcmp(addr, local, 16) ? "the same" :
+						    "another address");
 		return;
 	}
-	added = peering_pool_note(&m->pool, addr);
+	added = peering_pool_note(&m->pool, addr, epoch);
 	if (added)
 		dbg_logf("stun: egress +%u.%u.%u.%u (pool now %d)", addr[0],
 			 addr[1], addr[2], addr[3], added);
-	peering_pool_sample(&m->pool, addr, port);
+	peering_pool_sample(&m->pool, addr, port, epoch);
 }
 
 /* The verdict this round reached, and the pool it reached it against. Which
  * way this goes decides whether the offer names every egress address or one
  * of them, and until it was said out loud the difference was visible only as
  * a punch that sometimes worked. */
-static void probe_verdict(struct peering_net *m)
+static void probe_verdict(struct peering_net *m, uint32_t epoch)
 {
+	int npool = peering_pool_count(&m->pool, epoch);
 	int stable = peering_pool_port_stable(&m->pool);
-	int npool = peering_pool_count(&m->pool);
 	int st = peering_pool_mapping(&m->pool);
 
 	dbg_logf("stun: round done -- mapping %s, port %s, "
@@ -346,10 +367,13 @@ static void probe_round(struct peering_net *m, int family)
 	int fam = family == AF_INET6 ? 6 : 4;
 	uint8_t seed[STUN_PROBE_TXID_LEN];
 	char *const *list = m->servers;
+	struct probe_ctx ctx;
 	int n = m->nservers;
 	uint32_t epoch;
 
 	epoch = __atomic_load_n(&p->epoch, __ATOMIC_RELAXED);
+	ctx.m = m;
+	ctx.epoch = epoch;
 	if (family == AF_INET6) {
 		n = stun_pool_askable(m->servers, m->nservers, AF_INET6,
 				      p->start, targets,
@@ -360,9 +384,9 @@ static void probe_round(struct peering_net *m, int family)
 	}
 	random_bytes(seed, sizeof(seed));
 	stun_probe_run(family, list, n, PEERING_PROBE_MS, seed, &p->stop,
-		       probe_hit, m);
+		       probe_hit, &ctx);
 	if (family == AF_INET)
-		probe_verdict(m);
+		probe_verdict(m, epoch);
 	else
 		dbg_logf("stun: v6 round done, %d server(s) asked", n);
 	peering_facts_post(&m->facts, NSF_PROBE_DONE, fam, epoch);
@@ -432,14 +456,22 @@ void peering_net_stop(struct peering_net *m)
 	peering_net_reap(m, 6);
 }
 
+/* Everything said about a pool, in one place so the two callers cannot drift:
+ * how much of it the posted offer fans, and the verdict a view was told. Both
+ * belong to the loop, so neither is under the pool's lock. */
+static void pool_untold(struct peering_net *m)
+{
+	m->pool.posted = 0;
+	m->mapping_reported = 0;
+}
+
 void peering_net_renew(struct peering_net *m)
 {
 	uint8_t rb[2];
 
 	peering_desc_clear(&m->desc);
 	peering_pool_reset(&m->pool);
-	m->pool.reported = 0;
-	m->pool.posted = 0;
+	pool_untold(m);
 	m->rotations = 0;
 	if (m->nservers > 0) {
 		random_bytes(rb, 2);
@@ -449,7 +481,6 @@ void peering_net_renew(struct peering_net *m)
 	}
 	__atomic_store_n(&m->have_priv4, 0, __ATOMIC_RELAXED);
 	__atomic_store_n(&m->have_srflx4, 0, __ATOMIC_RELAXED);
-	m->mapping_reported = 0;
 }
 
 void peering_net_destroy(struct peering_net *m)
@@ -1041,6 +1072,25 @@ static void apply(struct peering_model *pm, struct peering_net *net,
 	}
 }
 
+/* The pool holds addresses no interface has, so the model is told them for as
+ * long as the network they were measured on lasts, and in full each pass, so
+ * nothing has to remember what was already shown. A pool measured elsewhere
+ * reads as empty here, and nothing of it is posted or shown. */
+static void pool_tell(struct peering_model *pm, struct peering_net *net)
+{
+	uint32_t e = netstate_epoch(&pm->ns, 4);
+	uint8_t pool[PEERING_POOL4_MAX][4];
+	int n, i;
+
+	n = peering_pool_copy(&net->pool, pool, e);
+	if (!n) {
+		pool_untold(net);
+		return;
+	}
+	for (i = 0; i < n; i++)
+		netstate_on_reflexive(&pm->ns, 4, e, pool[i], 4);
+}
+
 void peering_settle(struct peering_model *pm, struct peering_net *net,
 		    const struct peering_settle *cfg, uint64_t now)
 {
@@ -1056,6 +1106,7 @@ void peering_settle(struct peering_model *pm, struct peering_net *net,
 			peering_net_reap(net, f[i].family);
 		peering_facts_feed(&pm->ns, &f[i], f[i].epoch, now);
 	}
+	pool_tell(pm, net);
 	netstate_tick(&pm->ns, now);
 	if (netstate_take_actions(&pm->ns, &a))
 		apply(pm, net, cfg, &a, now);
@@ -1381,12 +1432,13 @@ int peering_offer_judge(struct peering *pr, const uint8_t *data, size_t len,
 	return !peering_ice_rotated(pr, ufrag);
 }
 
-int peering_net_fan(struct peering_net *m, char *sdp, size_t cap)
+int peering_net_fan(struct peering_net *m, char *sdp, size_t cap,
+		    uint32_t epoch)
 {
 	uint8_t pool[PEERING_POOL4_MAX][4];
 	int n, moves;
 
-	n = peering_pool_copy(&m->pool, pool);
+	n = peering_pool_copy(&m->pool, pool, epoch);
 	moves = !peering_pool_port_stable(&m->pool);
 	if (n >= 2)
 		cand_sdp_fan_v4(sdp, cap, pool, (size_t)n, moves);

@@ -55,8 +55,7 @@ void peering_facts_destroy(struct peering_facts *f);
 void peering_facts_post(struct peering_facts *f, int kind, int family,
 			uint32_t epoch);
 void peering_facts_post_addr(struct peering_facts *f, int family,
-			     uint32_t epoch, int via, const uint8_t *addr,
-			     const char *text);
+			     uint32_t epoch, const uint8_t *addr);
 
 /*
  * Take everything queued, emptying it; NSFACTS_OUT always takes the lot.
@@ -89,8 +88,8 @@ int peering_facts_feed(struct netstate *ns, const struct nsfact *q,
  * carrier rather than about the host.
  *
  * Grown from the probe thread and the gather thread, read from the loop, so it
- * carries its own lock. The counts of what has been shown and what has been
- * posted belong to the loop alone and are outside it.
+ * carries its own lock. How much of it the posted offer fans belongs to the
+ * loop alone and is outside it.
  */
 /*
  * A subscriber's flows spread only as wide as the NAT group behind its session
@@ -102,6 +101,9 @@ int peering_facts_feed(struct netstate *ns, const struct nsfact *q,
  * which the encoder answers with a failed post rather than a truncated one.
  */
 #define PEERING_POOL4_MAX 8
+#if PEERING_POOL4_MAX > NETSTATE_XLAT_MAX
+#error "the model must hold every egress address the pool can"
+#endif
 
 struct peering_pool {
 	pthread_mutex_t lock;
@@ -109,7 +111,10 @@ struct peering_pool {
 	int n;
 	/* RFC 4787 mapping classification, from the same probe's responses. */
 	struct stun_mapping map4;
-	int reported;			/* members a watcher has been shown */
+	uint32_t epoch;			/* the network every member was measured
+					 * on: what makes a member of the one
+					 * before it unaskable rather than merely
+					 * unwanted */
 	int posted;			/* members the posted offer fans */
 };
 
@@ -122,19 +127,25 @@ void peering_pool_destroy(struct peering_pool *p);
  * address is refused, a gathering agent emitting it as a placeholder and it
  * being nowhere a carrier maps this machine to, so fanning an offer across it
  * would spend every peer's checks on a destination that cannot answer.
+ *
+ * `epoch` is the network the measurement was taken on, so a producer that was
+ * winding up when the move landed cannot seed the new one: an older epoch is
+ * refused, and a newer one takes the pool with it.
  */
-int peering_pool_note(struct peering_pool *p, const uint8_t addr[4]);
+int peering_pool_note(struct peering_pool *p, const uint8_t addr[4],
+		      uint32_t epoch);
 
-/* A snapshot for the loop thread, and how many were copied. */
+/* A snapshot for the loop thread of what `epoch` measured, and how many were
+ * copied: nothing at all once the network has moved on. */
 int peering_pool_copy(struct peering_pool *p,
-		      uint8_t out[PEERING_POOL4_MAX][4]);
-int peering_pool_count(struct peering_pool *p);
+		      uint8_t out[PEERING_POOL4_MAX][4], uint32_t epoch);
+int peering_pool_count(struct peering_pool *p, uint32_t epoch);
 
 /* One sample of this socket's mapping, and the verdict the samples reach:
  * STUN_MAPPING_*, and whether the reflexive PORT held across servers, which is
  * the one thing a fan across the pool cannot survive moving. */
 void peering_pool_sample(struct peering_pool *p, const uint8_t addr[4],
-			 uint16_t port);
+			 uint16_t port, uint32_t epoch);
 int peering_pool_mapping(struct peering_pool *p);
 int peering_pool_port_stable(struct peering_pool *p);
 
@@ -319,9 +330,9 @@ void peering_net_reap(struct peering_net *m, int family);
 int peering_net_stun_pick(const struct peering_net *m, unsigned attempt,
 			  char *host, size_t hostlen, uint16_t *port);
 /*
- * Widen a description with the egress addresses this carrier maps us to, and
- * say how many the pool holds. Fewer than two is not a fan, so nothing is
- * written.
+ * Widen a description with the egress addresses this carrier maps us to on
+ * `epoch`, and say how many the pool holds for it. Fewer than two is not a fan,
+ * so nothing is written.
  *
  * A dependent mapping is the case this exists for, not a reason to skip it: a
  * carrier handing out an address per destination is exactly why naming one of
@@ -329,7 +340,8 @@ int peering_net_stun_pick(const struct peering_net *m, unsigned attempt,
  * it names the pool's addresses against this description's own reflexive port,
  * so that, and only that, calls it off.
  */
-int peering_net_fan(struct peering_net *m, char *sdp, size_t cap);
+int peering_net_fan(struct peering_net *m, char *sdp, size_t cap,
+		    uint32_t epoch);
 
 /*
  * If a gather has held a private or CGNAT v4 this long with no reflexive one,

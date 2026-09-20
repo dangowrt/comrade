@@ -189,6 +189,14 @@ struct ice_ctx {
 	 * callbacks any more, and that is where it goes.
 	 */
 	struct conn *shell;
+	/*
+	 * The networks this agent was built on, per family, written before it
+	 * exists and never after. What it reports is about them, whatever the
+	 * session has moved to since: one set aside by a resume goes on
+	 * trickling for seconds, and the stamp the session keeps has by then
+	 * been taken by the agent that replaced it.
+	 */
+	uint32_t epoch[2];
 };
 
 /* Agents this connection maintains beyond c->pr.ice.agent: a resume sets one aside
@@ -484,8 +492,9 @@ struct sess {
 					 * net_ch, held until a roam's burst of
 					 * interface changes settles */
 	uint64_t net_hold_ms;		/* release once quiet this long */
-	/* The epoch each gather was started for, stamped by the loop before it
-	 * starts and read by the gather thread as it reports. */
+	/* The epoch the latest gather was started for, per family: the network
+	 * the description in hand describes. What an agent reports is stamped
+	 * from its own ice_ctx, which outlives this being taken by the next. */
 	volatile uint32_t gather_epoch[2];
 
 	/*
@@ -1014,75 +1023,6 @@ static char *local_sdp(struct sess *s)
 }
 
 /*
- * Hand each local ICE candidate to the model, classified by scope and how it
- * was learnt. Re-run as they trickle in; the model de-duplicates.
- *
- * Stamped with the epoch the agent that gathered it was built under, never
- * the one current when the line is finally read -- they are routinely
- * different. A description gathered before a move is still in the trickle
- * buffer when the move lands, and stamping it with the network we are on now
- * makes it a fact about a place it was never seen: a public v6 learnt through
- * STUN on the last network survives onto one with no global v6 at all. The
- * round trips from this same agent already carry gather_epoch, so this was the
- * one thing left disagreeing with them.
- */
-static void report_candidates(struct sess *s, const char *sdp)
-{
-	const char *p = sdp;
-
-	/* Match "candidate:" so both a full sdp ("a=candidate:...") and a lone
-	 * trickled line ("[a=]candidate:...") are handled. */
-	while ((p = strstr(p, "candidate:")) != NULL) {
-		char addr[64], typ[16];
-		int via, fam;
-
-		if (sscanf(p, "candidate:%*s %*d %*s %*u %63s %*d typ %15s",
-			   addr, typ) == 2) {
-			if (!strcmp(typ, "host"))
-				via = NET_VIA_DIRECT;
-			else if (!strcmp(typ, "srflx"))
-				via = NET_VIA_STUN;
-			else
-				via = -1;
-			if (via >= 0) {
-				int scope = net_addr_scope(addr);
-				uint8_t raw[16];
-				int len;
-
-				/* Enumerating an address is not proving we
-				 * send from it; only a round trip is. */
-				if (via == NET_VIA_DIRECT && strchr(addr, ':') &&
-				    scope == NET_SCOPE_GLOBAL)
-					via = NET_VIA_SHADOW;
-				fam = strchr(addr, ':') ? 6 : 4;
-				if (fam == 4 && via == NET_VIA_STUN)
-					__atomic_store_n(&s->net.have_srflx4, 1,
-							 __ATOMIC_RELAXED);
-				else if (fam == 4 && via == NET_VIA_DIRECT &&
-					 scope != NET_SCOPE_GLOBAL)
-					__atomic_store_n(&s->net.have_priv4, 1,
-							 __ATOMIC_RELAXED);
-				len = fam == 6 ? 16 : 4;
-				if (inet_pton(fam == 6 ? AF_INET6 : AF_INET,
-					      addr, raw) == 1)
-					netstate_on_candidate(&s->pm.ns, fam,
-							      __atomic_load_n(
-							      &s->gather_epoch[fam_idx(fam)],
-							      __ATOMIC_RELAXED),
-							      scope, via, raw,
-							      len, addr);
-			}
-		}
-		p += 10;
-	}
-}
-
-static void obs_report_net(struct sess *s)
-{
-	report_candidates(s, local_sdp(s));
-}
-
-/*
  * The rendezvous node for `family` (4 or 6), printable ("addr:port"). The
  * published one, so both families show once the in-band exchange has caught up;
  * fall back to whatever the token carried for that family. Called from each
@@ -1190,25 +1130,9 @@ static void sdp_filter(const char *in, int family, char *out, size_t outlen)
  */
 static int fan_local_sdp(struct sess *s)
 {
-	return peering_net_fan(&s->net, local_sdp(s), NAT_SDP_MAX);
+	return peering_net_fan(&s->net, local_sdp(s), NAT_SDP_MAX,
+			       netstate_epoch(&s->pm.ns, 4));
 }
-
-/*
- * Members the probe found since the last pass: put them on the dashboard the
- * moment they are known, widen the posted description with them and post
- * again. The peer treats the re-post as a candidate trickle for the agent it
- * already primed (on_peer_offer feeds a repeat straight in), so a punch in
- * flight only gains targets, and a claimant that has not read the mailbox yet
- * finds the wider set waiting.
- *
- * Whenever the pool grows, not only while nobody has answered. How long a
- * carrier takes to show all of its egress addresses is not ours to know, so
- * the ones that arrive late are exactly the ones a peer would otherwise never
- * be told about -- and being unable to punch to the address the NAT picked
- * for that peer is how a link fails outright. Only our own slot is written
- * (sig_post, not sig_rotate), so the turnstile's answer slot is untouched and
- * the credentials do not change.
- */
 
 /*
  * "v6 direct": a host reaches its own global v6 at the address the kernel
@@ -1219,7 +1143,7 @@ static int fan_local_sdp(struct sess *s)
  * the source and is a tracking handle besides. So rewrite the one global v6
  * candidate to our real source and drop the rest (any other global v6 host
  * candidate, and the redundant v6 srflx), leaving v4 untouched. With no global
- * v6 source, leave v6 as gathered.
+ * v6 source, v6 is left as gathered but for what has been withdrawn since.
  */
 static void canon_v6(const char *in, const char *src6, char *out, size_t cap)
 {
@@ -1382,24 +1306,29 @@ static int v6_source_moved(struct sess *s)
 	return 1;
 }
 
+/*
+ * Members the probe found since the last pass: widen the posted description
+ * with them and post again. The peer treats the re-post as a candidate trickle
+ * for the agent it already primed (on_peer_offer feeds a repeat straight in),
+ * so a punch in flight only gains targets, and a claimant that has not read the
+ * mailbox yet finds the wider set waiting.
+ *
+ * Whenever the pool grows, not only while nobody has answered. How long a
+ * carrier takes to show all of its egress addresses is not ours to know, so
+ * the ones that arrive late are exactly the ones a peer would otherwise never
+ * be told about, and being unable to punch to the address the NAT picked for
+ * that peer is how a link fails outright. Only our own slot is written
+ * (sig_post, not sig_rotate), so the turnstile's answer slot is untouched and
+ * the credentials do not change.
+ */
 static void pool_pump(struct sess *s)
 {
 	const struct session_obs *o = s->cfg->obs;
 	uint8_t pool[PEERING_POOL4_MAX][4];
-	int n, i, st, rep, moved6;
+	int n, st, rep, moved6;
 
-	n = peering_pool_copy(&s->net.pool, pool);
+	n = peering_pool_copy(&s->net.pool, pool, netstate_epoch(&s->pm.ns, 4));
 	st = peering_pool_mapping(&s->net.pool);
-	for (i = s->net.pool.reported; i < n; i++) {
-		char ip[64];
-
-		if (inet_ntop(AF_INET, pool[i], ip, sizeof(ip)))
-			netstate_on_candidate(&s->pm.ns, 4,
-					      netstate_epoch(&s->pm.ns, 4),
-					      net_addr_scope(ip), NET_VIA_STUN,
-					      pool[i], 4, ip);
-	}
-	s->net.pool.reported = n;
 	if (st != STUN_MAPPING_UNKNOWN) {
 		rep = st == STUN_MAPPING_DEPENDENT ? 2 : 1;
 		if (rep != s->net.mapping_reported) {
@@ -1451,11 +1380,11 @@ static void offer_refresh(struct sess *s)
 		 strlen(peering_desc_local(&s->net.desc)));
 }
 
-/* A late local candidate reached the model: re-post it to the mailbox (so the
- * peer sees what was gathered, not just the dashboard) and show it locally.
- * repost is set only once an offer is live (TS_WAIT_CLAIM), so a re-post never
- * outruns the turnstile's gated first publish. */
-static void trickle_flush(struct sess *s, const struct session_obs *o, int repost)
+/* A late local candidate was gathered: re-post it to the mailbox, so the peer
+ * sees what libjuice produced. repost is set only once an offer is live
+ * (TS_WAIT_CLAIM), so a re-post never outruns the turnstile's gated first
+ * publish. */
+static void trickle_flush(struct sess *s, int repost)
 {
 	char buf[NAT_SDP_MAX];
 
@@ -1463,8 +1392,6 @@ static void trickle_flush(struct sess *s, const struct session_obs *o, int repos
 		return;
 	if (repost)
 		offer_refresh(s);
-	if (o && o->net)
-		report_candidates(s, buf);
 }
 
 /*
@@ -1586,9 +1513,9 @@ static void ns_post(struct sess *s, int kind, int family, uint32_t epoch)
 
 /* One more public v4 the carrier has been seen mapping us to, from the gather
  * thread; the probe round notes its own. */
-static void pool_note(struct sess *s, const uint8_t b[4])
+static void pool_note(struct sess *s, const uint8_t b[4], uint32_t epoch)
 {
-	int added = peering_pool_note(&s->net.pool, b);
+	int added = peering_pool_note(&s->net.pool, b, epoch);
 
 	if (added)
 		dbg_logf("stun: egress +%u.%u.%u.%u (pool now %d)",
@@ -1602,26 +1529,23 @@ static void on_ice_candidate(void *arg, const char *cand)
 {
 	struct conn *cc = __atomic_load_n(&((struct ice_ctx *)arg)->c,
 					  __ATOMIC_ACQUIRE);
-	struct sess *s = cc->sess;
 	const char *p = strstr(cand, "candidate:");
+	const struct ice_ctx *ctx = arg;
+	struct sess *s = cc->sess;
 	char addr[64], typ[16];
 
 	if (p && sscanf(p, "candidate:%*s %*d %*s %*u %63s %*d typ %15s",
 			addr, typ) == 2) {
 		if (strchr(addr, ':')) {
 			if (!strcmp(typ, "srflx"))	/* a real v6 STUN reply */
-				ns_post(s, NSF_ROUNDTRIP, 6,
-					__atomic_load_n(&s->gather_epoch[1],
-							__ATOMIC_RELAXED));
+				ns_post(s, NSF_ROUNDTRIP, 6, ctx->epoch[1]);
 		} else if (!strcmp(typ, "srflx")) {
 			uint8_t b[4];
 
 			__atomic_store_n(&s->net.have_srflx4, 1, __ATOMIC_RELAXED);
-			ns_post(s, NSF_ROUNDTRIP, 4,
-				__atomic_load_n(&s->gather_epoch[0],
-						__ATOMIC_RELAXED));
+			ns_post(s, NSF_ROUNDTRIP, 4, ctx->epoch[0]);
 			if (inet_pton(AF_INET, addr, b) == 1)
-				pool_note(s, b);
+				pool_note(s, b, ctx->epoch[0]);
 		} else if (!strcmp(typ, "host") &&
 			   net_addr_scope(addr) != NET_SCOPE_GLOBAL) {
 			__atomic_store_n(&s->net.have_priv4, 1, __ATOMIC_RELAXED);
@@ -2423,10 +2347,10 @@ static int nat_setup(struct conn *c)
 	s->remote_set = 0;
 	/* Stamp before the gather thread can report from it. One agent gathers
 	 * both families, but they move apart, so each gets its own. */
-	__atomic_store_n(&s->gather_epoch[0], netstate_epoch(&s->pm.ns, 4),
-			 __ATOMIC_RELAXED);
-	__atomic_store_n(&s->gather_epoch[1], netstate_epoch(&s->pm.ns, 6),
-			 __ATOMIC_RELAXED);
+	ctx->epoch[0] = netstate_epoch(&s->pm.ns, 4);
+	ctx->epoch[1] = netstate_epoch(&s->pm.ns, 6);
+	__atomic_store_n(&s->gather_epoch[0], ctx->epoch[0], __ATOMIC_RELAXED);
+	__atomic_store_n(&s->gather_epoch[1], ctx->epoch[1], __ATOMIC_RELAXED);
 	c->pr.ice.agent = nat_create(&cfg);
 	ctx->agent = c->pr.ice.agent;
 	c->pr.ice.ctx = ctx;
@@ -2766,18 +2690,6 @@ static uint32_t resume_backoff(struct conn *c)
 	return c->rs_backoff;
 }
 
-static int fam_usable_addr(const struct netmon_addr *addrs, size_t naddrs,
-			   int family)
-{
-	int af = family == 6 ? AF_INET6 : AF_INET;
-	size_t i;
-
-	for (i = 0; i < naddrs; i++)
-		if (addrs[i].family == af)
-			return 1;
-	return 0;
-}
-
 /* A roam surfaces as a burst of interface changes (down, link-local, v4, v6,
  * a temporary address); coalesce them into one acted-on change by holding it
  * until the interfaces are quiet, each new change restarting the hold. */
@@ -2808,8 +2720,7 @@ static void net_watch(struct sess *s, uint64_t now)
 	n = netmon_snapshot(addrs, NETMON_MAX_ADDRS);
 	netmon_fingerprint(fp4, fp6, fpif, addrs, n);
 	ch |= netmon_changed_fam_fp(&s->netmon, now, fp4, fp6, fpif);
-	netstate_on_netmon(&s->pm.ns, ch, fam_usable_addr(addrs, n, 4),
-			   fam_usable_addr(addrs, n, 6), now);
+	netstate_on_netmon(&s->pm.ns, ch, addrs, n, now);
 	if (s->pm.sig) {
 		/* Before the rebuild, so an answer in flight over the move is
 		 * not taken as proof of the network arrived on. */
@@ -2951,7 +2862,8 @@ static void resume_tick(struct conn *c)
 		 * through a re-post under the same credentials (a fresh gather
 		 * would mint a password and abort the punch). */
 		if (s->remote_set && peering_desc_have(&s->net.desc)) {
-			n = peering_pool_count(&s->net.pool);
+			n = peering_pool_count(&s->net.pool,
+					       netstate_epoch(&s->pm.ns, 4));
 			if (n >= 2 && n > s->net.pool.posted) {
 				s->net.pool.posted = fan_local_sdp(s);
 				sig_set_claim_offer(s->pm.sig, c->pr.ice.remote_ufrag);
@@ -4670,13 +4582,9 @@ static int host_turnstile(struct sess *s)
 			ts = TS_GATHER;
 		}
 
-		trickle_flush(s, o, ts == TS_WAIT_CLAIM);
-		if (o) {			/* dashboard: local candidates */
-			if (o->net && sdp_ready(s))
-				obs_report_net(s);
-			if (o->tick)
-				o->tick(o->arg);
-		}
+		trickle_flush(s, ts == TS_WAIT_CLAIM);
+		if (o && o->tick)
+			o->tick(o->arg);
 
 		for (i = 0; i < HOST_MAX_WORKERS; i++) {
 			if (ws[i].used && worker_done(&ws[i])) {
@@ -5386,10 +5294,8 @@ int session_run(const struct session_cfg *cfg)
 				       CONN_GATHERING : CONN_CONNECTING);
 			s.c.next_status_ms = now_ms() + 500;
 		}
-		trickle_flush(&s, o, 0);
+		trickle_flush(&s, 0);
 		if (o) {
-			if (o->net && sdp_ready(&s))
-				obs_report_net(&s);	/* view de-dups */
 			if (o->tick)
 				o->tick(o->arg);
 			if (o->escalate && !cfg->is_host && !s.escalated &&

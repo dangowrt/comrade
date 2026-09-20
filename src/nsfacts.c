@@ -1,7 +1,6 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 /* Copyright (C) 2026 Daniel Golle <daniel@makrotopia.org> */
 
-#include <stdio.h>
 #include <string.h>
 
 #include "nsfacts.h"
@@ -38,8 +37,8 @@ void nsfacts_post(struct nsfacts *f, int kind, int family, uint32_t epoch)
 	}
 }
 
-void nsfacts_post_addr(struct nsfacts *f, int family, uint32_t epoch, int via,
-		       const uint8_t *addr, const char *text)
+void nsfacts_post_addr(struct nsfacts *f, int family, uint32_t epoch,
+		       const uint8_t *addr)
 {
 	size_t len = addr_len(family);
 	struct nsfact *e;
@@ -57,10 +56,8 @@ void nsfacts_post_addr(struct nsfacts *f, int family, uint32_t epoch, int via,
 	memset(e, 0, sizeof(*e));
 	e->kind = NSF_ADDR;
 	e->family = family;
-	e->via = via;
 	e->epoch = epoch;
 	memcpy(e->addr, addr, len);
-	snprintf(e->text, sizeof(e->text), "%s", text);
 }
 
 /* One of the per-family slots into the caller's array. */
