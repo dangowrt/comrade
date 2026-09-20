@@ -407,6 +407,7 @@ struct sess {
 	 * (measured: 10 re-claims for 4 pickups, 2 of 4 served).
 	 */
 	char regathered_for[40];
+	char src6_offered[64];		/* v6 source the staged description names */
 	struct conn *offer_conn;		/* live conn the peer-offer callback feeds */
 
 	uint64_t next_gather_ms;	/* backoff after a gather found nothing */
@@ -1012,6 +1013,18 @@ static char *local_sdp(struct sess *s)
 	return peering_desc_local(&s->net.desc);
 }
 
+/* A candidate naming the address this machine sources from now cannot be a
+ * fact about a network we have left, whatever the agent was built under. */
+static uint32_t cand_epoch(struct sess *s, int fam, int via, const char *addr)
+{
+	if (fam == 6 && via == NET_VIA_DIRECT &&
+	    !strcmp(addr, netstate_src_text(&s->pm.ns, 6)))
+		return netstate_epoch(&s->pm.ns, 6);
+
+	return __atomic_load_n(&s->gather_epoch[fam_idx(fam)],
+			       __ATOMIC_RELAXED);
+}
+
 /*
  * Hand each local ICE candidate to the model, classified by scope and how it
  * was learnt. Re-run as they trickle in; the model de-duplicates.
@@ -1060,9 +1073,8 @@ static void report_candidates(struct sess *s, const char *sdp)
 				if (inet_pton(fam == 6 ? AF_INET6 : AF_INET,
 					      addr, raw) == 1)
 					netstate_on_candidate(&s->pm.ns, fam,
-							      __atomic_load_n(
-							      &s->gather_epoch[fam_idx(fam)],
-							      __ATOMIC_RELAXED),
+							      cand_epoch(s, fam,
+									 via, addr),
 							      scope, via, raw,
 							      len, addr);
 			}
@@ -1217,9 +1229,11 @@ static int fan_local_sdp(struct sess *s)
  */
 static void canon_v6(const char *in, const char *src6, char *out, size_t cap)
 {
+	int kept6 = 0, port = -1;
 	const char *line = in;
+	unsigned prio = 0, pr;
 	size_t o = 0;
-	int kept6 = 0;
+	int pt, n;
 
 	while (*line) {
 		const char *nl = strchr(line, '\n');
@@ -1227,6 +1241,14 @@ static void canon_v6(const char *in, const char *src6, char *out, size_t cap)
 		char addr[64], typ[16];
 		int drop = 0, rewrite = 0, a0 = 0, a1 = 0;
 
+		if (!strncmp(line, "a=candidate:", 12) &&
+		    sscanf(line, "a=candidate:%*s %*d %*s %u %63s %d typ %15s",
+			   &pr, addr, &pt, typ) == 4) {
+			if (port < 0)
+				port = pt;
+			if (!strcmp(typ, "host") && pr > prio)
+				prio = pr;
+		}
 		if (src6[0] && net_addr_scope(src6) == NET_SCOPE_GLOBAL &&
 		    !strncmp(line, "a=candidate:", 12) &&
 		    sscanf(line, "a=candidate:%*s %*d %*s %*u %63s %*d typ %15s",
@@ -1266,6 +1288,17 @@ static void canon_v6(const char *in, const char *src6, char *out, size_t cap)
 		if (!nl)
 			break;
 		line = nl + 1;
+	}
+	/* A network that brings v4 up first was gathered before its v6 address
+	 * existed, so there is nothing to rewrite and the source has to be
+	 * named outright. */
+	if (!kept6 && port > 0 && prio && src6[0] &&
+	    net_addr_scope(src6) == NET_SCOPE_GLOBAL) {
+		n = snprintf(out + o, cap - o,
+			     "a=candidate:v6src 1 UDP %u %s %d typ host\n",
+			     prio + 1, src6, port);
+		if (n > 0 && (size_t)n < cap - o)
+			o += (size_t)n;
 	}
 	out[o] = '\0';
 }
@@ -1323,22 +1356,43 @@ static void log_offer(const char *sdp, int served, int active)
  */
 static int sdp_ready(struct sess *s)
 {
+	const char *src6 = netstate_src_text(&s->pm.ns, 6);
 	char *local = peering_desc_local(&s->net.desc);
 	char raw[NAT_SDP_MAX];
 
 	if (peering_desc_take(&s->net.desc, raw, sizeof(raw))) {
-		canon_v6(raw, netstate_src_text(&s->pm.ns, 6), local,
-			 NAT_SDP_MAX);
+		canon_v6(raw, src6, local, NAT_SDP_MAX);
 		peering_desc_set(&s->net.desc, local);
+		snprintf(s->src6_offered, sizeof(s->src6_offered), "%s", src6);
 	}
 	return peering_desc_have(&s->net.desc);
+}
+
+/* canon_v6 drops every global v6 and names one, so running it again withdraws
+ * the address that has gone rather than accumulating. */
+static int v6_source_moved(struct sess *s)
+{
+	const char *src6 = netstate_src_text(&s->pm.ns, 6);
+	char *local = peering_desc_local(&s->net.desc);
+	char raw[NAT_SDP_MAX];
+
+	if (!strcmp(src6, s->src6_offered))
+		return 0;
+	snprintf(s->src6_offered, sizeof(s->src6_offered), "%s", src6);
+	if (!peering_desc_have(&s->net.desc))
+		return 0;
+	snprintf(raw, sizeof(raw), "%s", local);
+	canon_v6(raw, src6, local, NAT_SDP_MAX);
+	peering_desc_set(&s->net.desc, local);
+
+	return 1;
 }
 
 static void pool_pump(struct sess *s)
 {
 	const struct session_obs *o = s->cfg->obs;
 	uint8_t pool[PEERING_POOL4_MAX][4];
-	int n, i, st, rep;
+	int n, i, st, rep, moved6;
 
 	n = peering_pool_copy(&s->net.pool, pool);
 	st = peering_pool_mapping(&s->net.pool);
@@ -1360,7 +1414,10 @@ static void pool_pump(struct sess *s)
 				o->mapping4(o->arg, rep == 2);
 		}
 	}
-	if (sdp_ready(s) && n >= 2 && n > s->net.pool.posted) {
+	if (!sdp_ready(s))
+		return;
+	moved6 = v6_source_moved(s);
+	if (moved6 || (n >= 2 && n > s->net.pool.posted)) {
 		s->net.pool.posted = fan_local_sdp(s);
 		sig_set_claim_offer(s->pm.sig, s->c.pr.ice.remote_ufrag);
 		sig_post(s->pm.sig, (const uint8_t *)local_sdp(s),
