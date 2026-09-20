@@ -34,7 +34,11 @@ int stun_probe_mapped4(const uint8_t *pkt, size_t len,
  * resolvable now. */
 typedef void stun_more_fn(void *arg, int family);
 
+/* `local` is the address of ours the reply was addressed to and `locallen` is
+ * 16 when the kernel named it, 0 when it did not: a verdict that would have to
+ * guess is not one. */
 typedef void stun_probe_hit(void *arg, int family, const uint8_t addr[16],
+			    const uint8_t local[16], int locallen,
 			    uint16_t port);
 
 /*

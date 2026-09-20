@@ -1,6 +1,11 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 /* Copyright (C) 2026 Daniel Golle <daniel@makrotopia.org> */
 
+/* in6_pktinfo is feature-gated: glibc hides it without _GNU_SOURCE, and macOS
+ * without __APPLE_USE_RFC_3542. Both must precede any system header. */
+#define _GNU_SOURCE
+#define __APPLE_USE_RFC_3542
+
 #include <string.h>
 
 #include "wsock.h"
@@ -8,6 +13,7 @@
 #ifdef _WIN32
 
 #include <mstcpip.h>
+#include <mswsock.h>		/* WSARecvMsg, WSAID_WSARECVMSG, WSA_CMSG_* */
 
 #ifndef SIO_UDP_CONNRESET
 #define SIO_UDP_CONNRESET (IOC_IN | IOC_VENDOR | 12)
@@ -170,6 +176,64 @@ ssize_t sock_write(sock_t s, const void *buf, size_t len)
 	return n;
 }
 
+int sock_v6_want_local(sock_t s)
+{
+	DWORD on = 1;
+
+	return setsockopt(s, IPPROTO_IPV6, IPV6_PKTINFO, (const char *)&on,
+			  sizeof(on)) == 0 ? 0 : -1;
+}
+
+/* No import library entry: the pointer is fetched through a socket. */
+static LPFN_WSARECVMSG wsock_recvmsg(sock_t s)
+{
+	GUID id = WSAID_WSARECVMSG;
+	static LPFN_WSARECVMSG fn;
+	DWORD got = 0;
+
+	if (fn)
+		return fn;
+	if (WSAIoctl(s, SIO_GET_EXTENSION_FUNCTION_POINTER, &id, sizeof(id),
+		     &fn, sizeof(fn), &got, NULL, NULL))
+		fn = NULL;
+	return fn;
+}
+
+ssize_t sock_recv_local6(sock_t s, void *buf, size_t len, uint8_t local[16],
+			 int *locallen)
+{
+	char ctl[WSA_CMSG_SPACE(sizeof(struct in6_pktinfo))];
+	LPFN_WSARECVMSG recvmsg_fn = wsock_recvmsg(s);
+	struct in6_pktinfo pi;
+	WSACMSGHDR *c;
+	DWORD got = 0;
+	WSABUF iov;
+	WSAMSG msg;
+
+	*locallen = 0;
+	if (!recvmsg_fn)
+		return recv(s, (char *)buf, (int)len, 0);
+	iov.buf = buf;
+	iov.len = (ULONG)len;
+	memset(&msg, 0, sizeof(msg));
+	msg.lpBuffers = &iov;
+	msg.dwBufferCount = 1;
+	msg.Control.buf = ctl;
+	msg.Control.len = sizeof(ctl);
+	if (recvmsg_fn(s, &msg, &got, NULL, NULL))
+		return -1;
+	for (c = WSA_CMSG_FIRSTHDR(&msg); c; c = WSA_CMSG_NXTHDR(&msg, c)) {
+		if (c->cmsg_level != IPPROTO_IPV6 ||
+		    c->cmsg_type != IPV6_PKTINFO)
+			continue;
+		memcpy(&pi, WSA_CMSG_DATA(c), sizeof(pi));
+		memcpy(local, &pi.ipi6_addr, 16);
+		*locallen = 16;
+		break;
+	}
+	return (ssize_t)got;
+}
+
 #else /* !_WIN32 */
 
 #include <errno.h>
@@ -247,6 +311,46 @@ ssize_t sock_read(sock_t s, void *buf, size_t len)
 ssize_t sock_write(sock_t s, const void *buf, size_t len)
 {
 	return write(s, buf, len);
+}
+
+int sock_v6_want_local(sock_t s)
+{
+	int on = 1;
+
+	return setsockopt(s, IPPROTO_IPV6, IPV6_RECVPKTINFO, &on, sizeof(on));
+}
+
+ssize_t sock_recv_local6(sock_t s, void *buf, size_t len, uint8_t local[16],
+			 int *locallen)
+{
+	char ctl[CMSG_SPACE(sizeof(struct in6_pktinfo))];
+	struct in6_pktinfo pi;
+	struct cmsghdr *c;
+	struct msghdr msg;
+	struct iovec iov;
+	ssize_t n;
+
+	*locallen = 0;
+	iov.iov_base = buf;
+	iov.iov_len = len;
+	memset(&msg, 0, sizeof(msg));
+	msg.msg_iov = &iov;
+	msg.msg_iovlen = 1;
+	msg.msg_control = ctl;
+	msg.msg_controllen = sizeof(ctl);
+	n = recvmsg(s, &msg, 0);
+	if (n < 0)
+		return n;
+	for (c = CMSG_FIRSTHDR(&msg); c; c = CMSG_NXTHDR(&msg, c)) {
+		if (c->cmsg_level != IPPROTO_IPV6 ||
+		    c->cmsg_type != IPV6_PKTINFO)
+			continue;
+		memcpy(&pi, CMSG_DATA(c), sizeof(pi));
+		memcpy(local, &pi.ipi6_addr, 16);
+		*locallen = 16;
+		break;
+	}
+	return n;
 }
 
 #endif /* _WIN32 */

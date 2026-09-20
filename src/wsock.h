@@ -164,6 +164,15 @@ int sock_pair(sock_t sv[2]);
 /* poll() / WSAPoll(). */
 int sock_poll(struct pollfd *fds, nfds_t nfds, int timeout_ms);
 
+/* IPV6_RECVPKTINFO / IPV6_PKTINFO: report which local address a datagram was
+ * addressed to. Returns 0 on success. */
+int sock_v6_want_local(sock_t s);
+
+/* recvmsg()/WSARecvMsg(). `*locallen` is 16 when the ancillary data named the
+ * local address and 0 when it did not, so a caller need not guess. */
+ssize_t sock_recv_local6(sock_t s, void *buf, size_t len, uint8_t local[16],
+			 int *locallen);
+
 /*
  * read()/write() on a socket. Windows CRT read()/write() take an int fd from
  * the CRT's own table and cannot see a SOCKET at all, so these are recv()/

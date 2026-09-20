@@ -35,11 +35,11 @@ void peering_facts_post(struct peering_facts *f, int kind, int family,
 }
 
 void peering_facts_post_addr(struct peering_facts *f, int family,
-			     uint32_t epoch, const uint8_t *addr,
+			     uint32_t epoch, int via, const uint8_t *addr,
 			     const char *text)
 {
 	pthread_mutex_lock(&f->lock);
-	nsfacts_post_addr(&f->q, family, epoch, addr, text);
+	nsfacts_post_addr(&f->q, family, epoch, via, addr, text);
 	pthread_mutex_unlock(&f->lock);
 }
 
@@ -67,7 +67,7 @@ int peering_facts_feed(struct netstate *ns, const struct nsfact *q,
 	}
 	if (q->kind == NSF_ADDR) {
 		netstate_on_candidate(ns, q->family, epoch,
-				      net_addr_scope(q->text), NET_VIA_STUN,
+				      net_addr_scope(q->text), q->via,
 				      q->addr, q->family == 6 ? 16 : 4,
 				      q->text);
 		return 0;
@@ -278,25 +278,34 @@ int peering_sdp_has_candidate(const char *sdp)
 }
 
 static void probe_hit(void *arg, int family, const uint8_t addr[16],
-		      uint16_t port)
+		      const uint8_t local[16], int locallen, uint16_t port)
 {
 	int fam = family == AF_INET6 ? 6 : 4;
 	struct peering_net *m = arg;
 	struct peering_probe *p;
 	uint32_t epoch;
+	int added, via;
 	char ip[64];
-	int added;
 
 	p = family == AF_INET6 ? &m->probe6 : &m->probe;
 	epoch = __atomic_load_n(&p->epoch, __ATOMIC_RELAXED);
 	peering_facts_post(&m->facts, NSF_ROUNDTRIP, fam, epoch);
 	if (family == AF_INET6) {
 		/* No pool: v6 is not behind a carrier that maps per
-		 * destination, so the address it is seen at is a candidate. */
-		if (inet_ntop(AF_INET6, addr, ip, sizeof(ip))) {
-			dbg_logf("stun: v6 seen at %s", ip);
-			peering_facts_post_addr(&m->facts, 6, epoch, addr, ip);
+		 * destination, so the address it is seen at is a candidate.
+		 * Unless the kernel named what the reply was addressed to,
+		 * this exchange proves reachability and nothing else. */
+		if (!inet_ntop(AF_INET6, addr, ip, sizeof(ip)))
+			return;
+		if (locallen != 16) {
+			dbg_logf("stun: v6 seen at %s, local address unknown "
+				 "-- not judged", ip);
+			return;
 		}
+		via = !memcmp(addr, local, 16) ? NET_VIA_DIRECT : NET_VIA_STUN;
+		dbg_logf("stun: v6 seen at %s, sent from %s", ip,
+			 via == NET_VIA_DIRECT ? "the same" : "another address");
+		peering_facts_post_addr(&m->facts, 6, epoch, via, addr, ip);
 		return;
 	}
 	added = peering_pool_note(&m->pool, addr);

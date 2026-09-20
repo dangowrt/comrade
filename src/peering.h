@@ -55,7 +55,7 @@ void peering_facts_destroy(struct peering_facts *f);
 void peering_facts_post(struct peering_facts *f, int kind, int family,
 			uint32_t epoch);
 void peering_facts_post_addr(struct peering_facts *f, int family,
-			     uint32_t epoch, const uint8_t *addr,
+			     uint32_t epoch, int via, const uint8_t *addr,
 			     const char *text);
 
 /*

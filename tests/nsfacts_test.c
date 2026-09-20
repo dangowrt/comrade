@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "netstate.h"		/* NET_VIA_*: the verdict a fact carries */
 #include "nsfacts.h"
 
 static int count_kind(const struct nsfact *f, int n, int kind, int family)
@@ -76,7 +77,7 @@ static void round_end_outlives_a_full_queue(void)
 
 		addr4(a, i);
 		snprintf(text, sizeof(text), "203.0.113.%d", i);
-		nsfacts_post_addr(&q, 4, 3, a, text);
+		nsfacts_post_addr(&q, 4, 3, NET_VIA_STUN, a, text);
 	}
 	nsfacts_post(&q, NSF_PROBE_DONE, 4, 3);
 
@@ -97,11 +98,11 @@ static void addresses_are_not_repeated(void)
 
 	nsfacts_init(&q);
 	addr4(a, 9);
-	nsfacts_post_addr(&q, 4, 1, a, "203.0.113.9");
-	nsfacts_post_addr(&q, 4, 1, a, "203.0.113.9");
-	nsfacts_post_addr(&q, 4, 2, a, "203.0.113.9");	/* other network */
+	nsfacts_post_addr(&q, 4, 1, NET_VIA_STUN, a, "203.0.113.9");
+	nsfacts_post_addr(&q, 4, 1, NET_VIA_STUN, a, "203.0.113.9");
+	nsfacts_post_addr(&q, 4, 2, NET_VIA_STUN, a, "203.0.113.9");
 	addr4(a, 10);
-	nsfacts_post_addr(&q, 4, 1, a, "203.0.113.10");
+	nsfacts_post_addr(&q, 4, 1, NET_VIA_STUN, a, "203.0.113.10");
 
 	n = nsfacts_take(&q, out, NSFACTS_OUT);
 	assert(count_kind(out, n, NSF_ADDR, 4) == 3);
@@ -144,7 +145,7 @@ static void a_short_take_keeps_the_rest(void)
 
 		addr4(a, i);
 		snprintf(text, sizeof(text), "203.0.113.%d", i);
-		nsfacts_post_addr(&q, 4, 1, a, text);
+		nsfacts_post_addr(&q, 4, 1, NET_VIA_STUN, a, text);
 	}
 	nsfacts_post(&q, NSF_PROBE_DONE, 4, 1);
 

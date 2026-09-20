@@ -43,6 +43,8 @@ enum {
 struct nsfact {
 	int kind;
 	int family;
+	int via;			/* NSF_ADDR: the verdict the exchange
+					 * reached, which nothing later revises */
 	uint32_t epoch;			/* which network it was learnt on */
 	uint8_t addr[16];		/* NSF_ADDR: as bytes, and as printed */
 	char text[64];
@@ -71,7 +73,7 @@ void nsfacts_post(struct nsfacts *f, int kind, int family, uint32_t epoch);
 
 /* NSF_ADDR: dropped when the queue is full, since the next round says it
  * again. An address already queued for this family and epoch is not repeated. */
-void nsfacts_post_addr(struct nsfacts *f, int family, uint32_t epoch,
+void nsfacts_post_addr(struct nsfacts *f, int family, uint32_t epoch, int via,
 		       const uint8_t *addr, const char *text);
 
 /*
