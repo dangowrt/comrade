@@ -32,8 +32,8 @@ void obsemit_init(struct obsemit *e, const struct session_obs *o,
 		  struct netstate *ns);
 
 /*
- * The model's rows for one family, rebuilt rather than added to: a row shown
- * before the source was known has to be able to go away again.
+ * The model's rows for one family, rebuilt rather than added to: an address
+ * the kernel no longer reports has to be able to go away again.
  */
 void obsemit_rows(struct obsemit *e, int family);
 

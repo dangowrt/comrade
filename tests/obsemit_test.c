@@ -5,6 +5,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "wsock.h"
+
 #include "obsemit.h"
 
 /* What a watcher was told, in the order it was told. */
@@ -110,8 +112,8 @@ static void v6_node(struct sockaddr_in6 *sa, uint8_t last)
 	sa->sin6_addr.s6_addr[15] = last;
 }
 
-/* Rows are rebuilt rather than added to, so one shown before the source was
- * known can go away again. */
+/* Rows are rebuilt rather than added to, so an address the kernel has stopped
+ * reporting can go away again. The text a watcher sees is the model's. */
 static void rows_are_rebuilt_whole(void)
 {
 	struct session_obs o;
@@ -129,8 +131,7 @@ static void rows_are_rebuilt_whole(void)
 	assert(w.resets == 1);
 	assert(!w.rows);
 
-	netstate_on_candidate(&ns, 4, netstate_epoch(&ns, 4), NET_SCOPE_GLOBAL,
-			      NET_VIA_STUN, raw, 4, "203.0.113.7");
+	netstate_on_reflexive(&ns, 4, netstate_epoch(&ns, 4), raw, 4);
 	obsemit_rows(&e, 4);
 	assert(w.resets == 2);
 	assert(w.rows == 1);
@@ -291,6 +292,9 @@ static void a_rendezvous_row_says_what_is_known_of_the_node(void)
 
 int main(void)
 {
+	/* The row text a watcher is told is the model's, and this case runs on
+	 * Windows too, where the socket library comes up before anything else. */
+	assert(!wsock_init());
 	rows_are_rebuilt_whole();
 	a_watcher_that_asks_for_nothing_is_told_nothing();
 	the_connectivity_verdict_is_passed_on();

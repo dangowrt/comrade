@@ -22,7 +22,7 @@
  * Pure: no sockets, no threads, no clock (now_ms is passed in, as netmon and
  * path do). What the outside world must do is returned as an action rather
  * than performed, so this cannot block a loop or reach past the controller
- * into the view. Addresses cross as bytes plus the caller's own text.
+ * into the view. Addresses cross as bytes, printed here on the way out.
  *
  * Called only on the thread that owns sig, as sig.h requires.
  */
@@ -32,21 +32,23 @@ enum {					/* address scope for a local address */
 	NET_SCOPE_CGNAT,		/* 100.64/10 carrier-grade NAT */
 	NET_SCOPE_GLOBAL		/* globally routable */
 };
-enum {					/* how a local address was learnt */
-	NET_VIA_DIRECT,			/* locally gathered host candidate */
-	NET_VIA_STUN,			/* server-reflexive, learnt via STUN */
-	NET_VIA_SHADOW			/* globally routable, but not what we
-					 * source from; named to a reader,
-					 * never gathered as one */
+enum {					/* what is known about an address */
+	NET_VIA_DIRECT,			/* ours, and nothing translated it */
+	NET_VIA_STUN,			/* a translation: the world sees us here,
+					 * this machine does not have it */
+	NET_VIA_SHADOW			/* ours, enumerated and not yet proven */
 };
 /* Bits, not an enum, so a later verdict (NAT type, filtering) can join UP. */
 #define NET_CONN_UP	  (1 << 0)	/* proven: something answered us here */
 #define NET_CONN_PENDING (1 << 1)	/* a route exists; not yet proven */
 					/* 0: no route for this family at all */
 
-#define NETSTATE_ADDR_MAX 64		/* an address as the caller printed it */
+#define NETSTATE_ADDR_MAX 64		/* an address, printed */
 #define NETSTATE_SA_MAX 128		/* a sockaddr, opaque to this module */
-#define NETSTATE_ROWS_MAX 12		/* local addresses held per family */
+/* Derived, not chosen: whatever netmon can report has to fit. */
+#define NETSTATE_LOCAL_MAX NETMON_MAX_ADDRS
+#define NETSTATE_XLAT_MAX 8		/* translations held per family */
+#define NETSTATE_ROWS_MAX 12		/* offered to a view at once */
 
 /* Quickly while there is no source (an RA or DHCPv6 still finishing), then
  * slowly but forever: an RFC 4941 address rotating changes what the kernel
@@ -207,16 +209,30 @@ struct netstate_cand {
  * that the extra entries are nodes too far from the key to be worth a token. */
 #define NETSTATE_CANDS_MAX 4
 
-/* One local address, and whether it should be shown. Held rather than emitted
- * as it arrives, because whether a global v6 is ours to show is not knowable
- * until the source address is, which is often later. */
+/* One address this machine has, because the kernel says so. `proven` is an
+ * exchange having named it, which is about this network and goes with it. */
+struct netstate_local {
+	uint8_t addr[16];		/* the key; v4 in the low four bytes */
+	uint8_t len;			/* 4 or 16 */
+	uint8_t scope;			/* NET_SCOPE_* */
+	uint8_t proven;
+};
+
+/* An address the world saw us at that this machine does not have: a fact about
+ * this network's carrier and no other. */
+struct netstate_xlat {
+	uint8_t addr[16];
+	uint8_t len;
+	uint8_t scope;
+};
+
+/* One address as a view is told it, derived on the way out. */
 struct netstate_row {
+	char text[NETSTATE_ADDR_MAX];
 	uint8_t addr[16];		/* the key; v4 in the low four bytes */
 	uint8_t addr_len;		/* 4 or 16 */
-	char text[NETSTATE_ADDR_MAX];	/* as the caller printed it */
 	int scope;			/* NET_SCOPE_* */
 	int via;			/* NET_VIA_* */
-	int shown;			/* recomputed, never applied destructively */
 };
 
 struct netstate_fam {
@@ -270,15 +286,15 @@ struct netstate_fam {
 	int dht_acked;
 	int concluded;			/* pushed in: the rule reaches into sig */
 
-	struct netstate_row rows[NETSTATE_ROWS_MAX];
-	int nrows;
+	struct netstate_local locals[NETSTATE_LOCAL_MAX];
+	int nlocals;
+	struct netstate_xlat xlats[NETSTATE_XLAT_MAX];
+	int nxlats;
 };
 
 struct netstate {
 	struct netstate_fam f[2];	/* [0] v4, [1] v6 */
 	int is_host;			/* the only fork: NSA_EMIT_TOKEN */
-	int primed;			/* netmon reports no change on the call
-					 * that primes it, so take that one */
 	unsigned pend[2];
 };
 
@@ -289,10 +305,12 @@ struct netstate_actions {
 
 void netstate_init(struct netstate *ns, int is_host, uint64_t now);
 
-/* A family whose bit is clear keeps every fact it holds. have4/have6 must come
- * from the same snapshot as `changed`. */
-void netstate_on_netmon(struct netstate *ns, unsigned changed, int have4,
-			int have6, uint64_t now);
+/* A family whose bit is clear keeps every fact it holds; the address set
+ * follows `addrs` either way, an address the fingerprint ignores (APIPA)
+ * changing the set without changing a family. */
+void netstate_on_netmon(struct netstate *ns, unsigned changed,
+			const struct netmon_addr *addrs, size_t naddrs,
+			uint64_t now);
 
 /* len 0 means no route -- not a reason to forget the address we hold. */
 void netstate_on_src(struct netstate *ns, int family, uint32_t epoch,
@@ -300,27 +318,17 @@ void netstate_on_src(struct netstate *ns, int family, uint32_t epoch,
 		     uint64_t now);
 
 /*
- * The via a reader should be TOLD for a row, which is not always the one that
- * was gathered.
+ * AN EXCHANGE SAW US AT `addr`: the reply named it and went out from this
+ * machine in this epoch.
  *
- * A multi-homed IPv6 host has several globally routable addresses, and ICE
- * enumerates them all; each is reflexive to itself, since nothing translates
- * IPv6. Reported as gathered they read as so many NATs, which is the one thing
- * they are not. Two corrections, both about our own source address:
- *
- *   - the address we source from is never a translation of anything, however
- *     it was learnt, because it is what the world already sees;
- *   - another globally routable address, while the one we source from is
- *     itself global, is a SHADOW: an interface address we do not send from.
- *     A peer aiming at one reaches a socket that answers from the source
- *     address instead, so its check never completes -- which is why the offer
- *     leaves them out (canon_v6) and why naming them matters.
- *
- * Genuine NAT66 is what is left: a reflexive address that is global while ours
- * is not, and that still reads GLOBAL (NAT).
+ * One of ours proves that address, and a proof is never walked back inside an
+ * epoch. One the kernel does not report is a translation, and no snapshot
+ * prunes it. The two sets are disjoint and the kernel's word alone decides
+ * which of them an address is in, so no order of arrival can make them
+ * disagree: netmon moves an address across, carrying its proof with it.
  */
-int netstate_row_via(const struct netstate *ns, int family,
-		     const struct netstate_row *r);
+void netstate_on_reflexive(struct netstate *ns, int family, uint32_t epoch,
+			   const uint8_t *addr, int len);
 
 void netstate_on_probe_started(struct netstate *ns, int family, uint32_t epoch,
 			       uint64_t now);
@@ -403,11 +411,6 @@ void netstate_on_rdv_vouched(struct netstate *ns, int family,
  */
 void netstate_set_picking(struct netstate *ns, int family, int on);
 
-
-void netstate_on_candidate(struct netstate *ns, int family, uint32_t epoch,
-			   int scope, int via, const uint8_t *addr, int len,
-			   const char *text);
-
 void netstate_on_dht_concluded(struct netstate *ns, int family, int concluded);
 
 void netstate_tick(struct netstate *ns, uint64_t now);
@@ -430,9 +433,22 @@ uint32_t netstate_epoch(const struct netstate *ns, int family);
 const char *netstate_src_text(const struct netstate *ns, int family);
 int netstate_src(const struct netstate *ns, int family, uint8_t *out16);
 
-/* Shown and hidden alike; emit the ones marked shown. */
+/* Up to `max` rows into `out`: proven first, then this network's translations,
+ * then what the kernel reports on a segment, and last the global addresses no
+ * exchange has confirmed, so a view with less room than the model has
+ * addresses loses the least. */
 int netstate_rows(const struct netstate *ns, int family,
-		  const struct netstate_row **out);
+		  struct netstate_row *out, int max);
+
+/* Whether the kernel reports `addr`: an address of this network or of the one
+ * before it. */
+int netstate_has_local(const struct netstate *ns, int family,
+		       const uint8_t *addr, int len);
+
+/* Whether this network's carrier has been seen to map us to `addr`, which is
+ * an address no interface of ours holds. */
+int netstate_has_xlat(const struct netstate *ns, int family,
+		      const uint8_t *addr, int len);
 
 void netstate_facts(const struct netstate *ns, int family,
 		    struct tokgen_facts *out);

@@ -630,7 +630,7 @@ static void draw_peer_row(const struct peerrow *p, int n)
 
 static void draw(struct ui *u)
 {
-	int i, f = u->spin & 3, ns = 0, rc;
+	int i, f = u->spin & 3, ns = 0, rc, shown = 0;
 	const char *c4, *t4, *c6, *t6;
 	struct linkrow slink[8];
 	struct netrow snet[12];
@@ -661,11 +661,15 @@ static void draw(struct ui *u)
 	}
 	line("");
 
-	if (u->nnet)
-		ns = 1;
-	for (i = 0; i < u->nnet; i++)
+	for (i = 0; i < u->nnet; i++) {
+		if (u->net[i].via == NET_VIA_SHADOW)
+			continue;
+		shown++;
 		if (u->net[i].via == NET_VIA_STUN)
 			ns = 2;
+	}
+	if (shown && !ns)
+		ns = 1;
 	conn_label(u->conn4, &c4, &t4);
 	conn_label(u->conn6, &c6, &t6);
 	line(CYN "NETWORK" RST "  " YEL "%c" RST
@@ -673,12 +677,13 @@ static void draw(struct ui *u)
 	     net_flavor[ns][f], c4, t4, c6, t6,
 	     u->mapping_known && u->mapping_dependent ?
 	     DIM "  (per-destination NAT mapping)" RST : "");
-	if (!u->nnet && !u->nlink)
+	if (!shown && !u->nlink)
 		line(DIM "  probing ..." RST);
 	memcpy(snet, u->net, (size_t)u->nnet * sizeof(snet[0]));
 	qsort(snet, (size_t)u->nnet, sizeof(snet[0]), net_cmp);
 	for (i = 0; i < u->nnet; i++)
-		draw_net_row(&snet[i]);
+		if (snet[i].via != NET_VIA_SHADOW)
+			draw_net_row(&snet[i]);
 	memcpy(slink, u->link, (size_t)u->nlink * sizeof(slink[0]));
 	qsort(slink, (size_t)u->nlink, sizeof(slink[0]), link_cmp);
 	for (i = 0; i < u->nlink; i++)
