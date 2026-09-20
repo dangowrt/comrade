@@ -865,18 +865,16 @@ static void um_net(struct ui *u, int family, int scope, int via, const char *add
 {
 	int i;
 
-	/* De-dup by address alone, not (address, via): the same address
-	 * arriving both direct and via STUN means nothing translated it, so
-	 * it stays DIRECT rather than showing twice with one row wrongly
-	 * marked NAT. */
+	/* De-dup by address alone, not (address, via): the model owns the
+	 * verdict, so a second report of one address carries its revision. */
 	for (i = 0; i < u->nnet; i++)
 		if (u->net[i].family == family && !strcmp(u->net[i].addr, addr)) {
-			if (u->net[i].via == NET_VIA_STUN && via == NET_VIA_DIRECT) {
+			if (u->net[i].via != via) {
 				u->net[i].via = via;
 				if (u->anim)
 					u->dirty = 1;
 				else
-					vlog(u, "net    %s %-40s %s (not NAT)",
+					vlog(u, "net    %s %-40s %s",
 					     family == 6 ? "ipv6" : "ipv4",
 					     addr, scope_word(scope, via));
 			}

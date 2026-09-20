@@ -162,20 +162,18 @@ void netstate_on_netmon(struct netstate *ns, unsigned changed, int have4,
 int netstate_row_via(const struct netstate *ns, int family,
 		     const struct netstate_row *r)
 {
-	const struct netstate_fam *f = &ns->f[fam_idx(family)];
-	int have_src = f->src_epoch == f->epoch && f->src_len;
+	(void)ns;
+	(void)family;
 
-	if (!r)
-		return NET_VIA_DIRECT;
-	if (!have_src || r->scope != NET_SCOPE_GLOBAL)
-		return r->via;
-	/* Ours: nothing translated it, however it was learnt. */
-	if (r->addr_len == f->src_len &&
-	    !memcmp(r->addr, f->src, r->addr_len))
-		return NET_VIA_DIRECT;
-	if (f->src_scope == NET_SCOPE_GLOBAL)
-		return NET_VIA_SHADOW;
-	return r->via;			/* ours is not global: a real NAT */
+	return r ? r->via : NET_VIA_DIRECT;
+}
+
+/* fe80::/10 reaches nothing off-link, so the kernel naming it as the source for
+ * one means the global address is still tentative, not that we send from this.
+ * Only v6: an APIPA v4 source is how a segment with no DHCP is served. */
+static int src_unusable(const uint8_t *addr, int len)
+{
+	return len == 16 && addr[0] == 0xfe && (addr[1] & 0xc0) == 0x80;
 }
 
 void netstate_on_src(struct netstate *ns, int family, uint32_t epoch,
@@ -188,7 +186,7 @@ void netstate_on_src(struct netstate *ns, int family, uint32_t epoch,
 	if (epoch != f->epoch)
 		return;
 
-	if (len <= 0 || !addr) {
+	if (len <= 0 || !addr || src_unusable(addr, len)) {
 		/* No route yet is not a reason to forget the address we hold:
 		 * usually an RA or DHCPv6 that has not finished. */
 		f->src_tries++;
@@ -533,9 +531,14 @@ void netstate_on_candidate(struct netstate *ns, int family, uint32_t epoch,
 			strncpy(r->text, text, sizeof(r->text) - 1);
 			r->text[sizeof(r->text) - 1] = '\0';
 		}
-	} else if (r->via == NET_VIA_STUN && via == NET_VIA_DIRECT) {
+	} else if (via == NET_VIA_DIRECT && r->via != NET_VIA_DIRECT) {
 		/* Reached us both ways, so nothing translated it. */
-		r->via = NET_VIA_DIRECT;
+		r->via = via;
+	} else if (r->via == NET_VIA_SHADOW) {
+		/* An exchange judged what had only been enumerated. Evidence
+		 * only accumulates: no verdict is ever walked back, or the row
+		 * would flap for as long as the reports keep arriving. */
+		r->via = via;
 	} else {
 		return;
 	}

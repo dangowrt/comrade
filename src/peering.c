@@ -35,11 +35,11 @@ void peering_facts_post(struct peering_facts *f, int kind, int family,
 }
 
 void peering_facts_post_addr(struct peering_facts *f, int family,
-			     uint32_t epoch, const uint8_t *addr,
+			     uint32_t epoch, int via, const uint8_t *addr,
 			     const char *text)
 {
 	pthread_mutex_lock(&f->lock);
-	nsfacts_post_addr(&f->q, family, epoch, addr, text);
+	nsfacts_post_addr(&f->q, family, epoch, via, addr, text);
 	pthread_mutex_unlock(&f->lock);
 }
 
@@ -67,7 +67,7 @@ int peering_facts_feed(struct netstate *ns, const struct nsfact *q,
 	}
 	if (q->kind == NSF_ADDR) {
 		netstate_on_candidate(ns, q->family, epoch,
-				      net_addr_scope(q->text), NET_VIA_STUN,
+				      net_addr_scope(q->text), q->via,
 				      q->addr, q->family == 6 ? 16 : 4,
 				      q->text);
 		return 0;
@@ -284,8 +284,8 @@ static void probe_hit(void *arg, int family, const uint8_t addr[16],
 	struct peering_net *m = arg;
 	struct peering_probe *p;
 	uint32_t epoch;
+	int added, via;
 	char ip[64];
-	int added;
 
 	p = family == AF_INET6 ? &m->probe6 : &m->probe;
 	epoch = __atomic_load_n(&p->epoch, __ATOMIC_RELAXED);
@@ -293,9 +293,14 @@ static void probe_hit(void *arg, int family, const uint8_t addr[16],
 	if (family == AF_INET6) {
 		/* No pool: v6 is not behind a carrier that maps per
 		 * destination, so the address it is seen at is a candidate. */
+		via = p->srclen == 16 && !memcmp(addr, p->src, 16) ?
+		      NET_VIA_DIRECT : NET_VIA_STUN;
 		if (inet_ntop(AF_INET6, addr, ip, sizeof(ip))) {
-			dbg_logf("stun: v6 seen at %s", ip);
-			peering_facts_post_addr(&m->facts, 6, epoch, addr, ip);
+			dbg_logf("stun: v6 seen at %s, sent from %s", ip,
+				 via == NET_VIA_DIRECT ? "the same" :
+							 "another address");
+			peering_facts_post_addr(&m->facts, 6, epoch, via, addr,
+					        ip);
 		}
 		return;
 	}
@@ -342,6 +347,9 @@ static void probe_round(struct peering_net *m, int family)
 
 	epoch = __atomic_load_n(&p->epoch, __ATOMIC_RELAXED);
 	if (family == AF_INET6) {
+		p->srclen = 0;
+		if (net_source_addr(AF_INET6, NULL, 0, p->src, &p->srclen))
+			p->srclen = 0;
 		n = stun_pool_askable(m->servers, m->nservers, AF_INET6,
 				      p->start, targets,
 				      PEERING_PROBE6_SERVERS);

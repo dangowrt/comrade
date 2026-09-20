@@ -237,30 +237,71 @@ static void an_address_that_never_comes_stops_being_hurried(void)
  * already sees, the others are interface addresses we never send from, and
  * genuine NAT66 is the case where ours is not globally routable at all.
  */
+/* The kernel answers fe80:: for a global destination while the global address
+ * is tentative. Taken as the answer it ends the hurry and parks for the slow
+ * interval, so a global arriving moments later is not seen for seconds. */
+static void a_linklocal_is_not_a_source(void)
+{
+	uint8_t ll[16], g[16];
+	struct netstate ns;
+
+	start(&ns, 1);
+	fill(g, 16, 20);
+	memset(ll, 0, sizeof(ll));
+	ll[0] = 0xfe;
+	ll[1] = 0x80;
+	ll[15] = 1;
+
+	netstate_on_src(&ns, 6, netstate_epoch(&ns, 6), ll, 16, NET_SCOPE_LAN,
+			"fe80::1", t);
+	drain(&ns);
+	assert(!*netstate_src_text(&ns, 6));
+	assert(netstate_conn(&ns, 6) != NET_CONN_UP);
+
+	t += NETSTATE_SRC_FAST_MS;
+	netstate_tick(&ns, t);
+	assert(drain(&ns).f[1] & NSA_SAMPLE_SRC);
+
+	netstate_on_src(&ns, 6, netstate_epoch(&ns, 6), g, 16, NET_SCOPE_GLOBAL,
+			"2a00::14", t);
+	drain(&ns);
+	assert(!strcmp(netstate_src_text(&ns, 6), "2a00::14"));
+
+	/* A ULA still is one: NAT66 is a real case, not a tentative address. */
+	ll[0] = 0xfd;
+	ll[1] = 0x00;
+	netstate_on_src(&ns, 6, netstate_epoch(&ns, 6), ll, 16, NET_SCOPE_LAN,
+			"fd00::1", t);
+	drain(&ns);
+	assert(!strcmp(netstate_src_text(&ns, 6), "fd00::1"));
+}
+
 static void a_shadow_address_is_not_a_translation(void)
 {
-	struct netstate ns;
 	const struct netstate_row *rows;
-	uint8_t src[16], shadow[16], ula[16];
+	uint8_t src[16], shadow[16];
+	struct netstate ns;
+	uint8_t ula[16];
 	int n, i;
 
 	start(&ns, 1);
 	fill(src, 16, 20);
 	fill(shadow, 16, 60);
-	netstate_on_candidate(&ns, 6, netstate_epoch(&ns, 6), NET_SCOPE_GLOBAL,
-			      NET_VIA_STUN, src, 16, "src");
-	netstate_on_candidate(&ns, 6, netstate_epoch(&ns, 6), NET_SCOPE_GLOBAL,
-			      NET_VIA_STUN, shadow, 16, "shadow");
-	drain(&ns);
 
-	/* Nothing to judge them by yet, so they stand as gathered. */
+	/* Enumerated, not proven: a shadow until an exchange says otherwise. */
+	netstate_on_candidate(&ns, 6, netstate_epoch(&ns, 6), NET_SCOPE_GLOBAL,
+			      NET_VIA_SHADOW, src, 16, "src");
+	netstate_on_candidate(&ns, 6, netstate_epoch(&ns, 6), NET_SCOPE_GLOBAL,
+			      NET_VIA_SHADOW, shadow, 16, "shadow");
+	drain(&ns);
 	n = netstate_rows(&ns, 6, &rows);
 	assert(n == 2);
 	for (i = 0; i < n; i++)
-		assert(netstate_row_via(&ns, 6, &rows[i]) == NET_VIA_STUN);
+		assert(netstate_row_via(&ns, 6, &rows[i]) == NET_VIA_SHADOW);
 
-	netstate_on_src(&ns, 6, netstate_epoch(&ns, 6), src, 16,
-			NET_SCOPE_GLOBAL, "src", t);
+	/* The round sent from src and was seen at src: nothing translated it. */
+	netstate_on_candidate(&ns, 6, netstate_epoch(&ns, 6), NET_SCOPE_GLOBAL,
+			      NET_VIA_DIRECT, src, 16, "src");
 	drain(&ns);
 	n = netstate_rows(&ns, 6, &rows);
 	assert(n == 2);
@@ -273,10 +314,8 @@ static void a_shadow_address_is_not_a_translation(void)
 			assert(via == NET_VIA_SHADOW);
 	}
 
-	/*
-	 * NAT66 proper: ours is a ULA, so a global address really is something
-	 * translating us and goes on saying so.
-	 */
+	/* Whatever the source becomes, including a ULA, the rows do not move:
+	 * a verdict that is re-derived is a verdict that flaps. */
 	fill(ula, 16, 90);
 	ula[0] = 0xfd;
 	netstate_on_src(&ns, 6, netstate_epoch(&ns, 6), ula, 16, NET_SCOPE_LAN,
@@ -284,8 +323,25 @@ static void a_shadow_address_is_not_a_translation(void)
 	drain(&ns);
 	n = netstate_rows(&ns, 6, &rows);
 	assert(n == 2);
+	for (i = 0; i < n; i++) {
+		int via = netstate_row_via(&ns, 6, &rows[i]);
+
+		if (!memcmp(rows[i].addr, src, 16))
+			assert(via == NET_VIA_DIRECT);
+		else
+			assert(via == NET_VIA_SHADOW);
+	}
+
+	/* NAT66: the round was seen at an address it did not send from. */
+	netstate_on_candidate(&ns, 6, netstate_epoch(&ns, 6), NET_SCOPE_GLOBAL,
+			      NET_VIA_STUN, shadow, 16, "shadow");
+	drain(&ns);
+	n = netstate_rows(&ns, 6, &rows);
+	assert(n == 2);
 	for (i = 0; i < n; i++)
-		assert(netstate_row_via(&ns, 6, &rows[i]) == NET_VIA_STUN);
+		if (!memcmp(rows[i].addr, shadow, 16))
+			assert(netstate_row_via(&ns, 6, &rows[i]) ==
+			       NET_VIA_STUN);
 }
 
 /*
@@ -1401,6 +1457,7 @@ int main(void)
 	src_survives_the_roam_window();
 	an_address_that_never_comes_stops_being_hurried();
 	late_src_retracts_the_wrong_row();
+	a_linklocal_is_not_a_source();
 	a_shadow_address_is_not_a_translation();
 	a_peers_vouch_qualifies_what_we_cannot_reach();
 	src_is_never_stale_on_the_wire();

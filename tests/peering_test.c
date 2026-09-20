@@ -21,7 +21,7 @@ static void what_is_posted_is_taken_once(void)
 	assert(!peering_facts_take(&f, out, NSFACTS_OUT));
 
 	peering_facts_post(&f, NSF_ROUNDTRIP, 4, 3);
-	peering_facts_post_addr(&f, 4, 3, a, "198.51.100.9");
+	peering_facts_post_addr(&f, 4, 3, NET_VIA_STUN, a, "198.51.100.9");
 	assert(peering_facts_take(&f, out, NSFACTS_OUT) == 2);
 	assert(!peering_facts_take(&f, out, NSFACTS_OUT));
 	peering_facts_destroy(&f);
@@ -44,7 +44,7 @@ static void a_fact_is_fed_under_the_model_s_own_epoch(void)
 	netstate_init(&ns, 1, 1000);
 	/* Posted under a generation of the machine's own, which is not the
 	 * epoch this model counts in. */
-	peering_facts_post_addr(&f, 4, 77, a, "198.51.100.9");
+	peering_facts_post_addr(&f, 4, 77, NET_VIA_STUN, a, "198.51.100.9");
 	assert(peering_facts_take(&f, out, NSFACTS_OUT) == 1);
 
 	assert(!peering_facts_feed(&ns, &out[0], 77, 1000));

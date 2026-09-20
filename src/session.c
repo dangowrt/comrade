@@ -1061,6 +1061,11 @@ static void report_candidates(struct sess *s, const char *sdp)
 				uint8_t raw[16];
 				int len;
 
+				/* Enumerating an address is not proving we
+				 * send from it; only a round trip is. */
+				if (via == NET_VIA_DIRECT && strchr(addr, ':') &&
+				    scope == NET_SCOPE_GLOBAL)
+					via = NET_VIA_SHADOW;
 				fam = strchr(addr, ':') ? 6 : 4;
 				if (fam == 4 && via == NET_VIA_STUN)
 					__atomic_store_n(&s->net.have_srflx4, 1,
