@@ -53,6 +53,9 @@ static void ui_on_signal(int n) { (void)n; ui_abort_flag = 1; }
 #define WHT "\033[97m"
 #define DIM "\033[90m"
 
+/* Both families at once, since the model caps what it offers per family. */
+#define UI_NET_MAX (2 * NETSTATE_ROWS_MAX)
+
 struct netrow { int family; int scope; int via; char addr[80]; };
 struct linkrow { char name[32]; int has4, has6; };
 struct rdvrow { int family; int ready; char addr[80]; };
@@ -93,11 +96,11 @@ struct ui {
 	int dirty;
 	int cursor_hidden;
 
-	struct netrow net[12];
+	struct netrow net[UI_NET_MAX];
 	int nnet;
 	/* What a redraw took down, so the log can tell a new address from a
 	 * redrawn one. */
-	struct netrow prev[12];
+	struct netrow prev[UI_NET_MAX];
 	int nprev;
 	int mapping_known;
 	int mapping_dependent;
@@ -631,9 +634,9 @@ static void draw_peer_row(const struct peerrow *p, int n)
 static void draw(struct ui *u)
 {
 	int i, f = u->spin & 3, ns = 0, rc;
+	struct netrow snet[UI_NET_MAX];
 	const char *c4, *t4, *c6, *t6;
 	struct linkrow slink[8];
-	struct netrow snet[12];
 
 	if (u->view == UI_VIEW_QR_RO && !u->have_token_ro)
 		u->view = UI_VIEW_QR_RW;
@@ -880,7 +883,7 @@ static void um_net(struct ui *u, int family, int scope, int via, const char *add
 			}
 			return;
 		}
-	if (u->nnet >= 12)
+	if (u->nnet >= UI_NET_MAX)
 		return;
 	u->net[u->nnet].family = family;
 	u->net[u->nnet].scope = scope;
