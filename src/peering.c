@@ -293,8 +293,10 @@ static void probe_hit(void *arg, int family, const uint8_t addr[16],
 	if (family == AF_INET6) {
 		/* No pool: v6 is not behind a carrier that maps per
 		 * destination, so the address it is seen at is a candidate. */
-		if (inet_ntop(AF_INET6, addr, ip, sizeof(ip)))
+		if (inet_ntop(AF_INET6, addr, ip, sizeof(ip))) {
+			dbg_logf("stun: v6 seen at %s", ip);
 			peering_facts_post_addr(&m->facts, 6, epoch, addr, ip);
+		}
 		return;
 	}
 	added = peering_pool_note(&m->pool, addr);
@@ -352,6 +354,8 @@ static void probe_round(struct peering_net *m, int family)
 		       probe_hit, m);
 	if (family == AF_INET)
 		probe_verdict(m);
+	else
+		dbg_logf("stun: v6 round done, %d server(s) asked", n);
 	peering_facts_post(&m->facts, NSF_PROBE_DONE, fam, epoch);
 }
 
@@ -456,6 +460,7 @@ int peering_net_kick(struct peering_net *m, int family, uint32_t epoch,
 		return 0;
 	if (p->running) {
 		__atomic_store_n(&p->stop, 1, __ATOMIC_RELAXED);
+		dbg_logf("stun: v%d round wanted, one still winding up", family);
 		return 0;
 	}
 	p->start = start6;
@@ -464,8 +469,7 @@ int peering_net_kick(struct peering_net *m, int family, uint32_t epoch,
 			   family == 6 ? probe6_thread : probe_thread, m))
 		return 0;
 	p->running = 1;
-	if (family == 4)
-		dbg_logf("stun: v4 probe round started");
+	dbg_logf("stun: v%d probe round started", family);
 
 	return 1;
 }
