@@ -143,6 +143,7 @@ void netstate_on_netmon(struct netstate *ns, unsigned changed, int have4,
 		f->concluded = 0;
 
 		f->probe_rounds = 0;
+		f->probe_wanted = 0;
 		f->probe_running = 0;	/* whatever is in flight was started
 					 * for a network we have left */
 		f->probe_next_ms = now;
@@ -236,8 +237,18 @@ void netstate_on_probe_started(struct netstate *ns, int family, uint32_t epoch,
 	if (epoch != f->epoch)
 		return;
 	f->probe_running = 1;
+	f->probe_wanted = 0;
 	f->probe_rounds++;
 	f->probe_next_ms = now + probe_gap(f);
+}
+
+void netstate_on_probe_deferred(struct netstate *ns, int family, uint32_t epoch)
+{
+	struct netstate_fam *f = &ns->f[fam_idx(family)];
+
+	if (epoch != f->epoch)
+		return;
+	f->probe_wanted = 1;
 }
 
 void netstate_on_probe_done(struct netstate *ns, int family, uint32_t epoch,
@@ -249,6 +260,12 @@ void netstate_on_probe_done(struct netstate *ns, int family, uint32_t epoch,
 	if (epoch != f->epoch)
 		return;
 	f->probe_running = 0;
+	if (f->probe_wanted) {
+		f->probe_wanted = 0;
+		f->probe_next_ms = now;
+		raise_act(ns, i, NSA_KICK_PROBE);
+		return;
+	}
 	if (f->probe_next_ms > now + probe_gap(f))
 		f->probe_next_ms = now + probe_gap(f);
 }

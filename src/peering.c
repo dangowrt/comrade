@@ -469,7 +469,7 @@ int peering_net_kick(struct peering_net *m, int family, uint32_t epoch,
 	if (p->running) {
 		__atomic_store_n(&p->stop, 1, __ATOMIC_RELAXED);
 		dbg_logf("stun: v%d round wanted, one still winding up", family);
-		return 0;
+		return -1;
 	}
 	p->start = start6;
 	__atomic_store_n(&p->stop, 0, __ATOMIC_RELAXED);
@@ -990,7 +990,7 @@ static void apply(struct peering_model *pm, struct peering_net *net,
 		  const struct netstate_actions *a, uint64_t now)
 {
 	static const int famv[2] = { 4, 6 };
-	int i;
+	int i, kick;
 
 	for (i = 0; i < 2; i++) {
 		unsigned act = a->f[i];
@@ -999,10 +999,14 @@ static void apply(struct peering_model *pm, struct peering_net *net,
 		if (act & NSA_SAMPLE_SRC)
 			sample_src(pm, family, a->epoch[i], now);
 		if (act & NSA_KICK_PROBE) {
-			if (peering_net_kick(net, family, a->epoch[i],
-					     cfg->start6))
+			kick = peering_net_kick(net, family, a->epoch[i],
+						cfg->start6);
+			if (kick > 0)
 				netstate_on_probe_started(&pm->ns, family,
 							  a->epoch[i], now);
+			else if (kick < 0)
+				netstate_on_probe_deferred(&pm->ns, family,
+							   a->epoch[i]);
 		}
 		if (act & NSA_EMIT_ROWS)
 			obsemit_rows(&pm->oe, family);

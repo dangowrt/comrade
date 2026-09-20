@@ -239,6 +239,7 @@ struct netstate_fam {
 	uint32_t up_epoch;
 
 	int probe_running;
+	int probe_wanted;		/* a round was due and could not start */
 	uint32_t probe_epoch;
 	uint64_t probe_next_ms;
 	int probe_rounds;
@@ -325,6 +326,11 @@ void netstate_on_probe_started(struct netstate *ns, int family, uint32_t epoch,
 			       uint64_t now);
 void netstate_on_probe_done(struct netstate *ns, int family, uint32_t epoch,
 			    uint64_t now);
+
+/* A round was due and the previous one was still winding up, so it did not
+ * start: the next one is due as that one ends, not a gap after it. */
+void netstate_on_probe_deferred(struct netstate *ns, int family,
+				uint32_t epoch);
 
 /* Somewhere new to ask appeared: the round this family is waiting for is due
  * now rather than at the end of a gap it began before there was anywhere. */

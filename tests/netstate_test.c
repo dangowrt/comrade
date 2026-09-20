@@ -1133,6 +1133,30 @@ static void probe_slows_but_never_stops(void)
 	assert(probe_round(&ns, 6));
 }
 
+/* A round that could not start because the previous one was winding up is not
+ * lost: it is due as that one ends, not a gap after it. */
+static void a_deferred_round_is_due_at_once(void)
+{
+	struct netstate ns;
+	uint32_t e;
+
+	start(&ns, 1);
+	e = netstate_epoch(&ns, 6);
+	assert(probe_round(&ns, 6));
+
+	t += 100;
+	netstate_on_probe_started(&ns, 6, e, t);
+	netstate_on_probe_deferred(&ns, 6, e);
+	netstate_on_probe_done(&ns, 6, e, t);
+	assert(drain(&ns).f[1] & NSA_KICK_PROBE);
+
+	/* A deferral from a network we have left says nothing here. */
+	netstate_on_probe_started(&ns, 6, netstate_epoch(&ns, 6), t);
+	netstate_on_probe_deferred(&ns, 6, netstate_epoch(&ns, 6) - 1);
+	netstate_on_probe_done(&ns, 6, netstate_epoch(&ns, 6), t);
+	assert(!(drain(&ns).f[1] & NSA_KICK_PROBE));
+}
+
 /* B2a: a round is due when there is somewhere new to ask, not at the end of a
  * gap that was begun while there was nowhere. */
 static void somewhere_new_makes_a_round_due(void)
@@ -1480,6 +1504,7 @@ int main(void)
 	host_and_client_agree_except_on_the_token();
 	only_a_host_picks_its_own_rendezvous();
 	probe_slows_but_never_stops();
+	a_deferred_round_is_due_at_once();
 	somewhere_new_makes_a_round_due();
 	no_address_no_probe_no_pending();
 	row_merge_direct_beats_stun();
