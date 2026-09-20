@@ -1013,18 +1013,6 @@ static char *local_sdp(struct sess *s)
 	return peering_desc_local(&s->net.desc);
 }
 
-/* A candidate naming the address this machine sources from now cannot be a
- * fact about a network we have left, whatever the agent was built under. */
-static uint32_t cand_epoch(struct sess *s, int fam, int via, const char *addr)
-{
-	if (fam == 6 && via == NET_VIA_DIRECT &&
-	    !strcmp(addr, netstate_src_text(&s->pm.ns, 6)))
-		return netstate_epoch(&s->pm.ns, 6);
-
-	return __atomic_load_n(&s->gather_epoch[fam_idx(fam)],
-			       __ATOMIC_RELAXED);
-}
-
 /*
  * Hand each local ICE candidate to the model, classified by scope and how it
  * was learnt. Re-run as they trickle in; the model de-duplicates.
@@ -1078,8 +1066,9 @@ static void report_candidates(struct sess *s, const char *sdp)
 				if (inet_pton(fam == 6 ? AF_INET6 : AF_INET,
 					      addr, raw) == 1)
 					netstate_on_candidate(&s->pm.ns, fam,
-							      cand_epoch(s, fam,
-									 via, addr),
+							      __atomic_load_n(
+							      &s->gather_epoch[fam_idx(fam)],
+							      __ATOMIC_RELAXED),
 							      scope, via, raw,
 							      len, addr);
 			}
