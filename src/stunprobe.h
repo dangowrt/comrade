@@ -80,6 +80,11 @@ int stun_pool_askable(char *const *servers, int nservers, int family, int start,
 int stun_pool_warm_start(char *const *servers, int nservers, volatile int *stop,
 			 pthread_t *th, stun_more_fn *more, void *arg);
 
+/* Retire the callback and wait out any resolver thread inside one. A name
+ * lookup has no timeout, so those threads are detached and outlive the loop
+ * thread the caller joins; `arg` must stay alive until this returns. */
+void stun_pool_warm_forget(void);
+
 /*
  * RFC 4787 mapping-behaviour classification, built incrementally from the
  * (address, port) pairs a probe run's `hit` callback sees: every server

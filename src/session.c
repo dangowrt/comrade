@@ -5707,6 +5707,7 @@ done:
 	if (s.warm_running) {
 		__atomic_store_n(&s.warm_stop, 1, __ATOMIC_RELAXED);
 		pthread_join(s.warm_th, NULL);
+		stun_pool_warm_forget();
 		s.warm_running = 0;
 	}
 	stunlist_free(s.stun_servers, s.stun_count);

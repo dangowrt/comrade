@@ -299,14 +299,18 @@ static int askable_state(const char *server, int family)
 	return neg_has(server, family) ? -1 : 0;
 }
 
+static pthread_mutex_t stun_more_lock = PTHREAD_MUTEX_INITIALIZER;
 static stun_more_fn *stun_more_cb;
 static void *stun_more_arg;
 
-/* Set before the first resolver thread exists, so it needs no lock. */
+/* Held across the call, so a caller that has retired the callback knows no
+ * resolver thread is still inside one. */
 static void warm_more(int family)
 {
+	pthread_mutex_lock(&stun_more_lock);
 	if (stun_more_cb)
 		stun_more_cb(stun_more_arg, family);
+	pthread_mutex_unlock(&stun_more_lock);
 }
 
 /*
@@ -551,8 +555,10 @@ int stun_pool_warm_start(char *const *servers, int nservers, volatile int *stop,
 
 	if (nservers < 1)
 		return -1;
+	pthread_mutex_lock(&stun_more_lock);
 	stun_more_cb = more;
 	stun_more_arg = arg;
+	pthread_mutex_unlock(&stun_more_lock);
 	w = malloc(sizeof(*w));
 	if (!w)
 		return -1;
@@ -564,6 +570,14 @@ int stun_pool_warm_start(char *const *servers, int nservers, volatile int *stop,
 		return -1;
 	}
 	return 0;
+}
+
+void stun_pool_warm_forget(void)
+{
+	pthread_mutex_lock(&stun_more_lock);
+	stun_more_cb = NULL;
+	stun_more_arg = NULL;
+	pthread_mutex_unlock(&stun_more_lock);
 }
 
 /* Ask one server, naming it in the transaction id's last byte (which the
