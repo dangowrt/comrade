@@ -574,18 +574,16 @@ static int on_end_fd(socket_t fd, int revents, void *userdata)
  * Then it drains before returning and letting the caller close the channel,
  * for a length that depends on which end it was.
  *
- * The command exiting is a guest leaving, and nothing is owed to a client
- * already on its way out: a few more turns flush its last output.
- *
- * The end-of-session fd is the other case, and there it waits
- * SSHD_END_DRAIN_MS by the clock rather than by turns of the loop, because
- * there is something to wait FOR: the session layer's notice to the client
- * that the shared session has ended (CTLM_BYE), which it writes to the control
- * socket on seeing the same signal we do. Turns would not do it -- the end fd
- * stays readable once it has fired, so dopoll returns at once and three of them
- * pass in microseconds, closing the channel before the notice could be written,
- * let alone bridged. So the fd comes out of the event as soon as it has been
- * read, and the loop goes back to blocking for the length of the wait.
+ * Either way it waits SSHD_END_DRAIN_MS by the clock rather than by turns of
+ * the loop, because there is something to wait FOR and an fd that has fired
+ * stays readable: dopoll returns at once, a few turns pass in microseconds,
+ * and the channel closes before the thing could be written. For a guest
+ * leaving that thing is the command's last output, which the peer has to get a
+ * scheduler turn to read. For the end-of-session fd it is the session layer's
+ * notice to the client that the shared session has ended (CTLM_BYE), which it
+ * writes to the control socket on seeing the same signal we do. So the fd
+ * comes out of the event as soon as it has been read, and the loop goes back
+ * to blocking for the length of the wait.
  *
  * Serve one authenticated session: the control channel, port forwarding, and
  * a shell if the client asks for one. Returns the child's exit status, or 0
@@ -599,9 +597,10 @@ static int on_end_fd(socket_t fd, int revents, void *userdata)
 static int pump(ssh_session s, ssh_channel chan, const struct sshd_opts *o,
 		int read_only, int allow_shell)
 {
-	int ending = 0, drain = 0, exit_code = 0;
+	int ending = 0, exit_code = 0;
 	uint64_t child_gone_ms = 0;
 	sock_t end_fd = o->end_fd;
+	uint64_t ending_ms = 0;
 	uint64_t end_ms = 0;
 	struct pump_ctx c;
 	int verdict = 0;
@@ -666,10 +665,14 @@ static int pump(ssh_session s, ssh_channel chan, const struct sshd_opts *o,
 		 * once the guest's command has gone we wait that out before ruling
 		 * the end fd's silence a detach rather than a session end. */
 		if (!verdict && c.child && cpty_exited(c.child)) {
-			if (!sock_isset(o->end_fd) || !o->use_pty)
-				ending = 1;	/* no monitor, or no pty to
-						 * detach from: a guest leaving */
-			else if (!child_gone_ms)
+			if (!sock_isset(o->end_fd) || !o->use_pty) {
+				/* no monitor, or no pty to detach from: a
+				 * guest leaving */
+				if (!ending) {
+					ending = 1;
+					ending_ms = os_mono_ms();
+				}
+			} else if (!child_gone_ms)
 				child_gone_ms = os_mono_ms();
 			else if (os_mono_ms() - child_gone_ms >=
 				 SSHD_DETACH_CONFIRM_MS) {
@@ -680,7 +683,7 @@ static int pump(ssh_session s, ssh_channel chan, const struct sshd_opts *o,
 		if (verdict && o->ended_out)
 			__atomic_store_n(o->ended_out, verdict, __ATOMIC_RELAXED);
 		if ((verdict && os_mono_ms() - end_ms >= SSHD_END_DRAIN_MS) ||
-		    (ending && ++drain >= 3))
+		    (ending && os_mono_ms() - ending_ms >= SSHD_END_DRAIN_MS))
 			break;
 	}
 
