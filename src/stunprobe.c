@@ -592,9 +592,12 @@ void stun_probe_run(int family, char *const *servers, int nservers,
 {
 	int i, n = nservers, nres = 0, ndst = 0, max, got;
 	int want_fam = family == AF_INET6 ? 0x02 : 0x01;
+	uint8_t buf[512], addr[16], local[16];
 	struct sockaddr_storage *dst;
 	uint64_t t0, next_send = 0;
 	socklen_t *dlen;
+	uint16_t port;
+	int r, llen;
 	sock_t fd;
 
 	if (n <= 0)
@@ -612,6 +615,8 @@ void stun_probe_run(int family, char *const *servers, int nservers,
 		free(dlen);
 		return;
 	}
+	if (family == AF_INET6)
+		sock_v6_want_local(fd);
 
 	t0 = os_mono_ms();
 	while (!(stop && sb_flag(stop)) &&
@@ -645,15 +650,18 @@ void stun_probe_run(int family, char *const *servers, int nservers,
 		pf.revents = 0;
 		if (sock_poll(&pf, 1, nres < n ? 0 : PROBE_TICK_MS) > 0 &&
 		    (pf.revents & POLLIN)) {
-			uint8_t buf[512], addr[16];
-			uint16_t port;
-			int r = recvfrom(fd, (char *)buf, sizeof(buf), 0,
-					 NULL, NULL);
-
+			llen = 0;
+			memset(local, 0, sizeof(local));
+			if (family == AF_INET6)
+				r = (int)sock_recv_local6(fd, buf, sizeof(buf),
+							  local, &llen);
+			else
+				r = recvfrom(fd, (char *)buf, sizeof(buf), 0,
+					     NULL, NULL);
 			if (r > 0 &&
 			    !stun_probe_mapped_fam(buf, (size_t)r, seed,
 						   want_fam, addr, &port))
-				hit(arg, family, addr, port);
+				hit(arg, family, addr, local, llen, port);
 		}
 	}
 	sock_close(fd);

@@ -278,7 +278,7 @@ int peering_sdp_has_candidate(const char *sdp)
 }
 
 static void probe_hit(void *arg, int family, const uint8_t addr[16],
-		      uint16_t port)
+		      const uint8_t local[16], int locallen, uint16_t port)
 {
 	int fam = family == AF_INET6 ? 6 : 4;
 	struct peering_net *m = arg;
@@ -292,16 +292,20 @@ static void probe_hit(void *arg, int family, const uint8_t addr[16],
 	peering_facts_post(&m->facts, NSF_ROUNDTRIP, fam, epoch);
 	if (family == AF_INET6) {
 		/* No pool: v6 is not behind a carrier that maps per
-		 * destination, so the address it is seen at is a candidate. */
-		via = p->srclen == 16 && !memcmp(addr, p->src, 16) ?
-		      NET_VIA_DIRECT : NET_VIA_STUN;
-		if (inet_ntop(AF_INET6, addr, ip, sizeof(ip))) {
-			dbg_logf("stun: v6 seen at %s, sent from %s", ip,
-				 via == NET_VIA_DIRECT ? "the same" :
-							 "another address");
-			peering_facts_post_addr(&m->facts, 6, epoch, via, addr,
-					        ip);
+		 * destination, so the address it is seen at is a candidate.
+		 * Unless the kernel named what the reply was addressed to,
+		 * this exchange proves reachability and nothing else. */
+		if (!inet_ntop(AF_INET6, addr, ip, sizeof(ip)))
+			return;
+		if (locallen != 16) {
+			dbg_logf("stun: v6 seen at %s, local address unknown "
+				 "-- not judged", ip);
+			return;
 		}
+		via = !memcmp(addr, local, 16) ? NET_VIA_DIRECT : NET_VIA_STUN;
+		dbg_logf("stun: v6 seen at %s, sent from %s", ip,
+			 via == NET_VIA_DIRECT ? "the same" : "another address");
+		peering_facts_post_addr(&m->facts, 6, epoch, via, addr, ip);
 		return;
 	}
 	added = peering_pool_note(&m->pool, addr);
@@ -347,9 +351,6 @@ static void probe_round(struct peering_net *m, int family)
 
 	epoch = __atomic_load_n(&p->epoch, __ATOMIC_RELAXED);
 	if (family == AF_INET6) {
-		p->srclen = 0;
-		if (net_source_addr(AF_INET6, NULL, 0, p->src, &p->srclen))
-			p->srclen = 0;
 		n = stun_pool_askable(m->servers, m->nservers, AF_INET6,
 				      p->start, targets,
 				      PEERING_PROBE6_SERVERS);

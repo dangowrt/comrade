@@ -183,11 +183,6 @@ struct peering_probe {
 	volatile uint32_t epoch;	/* stamped by the loop, read by the
 					 * round as it reports */
 	int start;			/* v6: where in the list it begins */
-	/* What this machine sends from, read once as the round opens: the
-	 * verdict on a reply is what it says against this, and it must not be
-	 * re-read later or the answer changes under the row. */
-	uint8_t src[16];
-	int srclen;
 };
 
 /*
