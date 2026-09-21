@@ -110,8 +110,12 @@ static int xlat_forget(struct netstate_fam *f, const uint8_t *a, int len)
 	return 0;
 }
 
-/* The kernel's set, taken as this family's; non-zero when it moved. Removals
- * walk down, so dropping one cannot skip an entry still to be tested. */
+#define LOCAL_GAINED (1 << 0)
+#define LOCAL_LOST (1 << 1)
+
+/* The kernel's set, taken as this family's; which way it moved, if it did.
+ * Removals walk down, so dropping one cannot skip an entry still to be
+ * tested. */
 static int local_sync(struct netstate_fam *f, int af,
 		      const struct netmon_addr *addrs, size_t n)
 {
@@ -126,7 +130,7 @@ static int local_sync(struct netstate_fam *f, int af,
 		memmove(&f->locals[k], &f->locals[k + 1],
 			sizeof(f->locals[0]) * (size_t)(f->nlocals - 1 - k));
 		memset(&f->locals[--f->nlocals], 0, sizeof(f->locals[0]));
-		moved = 1;
+		moved |= LOCAL_LOST;
 	}
 	for (i = 0; i < n && f->nlocals < NETSTATE_LOCAL_MAX; i++) {
 		if (addrs[i].family != af || addrs[i].addrlen != (uint8_t)len)
@@ -139,7 +143,7 @@ static int local_sync(struct netstate_fam *f, int af,
 		l->len = (uint8_t)len;
 		l->scope = (uint8_t)addr_scope_raw(addrs[i].addr, len);
 		l->proven = (uint8_t)xlat_forget(f, addrs[i].addr, len);
-		moved = 1;
+		moved |= LOCAL_GAINED;
 	}
 	return moved;
 }
@@ -192,14 +196,21 @@ void netstate_on_netmon(struct netstate *ns, unsigned changed,
 			const struct netmon_addr *addrs, size_t naddrs,
 			uint64_t now)
 {
-	int i;
+	int i, chg, was_up, grew;
 
 	for (i = 0; i < 2; i++) {
 		struct netstate_fam *f = &ns->f[i];
 		unsigned bit = i ? NETMON_CH_V6 : NETMON_CH_V4;
 
-		if (local_sync(f, i ? AF_INET6 : AF_INET, addrs, naddrs))
+		grew = f->nlocals > 0;
+		chg = local_sync(f, i ? AF_INET6 : AF_INET, addrs, naddrs);
+		if (chg)
 			raise_act(ns, i, NSA_EMIT_ROWS);
+		/* Gained on a network we already had an address on: that one
+		 * is still the network, so what was proven on it still holds
+		 * and only the source a new socket is given may have moved. */
+		grew = grew && chg == LOCAL_GAINED;
+		was_up = f->up_epoch == f->epoch;
 		if (f->has_addr != !!f->nlocals) {
 			f->has_addr = !!f->nlocals;
 			sync_conn(ns, i);
@@ -212,9 +223,10 @@ void netstate_on_netmon(struct netstate *ns, unsigned changed,
 
 		/* src is kept but stops being current: "unchanged across the
 		 * move" has to stay distinguishable from "not up yet". */
-		f->routed = 0;
 		f->src_tries = 0;
 		f->src_next_ms = now;
+		if (!grew)
+			f->routed = 0;
 
 		/* A move bears on our reachability, not on the node: both
 		 * proofs stay, and the quiet detector, counting only once the
@@ -241,8 +253,12 @@ void netstate_on_netmon(struct netstate *ns, unsigned changed,
 
 		/* A proof is about the network it was made on; the addresses
 		 * are the kernel's and are not ours to forget. */
-		proofs_demote(f);
-		f->nxlats = 0;
+		if (!grew) {
+			proofs_demote(f);
+			f->nxlats = 0;
+		} else if (was_up) {
+			f->up_epoch = f->epoch;
+		}
 		f->conn = conn_of(f);
 
 		raise_act(ns, i, NSA_SAMPLE_SRC | NSA_KICK_PROBE |

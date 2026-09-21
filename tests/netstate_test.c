@@ -168,6 +168,44 @@ static void v6_change_leaves_v4_alone(void)
 	assert(a.f[1] != 0);		/* and everything for v6 */
 }
 
+/* A gain on a network we already had an address on leaves what was proven
+ * there standing; a loss, or the family's first address, does not. */
+static void a_gained_address_is_not_a_move(void)
+{
+	struct netstate_row rows[NETSTATE_ROWS_MAX];
+	struct netstate ns;
+	uint8_t extra[16];
+	int n, i, direct;
+
+	start(&ns, 1);
+	fill(extra, 16, 44);
+	netstate_on_reflexive(&ns, 6, netstate_epoch(&ns, 6), dfl6, 16);
+	netstate_on_roundtrip(&ns, 6, netstate_epoch(&ns, 6));
+	give_src(&ns, 6, 20);
+	drain(&ns);
+	assert(netstate_conn(&ns, 6) == NET_CONN_UP);
+	n = netstate_rows(&ns, 6, rows, NETSTATE_ROWS_MAX);
+	assert(n == 1 && rows[0].via == NET_VIA_DIRECT);
+
+	snap_add(6, extra);
+	netmon_again(&ns, NETMON_CH_V6);
+	drain(&ns);
+	assert(netstate_conn(&ns, 6) == NET_CONN_UP);
+	n = netstate_rows(&ns, 6, rows, NETSTATE_ROWS_MAX);
+	assert(n == 2);
+	for (i = 0, direct = 0; i < n; i++)
+		if (rows[i].via == NET_VIA_DIRECT)
+			direct++;
+	assert(direct == 1);
+
+	snap_drop(6, dfl6);
+	netmon_again(&ns, NETMON_CH_V6);
+	drain(&ns);
+	assert(netstate_conn(&ns, 6) != NET_CONN_UP);
+	n = netstate_rows(&ns, 6, rows, NETSTATE_ROWS_MAX);
+	assert(n == 1 && rows[0].via != NET_VIA_DIRECT);
+}
+
 /* B10/B5: a confirmed anchor survives a move and stays proven: the node did
  * not move, we did. Only the family's reachability drops, until it answers
  * here too. */
@@ -1824,6 +1862,7 @@ int main(void)
 	 * Windows too, where the socket library comes up before anything else. */
 	assert(!wsock_init());
 	v6_change_leaves_v4_alone();
+	a_gained_address_is_not_a_move();
 	a_confirmed_anchor_survives_a_move();
 	stale_roundtrip_never_marks_up();
 	src_survives_the_roam_window();
