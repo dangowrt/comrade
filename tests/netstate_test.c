@@ -198,12 +198,21 @@ static void a_gained_address_is_not_a_move(void)
 			direct++;
 	assert(direct == 1);
 
+	/* The retired one goes and the other remains: losing an address says
+	 * nothing about the address that is left, so its proof stands. */
 	snap_drop(6, dfl6);
 	netmon_again(&ns, NETMON_CH_V6);
 	drain(&ns);
-	assert(netstate_conn(&ns, 6) != NET_CONN_UP);
+	assert(netstate_conn(&ns, 6) == NET_CONN_UP);
 	n = netstate_rows(&ns, 6, rows, NETSTATE_ROWS_MAX);
-	assert(n == 1 && rows[0].via != NET_VIA_DIRECT);
+	assert(n == 1 && !memcmp(rows[0].addr, extra, 16));
+
+	/* The last one goes: the family has nothing, and nothing is proven. */
+	snap_drop(6, extra);
+	netmon_again(&ns, NETMON_CH_V6);
+	drain(&ns);
+	assert(netstate_conn(&ns, 6) != NET_CONN_UP);
+	assert(!netstate_rows(&ns, 6, rows, NETSTATE_ROWS_MAX));
 }
 
 /* B10/B5: a confirmed anchor survives a move and stays proven: the node did

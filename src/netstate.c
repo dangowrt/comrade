@@ -196,20 +196,26 @@ void netstate_on_netmon(struct netstate *ns, unsigned changed,
 			const struct netmon_addr *addrs, size_t naddrs,
 			uint64_t now)
 {
-	int i, chg, was_up, grew;
+	int i, chg, was_up, same, had;
 
 	for (i = 0; i < 2; i++) {
 		struct netstate_fam *f = &ns->f[i];
 		unsigned bit = i ? NETMON_CH_V6 : NETMON_CH_V4;
 
-		grew = f->nlocals > 0;
+		had = f->nlocals > 0;
 		chg = local_sync(f, i ? AF_INET6 : AF_INET, addrs, naddrs);
 		if (chg)
 			raise_act(ns, i, NSA_EMIT_ROWS);
-		/* Gained on a network we already had an address on: that one
-		 * is still the network, so what was proven on it still holds
-		 * and only the source a new socket is given may have moved. */
-		grew = grew && chg == LOCAL_GAINED;
+		/* One direction, with an address either side of it: the kernel
+		 * gained or retired one on the network we are already on, so
+		 * what was proven there still holds and only the source a new
+		 * socket is given may have moved. */
+		if (chg == LOCAL_GAINED)
+			same = had;
+		else if (chg == LOCAL_LOST)
+			same = f->nlocals > 0;
+		else
+			same = 0;
 		was_up = f->up_epoch == f->epoch;
 		if (f->has_addr != !!f->nlocals) {
 			f->has_addr = !!f->nlocals;
@@ -225,7 +231,7 @@ void netstate_on_netmon(struct netstate *ns, unsigned changed,
 		 * move" has to stay distinguishable from "not up yet". */
 		f->src_tries = 0;
 		f->src_next_ms = now;
-		if (!grew)
+		if (!same)
 			f->routed = 0;
 
 		/* A move bears on our reachability, not on the node: both
@@ -253,7 +259,7 @@ void netstate_on_netmon(struct netstate *ns, unsigned changed,
 
 		/* A proof is about the network it was made on; the addresses
 		 * are the kernel's and are not ours to forget. */
-		if (!grew) {
+		if (!same) {
 			proofs_demote(f);
 			f->nxlats = 0;
 		} else if (was_up) {
