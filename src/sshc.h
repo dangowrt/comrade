@@ -77,6 +77,11 @@ struct sshc_opts {
 	void (*status)(void *arg, struct conn_status *out);
 	void *status_arg;
 
+	/* The view's one-row rendering of its own state, for the reserved row.
+	 * NULL leaves the row unreserved. */
+	void (*render_status)(void *arg, int rows, int cols);
+	void *render_arg;
+
 	/* Raised by the session layer when the host's end verdict (CTLM_BYE or
 	 * CTLM_DETACHED) arrives; interactive mode waits on it after its shell
 	 * channel closes so the caller can tell an ended session from a detach. */

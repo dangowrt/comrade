@@ -66,6 +66,7 @@ struct peerrow {
 	int rtt_ms;			/* -1 unmeasured, 0 under a millisecond */
 	int read_only;
 	int nproven;			/* distinct paths ever proven to it */
+	uint64_t lost_ms;		/* when the link went; 0 while it holds */
 	char addr[80];
 	char ident[16];			/* stable label once the link is lost */
 };
@@ -124,6 +125,14 @@ struct ui {
 	int view;			/* enum ui_view */
 	char notice[96];		/* transient footer note (copy feedback) */
 	uint64_t notice_until;
+
+	/* This end's own grade, which no event carries: a guest is told it by
+	 * the token it joined with, and a host operator is never view-only. */
+	int self_read_only;
+
+	/* The status row is drawn by the terminal bridge's own thread while the
+	 * session thread is still folding events in; these cover what it reads. */
+	pthread_mutex_t lock;
 
 	/* A record split across reads, held until the rest of it arrives. */
 	char rx[1024];
@@ -989,6 +998,10 @@ static void um_peer_link(struct ui *u, int id, int state, int rtt_ms,
 		if (u->peer[i].link == state && u->peer[i].rtt_ms == rtt_ms &&
 		    u->peer[i].nproven == nproven)
 			return;
+		if (state == CONN_LOST && u->peer[i].link != CONN_LOST)
+			u->peer[i].lost_ms = now_ms();
+		else if (state != CONN_LOST)
+			u->peer[i].lost_ms = 0;
 		u->peer[i].link = state;
 		u->peer[i].rtt_ms = rtt_ms;
 		u->peer[i].nproven = nproven;
@@ -1241,7 +1254,16 @@ static void cb_mapping4(void *a, int d) { um_mapping4(a, d); }
 static void cb_net_conn(void *a, int f, int st) { um_net_conn(a, f, st); }
 static void cb_link(void *a, const char *n, int h4, int h6) { um_link(a, n, h4, h6); }
 static void cb_link_reset(void *a) { um_link_reset(a); }
-static void cb_rdv(void *a, int f, const char *ad, int rd) { um_rdv(a, f, rd, ad); }
+/* The status row is rendered by another thread, so everything it reads is
+ * mutated under the view's lock. */
+static void cb_rdv(void *a, int f, const char *ad, int rd)
+{
+	struct ui *u = a;
+
+	pthread_mutex_lock(&u->lock);
+	um_rdv(u, f, rd, ad);
+	pthread_mutex_unlock(&u->lock);
+}
 static void cb_rdv_stage(void *a, int f, int st) { um_rdv_stage(a, f, st); }
 static void cb_mailbox(void *a, const struct session_mailbox *m)
 {
@@ -1249,14 +1271,46 @@ static void cb_mailbox(void *a, const struct session_mailbox *m)
 }
 static void cb_peer_link(void *a, int id, int st, int rtt, int np)
 {
-	um_peer_link(a, id, st, rtt, np);
+	struct ui *u = a;
+
+	pthread_mutex_lock(&u->lock);
+	um_peer_link(u, id, st, rtt, np);
+	pthread_mutex_unlock(&u->lock);
 }
 static void cb_token(void *a, const char *t) { um_token(a, t); }
 static void cb_token_ro(void *a, const char *t) { um_token_ro(a, t); }
-static void cb_peer(void *a, int id, int s, const char *ad) { um_peer(a, id, s, ad); }
-static void cb_peer_ro(void *a, int id) { um_peer_ro(a, id); }
-static void cb_peer_ident(void *a, int id, const char *s) { um_peer_ident(a, id, s); }
-static void cb_reset(void *a) { um_reset(a); }
+static void cb_peer(void *a, int id, int s, const char *ad)
+{
+	struct ui *u = a;
+
+	pthread_mutex_lock(&u->lock);
+	um_peer(u, id, s, ad);
+	pthread_mutex_unlock(&u->lock);
+}
+static void cb_peer_ro(void *a, int id)
+{
+	struct ui *u = a;
+
+	pthread_mutex_lock(&u->lock);
+	um_peer_ro(u, id);
+	pthread_mutex_unlock(&u->lock);
+}
+static void cb_peer_ident(void *a, int id, const char *s)
+{
+	struct ui *u = a;
+
+	pthread_mutex_lock(&u->lock);
+	um_peer_ident(u, id, s);
+	pthread_mutex_unlock(&u->lock);
+}
+static void cb_reset(void *a)
+{
+	struct ui *u = a;
+
+	pthread_mutex_lock(&u->lock);
+	um_reset(u);
+	pthread_mutex_unlock(&u->lock);
+}
 static void cb_net_reset(void *a, int f) { um_net_reset(a, f); }
 static void cb_esc(void *a, const char *w) { um_escalate(a, w); }
 static void cb_esc_clear(void *a) { um_escalate_clear(a); }
@@ -1645,6 +1699,120 @@ static void feed(struct ui *u, char *ln)
 	}
 }
 
+/* Above this smoothed RTT the row goes amber to flag a sluggish link. */
+#define RTT_WARN_MS 250
+
+/* ws_col is an unsigned short; bound the paint width independently of it. */
+#define BAR_MAX_COLS 1024
+
+static const char *state_word(int s)
+{
+	switch (s) {
+	case CONN_GATHERING:
+		return "gathering";
+	case CONN_PUNCHING:
+		return "punching";
+	case CONN_LIVE:
+		return "live";
+	case CONN_LOST:
+		return "link lost";
+	default:
+		return "connecting";
+	}
+}
+
+static const char *state_sgr(int state, int rtt_ms)
+{
+	if (state == CONN_LOST)
+		return "\033[41;97m";
+	if (state == CONN_LIVE)
+		return rtt_ms > RTT_WARN_MS ? "\033[43;30m" : "\033[42;30m";
+	return "\033[44;97m";
+}
+
+/* The one link a single row can speak for: the one carrying the session. */
+static const struct peerrow *bar_peer(const struct ui *u)
+{
+	int i;
+
+	for (i = 0; i < u->npeer; i++)
+		if (u->peer[i].link == CONN_LIVE)
+			return &u->peer[i];
+	return u->npeer ? &u->peer[0] : NULL;
+}
+
+void ui_render_status(struct ui *u, int rows, int cols)
+{
+	char text[384], bar[BAR_MAX_COLS + 1], out[BAR_MAX_COLS + 64];
+	int state, since, w, n, len, rtt;
+	const struct peerrow *p;
+
+	if (rows < 1 || cols < 1)
+		return;
+	pthread_mutex_lock(&u->lock);
+	p = bar_peer(u);
+	state = p ? p->link : CONN_CONNECTING;
+	since = 0;
+	if (p && state == CONN_LOST && p->lost_ms)
+		since = (int)((now_ms() - p->lost_ms) / 1000);
+
+	len = snprintf(text, sizeof(text), "comrade%s  %s",
+		       u->self_read_only ? " [view-only]" : "",
+		       state_word(state));
+	if (len > 0 && len < (int)sizeof(text) && since > 0)
+		len += snprintf(text + len, sizeof(text) - len, " %ds", since);
+	if (len > 0 && len < (int)sizeof(text) && p && p->addr[0]) {
+		len += snprintf(text + len, sizeof(text) - len, "  peer %s",
+				p->addr);
+		if (len > 0 && len < (int)sizeof(text) && p->nproven > 1)
+			len += snprintf(text + len, sizeof(text) - len,
+					" (+%d)", p->nproven - 1);
+	}
+	if (len > 0 && len < (int)sizeof(text) && u->rdv[0].addr[0])
+		len += snprintf(text + len, sizeof(text) - len, "  rdv4 %s",
+				u->rdv[0].addr);
+	if (len > 0 && len < (int)sizeof(text) && u->rdv[1].addr[0])
+		len += snprintf(text + len, sizeof(text) - len, "  rdv6 %s",
+				u->rdv[1].addr);
+	/* Whole milliseconds, so a link answering in under one says so. */
+	if (len > 0 && len < (int)sizeof(text) && state == CONN_LIVE && p &&
+	    p->rtt_ms > 0)
+		len += snprintf(text + len, sizeof(text) - len, "  rtt %dms",
+				p->rtt_ms);
+	else if (len > 0 && len < (int)sizeof(text) && state == CONN_LIVE &&
+		 p && p->rtt_ms == 0)
+		len += snprintf(text + len, sizeof(text) - len, "  rtt <1ms");
+	if (len > 0 && len < (int)sizeof(text) && state == CONN_LOST)
+		len += snprintf(text + len, sizeof(text) - len,
+				"  [ESC or ^C to quit]");
+	rtt = p ? p->rtt_ms : 0;
+	pthread_mutex_unlock(&u->lock);
+
+	w = cols;
+	if (w > (int)sizeof(bar) - 1)
+		w = (int)sizeof(bar) - 1;
+	snprintf(bar, sizeof(bar), "%-*.*s", w, w, text);
+	n = snprintf(out, sizeof(out), "\0337\033[%d;1H%s%s\033[0m\0338",
+		     rows, state_sgr(state, rtt), bar);
+	if (n > 0 && tty_write(out, (size_t)n)) {
+		/* best effort */
+	}
+}
+
+void ui_set_read_only(struct ui *u, int read_only)
+{
+	if (u)
+		u->self_read_only = read_only;
+}
+
+int ui_dirty_take(struct ui *u)
+{
+	int was = u->dirty;
+
+	u->dirty = 0;
+	return was;
+}
+
 int ui_pump(struct ui *u, sock_t fd)
 {
 	char *nl;
@@ -1868,6 +2036,10 @@ struct ui *ui_create(int role, int mode)
 
 	if (!u)
 		return NULL;
+	if (pthread_mutex_init(&u->lock, NULL)) {
+		free(u);
+		return NULL;
+	}
 	u->role = role;
 	u->stage4 = u->stage6 = -1;
 	u->anim = (mode != UI_VERBOSE) && tty_isatty_out();
@@ -1895,5 +2067,6 @@ void ui_destroy(struct ui *u)
 		show_cursor(u);
 		fflush(stdout);
 	}
+	pthread_mutex_destroy(&u->lock);
 	free(u);
 }

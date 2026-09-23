@@ -99,6 +99,11 @@ static void on_rejoin_state(void *arg, int family, int state,
 		r->str[0] = '\0';	/* keep the one we came in on */
 }
 
+static void render_status_cb(void *arg, int rows, int cols)
+{
+	ui_render_status(arg, rows, cols);
+}
+
 static int session_connect(const char *arg, int ui_mode, int no_mcast,
 			   int no_dht, const struct fwdspec *fwd_l, int nfwd_l,
 			   const struct fwdspec *fwd_r, int nfwd_r,
@@ -178,6 +183,9 @@ static int session_connect(const char *arg, int ui_mode, int no_mcast,
 	if (u) {
 		ui_bind(u, &obs);
 		cfg.obs = &obs;
+		cfg.render_status = render_status_cb;
+		cfg.render_arg = u;
+		ui_set_read_only(u, (cfg.tok.flags & TOKEN_FLAG_RO) != 0);
 	}
 	rj.tok = cfg.tok;
 	rj.str[0] = '\0';

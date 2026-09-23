@@ -1052,6 +1052,33 @@ static void fmt_rdv_fam(struct sess *s, int family, char *out, size_t n)
 		snprintf(out, n, "%s:%u", ip, t->ep4_port);
 }
 
+/* The session's own link, which no turnstile reports for it. Told only when
+ * something moved, so the status cadence does not repaint on every pass. */
+static void report_conn_obs(struct conn *c, struct sess *s,
+			    const struct conn_status *cs)
+{
+	const struct session_obs *o = s->cfg->obs;
+	int rtt;
+
+	if (!o)
+		return;
+	rtt = cs->rtt_known ? cs->rtt_ms : -1;
+	if (o->peer_link &&
+	    (!c->link_told_any || c->link_told != cs->state ||
+	     c->rtt_told != rtt || c->paths_told != cs->nproven)) {
+		c->link_told = cs->state;
+		c->rtt_told = rtt;
+		c->paths_told = cs->nproven;
+		c->link_told_any = 1;
+		o->peer_link(o->arg, c->pr.id, cs->state, rtt, cs->nproven);
+	}
+	if (o->peer && s->peer_state == SESSION_PEER_LIVE &&
+	    strcmp(cs->peer, c->status_peer)) {
+		snprintf(c->status_peer, sizeof(c->status_peer), "%s", cs->peer);
+		o->peer(o->arg, c->pr.id, SESSION_PEER_LIVE, c->status_peer);
+	}
+}
+
 /*
  * Fill the structured connection status (no display text -- the view renders
  * it) and stash it: in memory for the client's in-process renderer, and, for
@@ -1102,6 +1129,11 @@ static void publish_status(struct conn *c, int state)
 
 	if (s->cfg->status_path)
 		conn_write(s->cfg->status_path, &cs);
+
+	/* Only this session's own connection: a host's served workers are the
+	 * turnstile's to report, and it holds their told-state. */
+	if (c == &s->c)
+		report_conn_obs(c, s, &cs);
 }
 
 /* sshc status callback: hand the client's renderer the current status data. */
@@ -2488,6 +2520,8 @@ static void *ssh_cli_thread(void *p)
 	o.tx_room_arg = c;
 	o.status = session_status;
 	o.status_arg = c;
+	o.render_status = s->cfg->render_status;
+	o.render_arg = s->cfg->render_arg;
 	o.end_verdict = &c->end_verdict;
 	o.send = s->cfg->test_send;
 	o.send_len = s->cfg->test_send_len;

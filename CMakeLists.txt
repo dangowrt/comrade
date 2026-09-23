@@ -520,10 +520,6 @@ add_library(comrade_netstate STATIC src/netstate.c)
 target_include_directories(comrade_netstate PUBLIC src)
 target_link_libraries(comrade_netstate PUBLIC comrade_compat)
 
-add_library(comrade_statusbar STATIC src/statusbar.c)
-target_include_directories(comrade_statusbar PUBLIC src)
-target_link_libraries(comrade_statusbar PUBLIC comrade_conn comrade_compat)
-
 # STUN server pool. The default set is baked in at configure time from the
 # always-online-stun submodule (its RFC 5780-capable list, which also serves
 # for plain reflexive gathering); `comrade stun-update` refreshes it into the
@@ -770,7 +766,7 @@ target_include_directories(comrade_ssh PUBLIC src)
 # The message-based libssh server API is deprecated in favour of the
 # callback API but is clearer and fully functional; migrate later.
 target_compile_options(comrade_ssh PRIVATE -Wno-deprecated-declarations)
-target_link_libraries(comrade_ssh PUBLIC comrade_token comrade_statusbar comrade_dbg comrade_termfilter comrade_fwdspec comrade_compat comrade_cpty PkgConfig::LIBSSH Threads::Threads)
+target_link_libraries(comrade_ssh PUBLIC comrade_token comrade_dbg comrade_termfilter comrade_fwdspec comrade_compat comrade_cpty PkgConfig::LIBSSH Threads::Threads)
 find_library(COMRADE_UTIL util)
 if(COMRADE_UTIL)
 	target_link_libraries(comrade_ssh PUBLIC ${COMRADE_UTIL})
@@ -830,7 +826,7 @@ if(WIN32)
 	# host_win.c serialises the ephemeral host key to the detached
 	# service over their socketpair, so it talks to libssh directly.
 	target_link_libraries(comrade_host PUBLIC comrade_cpty
-		comrade_statusbar comrade_conn PkgConfig::LIBSSH)
+		comrade_conn PkgConfig::LIBSSH)
 endif()
 
 # --- build identity (comrade --version) --------------------------------------
@@ -923,7 +919,6 @@ target_link_libraries(comrade
 	comrade_ui
 	comrade_token
 	comrade_stunlist
-	comrade_statusbar
 	comrade_fwdspec
 	comrade_sandbox
 )

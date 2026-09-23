@@ -15,7 +15,6 @@
 #include "oscompat.h"
 #include "sshc.h"
 #include "sshfwd.h"
-#include "statusbar.h"
 #include "termfilter.h"
 #include "tty.h"
 
@@ -477,7 +476,7 @@ static int run_interactive(ssh_session s, ssh_channel chan,
 	 * is room: the remote tmux was asked for a pty one row shorter, so it never
 	 * touches this row. */
 	memset(&prev, 0, sizeof(prev));
-	if (have_tty && o && o->status) {
+	if (have_tty && o && o->render_status) {
 		int r, c;
 
 		if (!tty_size(&r, &c) && r > 1) {
@@ -558,7 +557,7 @@ static int run_interactive(ssh_session s, ssh_channel chan,
 				reconnect = 1;
 			if (reserve && (memcmp(&cur, &prev, sizeof(cur)) ||
 			    now - last_status > 2000)) {
-				statusbar_render(rows, cols, &cur);
+				o->render_status(o->render_arg, rows, cols);
 				prev = cur;
 				last_status = now;
 			}

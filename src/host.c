@@ -55,7 +55,6 @@
 #include "sig.h"
 #include "spawner.h"
 #include "sshd.h"
-#include "statusbar.h"
 #include "termfilter.h"
 #include "token.h"
 #include "ui.h"
@@ -731,27 +730,32 @@ static int ev_ready(int fd)
 
 /*
  * Attach the operator to the shared tmux, reserving the bottom terminal row for
- * comrade's own status line -- run tmux in a pty one row shorter and paint the
- * status (read from the service's tmpfs file) on the freed row ourselves, so it
- * stays live even while the link is down. The view (statusbar) does the drawing;
- * we only bridge bytes and reserve the row. Falls back to a plain exec when
- * there is no usable tty.
+ * comrade's own status line -- run tmux in a pty one row shorter and leave the
+ * freed row to the view, so it stays live even while the link is down. The view
+ * does the drawing from the state it has been tracking all along; we only bridge
+ * bytes and reserve the row. Falls back to a plain exec when there is no usable
+ * tty.
  */
 static int attach(struct ui *u, const char *id, int keep)
 {
-	char sock[512], statuspath[512];
-	char *argv[] = { "tmux", "-S", sock, "attach", "-t", "comrade", NULL };
-	struct termios orig, raw;
-	struct sigaction sa, oldwinch;
-	struct winsize ws, cws;
 	int rows, cols, master, alive = 1;
-	pid_t child;
+	struct sigaction sa, oldwinch;
+	struct termios orig, raw;
 	uint64_t last_paint = 0;
-	struct conn_status cur, prev;
+	struct winsize ws, cws;
 	struct termfilter tf;
+	char sock[512];
+	char *argv[7];
+	pid_t child;
 
+	argv[0] = "tmux";
+	argv[1] = "-S";
+	argv[2] = sock;
+	argv[3] = "attach";
+	argv[4] = "-t";
+	argv[5] = "comrade";
+	argv[6] = NULL;
 	sock_path(sock, sizeof(sock), id);
-	status_path(statuspath, sizeof(statuspath), id);
 
 	if (!isatty(STDIN_FILENO) || ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) ||
 	    ws.ws_row < 2 || tcgetattr(STDIN_FILENO, &orig))
@@ -779,7 +783,6 @@ static int attach(struct ui *u, const char *id, int keep)
 	memset(&sa, 0, sizeof(sa));
 	sa.sa_handler = on_winch;
 	sigaction(SIGWINCH, &sa, &oldwinch);
-	memset(&prev, 0, sizeof(prev));
 
 	while (alive) {
 		struct pollfd fds[2];
@@ -807,7 +810,7 @@ static int attach(struct ui *u, const char *id, int keep)
 				scroll_guard(rows, 1, 1);
 				dbg_logf("host resize: rows=%d cols=%d -> tmux "
 					 "%d rows", rows, cols, rows - 1);
-				memset(&prev, 0, sizeof(prev));
+				ui_render_status(u, rows, cols);
 			}
 		}
 		if (fds[0].revents & POLLIN) {
@@ -839,11 +842,8 @@ static int attach(struct ui *u, const char *id, int keep)
 				keep = -1;
 
 		now = mono_ms();
-		memset(&cur, 0, sizeof(cur));
-		conn_read(statuspath, &cur);	/* zeroed = "connecting" if absent */
-		if (memcmp(&cur, &prev, sizeof(cur)) || now - last_paint > 2000) {
-			statusbar_render(rows, cols, &cur);
-			prev = cur;
+		if (ui_dirty_take(u) || now - last_paint > 2000) {
+			ui_render_status(u, rows, cols);
 			last_paint = now;
 		}
 	}
