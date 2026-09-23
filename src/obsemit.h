@@ -23,7 +23,8 @@
 struct obsemit {
 	const struct session_obs *o;	/* may be NULL: then nothing is said */
 	struct netstate *ns;
-	/* The last mailbox reported, so an unchanged one is not repeated. */
+	/* The last mailbox reported, so an identical one is not repeated. Its
+	 * ages advance every second, so that is the floor on how often it is. */
 	struct session_mailbox told;
 	int told_any;
 };
@@ -47,7 +48,8 @@ void obsemit_conn(struct obsemit *e, int family, int conn);
  */
 void obsemit_links(struct obsemit *e, const struct sig_mcast_if *ifs, int n);
 
-/* The mailbox, if anything about it has changed since it was last said. */
+/* The mailbox, whenever it differs from the one last said. The ages below are
+ * part of that, so an otherwise idle session still says it once a second. */
 void obsemit_mailbox(struct obsemit *e, const struct sig_mailbox *sm,
 		     uint64_t now);
 
