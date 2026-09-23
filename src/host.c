@@ -115,7 +115,6 @@ struct svc {
 	char last_tok[TOKEN_STR_LEN + 1];	/* the token last written out */
 	char sock[512];
 	char tokfile[512];
-	char statusfile[512];
 	char svcfile[512];		/* this service's pid, while it runs */
 	int no_fwd;			/* decline all client port forwarding */
 	int forward_only;		/* serve no shell/tmux, forwarding only */
@@ -216,13 +215,6 @@ static void sock_path(char *out, size_t n, const char *id)
 static void tok_path(char *out, size_t n, const char *id)
 {
 	snprintf(out, n, "%s/%s.tok", state_dir(), id);
-}
-
-/* The connection-status line file (tmpfs), written by the service, read by the
- * operator's foreground to paint the local status row. */
-static void status_path(char *out, size_t n, const char *id)
-{
-	snprintf(out, n, "%s/%s.status", state_dir(), id);
 }
 
 /* The machine view's state document and the headless service's pidfile. */
@@ -589,8 +581,6 @@ static void sweep_one(const char *id, void *arg)
 	sock_path(p, sizeof(p), id);
 	unlink(p);
 	tok_path(p, sizeof(p), id);
-	unlink(p);
-	status_path(p, sizeof(p), id);
 	unlink(p);
 	json_path(p, sizeof(p), id);
 	unlink(p);
@@ -1060,7 +1050,6 @@ static void svc_serve(struct svc *v, void *hostkey, int no_mcast, int no_dht)
 		cfg.ssh_command_ro = cmd_ro;
 		cfg.use_pty = 1;
 	}
-	cfg.status_path = v->statusfile;
 	cfg.on_token_state = on_token_state;
 	cfg.arg = v;
 	cfg.obs = &v->obs;
@@ -1101,7 +1090,6 @@ static void svc_serve(struct svc *v, void *hostkey, int no_mcast, int no_dht)
 		waitpid(end_pid, NULL, 0);
 	}
 	unlink(v->tokfile);
-	unlink(v->statusfile);
 	if (v->svcfile[0])
 		unlink(v->svcfile);
 }
@@ -1279,7 +1267,6 @@ static int start_new(int ui_mode, int no_mcast, int no_dht, int no_fwd)
 	}
 	sock_path(v.sock, sizeof(v.sock), id);
 	tok_path(v.tokfile, sizeof(v.tokfile), id);
-	status_path(v.statusfile, sizeof(v.statusfile), id);
 	svc_path(v.svcfile, sizeof(v.svcfile), id);
 
 	v.tok.version = TOKEN_VERSION;
@@ -1601,7 +1588,6 @@ int host_headless(const char *id_opt, int no_mcast, int no_dht, int no_fwd,
 	}
 	sock_path(v.sock, sizeof(v.sock), id);
 	tok_path(v.tokfile, sizeof(v.tokfile), id);
-	status_path(v.statusfile, sizeof(v.statusfile), id);
 	json_path(jsonp, sizeof(jsonp), id);
 	pid_path(pidp, sizeof(pidp), id);
 

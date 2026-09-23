@@ -1079,11 +1079,8 @@ static void report_conn_obs(struct conn *c, struct sess *s,
 	}
 }
 
-/*
- * Fill the structured connection status (no display text -- the view renders
- * it) and stash it: in memory for the client's in-process renderer, and, for
- * the host, in a tmpfs file the operator's separate process reads.
- */
+/* Fill the structured connection status (no display text -- the view renders
+ * it) and stash it for the decisions that read it back. */
 static void publish_status(struct conn *c, int state)
 {
 	struct ctlplane_live live;
@@ -1126,9 +1123,6 @@ static void publish_status(struct conn *c, int state)
 	pthread_mutex_lock(&c->status_lock);
 	c->status = cs;
 	pthread_mutex_unlock(&c->status_lock);
-
-	if (s->cfg->status_path)
-		conn_write(s->cfg->status_path, &cs);
 
 	/* Only this session's own connection: a host's served workers are the
 	 * turnstile's to report, and it holds their told-state. */

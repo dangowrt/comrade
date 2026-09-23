@@ -68,13 +68,6 @@ struct session_cfg {
 	 */
 	sock_t ssh_end_fd;
 	/*
-	 * Where to write the one-line connection status (host only): the operator
-	 * runs in a separate process from this service, so it reads the line from
-	 * this file. Put it on tmpfs (the runtime dir) -- it is rewritten often.
-	 * NULL for the client, which reads its status in-process.
-	 */
-	const char *status_path;
-	/*
 	 * Called when a family's token state is first determined and whenever
 	 * it changes: the host writes `state` (TOKEN_STATE_*) into that
 	 * family's slot and re-emits the token. `addr` is the family's address

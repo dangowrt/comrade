@@ -74,7 +74,6 @@ struct svc {
 	char last_tok[TOKEN_STR_LEN + 1];	/* the token last written out */
 	char sock[512];
 	char tokfile[512];
-	char statusfile[512];
 	int no_fwd;
 	int no_mcast;
 	int no_dht;
@@ -111,11 +110,6 @@ static void sock_path(char *out, size_t n, const char *id)
 static void tok_path(char *out, size_t n, const char *id)
 {
 	snprintf(out, n, "%s\\%s.tok", state_dir(), id);
-}
-
-static void status_path(char *out, size_t n, const char *id)
-{
-	snprintf(out, n, "%s\\%s.status", state_dir(), id);
 }
 
 static int gen_id(char *out)
@@ -281,8 +275,6 @@ static void sweep_one(const char *id, void *arg)
 		return;				/* a live session: leave it */
 	DeleteFileA(sock);
 	tok_path(other, sizeof(other), id);
-	DeleteFileA(other);
-	status_path(other, sizeof(other), id);
 	DeleteFileA(other);
 }
 
@@ -588,7 +580,6 @@ static void run_service(struct svc *v, void *hostkey, sock_t wfd)
 	cfg.use_pty = 1;
 	cfg.ssh_end_fd = sock_isset(end_fd) ? end_fd : 0;
 	cfg.no_fwd = v->no_fwd;
-	cfg.status_path = v->statusfile;
 	cfg.on_token_state = on_token_state;
 	cfg.arg = v;
 	cfg.obs = &v->obs;
@@ -602,7 +593,6 @@ static void run_service(struct svc *v, void *hostkey, sock_t wfd)
 	if (sock_isset(end_fd))
 		sock_close(end_fd);
 	DeleteFileA(v->tokfile);
-	DeleteFileA(v->statusfile);
 	exit(0);
 }
 
@@ -659,9 +649,9 @@ static int send_state(sock_t s, const struct svc *v, void *hostkey)
 	blob = malloc(cap);
 	if (!blob)
 		goto out;
-	n = snprintf(blob, cap, "%s\nsock %s\ntok %s\nstatus %s\n"
+	n = snprintf(blob, cap, "%s\nsock %s\ntok %s\n"
 		     "nofwd %d\nnomcast %d\nnodht %d\ntoken ", SVC_MAGIC,
-		     v->sock, v->tokfile, v->statusfile, v->no_fwd,
+		     v->sock, v->tokfile, v->no_fwd,
 		     v->no_mcast, v->no_dht);
 	if (n < 0 || (size_t)n >= cap)
 		goto out;
@@ -725,9 +715,6 @@ static void *recv_state(sock_t s, struct svc *v)
 			snprintf(v->sock, sizeof(v->sock), "%s", line + 5);
 		else if (!strncmp(line, "tok ", 4))
 			snprintf(v->tokfile, sizeof(v->tokfile), "%s", line + 4);
-		else if (!strncmp(line, "status ", 7))
-			snprintf(v->statusfile, sizeof(v->statusfile), "%s",
-				 line + 7);
 		else if (!strncmp(line, "nofwd ", 6))
 			v->no_fwd = atoi(line + 6);
 		else if (!strncmp(line, "nomcast ", 8))
@@ -913,7 +900,6 @@ static int start_new(int ui_mode, int no_mcast, int no_dht, int no_fwd)
 	}
 	sock_path(v.sock, sizeof(v.sock), id);
 	tok_path(v.tokfile, sizeof(v.tokfile), id);
-	status_path(v.statusfile, sizeof(v.statusfile), id);
 
 	v.tok.version = TOKEN_VERSION;
 	hostkey = sshd_hostkey_new(v.tok.hostpub);

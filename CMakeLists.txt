@@ -474,9 +474,8 @@ add_library(comrade_ctlproto STATIC src/ctlproto.c)
 target_include_directories(comrade_ctlproto PUBLIC src)
 target_link_libraries(comrade_ctlproto PUBLIC comrade_compat)
 
-add_library(comrade_conn STATIC src/conn.c)
-target_include_directories(comrade_conn PUBLIC src)
-target_link_libraries(comrade_conn PUBLIC comrade_compat)
+add_library(comrade_conn INTERFACE)
+target_include_directories(comrade_conn INTERFACE src)
 
 # -L/-R forwarding-spec parsing (no dependencies; the engine lives with ssh).
 add_library(comrade_fwdspec STATIC src/fwdspec.c)
