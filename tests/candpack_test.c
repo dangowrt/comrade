@@ -35,10 +35,10 @@ static void for_dht_check(void)
 	char out[2048];
 	int n, r;
 
-	n = candpack_encode(sdp, 1, 0, NULL, buf, sizeof(buf));
+	n = candpack_encode(sdp, 1, 0, NULL, NULL, buf, sizeof(buf));
 	assert(n > 0);
 
-	r = candpack_decode(buf, (size_t)n, NULL, NULL, 0, out, sizeof(out));
+	r = candpack_decode(buf, (size_t)n, NULL, NULL, 0, NULL, out, sizeof(out));
 	assert(r > 0);
 
 	/* ufrag/pwd preserved (libjuice rejects a description lacking them). */
@@ -68,9 +68,9 @@ static void full_set_check(void)
 
 	/* Permissive keeps every on-link address, including private v4 and the
 	 * link-local v6 that same-segment peers use. All five survive. */
-	n = candpack_encode(sdp, 0, 0, NULL, buf, sizeof(buf));
+	n = candpack_encode(sdp, 0, 0, NULL, NULL, buf, sizeof(buf));
 	assert(n > 0);
-	r = candpack_decode(buf, (size_t)n, NULL, NULL, 0, out, sizeof(out));
+	r = candpack_decode(buf, (size_t)n, NULL, NULL, 0, NULL, out, sizeof(out));
 	assert(r > 0);
 	assert(strstr(out, "192.168.0.2"));
 	assert(strstr(out, "10.1.2.3"));
@@ -85,7 +85,7 @@ static void no_creds_check(void)
 
 	/* Nothing packable without credentials. */
 	n = candpack_encode("a=candidate:1 1 UDP 100 203.0.113.5 9 typ host\n", 1,
-			    0, NULL, buf, sizeof(buf));
+			    0, NULL, NULL, buf, sizeof(buf));
 	assert(n == 0);
 }
 
@@ -97,14 +97,14 @@ static void gen_check(void)
 	uint32_t g = 0;
 	int n, r;
 
-	n = candpack_encode(sdp, 1, 0xdeadbeef, NULL, buf, sizeof(buf));
+	n = candpack_encode(sdp, 1, 0xdeadbeef, NULL, NULL, buf, sizeof(buf));
 	assert(n > 0);
-	r = candpack_decode(buf, (size_t)n, &g, NULL, 0, out, sizeof(out));
+	r = candpack_decode(buf, (size_t)n, &g, NULL, 0, NULL, out, sizeof(out));
 	assert(r > 0);
 	assert(g == 0xdeadbeef);
-	n = candpack_encode(sdp, 1, 0, NULL, buf, sizeof(buf));
+	n = candpack_encode(sdp, 1, 0, NULL, NULL, buf, sizeof(buf));
 	assert(n > 0);
-	r = candpack_decode(buf, (size_t)n, &g, NULL, 0, out, sizeof(out));
+	r = candpack_decode(buf, (size_t)n, &g, NULL, 0, NULL, out, sizeof(out));
 	assert(r > 0 && g == 0);
 }
 
@@ -116,10 +116,10 @@ static void offer_check(void)
 	uint8_t buf[512];
 	int n, r;
 
-	n = candpack_encode(sdp, 1, 0, "9f3c2a1b", buf, sizeof(buf));
+	n = candpack_encode(sdp, 1, 0, "9f3c2a1b", NULL, buf, sizeof(buf));
 	assert(n > 0);
 	co[0] = 'x';
-	r = candpack_decode(buf, (size_t)n, NULL, co, sizeof(co), out,
+	r = candpack_decode(buf, (size_t)n, NULL, co, sizeof(co), NULL, out,
 			    sizeof(out));
 	assert(r > 0);
 	assert(!strcmp(co, "9f3c2a1b"));
@@ -127,13 +127,66 @@ static void offer_check(void)
 	assert(strstr(out, "a=ice-ufrag:abcdef01\n"));
 	assert(count_cands(out) == 4);
 
-	n = candpack_encode(sdp, 1, 0, NULL, buf, sizeof(buf));
+	n = candpack_encode(sdp, 1, 0, NULL, NULL, buf, sizeof(buf));
 	assert(n > 0);
 	co[0] = 'x';
-	r = candpack_decode(buf, (size_t)n, NULL, co, sizeof(co), out,
+	r = candpack_decode(buf, (size_t)n, NULL, co, sizeof(co), NULL, out,
 			    sizeof(out));
 	assert(r > 0);
 	assert(co[0] == '\0');
+}
+
+/* The claimant's instance id rides the packed slot and comes back whole; a
+ * packing that names none decodes to zeroes. */
+static void cid_check(void)
+{
+	static const uint8_t zero[CANDPACK_CID_LEN] = { 0 };
+	uint8_t buf[512], got[CANDPACK_CID_LEN];
+	uint8_t want[CANDPACK_CID_LEN];
+	char out[2048];
+	int n, r;
+
+	memset(want, 0xa5, sizeof(want));
+	n = candpack_encode(sdp, 1, 0, NULL, want, buf, sizeof(buf));
+	assert(n > 0);
+	r = candpack_decode(buf, (size_t)n, NULL, NULL, 0, got, out,
+			    sizeof(out));
+	assert(r > 0);
+	assert(!memcmp(got, want, sizeof(want)));
+	/* the candidates and creds are unaffected by the named instance */
+	assert(strstr(out, "a=ice-ufrag:abcdef01\n"));
+	assert(count_cands(out) == 4);
+
+	n = candpack_encode(sdp, 1, 0, NULL, NULL, buf, sizeof(buf));
+	assert(n > 0);
+	memset(got, 0xff, sizeof(got));
+	r = candpack_decode(buf, (size_t)n, NULL, NULL, 0, got, out,
+			    sizeof(out));
+	assert(r > 0);
+	assert(!memcmp(got, zero, sizeof(zero)));
+}
+
+/* A version-3 buffer predates the instance id and still decodes, naming none. */
+static void v3_compat_check(void)
+{
+	static const uint8_t v3[] = {
+		3, 0, 0, 0, 0,
+		0,
+		4, 'a', 'b', 'c', 'd',
+		4, '1', '2', '3', '4',
+		0
+	};
+	static const uint8_t zero[CANDPACK_CID_LEN] = { 0 };
+	uint8_t got[CANDPACK_CID_LEN];
+	char out[2048];
+	int r;
+
+	memset(got, 0xff, sizeof(got));
+	r = candpack_decode(v3, sizeof(v3), NULL, NULL, 0, got, out,
+			    sizeof(out));
+	assert(r > 0);
+	assert(!memcmp(got, zero, sizeof(zero)));
+	assert(strstr(out, "a=ice-ufrag:abcd\n"));
 }
 
 /* A version-2 buffer predates the offer-ufrag field and still decodes. */
@@ -150,7 +203,7 @@ static void v2_compat_check(void)
 	int r;
 
 	co[0] = 'x';
-	r = candpack_decode(v2, sizeof(v2), &g, co, sizeof(co), out,
+	r = candpack_decode(v2, sizeof(v2), &g, co, sizeof(co), NULL, out,
 			    sizeof(out));
 	assert(r > 0);
 	assert(g == 0);
@@ -166,6 +219,8 @@ int main(void)
 	no_creds_check();
 	gen_check();
 	offer_check();
+	cid_check();
+	v3_compat_check();
 	v2_compat_check();
 	printf("candpack_test: all checks passed\n");
 	return 0;

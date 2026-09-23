@@ -7,7 +7,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define TOKEN_VERSION		2
+/* The whole protocol's version, bumped for any wire change (PROTOCOL.md 3). */
+#define TOKEN_VERSION		3
 
 #define TOKEN_RDV_LEN		16
 #define TOKEN_AUTH_LEN		16

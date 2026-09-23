@@ -210,7 +210,7 @@ Fixed **90-byte** payload (`TOKEN_RAW_LEN`), packed in order:
 
 | field | bytes | meaning |
 |-------|-------|---------|
-| version | 1 | `TOKEN_VERSION = 2` |
+| version | 1 | `TOKEN_VERSION = 3` |
 | flags | 1 | see below |
 | rdv `R` | 16 | rendezvous secret (KDF input, §2) |
 | auth `A` | 16 | session auth secret (SSH password, §10) |
@@ -298,10 +298,21 @@ match, and `version == TOKEN_VERSION` (`token.c:token_decode`). A decoder
 cleanly on an older build instead of being misparsed as this one, and must
 report it apart from the rest: every other reason a decode fails is a typo,
 while this one is an intact string whose other end derives different keys
-from it. Version 1 differs from this one only below the token, in how §2
-draws the wire tags and the multicast port, so without that check the two
-meet in the same mailbox, exchange offers, and then never complete a punch --
-which is the failure this is worth a version number to avoid.
+from it.
+
+`TOKEN_VERSION` numbers the **whole protocol**, not this table. It is the
+only field either end reads before it derives a key or sends a packet, and
+the only one carried by something a human hands over, so it is the one place
+an incompatible peer can be refused with a word to the user rather than a
+silence. Every incompatible change anywhere on the wire bumps it, whether or
+not the 90 bytes above move: a `CANDPACK_VERSION` bump (§7), a different
+seal, a new key schedule, a changed framing. Two peers that disagree below
+the token still read the same 90 bytes, so without the bump they meet in the
+same mailbox, exchange offers and then never complete a punch. That is what
+happened between versions 2 and 3, which differ only in §7, and it is the
+failure a protocol-wide version number exists to turn into one clear line at
+the point the token is pasted. Wire compatibility is deliberately unstable
+across 0.x, so the bump costs nothing and is never worth skipping.
 
 ---
 
@@ -542,16 +553,28 @@ Policy defaults (`cand_policy_default`): keep private v4; **drop** ULA
 separately in `session.c:addr_scope`, which also treats `fe80::/10`,
 `fec0::/10` site-local and `fc00::/7` as LAN.)
 
-candpack binary layout (`candpack.c`, `CANDPACK_VERSION = 2`):
+candpack binary layout (`candpack.c`, `CANDPACK_VERSION = 4`):
 
 ```
-  version(1)=2 | gen(4,BE) | ufrag_len(1) | ufrag | pwd_len(1) | pwd | ncand(1)
+  version(1)=4 | gen(4,BE) | offer_len(1) | offer_ufrag | cid_len(1) | cid
+              | ufrag_len(1) | ufrag | pwd_len(1) | pwd | ncand(1)
   ncand *   [ type(1) | family(1) | prio(4,BE) | port(2,BE) | addr(4 or 16) ]
 ```
 
 `gen` is the offerer's network generation (`session.c: netgen`, 0 where none),
 which bumps on every move; a client tells a moved offer, whose candidates are
 new, from one that only rotated credentials, and re-claims at once on a move.
+
+`offer_ufrag` (v3) names the peer offer a claim answers; an offer names none and
+packs `offer_len = 0`. `cid` (v4) is the claimant's instance id, 8 bytes minted
+once per comrade process, or `cid_len = 0` naming none. ICE credentials cannot
+say that two claims came from one client, because a reconnect is an ICE restart
+and carries fresh ones; the instance id is what a host tells a reconnecting
+client by, and it rides inside the box (§8), so only the host reads it and a
+room of guests cannot correlate each other. Decoding accepts versions 2 through
+4, taking the fields a older packing lacks as absent. A `CANDPACK_VERSION`
+bump that older peers cannot decode also bumps `TOKEN_VERSION` (§3), which is
+where a mismatch is caught and named.
 
 `type`: `0 host, 1 srflx, 2 prflx, 3 relay`. `family`: `4` or `6`. Only
 `component 1`, `UDP` candidates are packed. Decode rebuilds

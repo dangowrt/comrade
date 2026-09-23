@@ -25,18 +25,26 @@
  * the public DHT. Without for_dht every gathered address is packed.
  */
 
+/* The claimant's instance id, minted once per comrade process: a reconnect is
+ * an ICE restart and carries fresh credentials, so they cannot say that two
+ * claims came from one client. */
+#define CANDPACK_CID_LEN 8
+
 /* Pack an SDP description into out (up to max), stamping it with gen, the
- * offerer's network generation (0 where none), and offer_ufrag, the ufrag of
- * the peer offer a claim answers (NULL or "" on an offer, which names none).
- * Returns bytes written, -1 on error, 0 if nothing packable (no ufrag/pwd). */
+ * offerer's network generation (0 where none), offer_ufrag, the ufrag of the
+ * peer offer a claim answers (NULL or "" on an offer, which names none), and
+ * cid, CANDPACK_CID_LEN bytes or NULL to name no instance. Returns bytes
+ * written, -1 on error, 0 if nothing packable (no ufrag/pwd). */
 int candpack_encode(const char *sdp, int for_dht, uint32_t gen,
-		    const char *offer_ufrag, uint8_t *out, size_t max);
+		    const char *offer_ufrag, const uint8_t *cid,
+		    uint8_t *out, size_t max);
 
 /* Rebuild an SDP description from packed bytes into out (NUL-terminated, up to
- * max); *gen, if given, takes the stamped generation, and offer_ufrag, if
- * given, the named offer ufrag ("" when the packing named none). Returns the
- * string length, or -1 on error. */
+ * max); *gen takes the stamped generation, offer_ufrag the named offer ufrag
+ * ("" when none), cid the instance id (zeroed when none), each if given.
+ * Returns the string length, or -1 on error. */
 int candpack_decode(const uint8_t *in, size_t in_len, uint32_t *gen,
-		    char *offer_ufrag, size_t offer_max, char *out, size_t max);
+		    char *offer_ufrag, size_t offer_max, uint8_t *cid,
+		    char *out, size_t max);
 
 #endif
