@@ -8,13 +8,12 @@
  * Structured connection status -- plain data the controller (session.c) fills
  * in and the view renders. No display text or terminal I/O here;
  * that keeps the model/controller side free of view concerns (see the MVC
- * split). The host's service and its operator run in separate processes, so the
- * struct is also serialised to a small tmpfs file for the operator to read.
+ * split).
  */
 
 /*
- * Appended to, never reordered: the struct below is serialised to a file that
- * an operator process reads, and a zeroed one has to keep meaning "connecting".
+ * Appended to, never reordered: the scale below crosses the service/foreground
+ * event stream, and a zeroed one has to keep meaning "connecting".
  */
 enum conn_state {
 	CONN_CONNECTING,
@@ -63,9 +62,5 @@ struct conn_status {
 	 * counts it. */
 	int nproven;
 };
-
-/* Serialise/parse to a tmpfs file. Return 0 on success, -1 on failure. */
-int conn_write(const char *path, const struct conn_status *st);
-int conn_read(const char *path, struct conn_status *st);
 
 #endif
