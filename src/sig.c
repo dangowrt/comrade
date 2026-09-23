@@ -504,7 +504,7 @@ int sig_post(struct sig *s, const uint8_t *data, size_t len)
 	sdp[len] = '\0';
 	sdp_ufrag_of(sdp, s->my_ufrag, sizeof(s->my_ufrag));
 	plen = candpack_encode(sdp, 1, s->my_gen,
-			       s->is_host ? NULL : s->claim_offer, packed,
+			       s->is_host ? NULL : s->claim_offer, NULL, packed,
 			       sizeof(packed));
 	if (plen <= 0)
 		return -1;
@@ -1075,7 +1075,7 @@ static void deliver_peer(struct sig *s, const uint8_t *sealed, size_t len)
 	slen = candpack_decode(packed, (size_t)n, &s->peer_gen,
 			       s->is_host ? s->peer_claim_offer : NULL,
 			       s->is_host ? sizeof(s->peer_claim_offer) : 0,
-			       sdp, sizeof(sdp));
+			       NULL, sdp, sizeof(sdp));
 	if (slen < 0)
 		return;
 	if (!s->is_host)
@@ -1328,8 +1328,8 @@ static void deliver_peer_mcast(struct sig *s, const uint8_t *sealed, size_t len,
 			NULL, 0);
 	if (n < 0)
 		return;
-	slen = candpack_decode(packed, (size_t)n, &s->peer_gen, NULL, 0, sdp,
-			       sizeof(sdp));
+	slen = candpack_decode(packed, (size_t)n, &s->peer_gen, NULL, 0, NULL,
+			       sdp, sizeof(sdp));
 	if (slen >= 0 && s->cb && !(s->is_host && s->mcast_claims))
 		s->cb(s->arg, (const uint8_t *)sdp, (size_t)slen);
 

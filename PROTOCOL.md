@@ -542,16 +542,26 @@ Policy defaults (`cand_policy_default`): keep private v4; **drop** ULA
 separately in `session.c:addr_scope`, which also treats `fe80::/10`,
 `fec0::/10` site-local and `fc00::/7` as LAN.)
 
-candpack binary layout (`candpack.c`, `CANDPACK_VERSION = 2`):
+candpack binary layout (`candpack.c`, `CANDPACK_VERSION = 4`):
 
 ```
-  version(1)=2 | gen(4,BE) | ufrag_len(1) | ufrag | pwd_len(1) | pwd | ncand(1)
+  version(1)=4 | gen(4,BE) | offer_len(1) | offer_ufrag | cid_len(1) | cid
+              | ufrag_len(1) | ufrag | pwd_len(1) | pwd | ncand(1)
   ncand *   [ type(1) | family(1) | prio(4,BE) | port(2,BE) | addr(4 or 16) ]
 ```
 
 `gen` is the offerer's network generation (`session.c: netgen`, 0 where none),
 which bumps on every move; a client tells a moved offer, whose candidates are
 new, from one that only rotated credentials, and re-claims at once on a move.
+
+`offer_ufrag` (v3) names the peer offer a claim answers; an offer names none and
+packs `offer_len = 0`. `cid` (v4) is the claimant's instance id, 8 bytes minted
+once per comrade process, or `cid_len = 0` naming none. ICE credentials cannot
+say that two claims came from one client, because a reconnect is an ICE restart
+and carries fresh ones; the instance id is what a host tells a reconnecting
+client by, and it rides inside the box (§8), so only the host reads it and a
+room of guests cannot correlate each other. Decoding accepts versions 2 through
+4, taking the fields a older packing lacks as absent.
 
 `type`: `0 host, 1 srflx, 2 prflx, 3 relay`. `family`: `4` or `6`. Only
 `component 1`, `UDP` candidates are packed. Decode rebuilds
