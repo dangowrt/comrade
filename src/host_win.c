@@ -377,7 +377,19 @@ static int run_tmux_plain(const char *sock)
  * except that the pty is a ConPTY, SIGWINCH is a polled size comparison, and
  * the console is bridged to a socket so one poll covers both directions.
  */
-static int attach(const char *id)
+/* Is there a service event waiting, without blocking for one. */
+static int ev_ready(sock_t fd)
+{
+	struct pollfd p;
+
+	p.fd = fd;
+	p.events = POLLIN;
+	p.revents = 0;
+	return sock_poll(&p, 1, 0) > 0 &&
+	       (p.revents & (POLLIN | POLLHUP | POLLERR)) != 0;
+}
+
+static int attach(struct ui *u, const char *id, sock_t ev)
 {
 	char sock[512], statuspath[512], cmd[600];
 	struct cpty *child;
@@ -460,6 +472,12 @@ static int attach(const char *id)
 		}
 		if (cpty_exited(child) && !(fds[0].revents & POLLIN))
 			alive = 0;
+
+		/* The view tracks state for the whole session, so the service's
+		 * channel is read here too; retired at EOF. */
+		while (sock_valid(ev) && ev_ready(ev))
+			if (ui_pump(u, ev))
+				ev = INVALID_SOCK;
 
 		now = os_mono_ms();
 		memset(&cur, 0, sizeof(cur));
@@ -983,7 +1001,7 @@ static int start_new(int ui_mode, int no_mcast, int no_dht, int no_fwd)
 		if (enter != 1)
 			break;
 		entered = 1;
-		rc = attach(id);
+		rc = attach(ui, id, sv[0]);
 		if (rc != 2)
 			break;
 	}
