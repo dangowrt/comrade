@@ -89,6 +89,11 @@ struct session_cfg {
 	/* Progress observer (the view); NULL for a headless run. */
 	const struct session_obs *obs;
 
+	/* The view's one-row rendering, for the terminal bridge's reserved row;
+	 * NULL leaves it unreserved. */
+	void (*render_status)(void *arg, int rows, int cols);
+	void *render_arg;
+
 	/* Client only. */
 	int interactive;		/* bridge the local terminal */
 	/* -L/-R TCP port forwarding specs (OpenSSH semantics), served over

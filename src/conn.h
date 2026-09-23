@@ -6,7 +6,7 @@
 
 /*
  * Structured connection status -- plain data the controller (session.c) fills
- * in and the view (statusbar.c) renders. No display text or terminal I/O here;
+ * in and the view renders. No display text or terminal I/O here;
  * that keeps the model/controller side free of view concerns (see the MVC
  * split). The host's service and its operator run in separate processes, so the
  * struct is also serialised to a small tmpfs file for the operator to read.

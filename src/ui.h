@@ -43,6 +43,17 @@ void ui_emitter_token(const struct session_obs *obs, const char *token_str);
 void ui_emitter_token_ro(const struct session_obs *obs, const char *token_str);
 
 /*
+ * ui_render_status: the same state the dashboard draws, on one reserved row,
+ * for use while the shared terminal owns the screen. ui_set_read_only records
+ * this end's own grade, which no event carries.
+ */
+void ui_render_status(struct ui *u, int rows, int cols);
+void ui_set_read_only(struct ui *u, int read_only);
+
+/* Whether the state moved since this was last asked, clearing the mark. */
+int ui_dirty_take(struct ui *u);
+
+/*
  * ui_pump: fold whatever the service has sent into the view's state, without
  * rendering. Returns -1 once the channel is closed, 0 otherwise. Call it from
  * whichever loop is running: the view tracks state for the whole session, so

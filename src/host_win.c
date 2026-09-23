@@ -23,7 +23,6 @@
 #include "session.h"
 #include "sig.h"
 #include "sshd.h"
-#include "statusbar.h"
 #include "termfilter.h"
 #include "tmuxpath.h"
 #include "token.h"
@@ -391,17 +390,15 @@ static int ev_ready(sock_t fd)
 
 static int attach(struct ui *u, const char *id, sock_t ev)
 {
-	char sock[512], statuspath[512], cmd[600];
-	struct cpty *child;
+	int rows = 0, cols = 0, alive = 1;
+	char sock[512], cmd[600];
+	uint64_t last_paint = 0;
 	struct tty_saved saved;
 	struct termfilter tf;
-	struct conn_status cur, prev;
-	uint64_t last_paint = 0;
+	struct cpty *child;
 	sock_t kbd, out;
-	int rows = 0, cols = 0, alive = 1;
 
 	sock_path(sock, sizeof(sock), id);
-	status_path(statuspath, sizeof(statuspath), id);
 	attach_cmd(cmd, sizeof(cmd), sock);
 
 	if (!tty_isatty_in() || !tty_isatty_out() || tty_size(&rows, &cols) ||
@@ -427,7 +424,6 @@ static int attach(struct ui *u, const char *id, sock_t ev)
 	scroll_guard(rows, 1, 1);
 	termfilter_init(&tf, 1);	/* keep tmux one row shorter than the tty */
 	tty_resize_watch(1);
-	memset(&prev, 0, sizeof(prev));
 
 	while (alive) {
 		struct pollfd fds[2];
@@ -451,7 +447,7 @@ static int attach(struct ui *u, const char *id, sock_t ev)
 			scroll_guard(rows, 1, 1);
 			dbg_logf("host resize: rows=%d cols=%d -> tmux %d rows",
 				 rows, cols, rows - 1);
-			memset(&prev, 0, sizeof(prev));
+			ui_render_status(u, rows, cols);
 		}
 		if (nfds > 1 && (fds[1].revents & (POLLIN | POLLHUP | POLLERR))) {
 			n = (int)sock_read(kbd, buf, sizeof(buf));
@@ -480,11 +476,8 @@ static int attach(struct ui *u, const char *id, sock_t ev)
 				ev = INVALID_SOCK;
 
 		now = os_mono_ms();
-		memset(&cur, 0, sizeof(cur));
-		conn_read(statuspath, &cur);	/* zeroed = "connecting" if absent */
-		if (memcmp(&cur, &prev, sizeof(cur)) || now - last_paint > 2000) {
-			statusbar_render(rows, cols, &cur);
-			prev = cur;
+		if (ui_dirty_take(u) || now - last_paint > 2000) {
+			ui_render_status(u, rows, cols);
 			last_paint = now;
 		}
 	}
