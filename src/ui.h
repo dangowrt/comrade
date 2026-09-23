@@ -43,6 +43,14 @@ void ui_emitter_token(const struct session_obs *obs, const char *token_str);
 void ui_emitter_token_ro(const struct session_obs *obs, const char *token_str);
 
 /*
+ * ui_pump: fold whatever the service has sent into the view's state, without
+ * rendering. Returns -1 once the channel is closed, 0 otherwise. Call it from
+ * whichever loop is running: the view tracks state for the whole session, so
+ * the channel must be read even while nothing is being drawn.
+ */
+int ui_pump(struct ui *u, sock_t fd);
+
+/*
  * ui_host_wait: foreground side. Render events read from fd until the operator
  * acts. Returns 1 to enter (ENTER/SPACE, which plays the zap), -1 to abort
  * (ESC / Ctrl-C / SIGTERM -- the caller tears the service down), or 0 if the

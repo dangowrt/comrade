@@ -125,6 +125,10 @@ struct ui {
 	char notice[96];		/* transient footer note (copy feedback) */
 	uint64_t notice_until;
 
+	/* A record split across reads, held until the rest of it arrives. */
+	char rx[1024];
+	int rxlen;
+
 	struct tty_saved saved;
 	int raw;
 };
@@ -1641,6 +1645,32 @@ static void feed(struct ui *u, char *ln)
 	}
 }
 
+int ui_pump(struct ui *u, sock_t fd)
+{
+	char *nl;
+	int got;
+
+	/* A full buffer with no newline is malformed: emitters cap records well
+	 * below it. Leaving it would size the next read at zero, which reads
+	 * back as EOF and retires a live service. */
+	if (u->rxlen == (int)sizeof(u->rx) - 1)
+		u->rxlen = 0;
+	got = (int)sock_read(fd, u->rx + u->rxlen,
+			     sizeof(u->rx) - 1 - u->rxlen);
+	if (got <= 0)
+		return -1;
+
+	u->rxlen += got;
+	u->rx[u->rxlen] = '\0';
+	while ((nl = memchr(u->rx, '\n', u->rxlen)) != NULL) {
+		*nl = '\0';
+		feed(u, u->rx);
+		u->rxlen -= (int)(nl + 1 - u->rx);
+		memmove(u->rx, nl + 1, u->rxlen + 1);
+	}
+	return 0;
+}
+
 static void raw_on(struct ui *u)
 {
 	/* Not full raw: the host dashboard keeps signal generation so Ctrl-C
@@ -1673,8 +1703,7 @@ static void raw_off(struct ui *u)
 
 int ui_host_wait(struct ui *u, sock_t fd)
 {
-	char buf[1024];
-	int len = 0, result = 0, eof = 0, stdin_ok = 1;
+	int result = 0, eof = 0, stdin_ok = 1;
 	void (*oint)(int);
 #ifdef SIGTERM
 	void (*oterm)(int);
@@ -1723,33 +1752,8 @@ int ui_host_wait(struct ui *u, sock_t fd)
 		}
 		/* POLLHUP without POLLIN signals the service closed the pipe. */
 		if (fds[0].revents & (POLLIN | POLLHUP | POLLERR)) {
-			int got;
-
-			/*
-			 * Emitters cap their records well below this buffer, so a
-			 * full one with no newline in it is malformed. Drop it:
-			 * leaving it would size the next read at zero bytes, which
-			 * reads back as EOF and retires a live service.
-			 */
-			if (len == (int)sizeof(buf) - 1)
-				len = 0;
-			got = (int)sock_read(fd, buf + len,
-					     sizeof(buf) - 1 - len);
-
-			if (got <= 0)
+			if (ui_pump(u, fd))
 				eof = 1;
-			else {
-				char *nl;
-
-				len += got;
-				buf[len] = '\0';
-				while ((nl = memchr(buf, '\n', len)) != NULL) {
-					*nl = '\0';
-					feed(u, buf);
-					len -= (int)(nl + 1 - buf);
-					memmove(buf, nl + 1, len + 1);
-				}
-			}
 		}
 		if (fds[1].revents & (POLLIN | POLLHUP | POLLERR)) {
 			char buf[16];
