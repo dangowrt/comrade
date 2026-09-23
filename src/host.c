@@ -717,6 +717,18 @@ static void scroll_guard(int rows, int reserve, int on)
 	}
 }
 
+/* Is there a service event waiting, without blocking for one. */
+static int ev_ready(int fd)
+{
+	struct pollfd p;
+
+	p.fd = fd;
+	p.events = POLLIN;
+	p.revents = 0;
+	return poll(&p, 1, 0) > 0 &&
+	       (p.revents & (POLLIN | POLLHUP | POLLERR)) != 0;
+}
+
 /*
  * Attach the operator to the shared tmux, reserving the bottom terminal row for
  * comrade's own status line -- run tmux in a pty one row shorter and paint the
@@ -725,7 +737,7 @@ static void scroll_guard(int rows, int reserve, int on)
  * we only bridge bytes and reserve the row. Falls back to a plain exec when
  * there is no usable tty.
  */
-static int attach(const char *id, int keep)
+static int attach(struct ui *u, const char *id, int keep)
 {
 	char sock[512], statuspath[512];
 	char *argv[] = { "tmux", "-S", sock, "attach", "-t", "comrade", NULL };
@@ -820,6 +832,12 @@ static int attach(const char *id, int keep)
 				alive = 0;	/* tmux exited */
 			}
 		}
+		/* The view tracks state for the whole session, so the service's
+		 * channel is read here too; -1 retires it at EOF. */
+		while (keep >= 0 && ev_ready(keep))
+			if (ui_pump(u, keep))
+				keep = -1;
+
 		now = mono_ms();
 		memset(&cur, 0, sizeof(cur));
 		conn_read(statuspath, &cur);	/* zeroed = "connecting" if absent */
@@ -1316,7 +1334,7 @@ static int start_new(int ui_mode, int no_mcast, int no_dht, int no_fwd)
 		if (enter != 1)
 			break;
 		entered = 1;
-		rc = attach(id, pfd[0]);
+		rc = attach(ui, id, pfd[0]);
 		if (rc != 2)
 			break;
 	}
