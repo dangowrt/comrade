@@ -3653,6 +3653,10 @@ static int sb_run_probe(const struct sb_probe *pr, int no_pty)
 	if (pid < 0)
 		return SB_PROBE_FAIL;
 	if (pid == 0) {
+		/* A refused probe dies by SIGSYS on purpose. RLIMIT_CORE does
+		 * not cover it where core_pattern pipes to a handler, which is
+		 * the usual systemd case, so refuse the dump itself. */
+		(void)no_dumpable();
 		prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
 #if defined(SYS_seccomp) && defined(SB_AUDIT_ARCH)
 		sb_mode_prepare(SANDBOX_CLIENT);
