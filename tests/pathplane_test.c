@@ -427,7 +427,7 @@ static void the_carry_is_read_off_the_ranking(void)
 	end_init(&b, 2, "abcd");
 	assert(pathplane_pick(&a.pl, &a.k, 1000, &pick) == -1);
 	assert(pick.kind == -1);		/* nothing to carry on */
-	assert(!pathplane_proven(&a.pl));
+	assert(!pathplane_proven(&a.pl, 1000));
 	assert(!pathplane_carry_rtt(&a.pl, &rtt));
 
 	assert(!pathplane_add_ep(&a.pl, &a.k, PATH_SEGMENT, &b.here, NULL, 0,
@@ -436,7 +436,7 @@ static void the_carry_is_read_off_the_ranking(void)
 	assert(pick.kind == PATH_SEGMENT);
 	assert(pick.moved);			/* it began carrying here */
 	assert(!pick.qualified);		/* but nothing has answered */
-	assert(!pathplane_proven(&a.pl));
+	assert(!pathplane_proven(&a.pl, 1000));
 	assert(!pathplane_carry_rtt(&a.pl, &rtt));
 
 	pathplane_tick(&a.pl, &a.k, 1000);
@@ -445,9 +445,12 @@ static void the_carry_is_read_off_the_ranking(void)
 	assert(!pathplane_pick(&a.pl, &a.k, 1020, &pick));
 	assert(pick.qualified);
 	assert(!pick.moved);			/* the same path still */
-	assert(pathplane_proven(&a.pl) == 1);
+	assert(pathplane_proven(&a.pl, 1020) == 1);
 	assert(pathplane_carry_rtt(&a.pl, &rtt));
 	assert(rtt >= 0);
+	/* Silent past PATH_DEAD_MS: the latch stands, but a segment the peer
+	 * has left is no longer one it is proven on. */
+	assert(!pathplane_proven(&a.pl, 1020 + PATH_DEAD_MS + 1));
 	end_done(&a);
 	end_done(&b);
 }

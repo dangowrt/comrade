@@ -277,11 +277,11 @@ int pathplane_any_qualified(struct pathplane *pl);
 int pathplane_carry_rtt(struct pathplane *pl, int *out);
 
 /*
- * How many distinct paths a probe has ever qualified. Qualification latches
- * and never clears on silence, so this counts the endpoints this peer was
- * actually proven on, and stays stable as they later fall dead.
+ * How many distinct paths hold a qualification now. The latch itself never
+ * clears on silence, so a path that has fallen dead is left out here: the
+ * segments a roaming peer has left would otherwise be counted for ever.
  */
-int pathplane_proven(struct pathplane *pl);
+int pathplane_proven(struct pathplane *pl, uint64_t now);
 
 /* What a caller needs of the path carrying right now, copied out under the
  * lock so nothing reaches into the table without it. */
