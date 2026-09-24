@@ -115,6 +115,8 @@ struct sig {
 	 */
 	int end_placed_direct;
 	int end_placed_wide;
+	int end_store_inflight;		/* a tombstone store is out; a second
+					 * would lose its own compare-and-swap */
 	uint64_t tomb_seen_ms;		/* when a tombstone was first seen with
 					 * nothing since to contradict it, 0 none */
 	uint64_t offer_seen_ms;		/* and when the host's offer last was */
@@ -1430,6 +1432,7 @@ static void on_tomb_direct(void *arg, int stored, const struct sockaddr *node,
 	(void)node_len;
 	dbg_logf("sig: tombstone stored on the rendezvous node -> %d node(s)",
 		 stored);
+	s->end_store_inflight = 0;
 	if (stored > 0)
 		s->end_placed_direct = 1;
 }
@@ -1443,6 +1446,7 @@ static void on_tomb_wide(void *arg, int stored, const struct sockaddr *node,
 	(void)node_len;
 	dbg_logf("sig: tombstone stored where the key belongs -> %d node(s)",
 		 stored);
+	s->end_store_inflight = 0;
 	if (stored > 0)
 		s->end_placed_wide = 1;
 }
@@ -1583,13 +1587,20 @@ static void dht_pump(struct sig *s, uint64_t now)
 		 * waits out its whole grace for a store that will never be
 		 * acknowledged.
 		 */
-		if (!s->end_placed_direct && (s->rnode4_len || s->rnode6_len)) {
+		if (s->end_store_inflight) {
+			/* Nothing until the one out there answers: the cadence
+			 * is what serialises them, and two of the same route
+			 * collide exactly as the two routes would. */
+		} else if (!s->end_placed_direct &&
+			   (s->rnode4_len || s->rnode6_len)) {
 			sig_note_put(s);
+			s->end_store_inflight = 1;
 			bep44_update_direct(s->engine, s->keys.bep44_sk,
 					    s->keys.bep44_pk, SIG_SALT,
 					    sig_merge, s, on_tomb_direct, s);
 		} else if ((routes & SIG_ROUTE_WIDE) && !s->end_placed_wide) {
 			sig_note_put(s);
+			s->end_store_inflight = 1;
 			bep44_update(s->engine, s->keys.bep44_sk,
 				     s->keys.bep44_pk, SIG_SALT, sig_merge, s,
 				     on_tomb_wide, s);
