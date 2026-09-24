@@ -650,13 +650,14 @@ int pathplane_carry_rtt(struct pathplane *pl, int *out)
 	return known;
 }
 
-int pathplane_proven(struct pathplane *pl)
+int pathplane_proven(struct pathplane *pl, uint64_t now)
 {
 	int i, n = 0;
 
 	pthread_mutex_lock(&pl->lock);
 	for (i = 0; i < PATH_TABLE_MAX; i++)
-		if (pl->t.p[i].used && pl->t.p[i].qualified)
+		if (pl->t.p[i].used && pl->t.p[i].qualified &&
+		    path_warmth_of(&pl->t.p[i], now) != PATH_DEAD)
 			n++;
 	pthread_mutex_unlock(&pl->lock);
 

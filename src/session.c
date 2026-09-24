@@ -1002,7 +1002,7 @@ static int conn_rtt_ms(struct conn *c, int *out)
  * connection was actually proven on, stable as they later fall dead. */
 static int conn_proven_paths(struct conn *c)
 {
-	return pathplane_proven(&c->pr.pl);
+	return pathplane_proven(&c->pr.pl, now_ms());
 }
 
 /* An endpoint the peer advertised over CTLM_CAND, entered as one more
