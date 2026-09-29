@@ -781,10 +781,12 @@ target_link_libraries(comrade_session PUBLIC
 	comrade_claimlog comrade_hbeat comrade_replay comrade_dataauth
 	comrade_probeplane comrade_pathplane comrade_ctlplane comrade_obsemit
 	comrade_peering)
-# session.c reads and writes two 64-bit stamps with the __atomic builtins. A
-# target whose widest lock-free atomic is 4 bytes (32-bit MIPS, ARMv5) lowers
-# those to calls into libatomic, so the probe links one and the library is
-# added where the probe fails.
+# ctlplane.c and session.c read and write 64-bit stamps with the __atomic
+# builtins. A target whose widest lock-free atomic is 4 bytes (32-bit MIPS,
+# ARMv5) lowers those to calls into libatomic, so the probe links one and the
+# library is added where the probe fails. It goes on the compat layer, which
+# every other target links, so a test binary that names neither module still
+# resolves them.
 check_c_source_compiles("
 #include <stdint.h>
 int main(void) { uint64_t v = 0; __atomic_store_n(&v, 1, __ATOMIC_RELAXED);
@@ -796,7 +798,7 @@ if(NOT COMRADE_ATOMIC64_LOCK_FREE)
 		message(FATAL_ERROR
 			"64-bit atomics need libatomic on this target and none was found")
 	endif()
-	target_link_libraries(comrade_session PUBLIC ${COMRADE_LIBATOMIC})
+	target_link_libraries(comrade_compat PUBLIC ${COMRADE_LIBATOMIC})
 endif()
 
 # The view: the only module that draws to the terminal (MVC).
