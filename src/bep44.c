@@ -33,6 +33,7 @@ static int debug_on(void)
 #include "bencode.h"
 #include "bep44.h"
 #include "ccrypto.h"
+#include "dbg.h"
 #include "keys.h"
 #include "sha1.h"
 
@@ -1031,6 +1032,32 @@ static void op_retain_nodes(struct bep44_engine *e, struct b44_op *op)
 	}
 }
 
+/* One line per completed operation, to apportion a rendezvous round trip
+ * between the lookup and the store. */
+static void op_log_timing(const struct b44_op *op)
+{
+	int i, replied = 0, stored_n = 0;
+
+	for (i = 0; i < op->nnodes; i++) {
+		if (op->nodes[i].state == B44_NODE_REPLIED ||
+		    op->nodes[i].state == B44_NODE_STORED ||
+		    op->nodes[i].state == B44_NODE_STORE_INFLIGHT)
+			replied++;
+		if (op->nodes[i].state == B44_NODE_STORED)
+			stored_n++;
+	}
+	dbg_logf("mb: %s%s%s salt=%s took %ums phase=%s nodes=%d replied=%d "
+		 "stored=%d best_seq=%lld",
+		 op->is_update ? "update" : op->is_put ? "put" : "get",
+		 op->direct ? " direct" : " wide",
+		 op->store_deferred ? " (store deferred)" : "",
+		 op->salt[0] ? op->salt : "-",
+		 (unsigned)(now_ms() - op->start_ms),
+		 op->phase == B44_PHASE_STORE ? "store" : "lookup",
+		 op->nnodes, replied, stored_n,
+		 op->have_best ? (long long)op->best_seq : -1LL);
+}
+
 static void op_finish(struct b44_op *op)
 {
 	struct sockaddr_storage best_node[2];
@@ -1102,6 +1129,9 @@ static void op_finish(struct b44_op *op)
 			break;
 		}
 	}
+
+	if (dbg_mailbox_on())
+		op_log_timing(op);
 
 	memcpy(best_node, op->best_node, sizeof(best_node));
 	memcpy(best_node_len, op->best_node_len, sizeof(best_node_len));

@@ -642,7 +642,8 @@ target_link_libraries(comrade_mailbox PUBLIC comrade_crypto)
 # DHT library.
 add_library(comrade_bep44 STATIC src/bep44.c)
 target_include_directories(comrade_bep44 PUBLIC src)
-target_link_libraries(comrade_bep44 PUBLIC comrade_crypto comrade_compat)
+target_link_libraries(comrade_bep44 PUBLIC comrade_crypto comrade_compat
+	comrade_dbg)
 
 # The check above guarantees one of the two jech/dht routes is present: a
 # source checkout compiled straight in, or an installed libdht to link.
@@ -1158,7 +1159,8 @@ if(BUILD_TESTING)
 	# Includes bep44.c to reach the static per-source rate bucket, so it
 	# links the crypto pieces directly rather than the comrade_bep44 archive.
 	add_executable(bep44_rl_test tests/bep44_rl_test.c)
-	target_link_libraries(bep44_rl_test comrade_crypto comrade_compat)
+	target_link_libraries(bep44_rl_test comrade_crypto comrade_compat
+		comrade_dbg)
 	target_include_directories(bep44_rl_test PRIVATE src)
 	add_test(NAME bep44_rl_test COMMAND bep44_rl_test)
 
