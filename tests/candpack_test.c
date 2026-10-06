@@ -212,6 +212,46 @@ static void v2_compat_check(void)
 	assert(strstr(out, "a=ice-pwd:1234\n"));
 }
 
+static void version_reject_check(void)
+{
+	uint8_t blob[64], cur;
+	char out[2048];
+	uint32_t g = 7;
+	int r, n;
+
+	n = candpack_encode("a=ice-ufrag:abcd\na=ice-pwd:1234\n", 0, 3, NULL,
+			    NULL, blob, sizeof(blob));
+	assert(n > 0);
+	cur = blob[0];
+	r = candpack_decode(blob, (size_t)n, &g, NULL, 0, NULL, out,
+			    sizeof(out));
+	assert(r > 0);
+
+	blob[0] = (uint8_t)(cur + 1);
+	r = candpack_decode(blob, (size_t)n, &g, NULL, 0, NULL, out,
+			    sizeof(out));
+	assert(r == CANDPACK_ERR_VERSION);
+	blob[0] = 0xff;
+	r = candpack_decode(blob, (size_t)n, &g, NULL, 0, NULL, out,
+			    sizeof(out));
+	assert(r == CANDPACK_ERR_VERSION);
+	blob[0] = 1;
+	r = candpack_decode(blob, (size_t)n, &g, NULL, 0, NULL, out,
+			    sizeof(out));
+	assert(r == CANDPACK_ERR_VERSION);
+	blob[0] = 0;
+	r = candpack_decode(blob, (size_t)n, &g, NULL, 0, NULL, out,
+			    sizeof(out));
+	assert(r == CANDPACK_ERR_VERSION);
+
+	/* A truncated packing of a version we speak stays a plain error. */
+	blob[0] = cur;
+	r = candpack_decode(blob, 3, &g, NULL, 0, NULL, out, sizeof(out));
+	assert(r == -1);
+	r = candpack_decode(blob, 0, &g, NULL, 0, NULL, out, sizeof(out));
+	assert(r == -1);
+}
+
 int main(void)
 {
 	for_dht_check();
@@ -222,6 +262,7 @@ int main(void)
 	cid_check();
 	v3_compat_check();
 	v2_compat_check();
+	version_reject_check();
 	printf("candpack_test: all checks passed\n");
 	return 0;
 }

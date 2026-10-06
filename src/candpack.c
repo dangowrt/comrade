@@ -9,8 +9,6 @@
 #include "candpack.h"
 #include "candpolicy.h"
 
-#define CANDPACK_VERSION 4
-
 #define CT_HOST 0
 #define CT_SRFLX 1
 #define CT_PRFLX 2
@@ -223,7 +221,7 @@ int candpack_decode(const uint8_t *in, size_t in_len, uint32_t *gen,
 		return -1;
 	ver = in[i++];
 	if (ver < 2 || ver > CANDPACK_VERSION)
-		return -1;
+		return CANDPACK_ERR_VERSION;
 	if (i + 4 > in_len)
 		return -1;
 	if (gen)

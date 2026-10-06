@@ -39,10 +39,18 @@ int candpack_encode(const char *sdp, int for_dht, uint32_t gen,
 		    const char *offer_ufrag, const uint8_t *cid,
 		    uint8_t *out, size_t max);
 
+/* The highest packing this build writes and reads; see PROTOCOL.md section 7. */
+#define CANDPACK_VERSION 4
+
+/* A well-formed packing of a version this build does not speak, which a caller
+ * can name rather than discarding an intact message in silence. */
+#define CANDPACK_ERR_VERSION (-2)
+
 /* Rebuild an SDP description from packed bytes into out (NUL-terminated, up to
  * max); *gen takes the stamped generation, offer_ufrag the named offer ufrag
  * ("" when none), cid the instance id (zeroed when none), each if given.
- * Returns the string length, or -1 on error. */
+ * Returns the string length, CANDPACK_ERR_VERSION for an unreadable version,
+ * or -1 on error. */
 int candpack_decode(const uint8_t *in, size_t in_len, uint32_t *gen,
 		    char *offer_ufrag, size_t offer_max, uint8_t *cid,
 		    char *out, size_t max);
