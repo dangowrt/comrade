@@ -1295,10 +1295,11 @@ static void canon_v6(struct sess *s, const char *in, const char *src6, char *out
  * with none, so on a v6 network a count of zero here is the ordinary case and
  * says nothing is wrong.
  */
-static void log_offer(const char *sdp, int served, int active)
+static void log_offer(const char *sdp, int served, int active, int is_host)
 {
-	const char *p;
 	int cands = 0, reflexive = 0;
+	const char *p, *u;
+	char ufrag[40];
 
 	for (p = sdp; (p = strstr(p, "a=candidate:")) != NULL; p += 12) {
 		const char *end = strchr(p, '\n');
@@ -1312,14 +1313,19 @@ static void log_offer(const char *sdp, int served, int active)
 		    !strncmp(t, "typ relay", 9))
 			reflexive++;
 	}
+	ufrag[0] = '\0';
+	u = strstr(sdp, "a=ice-ufrag:");
+	if (u)
+		sscanf(u + 12, "%39[^\r\n]", ufrag);
 	if (served < 0)
-		dbg_logf("host: offer re-posted, fanned across %d egress "
-			 "address(es): %d candidate(s), %d reflexive",
-			 active, cands, reflexive);
+		dbg_logf("%s: description %.8s re-posted, fanned across %d "
+			 "egress address(es): %d candidate(s), %d reflexive",
+			 is_host ? "host" : "client", ufrag, active, cands,
+			 reflexive);
 	else
-		dbg_logf("host: offer published (served=%d active=%d) "
+		dbg_logf("host: offer %.8s published (served=%d active=%d) "
 			 "%d candidate(s), %d reflexive",
-			 served, active, cands, reflexive);
+			 ufrag, served, active, cands, reflexive);
 }
 
 /*
@@ -1414,7 +1420,7 @@ static void pool_pump(struct sess *s)
 		 * peer only through this re-post -- which is not the publish
 		 * the offer log reports, so without this the one thing that
 		 * makes such a network work is invisible. */
-		log_offer(local_sdp(s), -1, n);
+		log_offer(local_sdp(s), -1, n, s->cfg->is_host);
 	}
 }
 
@@ -4354,8 +4360,11 @@ static void punch_scan(struct sess *s, struct worker *ws, int *dash_seq)
 			   ((c->punch_resume && conn_is_proven(c->punch_resume)) ?
 			    ICE_ATTEMPT_MS : HOST_PUNCH_MS) ||
 			   (!c->punch_stuck && peering_ice_failed(&c->pr))) {
-			dbg_logf("host: punch %s -> drop",
-				 c->punch_stuck ? "wedged (test)" : "failed");
+			dbg_logf("host: punch %s -> drop %.8s after %ums",
+				 c->punch_stuck ? "wedged (test)" :
+				 peering_ice_failed(&c->pr) ? "failed" :
+				 "timed out", c->punch_ufrag,
+				 (unsigned)(now_ms() - c->punch_start_ms));
 			if (c->punch_resume) {
 				__atomic_sub_fetch(&c->punch_resume->resume_pending,
 						   1, __ATOMIC_RELAXED);
@@ -4888,7 +4897,7 @@ static int host_turnstile(struct sess *s)
 					   (const uint8_t *)local_sdp(s),
 					   strlen(local_sdp(s)));
 				sig_locate(s->pm.sig);
-				log_offer(local_sdp(s), served, active);
+				log_offer(local_sdp(s), served, active, 1);
 				ts = TS_WAIT_CLAIM;
 			}
 			break;
