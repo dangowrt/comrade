@@ -162,6 +162,8 @@ struct sig {
 	char peer_claim_offer[64];	/* host: the offer ufrag a served claim named */
 	char peer_offer_ufrag[64];	/* client: the ufrag of the offer last read */
 	int claim_unwritten;		/* client: a claim changed since last written */
+	uint8_t peer_cid[CANDPACK_CID_LEN];
+	int have_peer_cid;
 
 	int locate;
 	int put_inflight;		/* a convergent host store is running */
@@ -476,6 +478,36 @@ static uint64_t sdp_identity(const char *sdp)
 	return h;
 }
 
+/* One instance id per process, not per signaller: it has to survive this one
+ * being rebuilt on a network change, which is the whole point of it. */
+static const uint8_t *sig_my_cid(void)
+{
+	static uint8_t cid[CANDPACK_CID_LEN];
+	static int set;
+
+	if (!set) {
+		if (random_bytes(cid, sizeof(cid)))
+			return NULL;
+		set = 1;
+	}
+	return cid;
+}
+
+/* candpack zeroes the field when the peer named no instance, so an all-zero
+ * id means absent rather than an id that happens to be zero. */
+static void peer_cid_note(struct sig *s)
+{
+	static const uint8_t zero[CANDPACK_CID_LEN];
+	int had = s->have_peer_cid;
+
+	s->have_peer_cid = memcmp(s->peer_cid, zero, sizeof(zero)) != 0;
+	if (s->have_peer_cid && !had)
+		dbg_logf("sig: peer instance %02x%02x%02x%02x%02x%02x%02x%02x",
+			 s->peer_cid[0], s->peer_cid[1], s->peer_cid[2],
+			 s->peer_cid[3], s->peer_cid[4], s->peer_cid[5],
+			 s->peer_cid[6], s->peer_cid[7]);
+}
+
 static void sig_mb_note(const char *tag, uint32_t gen, const char *off,
 			const uint8_t *packed, size_t plen, const char *sdp)
 {
@@ -506,8 +538,8 @@ int sig_post(struct sig *s, const uint8_t *data, size_t len)
 	sdp[len] = '\0';
 	sdp_ufrag_of(sdp, s->my_ufrag, sizeof(s->my_ufrag));
 	plen = candpack_encode(sdp, 1, s->my_gen,
-			       s->is_host ? NULL : s->claim_offer, NULL, packed,
-			       sizeof(packed));
+			       s->is_host ? NULL : s->claim_offer,
+			       sig_my_cid(), packed, sizeof(packed));
 	if (plen <= 0)
 		return -1;
 	/*
@@ -724,6 +756,11 @@ void sig_set_family_epoch(struct sig *s, int family, uint32_t epoch)
 uint32_t sig_peer_gen(const struct sig *s)
 {
 	return s->peer_gen;
+}
+
+const uint8_t *sig_peer_cid(const struct sig *s)
+{
+	return s->have_peer_cid ? s->peer_cid : NULL;
 }
 
 void sig_set_claim_offer(struct sig *s, const char *ufrag)
@@ -1077,9 +1114,18 @@ static void deliver_peer(struct sig *s, const uint8_t *sealed, size_t len)
 	slen = candpack_decode(packed, (size_t)n, &s->peer_gen,
 			       s->is_host ? s->peer_claim_offer : NULL,
 			       s->is_host ? sizeof(s->peer_claim_offer) : 0,
-			       NULL, sdp, sizeof(sdp));
-	if (slen < 0)
+			       s->peer_cid, sdp, sizeof(sdp));
+	peer_cid_note(s);
+	if (slen < 0) {
+		if (slen == CANDPACK_ERR_VERSION)
+			dbg_logf("sig: peer slot packs candpack v%u, this build "
+				 "reads up to v%u -- ignored",
+				 (unsigned)packed[0],
+				 (unsigned)CANDPACK_VERSION);
+		else
+			dbg_logf("sig: peer slot did not decode -- ignored");
 		return;
+	}
 	if (!s->is_host)
 		sdp_ufrag_of(sdp, s->peer_offer_ufrag,
 			     sizeof(s->peer_offer_ufrag));
@@ -1330,8 +1376,13 @@ static void deliver_peer_mcast(struct sig *s, const uint8_t *sealed, size_t len,
 			NULL, 0);
 	if (n < 0)
 		return;
-	slen = candpack_decode(packed, (size_t)n, &s->peer_gen, NULL, 0, NULL,
-			       sdp, sizeof(sdp));
+	slen = candpack_decode(packed, (size_t)n, &s->peer_gen, NULL, 0,
+			       s->peer_cid, sdp, sizeof(sdp));
+	peer_cid_note(s);
+	if (slen == CANDPACK_ERR_VERSION)
+		dbg_logf("sig: multicast peer packs candpack v%u, this build "
+			 "reads up to v%u -- ignored", (unsigned)packed[0],
+			 (unsigned)CANDPACK_VERSION);
 	if (slen >= 0 && s->cb && !(s->is_host && s->mcast_claims))
 		s->cb(s->arg, (const uint8_t *)sdp, (size_t)slen);
 

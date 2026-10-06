@@ -214,6 +214,11 @@ void sig_set_family_up(struct sig *s, int family, int up);
 void sig_set_gen(struct sig *s, uint32_t gen);
 uint32_t sig_peer_gen(const struct sig *s);
 
+/* The peer's instance id (CANDPACK_CID_LEN bytes), NULL while it has named
+ * none. Stable across its reconnects and roams, unlike any ICE credential, so
+ * it is what tells a returning peer apart. Both roles post and read one. */
+const uint8_t *sig_peer_cid(const struct sig *s);
+
 /* Client: name (NULL/"" clears) the offer ufrag our claim answers, packed into
  * the claim only; sig_claim_offer reads a served claim's name back on the host
  * ("" when none), so the turnstile matches it beside the claimant ufrag/pwd. */
