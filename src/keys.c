@@ -252,6 +252,34 @@ void keys_conn_key(uint8_t out[32], const uint8_t sig_key[32],
 	cc_blake2b_keyed(out, 32, sig_key, 32, buf, sizeof(buf));
 }
 
+void keys_slot_salt(char out[KEYS_SALT_LEN], const uint8_t rdv[TOKEN_RDV_LEN],
+		    char kind, const uint8_t *cid, size_t cid_len)
+{
+	static const char slot_info[] = "comrade1 slot ";
+	static const char hx[] = "0123456789abcdef";
+	uint8_t info[sizeof(slot_info) + 64];
+	uint8_t raw[32];
+	size_t n = 0;
+	int i;
+
+	memcpy(info, slot_info, sizeof(slot_info) - 1);
+	n = sizeof(slot_info) - 1;
+	info[n++] = (uint8_t)kind;
+	if (cid && cid_len) {
+		if (cid_len > sizeof(info) - n)
+			cid_len = sizeof(info) - n;
+		memcpy(info + n, cid, cid_len);
+		n += cid_len;
+	}
+	cc_blake2b_keyed(raw, sizeof(raw), rdv, TOKEN_RDV_LEN, info, n);
+	out[0] = kind;
+	for (i = 0; i < 8; i++) {
+		out[1 + 2 * i] = hx[raw[i] >> 4];
+		out[2 + 2 * i] = hx[raw[i] & 15];
+	}
+	out[17] = '\0';
+}
+
 void keys_derive_ro_auth(uint8_t ro[TOKEN_AUTH_LEN],
 			 const uint8_t rw[TOKEN_AUTH_LEN])
 {

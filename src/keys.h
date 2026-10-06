@@ -43,6 +43,17 @@ struct session_keys {
 #define KEYS_HALF_LEN 32
 
 int keys_derive(struct session_keys *keys, const uint8_t rdv[TOKEN_RDV_LEN]);
+
+/* A rendezvous slot's BEP 44 salt: a kind letter then eight derived bytes in
+ * hex, so it stays NUL-free for the bep44 string API. `cid` names a claimant's
+ * own slot and is NULL for the kinds there is one of. */
+#define KEYS_SLOT_HOST  'h'
+#define KEYS_SLOT_BELL  'd'
+#define KEYS_SLOT_CLAIM 'c'
+#define KEYS_SALT_LEN   18
+
+void keys_slot_salt(char out[KEYS_SALT_LEN], const uint8_t rdv[TOKEN_RDV_LEN],
+		    char kind, const uint8_t *cid, size_t cid_len);
 /*
  * The key one connection's probes are sealed under: the session key, which
  * says a token holder is speaking, and a random half from each end, which says

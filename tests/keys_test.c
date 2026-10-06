@@ -37,6 +37,49 @@ static int is_wg(uint32_t first_four_le)
 	return first_four_le >= 1 && first_four_le <= 4;
 }
 
+/* Every slot salt is NUL-free and distinct: a host slot, a doorbell and one
+ * slot per claimant, none of them colliding across invitations. */
+static void slot_salt_checks(void)
+{
+	char host[KEYS_SALT_LEN], bell[KEYS_SALT_LEN], a[KEYS_SALT_LEN];
+	uint8_t rdv[TOKEN_RDV_LEN], rdv2[TOKEN_RDV_LEN];
+	char b[KEYS_SALT_LEN], a2[KEYS_SALT_LEN];
+	uint8_t cid_a[8], cid_b[8];
+	int i;
+
+	for (i = 0; i < TOKEN_RDV_LEN; i++) {
+		rdv[i] = (uint8_t)(i + 1);
+		rdv2[i] = (uint8_t)(i + 2);
+	}
+	for (i = 0; i < 8; i++) {
+		cid_a[i] = (uint8_t)(0x10 + i);
+		cid_b[i] = (uint8_t)(0x20 + i);
+	}
+
+	keys_slot_salt(host, rdv, KEYS_SLOT_HOST, NULL, 0);
+	keys_slot_salt(bell, rdv, KEYS_SLOT_BELL, NULL, 0);
+	keys_slot_salt(a, rdv, KEYS_SLOT_CLAIM, cid_a, sizeof(cid_a));
+	keys_slot_salt(b, rdv, KEYS_SLOT_CLAIM, cid_b, sizeof(cid_b));
+	keys_slot_salt(a2, rdv2, KEYS_SLOT_CLAIM, cid_a, sizeof(cid_a));
+
+	/* Shape: kind letter, 16 hex digits, NUL, and nothing else. */
+	assert(strlen(host) == KEYS_SALT_LEN - 1);
+	assert(host[0] == KEYS_SLOT_HOST && bell[0] == KEYS_SLOT_BELL);
+	assert(a[0] == KEYS_SLOT_CLAIM && b[0] == KEYS_SLOT_CLAIM);
+	for (i = 1; i < KEYS_SALT_LEN - 1; i++)
+		assert(strchr("0123456789abcdef", host[i]) != NULL);
+
+	/* Kinds differ, claimants differ, and one claimant's slot differs
+	 * between two invitations, so no slot is shared by accident. */
+	assert(strcmp(host, bell) && strcmp(host, a) && strcmp(bell, a));
+	assert(strcmp(a, b));
+	assert(strcmp(a, a2));
+
+	/* Deterministic: the same inputs name the same slot every time. */
+	keys_slot_salt(b, rdv, KEYS_SLOT_CLAIM, cid_a, sizeof(cid_a));
+	assert(!strcmp(a, b));
+}
+
 int main(void)
 {
 	struct session_keys k, again;
@@ -81,5 +124,6 @@ int main(void)
 		/* Above the registered range, inside the derived window. */
 		assert(k.mcast_port >= 32768 && k.mcast_port < 32768 + 16384);
 	}
+	slot_salt_checks();
 	return 0;
 }
