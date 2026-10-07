@@ -493,6 +493,9 @@ target_include_directories(comrade_hostreap PUBLIC src)
 add_library(comrade_claimlog STATIC src/claimlog.c)
 target_include_directories(comrade_claimlog PUBLIC src)
 
+add_library(comrade_rdv STATIC src/rdv.c)
+target_include_directories(comrade_rdv PUBLIC src)
+
 add_library(comrade_hbeat STATIC src/hbeat.c)
 target_include_directories(comrade_hbeat PUBLIC src)
 
@@ -1044,6 +1047,10 @@ if(BUILD_TESTING)
 	target_link_libraries(claimlog_test comrade_claimlog)
 	add_test(NAME claimlog_test COMMAND claimlog_test)
 
+	add_executable(rdv_test tests/rdv_test.c)
+	target_link_libraries(rdv_test comrade_rdv)
+	add_test(NAME rdv_test COMMAND rdv_test)
+
 	# How long silence may last before a link is given up on.
 	add_executable(hbeat_test tests/hbeat_test.c)
 	target_link_libraries(hbeat_test comrade_hbeat)
@@ -1527,7 +1534,7 @@ if(BUILD_TESTING)
 	foreach(t IN ITEMS
 		token_test tokgen_test netstate_test nsfacts_test
 		hostreap_test sigquiet_test claimlog_test hbeat_test replay_test
-		termfilter_test
+		rdv_test termfilter_test
 		ctlproto_test netmon_test
 		candpolicy_test candpack_test mailbox_test roauth_test keys_test
 		dhtnode_boot_test
