@@ -297,6 +297,13 @@ static void a_moved_host_is_re_announced_to(void)
 	rdv_client_set_live(&c, 0);
 	assert(c.state == RDV_CL_ANNOUNCING);
 	assert(rdv_client_next(&c, (const uint8_t *)"O", 1, &o) == 1);
+
+	/* A tombstone stops it: there is nothing left to be answered by. */
+	m.kind = RDV_TOMB;
+	m.seq = 4;
+	rdv_client_host_slot(&c, &m);
+	assert(c.host_gone);
+	assert(rdv_client_next(&c, (const uint8_t *)"O", 1, &o) == 0);
 }
 
 static void stale_and_unaddressed_messages_are_no_ops(void)

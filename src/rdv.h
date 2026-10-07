@@ -20,7 +20,8 @@ enum rdv_kind {
 	RDV_BELL,
 	RDV_OFFER,
 	RDV_ANSWER,
-	RDV_REFUSE
+	RDV_REFUSE,
+	RDV_TOMB			/* host slot: the session is over */
 };
 
 enum rdv_refusal {
@@ -77,11 +78,13 @@ struct rdv_host {
 	int answered;
 	struct rdv_claimant c[RDV_HOST_MAX];
 	uint8_t info_pending;
+	uint8_t gone;
 };
 
 void rdv_host_init(struct rdv_host *h, const uint8_t cid[RDV_CID_LEN],
 		   uint32_t gen, int grant);
 void rdv_host_set_gen(struct rdv_host *h, uint32_t gen);
+void rdv_host_entomb(struct rdv_host *h);
 void rdv_host_bell(struct rdv_host *h, const struct rdv_msg *m);
 int rdv_host_slot(struct rdv_host *h, const struct rdv_msg *m);
 void rdv_host_answer(struct rdv_host *h, const uint8_t cid[RDV_CID_LEN],
@@ -108,6 +111,7 @@ struct rdv_client {
 	uint8_t live;
 	uint8_t turn;			/* alternates bell and offer */
 	uint8_t refusal;
+	uint8_t host_gone;		/* the host said so, in its own slot */
 	uint8_t answer[RDV_MAX_PAYLOAD];
 	uint16_t answer_len;
 };

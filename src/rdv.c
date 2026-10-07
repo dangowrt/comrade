@@ -102,6 +102,12 @@ void rdv_host_set_gen(struct rdv_host *h, uint32_t gen)
 	h->info_pending = 1;
 }
 
+void rdv_host_entomb(struct rdv_host *h)
+{
+	h->gone = 1;
+	h->info_pending = 1;
+}
+
 static struct rdv_claimant *host_find(struct rdv_host *h,
 				      const uint8_t cid[RDV_CID_LEN])
 {
@@ -215,7 +221,7 @@ int rdv_host_next(struct rdv_host *h, const uint8_t *info, size_t info_len,
 	if (h->info_pending) {
 		if (info_len > RDV_MAX_PAYLOAD)
 			return 0;
-		m.kind = RDV_HOSTINFO;
+		m.kind = h->gone ? RDV_TOMB : RDV_HOSTINFO;
 		m.gen = h->gen;
 		memcpy(m.from, h->cid, RDV_CID_LEN);
 		m.seq = ++h->seq;
@@ -269,6 +275,13 @@ int rdv_client_host_slot(struct rdv_client *c, const struct rdv_msg *m)
 {
 	int moved;
 
+	if (m->kind == RDV_TOMB) {
+		/* The host says the session is over, so there is nothing to
+		 * come back to and announcing again would never be answered. */
+		if (memcmp(m->from, rdv_zero, RDV_CID_LEN))
+			c->host_gone = 1;
+		return 0;
+	}
 	if (m->kind != RDV_HOSTINFO)
 		return 0;
 	if (!memcmp(m->from, rdv_zero, RDV_CID_LEN))
@@ -331,7 +344,7 @@ int rdv_client_next(struct rdv_client *c, const uint8_t *offer,
 
 	memset(o, 0, sizeof(*o));
 	memset(&m, 0, sizeof(m));
-	if (c->live || c->state == RDV_CL_REFUSED)
+	if (c->live || c->state == RDV_CL_REFUSED || c->host_gone)
 		return 0;
 	if (c->state == RDV_CL_ANSWERED)
 		return 0;
