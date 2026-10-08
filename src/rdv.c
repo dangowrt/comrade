@@ -3,7 +3,12 @@
 
 #include <string.h>
 
+#include "bep44.h"
+#include "keys.h"
 #include "rdv.h"
+
+_Static_assert(RDV_MAX_MSG + SEAL_OVERHEAD <= BEP44_MAX_VALUE,
+	       "a sealed slot message must fit one mutable item");
 
 static const uint8_t rdv_zero[RDV_CID_LEN];
 

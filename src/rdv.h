@@ -9,7 +9,7 @@
 
 #define RDV_VERSION 1
 #define RDV_CID_LEN 8
-#define RDV_MAX_PAYLOAD 1200
+#define RDV_MAX_PAYLOAD 900
 #define RDV_HDR_LEN (1 + 1 + 4 + RDV_CID_LEN + RDV_CID_LEN + 4 + 2)
 #define RDV_MAX_MSG (RDV_HDR_LEN + RDV_MAX_PAYLOAD)
 #define RDV_ERR_VERSION (-2)
