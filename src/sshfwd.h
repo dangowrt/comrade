@@ -47,6 +47,12 @@ void sshfwd_destroy(struct sshfwd *f);
  */
 void sshfwd_set_tx_room(struct sshfwd *f, int (*fn)(void *arg), void *arg);
 
+/* Told once per -L spec when the host declines the direct-tcpip channel. A -R
+ * is refused at registration and reported there; a -L binds locally with no
+ * host involved, so refusal is only knowable once something connects. */
+void sshfwd_set_declined(struct sshfwd *f,
+			 void (*fn)(void *arg, const char *target), void *arg);
+
 /*
  * One housekeeping pass from the session's poll loop: accept on
  * listeners, progress pending connects and channel opens, pick up

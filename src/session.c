@@ -2444,6 +2444,18 @@ static void pump_once(struct sess *s, int timeout_cap_ms)
 
 /* From the ssh thread: does the KCP stream take more bulk? (The thread is
  * joined before the stream dies; the lock covers future reordering.) */
+/* Runs on the ssh thread, so it only publishes; the view does the words. */
+static void conn_fwd_declined(void *arg, const char *target)
+{
+	const struct session_obs *o;
+	struct conn *c = arg;
+
+	o = c->sess->cfg->obs;
+	dbg_logf("fwd: the host declined -L %s", target);
+	if (o && o->fwd_declined)
+		o->fwd_declined(o->arg, target);
+}
+
 static int conn_tx_room(void *arg)
 {
 	struct conn *c = arg;
@@ -2504,6 +2516,8 @@ static void *ssh_cli_thread(void *p)
 	o.nfwd_r = s->cfg->nfwd_r;
 	o.tx_room = conn_tx_room;
 	o.tx_room_arg = c;
+	o.fwd_declined = conn_fwd_declined;
+	o.fwd_declined_arg = c;
 	o.status = session_status;
 	o.status_arg = c;
 	o.render_status = s->cfg->render_status;

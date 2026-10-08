@@ -170,6 +170,7 @@ static struct sshfwd *fwd_up(ssh_session s, ssh_event ev,
 	if (!f)
 		return NULL;
 	sshfwd_set_tx_room(f, o->tx_room, o->tx_room_arg);
+	sshfwd_set_declined(f, o->fwd_declined, o->fwd_declined_arg);
 	for (i = 0; i < o->nfwd_l; i++)
 		sshfwd_cli_local(f, &o->fwd_l[i]);
 	for (i = 0; i < o->nfwd_r; i++)

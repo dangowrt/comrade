@@ -122,6 +122,10 @@ struct session_obs {
 	 * forwarding, or the guest is read-only). Fired once, so an operator
 	 * sees an attempted tunnel rather than the guest failing silently. */
 	void (*peer_fwd_refused)(void *arg, int id);
+	/* Our own -L was declined by the host. The listener stays up and keeps
+	 * accepting, so a guest told nothing sees a port that carries nothing;
+	 * a -R is refused at registration and reported there instead. */
+	void (*fwd_declined)(void *arg, const char *target);
 	/* The connection context was torn down and is being rebuilt (a roam or
 	 * reconnect): drop stale local candidates, the peer, and the "link up"
 	 * state, so the dashboard reflects the fresh attempt rather than the

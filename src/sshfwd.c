@@ -40,6 +40,7 @@ struct fwd_listener {
 	struct fwdspec sp;		/* client -L: connect target */
 	char req_addr[64];		/* host -R: address to report */
 	uint16_t port;			/* bound port (reported / matched) */
+	int declined;			/* told once, not per connection */
 };
 
 enum pend_kind {
@@ -72,6 +73,8 @@ struct sshfwd {
 	int have_remote;		/* any -R registered: poll for accepts */
 	int (*tx_room)(void *arg);	/* transport takes more bulk? NULL = yes */
 	void *tx_room_arg;
+	void (*declined)(void *arg, const char *target);
+	void *declined_arg;
 	struct fwd_bridge br[FWD_MAX_BRIDGE];
 	struct fwd_listener ls[FWD_MAX_LISTEN];
 	struct fwd_pend pd[FWD_MAX_PEND];
@@ -419,6 +422,15 @@ void sshfwd_set_tx_room(struct sshfwd *f, int (*fn)(void *arg), void *arg)
 	f->tx_room_arg = arg;
 }
 
+void sshfwd_set_declined(struct sshfwd *f,
+			 void (*fn)(void *arg, const char *target), void *arg)
+{
+	if (!f)
+		return;
+	f->declined = fn;
+	f->declined_arg = arg;
+}
+
 void sshfwd_destroy(struct sshfwd *f)
 {
 	int i;
@@ -517,10 +529,11 @@ int sshfwd_cli_remote(struct sshfwd *f, const struct fwdspec *sp)
  * channel (blocks briefly for the host's reply) and bridge. */
 static void cli_local_accept(struct sshfwd *f, struct fwd_listener *l)
 {
-	char orig[64];
-	uint16_t oport;
-	ssh_channel chan;
 	sock_t fd = accept(l->fd, NULL, NULL);
+	char tgt[sizeof(l->sp.host) + 32];
+	ssh_channel chan;
+	uint16_t oport;
+	char orig[64];
 
 	if (!sock_valid(fd))
 		return;
@@ -534,6 +547,15 @@ static void cli_local_accept(struct sshfwd *f, struct fwd_listener *l)
 				     orig, oport) != SSH_OK) {
 		dbg_logf("sshfwd -L: host refused %s:%u",
 			 l->sp.host, l->sp.port);
+		/* Say so once: the listener stays up and keeps accepting, so
+		 * without a word the guest sees a port that carries nothing. */
+		if (!l->declined) {
+			l->declined = 1;
+			snprintf(tgt, sizeof(tgt), "%u -> %s:%u", l->port,
+				 l->sp.host, l->sp.port);
+			if (f->declined)
+				f->declined(f->declined_arg, tgt);
+		}
 		sock_close(fd);
 		ssh_channel_free(chan);
 		return;

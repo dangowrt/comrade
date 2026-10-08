@@ -1149,6 +1149,20 @@ static void um_peer_ident(struct ui *u, int id, const char *ident)
 		}
 }
 
+/* A -L the host turned down. Shown like an escalation, since it is the same
+ * kind of fact: something the guest asked for is not going to happen. */
+static void um_fwd_declined(struct ui *u, const char *target)
+{
+	if (!u->anim) {
+		vlog(u, "fwd    ! -L %s declined by the host", target);
+		return;
+	}
+	snprintf(u->escalate, sizeof(u->escalate),
+		 "-L %s declined by the host", target);
+	u->have_escalate = 1;
+	u->dirty = 1;
+}
+
 static void um_escalate(struct ui *u, const char *why)
 {
 	if (!u->anim) {
@@ -1313,6 +1327,7 @@ static void cb_reset(void *a)
 	pthread_mutex_unlock(&u->lock);
 }
 static void cb_net_reset(void *a, int f) { um_net_reset(a, f); }
+static void cb_fwd_declined(void *a, const char *t) { um_fwd_declined(a, t); }
 static void cb_esc(void *a, const char *w) { um_escalate(a, w); }
 static void cb_esc_clear(void *a) { um_escalate_clear(a); }
 static void cb_tick(void *a)
@@ -1364,6 +1379,7 @@ void ui_bind(struct ui *u, struct session_obs *obs)
 	obs->net_reset = cb_net_reset;
 	obs->escalate = cb_esc;
 	obs->escalate_clear = cb_esc_clear;
+	obs->fwd_declined = cb_fwd_declined;
 	obs->established = cb_established;
 	obs->tick = cb_tick;
 }

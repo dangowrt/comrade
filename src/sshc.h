@@ -68,6 +68,10 @@ struct sshc_opts {
 	int (*tx_room)(void *arg);
 	void *tx_room_arg;
 
+	/* Told once per -L spec when the host declines it (sshfwd_set_declined). */
+	void (*fwd_declined)(void *arg, const char *target);
+	void *fwd_declined_arg;
+
 	/*
 	 * Optional local status. When set, interactive mode reserves the bottom
 	 * terminal row (runs the remote tmux one row shorter) and has the view
