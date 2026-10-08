@@ -6,14 +6,16 @@ code commits on this branch, and four findings that reach into the design
 rather than sitting in one place in it.
 
 Three of the four are now closed in code: nothing on the transport or in the
-mailbox can be read by a holder of the invitation who is not a party to it (1),
-the stream says who sent it (3), and an outage no longer costs a working agent
-(4). What is left here is what those changes do not reach: a holder can still
-take the turnstile and delay somebody else's exchange, though not read it (1);
-comrade is UDP-only with no fallback (2); the KCP header is still readable (3);
-and an adversary who drops everything is indistinguishable from a dead network
-(4). Each says what the remaining option is and what it would cost. None of
-those options is implemented.
+rendezvous can be read by a holder of the invitation who is not a party to it
+(1), the stream says who sent it (3), and an outage no longer costs a working
+agent (4). What is left here is what those changes do not reach: comrade is
+UDP-only with no fallback (2); the KCP header is still readable (3); and an
+adversary who drops everything is indistinguishable from a dead network (4).
+
+Finding (1) also had a residual, a holder taking the shared answer slot and
+delaying somebody else's exchange, and that one is now closed as well: the
+rendezvous is a slot per party rather than one container, so there is no mutex
+to take. What survives of it is narrower and recorded in section 1.
 
 The threat models were: a holder of the invitation who is not the peer --
 including someone handed a view-only link -- and the ISP or hoster, who sees
@@ -36,10 +38,13 @@ No guest can reach another guest's path plane or stream once a session is up,
 whatever the invitation says. The switch is clocked by the peer rather than a
 timer, because the halves travel over the stream the key protects.
 
-**Closed for the mailbox too.** The rendezvous still runs under the
-invitation's key, and its slots are still sealed with it, so a token holder
-can still tell a claim is present and can still take the turnstile. What it can
-no longer do is read one. The two slots a peer writes were not alike:
+**Closed for the rendezvous too, and by a cheaper route than the one costed
+below.** The rendezvous is no longer one container under the invitation's key.
+It is a slot per party, each named by its own BEP 44 salt under the one
+keypair, and a claimant's slot is sealed under a key derived from the auth
+secret of that claimant's credential class (`keys.c:keys_slot_key`). The two
+slots the old shared container held were not alike, which is why reading it
+mattered:
 
 - The *offer* slot is the host's own description. Every invited guest needs it
   to reach the host, view-only ones included, so reading it is not a leak -- it
@@ -52,70 +57,65 @@ no longer do is read one. The two slots a peer writes were not alike:
   the one handed to a room, and a crowd with no reason to trust each other was
   publishing its addresses to itself.
 
-A claim is now boxed to the host (`box_seal`, keys.c) inside the seal the slot
-already carried. The host publishes an X25519 public key in its own slot -- the
-one every guest fetches anyway -- and holds the secret half alone, so the outer
-seal still says a token holder wrote the slot and the box says only the host
-may read it. It closes all three pairs at once, read-only to read-only included,
-and needs no token change, no second mailbox and no per-guest keys.
+A claimant now writes its description into a slot of its own, sealed under its
+class key. A read-only holder derives that key from the `A_ro` it was given and
+cannot reach `A_rw`, because `keys_derive_ro_auth` is one-way, so it cannot
+read or write a read-write holder's slot at all. That is the pair the design
+cared about: a read-only link is the one handed to a room, and an audience can
+no longer touch the operator's own people.
 
-The claimant's ufrag rides in the clear beside the box: the rule that lets a
-client overwrite its own superseded claim is about which claimant holds the
-slot, not where that claimant is. A client cannot open even its own box, the
-ephemeral secret being gone the moment it is sealed.
+Read-write holders can still reach each other, which is deliberate: the host
+has trusted each of them with a shell, so they are trusted accordingly by each
+other. Two read-only holders can still reach each other too, since they share
+`A_ro` and instance ids travel in the clear through the doorbell. That is an
+accepted flaw, recorded in `PROTOCOL.md` section 4.2. Note it is wider than
+disclosure: a holder able to derive another's slot key can also overwrite that
+slot, so within a class the exposure is interference as well as reading.
 
 It also takes away what the pre-handshake probe interference used to aim with.
 The per-connection key binds only once the SSH handshake completes, so until
 then a guest can still send probes at another guest's punch -- but the
 endpoints it would send them to came out of the mailbox.
 
-**What it does not fix, and that is where the line is drawn.** Occupancy is
-inherent to a mutex: any guest can still see that the slot is taken, and can
-still take it, so a holder can delay another's candidate exchange or deny it
-for as long as it keeps claiming. Closing that means mailboxes that are
-single-use, or private per guest, and the price is the property the whole tool
-rests on -- one token is one BEP 44 key, so a link can be handed to whoever you
-like and simply works. Trading that for protection against an *authenticated*
-holder delaying an exchange it can no longer read is not worth it. The attack
-that remains needs a valid invitation, achieves delay rather than disclosure,
-and is visible as a mailbox that will not settle.
+**The occupancy argument this section used to make was wrong, and the cost it
+quoted was wrong twice.** It held that occupancy is inherent to a mutex, that
+closing it needed mailboxes single-use or private per guest, and that the price
+would be the property the whole tool rests on: one token is one BEP 44 key, so
+a link can be handed to whoever you like and simply works. Both halves were
+mistaken. A slot per party costs no second key, because BEP 44 names an item by
+keypair *and salt*, so one keypair carries as many private slots as there are
+parties. And the mutex was not merely an occupancy risk, it was a liveness
+fault in ordinary use: with one answer slot, three claimants resolved 60/0/0,
+two of them never getting in at all, which is why a real user connected once
+and never again. It was measured, not postulated (`PROTOCOL.md` section 4).
 
-**The option that remains, not implemented: a rendezvous secret per class.**
-Derive the read-only one one-way from the read-write one, exactly as
-`keys_derive_ro_auth` already does for the auth secret, and put it in the
-read-only token's `rdv` field. The token format does not change at all -- same
-16 bytes, a different value, with `TOKEN_FLAG_RO` already telling them apart.
-The host holds the read-write secret and can derive the read-only twin; the
-reverse is impossible, which is the point.
+**What survives.** The doorbell is shared and last-writer-wins, so an
+authenticated holder can overwrite another's announcement and delay its
+harvest. A claimant keeps ringing while it has no live path, so this is delay
+rather than denial, and the bound is in messages rather than seconds. Within a
+class a holder can read and overwrite a peer's slot, as above. None of this
+reaches across the class boundary, and none of it needs a timeout to recover.
 
-It would not stop a read-only guest taking the read-only turnstile, since that
-class would still share one mailbox -- but it would stop one taking the
-read-write turnstile, which is the part that lets an audience interfere with
-the operator's own people. Per-class admission limits are the other half.
+**No longer needed: a rendezvous secret per class.** This section used to
+propose deriving a read-only rendezvous secret one-way from the read-write one
+and putting it in the read-only token's `rdv` field. The per-class *slot* key
+achieves the same separation without touching the token or splitting the
+rendezvous, so the proposal is withdrawn. Per-class admission limits remain
+open, and the grant now refuses a claimant in its own slot rather than leaving
+it silent, which is the mechanism such a limit would use.
 
-What it costs, since the obvious estimate is wrong twice over. It does *not*
-need a second DHT node: a `dhtnode` is transport and holds no identity, while
-`bep44_put(e, sk, pk, ...)` and `bep44_get(e, pk, salt, ...)` take the keypair
-per call, so one node serves any number of mailboxes. `sig` touches its node in
-twelve places, all "ready?", poll or free, and `sig_discard` exists precisely
-because a node's lifetime is not a signaller's -- so letting a signaller borrow
-a node is small. It does need the host's own machinery: `session.c` makes 71
-calls into `sig_*` across some thirty entry points, all written as "the"
-signaller, and those on the host's path would have to become per-plane, with
-admission recording which plane a worker was claimed on. A client is
-unaffected, one token being one class. And it is only needed once a read-only
-invitation has actually been minted, which the host knows where it mints one.
+One property the slot design relies on, worth keeping rather than assuming: a
+DHT stores an item on the nodes closest to its key, and salts do not move it,
+so every slot of one invitation lives in the same place and a pinned rendezvous
+node serves them all. That is what makes a slot per party cost lookups rather
+than nodes.
 
-One wrinkle the mailbox comment already names: a DHT stores a key on the nodes
-closest to it, so two mailbox keys live in two different places. A pinned
-rendezvous node is queried directly on every lookup rather than by proximity,
-so one node can serve both, but that is a property to keep rather than assume.
-
-**What is not worth doing.** Per-invitation keys would separate the crowd from
-each other, but a crowd is exactly what one link handed to many people is; the
-model that makes an anonymous audience possible is the model that gives them a
-shared key. Sealing claims to the host gets the same protection without asking
-the operator to mint and track a token per attendee.
+**What is still not worth doing.** Per-invitation keys would separate the crowd
+from each other, but a crowd is exactly what one link handed to many people is;
+the model that makes an anonymous audience possible is the model that gives
+them a shared secret. The per-class slot key gets the protection that matters,
+read-only away from read-write, without asking the operator to mint and track a
+token per attendee.
 
 ## 2. Comrade is identifiable, and therefore blockable
 

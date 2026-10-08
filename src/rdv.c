@@ -44,6 +44,8 @@ int rdv_encode(const struct rdv_msg *m, uint8_t *out, size_t max)
 	o += RDV_CID_LEN;
 	put32(out + o, m->seq);
 	o += 4;
+	put32(out + o, m->re);
+	o += 4;
 	out[o++] = (uint8_t)(m->payload_len >> 8);
 	out[o++] = (uint8_t)m->payload_len;
 	memcpy(out + o, m->payload, m->payload_len);
@@ -72,6 +74,8 @@ int rdv_decode(struct rdv_msg *m, const uint8_t *in, size_t len)
 	memcpy(m->to, in + o, RDV_CID_LEN);
 	o += RDV_CID_LEN;
 	m->seq = get32(in + o);
+	o += 4;
+	m->re = get32(in + o);
 	o += 4;
 	m->payload_len = (uint16_t)((in[o] << 8) | in[o + 1]);
 	o += 2;
@@ -201,6 +205,7 @@ int rdv_host_slot(struct rdv_host *h, const struct rdv_msg *m)
 		c->state = RDV_C_REFUSED;
 		c->refusal = RDV_REFUSE_FULL;
 		c->pending = 1;
+		c->answer_re = c->last_seq;
 		return 0;
 	}
 	return 1;
@@ -218,6 +223,7 @@ void rdv_host_answer(struct rdv_host *h, const uint8_t cid[RDV_CID_LEN],
 	c->state = RDV_C_ANSWERED;
 	c->refusal = RDV_REFUSE_NONE;
 	c->pending = 1;
+	c->answer_re = c->last_seq;
 	if (payload && len)
 		memcpy(c->answer, payload, len);
 	c->answer_len = (uint16_t)len;
@@ -235,7 +241,20 @@ void rdv_host_refuse(struct rdv_host *h, const uint8_t cid[RDV_CID_LEN],
 	c->state = RDV_C_REFUSED;
 	c->refusal = (uint8_t)reason;
 	c->pending = 1;
+	c->answer_re = c->last_seq;
 	c->answer_len = 0;
+}
+
+void rdv_host_keep(struct rdv_host *h, const uint8_t cid[RDV_CID_LEN])
+{
+	struct rdv_claimant *c = rdv_host_find(h, cid);
+
+	if (!c || c->state == RDV_C_GONE)
+		return;
+	if (c->state != RDV_C_ANSWERED)
+		h->answered++;
+	c->state = RDV_C_ANSWERED;
+	c->pending = 0;
 }
 
 void rdv_host_forget(struct rdv_host *h, const uint8_t cid[RDV_CID_LEN])
@@ -296,6 +315,7 @@ int rdv_host_next(struct rdv_host *h, const uint8_t *info, size_t info_len,
 		memcpy(m.from, h->cid, RDV_CID_LEN);
 		memcpy(m.to, h->c[i].cid, RDV_CID_LEN);
 		m.seq = ++h->seq;
+		m.re = h->c[i].answer_re;
 		if (m.kind == RDV_REFUSE) {
 			m.payload[0] = h->c[i].refusal;
 			m.payload_len = 1;
@@ -319,35 +339,72 @@ void rdv_client_init(struct rdv_client *c, const uint8_t cid[RDV_CID_LEN])
 	memset(c, 0, sizeof(*c));
 	memcpy(c->cid, cid, RDV_CID_LEN);
 	c->state = RDV_CL_ANNOUNCING;
+	c->h_seq = -1;
 }
 
-int rdv_client_host_slot(struct rdv_client *c, const struct rdv_msg *m)
+static int client_knew(const struct rdv_client *c, const uint8_t *cid)
+{
+	int i;
+
+	if (c->have_host && !memcmp(c->host_cid, cid, RDV_CID_LEN))
+		return 1;
+	for (i = 0; i < c->nprev && i < RDV_PREV_MAX; i++)
+		if (!memcmp(c->prev_cid[i], cid, RDV_CID_LEN))
+			return 1;
+	return 0;
+}
+
+/* A copy below the highest sequence seen is a replica that fell behind, and
+ * from an instance already dealt with it says nothing new; a restarted host
+ * can write below its predecessor, so an instance never met still counts. */
+static int client_copy_acts(struct rdv_client *c, const struct rdv_msg *m,
+			    int64_t seq)
+{
+	if (seq >= 0 && seq < c->h_seq && client_knew(c, m->from))
+		return 0;
+	if (seq > c->h_seq)
+		c->h_seq = seq;
+	return 1;
+}
+
+int rdv_client_host_slot(struct rdv_client *c, const struct rdv_msg *m,
+			 int64_t seq)
 {
 	int moved;
 
-	if (m->kind == RDV_TOMB) {
-		/* The host says the session is over, so there is nothing to
-		 * come back to and announcing again would never be answered. */
-		if (memcmp(m->from, rdv_zero, RDV_CID_LEN))
-			c->host_gone = 1;
-		return 0;
-	}
-	if (m->kind != RDV_HOSTINFO)
+	if (m->kind != RDV_TOMB && m->kind != RDV_HOSTINFO)
 		return 0;
 	if (!memcmp(m->from, rdv_zero, RDV_CID_LEN))
 		return 0;
+	if (!client_copy_acts(c, m, seq))
+		return -1;
+	if (m->kind == RDV_TOMB) {
+		/* The host says the session is over, so there is nothing to
+		 * come back to and announcing again would never be answered. */
+		c->host_gone = 1;
+		return 0;
+	}
+	c->host_gone = 0;
 	moved = !c->have_host || memcmp(c->host_cid, m->from, RDV_CID_LEN) ||
 		m->gen != c->host_gen;
 	if (!moved)
 		return 0;
 	/* The host is new or has moved, so whatever we were told is void and
 	 * the slot it would answer in is one it no longer knows about. */
+	if (c->have_host && memcmp(c->host_cid, m->from, RDV_CID_LEN)) {
+		memcpy(c->prev_cid[c->nprev % RDV_PREV_MAX], c->host_cid,
+		       RDV_CID_LEN);
+		if (c->nprev < RDV_PREV_MAX)
+			c->nprev++;
+		/* A new instance numbers its statements from one. */
+		c->have_answer_seq = 0;
+	}
 	memcpy(c->host_cid, m->from, RDV_CID_LEN);
 	c->host_gen = m->gen;
 	c->have_host = 1;
 	c->state = RDV_CL_ANNOUNCING;
-	c->have_answer_seq = 0;
 	c->answer_len = 0;
+	c->offer_seq = 0;
 	c->refusal = RDV_REFUSE_NONE;
 	return 1;
 }
@@ -361,6 +418,10 @@ int rdv_client_own_slot(struct rdv_client *c, const struct rdv_msg *m)
 	if (memcmp(m->to, c->cid, RDV_CID_LEN))
 		return 0;
 	if (c->have_host && memcmp(m->from, c->host_cid, RDV_CID_LEN))
+		return 0;
+	/* Only an answer to the offer standing now: a replica still serving the
+	 * answer to an earlier one would otherwise prime a dead punch. */
+	if (!c->offer_seq || m->re != c->offer_seq)
 		return 0;
 	if (c->have_answer_seq && m->seq <= c->answer_seq)
 		return 0;

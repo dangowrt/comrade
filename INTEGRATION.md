@@ -101,7 +101,7 @@ one on its own, watched by its token file disappearing (~6 s). When
 `stop` returns 0,
 access has ended, the service is gone and the state file with it. A
 client still holding the token is told so rather than left waiting: the
-service replaces the mailbox offer with a tombstone on its way out
+service replaces its host slot with a tombstone on its way out
 (PROTOCOL.md §4.1), so a join attempt fails with an error in a few
 seconds. Idempotent: exit 0, and nothing printed, when nothing was
 running. Without `--id` it acts on the single live session and refuses
@@ -258,8 +258,24 @@ One JSON object per line. Every event carries the resulting `"state"`.
      "grade":"ro","forward_refused":true},"state":"serving"}
     {"event":"warning","warning":"...","state":"ready"}
     {"event":"warning_cleared","state":"ready"}
+    {"event":"mailbox","mailbox":{"engaged":true,"dht":"ready",
+     "ours":"stored","peer":"present","node":"proven","proving":false,
+     "proven":true,"seq":12,"reads":40,"writes":3,"claim":"unknown",
+     "read_age_s":1,"write_age_s":30},"state":"ready"}
     {"event":"error","state":"error"}
     {"event":"stopped","state":"..."}
+
+The `mailbox` event reports the rendezvous (PROTOCOL.md §4) when its state
+moves, and the same object is written into the state document. `dht` is
+`cold` | `warmup` | `store` | `get` | `ready`; `ours` is `none` | `unstored` |
+`stored` (whether our own slot has been published, and whether its last store
+was acknowledged); `peer` is `present` once the other end has been heard from
+(a claimant on a host, the host slot on a client); `node` is `none` |
+`proving` | `proven` for the rendezvous node; `seq` is the host slot's
+sequence, -1 unread. `claim` is a client's standing as a claimant: `unknown` |
+`free` (announcing, not yet offered) | `held` (our offer is in our slot) |
+`answered` | `refused` (the host's grant is spent); a host always reports
+`unknown`. Counters and ages move without producing an event.
 
 Under procd, point stdout at logd and the system log becomes a session
 audit trail.

@@ -7,21 +7,21 @@
 #include <string.h>
 #include <time.h>
 
+#include "bencode.h"
 #include "bep44.h"
 #include "dbg.h"
 #include "candpack.h"
-#include "ccrypto.h"
 #include "dhtnode.h"
 #include "keys.h"
-#include "mailbox.h"
+#include "rdv.h"
 #include "sig.h"
 #include "sig_mcast.h"
 
-#define SIG_SALT "m"			/* the one shared mailbox */
-#define SIG_SEALED_MAX (SIG_MAX_VALUE + SEAL_OVERHEAD)
-/* the mcast value prepends a 2-byte direct-transport port to the candpack */
-#define SIG_MCAST_SEALED_MAX (2 + SIG_MAX_VALUE + SEAL_OVERHEAD)
+#define SIG_VALUE_MAX (RDV_MAX_MSG + SEAL_OVERHEAD)
+#define SIG_WIRE_MAX BEP44_MAX_VALUE	/* the sealed value as a bencoded string */
 #define SIG_SDP_MAX 4096		/* raw ICE description in/out of candpack */
+#define SIG_OPS_MAX 64
+#define SIG_MCAST_MAX (RDV_CID_LEN + 2 + SIG_VALUE_MAX)
 
 #define SIG_DHT_GET_MS 1000
 #define SIG_DHT_PUT_MS 1000		/* re-run the convergent store/gather this
@@ -37,7 +37,7 @@
 /*
  * How long a tombstone must stand unanswered before a client believes it.
  *
- * Every holder of the invitation can write the container, so the slot alone is
+ * Every holder of the invitation can write the host slot, so the slot alone is
  * not proof: a live host takes it back on its next write, roughly once a
  * second while it is serving. Waiting a few of those rounds is what separates
  * a session that ended from one somebody is lying about.
@@ -55,20 +55,18 @@
  * turns meeting into one round trip instead of a lookup. A token that names
  * none of them -- minted before the host had found any -- or names one that
  * has since gone must still work, or the invite someone copied an hour ago is
- * worthless. So the mailbox is also reached the ordinary way, by converging on
- * the key, whenever the direct route has not produced the peer.
+ * worthless. So the host slot is also reached the ordinary way, by converging
+ * on its key, whenever the direct route has not produced it.
  *
- * Both ends need it. A client that finds the value this way writes its answer
- * to the nodes that served it, and those are only read back if the host also
- * looks past the handful it pinned.
+ * Only the host slot: a client that finds it this way retains the nodes that
+ * served it, which are the host's own, and writes its bell and offer there.
  */
-/* Reads older than the one we hold, before we believe the item restarted. */
 
-#define SIG_DHT_WIDE_GET_MS 4000	/* while the peer's slot is still unseen */
+#define SIG_DHT_WIDE_GET_MS 4000	/* while the host slot is still unseen */
 #define SIG_DHT_WIDE_IDLE_MS 20000	/* once it has been, as a safety net */
 #define SIG_DHT_RELAY_MS 4000		/* operating a rendezvous the peer cannot
 					 * reach: often enough that a change to
-					 * its offer reaches the family within a
+					 * its slot reaches the family within a
 					 * round of being made */
 #define SIG_DHT_WIDE_PUT_MS 45000	/* keep the value on whoever is closest
 					 * now, not only where it first landed */
@@ -78,137 +76,96 @@
 					 * slower pace instead of not at all --
 					 * see sig_set_family_up. */
 
+#define SIG_GRADE_RW 1
+#define SIG_GRADE_RO 2
+
+struct sig_fam {
+	struct sockaddr_storage rnode;
+	struct sockaddr_storage ack_node;
+	socklen_t rnode_len;
+	socklen_t ack_node_len;
+	uint32_t epoch;
+	int ack_new;
+	int anchor_seen;
+	int relocate;
+	int relay;
+	int up;
+};
+
+/* One operation in flight: the slot it reads or writes, and for a read the
+ * network each family was on when it was asked. */
+struct sig_op {
+	struct sig *s;
+	uint8_t val[SIG_WIRE_MAX];
+	size_t val_len;
+	uint8_t cid[RDV_CID_LEN];
+	uint32_t qep[2];
+	int64_t seq_seen;
+	char kind;
+	uint8_t busy, done, wide, is_put;
+};
+
 struct sig {
 	unsigned flags;
 	struct session_keys keys;
+	uint8_t rdv[TOKEN_RDV_LEN];
+	uint8_t auth[TOKEN_AUTH_LEN];
+	uint8_t auth_ro[TOKEN_AUTH_LEN];
+	int have_rw;
 	uint64_t start_ms;
-	int is_host;			/* our slot: 'o' (host) or 'a' (client) */
+	int is_host;
 
-	int dht_engaged;
 	struct dhtnode *node;
 	struct bep44_engine *engine;
+	struct sig_op ops[SIG_OPS_MAX];
 
 	struct sig_mcast *mc;
 	int mcast_claims;		/* host demultiplexes lanlink itself, so a
 					 * mcast claimant is a direct claim, not an
 					 * ICE offer for the turnstile */
 
-	struct mailbox mb;		/* the two-slot rendezvous container */
-	uint8_t mcast_mine[SIG_MCAST_SEALED_MAX];	/* our announcement, sealed (mcast) */
-	size_t mcast_mine_len;
-
-	/*
-	 * The end of the session, as the mailbox carries it. The host places a
-	 * tombstone where the invitation points so a client joining a session
-	 * that is over is told so instead of waiting for an offer nobody will
-	 * write again; the client weighs what it reads against when it last saw
-	 * an offer, since the slot is writable by everyone the invitation was
-	 * handed to.
-	 */
-	int ending;			/* host: the tombstone is what we publish */
-	/*
-	 * Where it has found a home, counted apart because the two stores reach
-	 * different readers and a client is only told by the one it uses: the
-	 * direct store lands on the node a token names, the convergent one on
-	 * whoever is closest to the key -- which is both where a token naming
-	 * no node leads, and where this host's own offer was left.
-	 */
+	struct rdv_host *rh;
+	struct rdv_client *rc;
+	uint8_t hval[SIG_WIRE_MAX];
+	size_t hval_len;
+	int h_stale;
+	uint8_t hcopy[SIG_WIRE_MAX];
+	size_t hcopy_len;
+	int64_t hcopy_seq;
+	int64_t h_seq;
 	int end_placed_direct;
 	int end_placed_wide;
-	int end_store_inflight;		/* a tombstone store is out; a second
-					 * would lose its own compare-and-swap */
-	uint64_t tomb_seen_ms;		/* when a tombstone was first seen with
-					 * nothing since to contradict it, 0 none */
-	uint64_t offer_seen_ms;		/* and when the host's offer last was */
+	uint64_t tomb_seen_ms;
+	uint64_t info_seen_ms;
 
 	sig_recv_cb *cb;
 	void *arg;
 	uint16_t direct_port;		/* our direct-transport port, announced */
 	sig_direct_cb *direct_cb;	/* fires on a link-local announcement */
 	void *direct_arg;
-	uint8_t last_peer[SIG_MAX_VALUE];
-	size_t last_peer_len;
-	int have_last;
-	/*
-	 * A claim names where a peer is, and every holder of the invitation can
-	 * read the mailbox -- a read-only link handed to a room is a crowd with
-	 * no reason to trust each other. So the host publishes a key in its own
-	 * slot and holds the secret half alone, and a claim is boxed to it
-	 * inside the seal the slot already carries: the seal still says a token
-	 * holder wrote it, the box says only the host may read it.
-	 *
-	 * The claimant's ufrag rides in the clear beside the box, because the
-	 * turnstile rule that lets a client overwrite its own superseded claim
-	 * is about identity, not about where that claimant is.
-	 */
-	uint8_t claim_sk[32];		/* host: the half nobody else has */
-	uint8_t claim_pk[32];
-	uint8_t peer_claim_pk[32];	/* client: taken from the host's slot */
-	int have_peer_claim_pk;
-	uint8_t my_packed[SIG_MAX_VALUE];	/* staged before it can be boxed */
+	uint8_t my_packed[RDV_MAX_PAYLOAD];
 	size_t my_packed_len;
-	uint64_t my_ident;		/* our description sans its candidates:
-					 * a change here is not gathering */
-	char my_ufrag[64];		/* our claim's ICE ufrag: recognises our
-					 * own (possibly superseded) answer in
-					 * the slot, see mailbox_note_own_answer */
-	uint32_t my_gen;		/* our offer's network generation, stamped
-					 * into the packed slot; the peer's, read
-					 * back off its slot, is peer_gen */
-	uint32_t peer_gen;
-	char claim_offer[64];		/* client: the offer ufrag our claim names,
-					 * so the host punches the generation we
-					 * primed */
-	char peer_claim_offer[64];	/* host: the offer ufrag a served claim named */
-	char peer_offer_ufrag[64];	/* client: the ufrag of the offer last read */
-	int claim_unwritten;		/* client: a claim changed since last written */
-	uint8_t peer_cid[CANDPACK_CID_LEN];
-	int have_peer_cid;
+	uint32_t my_gen;
 
 	int locate;
-	int put_inflight;		/* a convergent host store is running */
-	struct sockaddr_storage rnode4;	/* rendezvous node per family: captured */
-	socklen_t rnode4_len;		/* independently as each family's DHT */
-	struct sockaddr_storage rnode6;	/* serves the value back */
-	socklen_t rnode6_len;
-	int acked4, acked6;		/* a validated get had a node of this
-					 * family serve our own value back */
-	/*
-	 * The node that served the last validated get, per family, waiting to be
-	 * read. Who answered is what says whether the rendezvous we hold is
-	 * still the rendezvous, so it is reported rather than acted on here:
-	 * keeping or replacing an anchor is a decision about the network we are
-	 * on, and that is not this module's to make.
-	 */
-	struct sockaddr_storage ack_node4, ack_node6;
-	socklen_t ack_node4_len, ack_node6_len;
-	int ack_new4, ack_new6;
-	int relocate4, relocate6;	/* search for a replacement, while still
-					 * serving the one we hold */
-	int relay4, relay6;		/* client: asked to establish a
-					 * rendezvous the peer cannot reach */
-	int up4, up6;			/* proven connectivity, see sig_set_family_up */
-	uint32_t epoch4, epoch6;	/* the network each family is on now */
-	uint32_t qep4, qep6;		/* and what the last get went out under */
-	int gets_ok;			/* validated reads of the container */
-	int puts_ok;			/* stores that found a home */
-	uint64_t last_get_ms;		/* when either last happened, 0 = never */
+	int located_any;
+	int mine_stored;
+	struct sig_fam fam[2];
+	int gets_ok;
+	int puts_ok;
+	uint64_t last_get_ms;
 	uint64_t last_put_ms;
-	uint64_t engaged_ms;		/* when the DHT was engaged: what the
-					 * silence is measured from until a read
-					 * comes back */
-	uint64_t next_wide_get_ms;
-	uint64_t next_wide_put_ms;
-	int anchor_seen4, anchor_seen6;	/* the node we hold answered a get since
-					 * this was last taken; sticky, because
-					 * another holder answering after it must
-					 * not erase that it did */
-	uint64_t first_locate_ms;	/* when the first family was captured */
+	uint64_t engaged_ms;
 	int rdv_stage;			/* engine-wide progress: cold/warmup/store/get */
 	int routeless;			/* the last pump had nowhere to ask */
+	unsigned read_turn;
+	int claim_cursor;
 
 	uint64_t next_get_ms;
 	uint64_t next_put_ms;
+	uint64_t next_hput_ms;		/* the host slot's own store schedule */
+	uint64_t next_wide_get_ms;
+	uint64_t next_wide_put_ms;
 	uint64_t next_mcast_ms;
 	uint64_t next_mcast_open_ms;
 	uint64_t next_dht_open_ms;
@@ -222,15 +179,14 @@ static uint64_t now_ms(void)
 	return (uint64_t)ts.tv_sec * 1000 + (uint64_t)(ts.tv_nsec / 1000000);
 }
 
-
-static char my_slot(const struct sig *s)
+static int fam_of(int family)
 {
-	return s->is_host ? 'o' : 'a';
+	return family == 6 ? 1 : 0;
 }
 
-static char peer_slot(const struct sig *s)
+static int fam_of_af(int af)
 {
-	return s->is_host ? 'a' : 'o';
+	return af == AF_INET6 ? 1 : 0;
 }
 
 static int engage_dht(struct sig *s)
@@ -239,13 +195,26 @@ static int engage_dht(struct sig *s)
 	if (!s->node)
 		return -1;
 	s->engine = dhtnode_engine(s->node);
-	s->dht_engaged = 1;
 	s->engaged_ms = now_ms();
 	return 0;
 }
 
-struct sig *sig_create(const uint8_t rdv[TOKEN_RDV_LEN], unsigned flags,
-		       int is_host)
+const uint8_t *sig_instance_id(void)
+{
+	static uint8_t cid[RDV_CID_LEN];
+	static int set;
+
+	if (!set) {
+		if (random_bytes(cid, sizeof(cid)))
+			return NULL;
+		set = 1;
+	}
+	return cid;
+}
+
+struct sig *sig_create(const uint8_t rdv[TOKEN_RDV_LEN],
+		       const uint8_t auth[TOKEN_AUTH_LEN], int auth_ro,
+		       unsigned flags, int is_host)
 {
 	struct sig *s = calloc(1, sizeof(*s));
 
@@ -255,21 +224,18 @@ struct sig *sig_create(const uint8_t rdv[TOKEN_RDV_LEN], unsigned flags,
 		free(s);
 		return NULL;
 	}
-	/*
-	 * The key claims are boxed to. Minted once per signaller rather than
-	 * per offer: a rotation that changed it would strand a claim already in
-	 * flight against the old one, and a rebuild -- which is what a move or
-	 * a new network produces -- mints a fresh one anyway.
-	 */
-	if (is_host &&
-	    (random_bytes(s->claim_sk, sizeof(s->claim_sk)) ||
-	     cc_x25519_public(s->claim_pk, s->claim_sk))) {
-		free(s);
-		return NULL;
+	memcpy(s->rdv, rdv, TOKEN_RDV_LEN);
+	if (auth_ro) {
+		memcpy(s->auth_ro, auth, TOKEN_AUTH_LEN);
+	} else {
+		memcpy(s->auth, auth, TOKEN_AUTH_LEN);
+		keys_derive_ro_auth(s->auth_ro, auth);
+		s->have_rw = 1;
 	}
 	s->flags = flags;
 	s->is_host = is_host;
-	mailbox_init(&s->mb, is_host);
+	s->h_seq = -1;
+	s->hcopy_seq = -1;
 	s->start_ms = now_ms();
 
 	/*
@@ -307,22 +273,6 @@ static void sig_free(struct sig *s, int persist)
 	free(s);
 }
 
-int sig_use_claim_key(struct sig *s, const uint8_t sk[32])
-{
-	if (!s || !s->is_host || !sk)
-		return 0;
-	memcpy(s->claim_sk, sk, 32);
-	return cc_x25519_public(s->claim_pk, s->claim_sk) ? -1 : 0;
-}
-
-int sig_claim_key(const struct sig *s, uint8_t sk[32])
-{
-	if (!s || !s->is_host)
-		return -1;
-	memcpy(sk, s->claim_sk, 32);
-	return 0;
-}
-
 void sig_destroy(struct sig *s)
 {
 	sig_free(s, 1);
@@ -331,6 +281,19 @@ void sig_destroy(struct sig *s)
 void sig_discard(struct sig *s)
 {
 	sig_free(s, 0);
+}
+
+void sig_rdv_host(struct sig *s, struct rdv_host *h)
+{
+	s->rh = h;
+	s->next_put_ms = 0;
+	s->next_hput_ms = 0;
+}
+
+void sig_rdv_client(struct sig *s, struct rdv_client *c)
+{
+	s->rc = c;
+	s->next_put_ms = 0;
 }
 
 unsigned sig_routes_open(int node_ready, int rdv_held)
@@ -351,7 +314,7 @@ int sig_prepare(struct sig *s, struct pollfd *fds, int maxfds, int *timeout_ms)
 {
 	int nfds = 0, t;
 
-	if (s->dht_engaged)
+	if (s->node)
 		nfds += dhtnode_prepare(s->node, fds + nfds, maxfds - nfds, &t);
 	if (s->mc)
 		nfds += sig_mcast_prepare(s->mc, fds + nfds, maxfds - nfds);
@@ -363,210 +326,63 @@ int sig_ready(struct sig *s)
 {
 	if (s->mc)
 		return 1;
-	return s->dht_engaged && routes_now(s) != 0;
+	return s->node && routes_now(s) != 0;
 }
 
-/* The ICE ufrag an sdp names, "" when absent. */
-static void sdp_ufrag_of(const char *sdp, char *out, size_t outlen)
+static void slot_key(const struct sig *s, int grade, const uint8_t *cid,
+		     uint8_t out[32])
 {
-	const char *p = strstr(sdp, "ice-ufrag:");
-	size_t i = 0;
-
-	out[0] = '\0';
-	if (!p)
-		return;
-	p += 10;
-	while (*p && *p != '\r' && *p != '\n' && i + 1 < outlen)
-		out[i++] = *p++;
-	out[i] = '\0';
+	keys_slot_key(out, grade == SIG_GRADE_RO ? s->auth_ro : s->auth, cid,
+		      RDV_CID_LEN);
 }
 
-/*
- * Build what goes in our slot from the packed description we hold, and stage
- * it. The host prefixes the key claims are boxed to; a client boxes to that
- * key and puts its ufrag in the clear beside it. A client that has not seen
- * the host's slot yet cannot box anything, so it stages nothing and is called
- * again when the slot arrives -- which is before it could have written, since
- * a write is only decided against a container that has been read.
- */
-static int sig_stage(struct sig *s)
+static int my_grade(const struct sig *s)
 {
-	uint8_t val[SIG_MAX_VALUE];
-	uint8_t sealed[SIG_SEALED_MAX];
-	uint8_t mc[2 + SIG_MAX_VALUE];
-	char ms[2];
-	size_t ulen, n;
-	int slen;
-
-	if (!s->my_packed_len)
-		return -1;
-	if (s->is_host) {
-		if (32 + s->my_packed_len > sizeof(val))
-			return -1;
-		memcpy(val, s->claim_pk, 32);
-		memcpy(val + 32, s->my_packed, s->my_packed_len);
-		n = 32 + s->my_packed_len;
-	} else {
-		if (!s->have_peer_claim_pk)
-			return -1;
-		ulen = strlen(s->my_ufrag);
-		if (ulen > 255 ||
-		    1 + ulen + s->my_packed_len + BOX_OVERHEAD > sizeof(val))
-			return -1;
-		val[0] = (uint8_t)ulen;
-		memcpy(val + 1, s->my_ufrag, ulen);
-		slen = box_seal(val + 1 + ulen, sizeof(val) - 1 - ulen,
-				s->peer_claim_pk, s->my_packed,
-				s->my_packed_len);
-		if (slen < 0)
-			return -1;
-		n = 1 + ulen + (size_t)slen;
-	}
-	slen = msg_seal(sealed, sizeof(sealed), s->keys.sig_key, val, n);
-	if (slen < 0)
-		return -1;
-	mailbox_set_mine(&s->mb, sealed, (size_t)slen);
-
-	/*
-	 * The multicast announcement carries the same value with our
-	 * direct-transport port prepended, bound to the slot letter it goes out
-	 * under: that letter frames the value outside the seal and is what says
-	 * whether a description is an offer or an answer, so without binding it
-	 * a frame captured from one slot opens in the other.
-	 */
-	mc[0] = (uint8_t)(s->direct_port >> 8);
-	mc[1] = (uint8_t)s->direct_port;
-	memcpy(mc + 2, val, n);
-	ms[0] = my_slot(s);
-	ms[1] = '\0';
-	slen = msg_seal_ad(s->mcast_mine, sizeof(s->mcast_mine),
-			   s->keys.sig_key, (const uint8_t *)ms, 1, mc, n + 2);
-	if (slen > 0)
-		s->mcast_mine_len = (size_t)slen;
-	return 0;
+	return s->have_rw ? SIG_GRADE_RW : SIG_GRADE_RO;
 }
 
-/*
- * A description's identity, which is everything in it that is not one more way
- * to reach the same agent: the credentials, the fingerprint, the session's own
- * name for itself. Candidate lines are left out, so two descriptions differing
- * only in how many candidates have turned up so far hash the same.
- *
- * A collision would at worst treat one change as the wrong kind for a single
- * put, nothing worse, so a hash is enough to decide this.
- */
-static uint64_t sdp_identity(const char *sdp)
+static void slot_salt(const struct sig *s, char kind, const uint8_t *cid,
+		      char out[KEYS_SALT_LEN])
 {
-	uint64_t h = 1469598103934665603ULL;		/* FNV-1a */
-	const char *line = sdp;
-
-	while (*line) {
-		const char *nl = strchr(line, '\n');
-		size_t len = nl ? (size_t)(nl - line + 1) : strlen(line);
-		size_t i;
-
-		if (strncmp(line, "a=candidate:", 12) &&
-		    strncmp(line, "candidate:", 10))
-			for (i = 0; i < len; i++) {
-				h ^= (uint64_t)(unsigned char)line[i];
-				h *= 1099511628211ULL;
-			}
-		if (!nl)
-			break;
-		line = nl + 1;
-	}
-	return h;
+	keys_slot_salt(out, s->rdv, kind, cid, cid ? RDV_CID_LEN : 0);
 }
 
-/* One instance id per process, not per signaller: it has to survive this one
- * being rebuilt on a network change, which is the whole point of it. */
-static const uint8_t *sig_my_cid(void)
-{
-	static uint8_t cid[CANDPACK_CID_LEN];
-	static int set;
-
-	if (!set) {
-		if (random_bytes(cid, sizeof(cid)))
-			return NULL;
-		set = 1;
-	}
-	return cid;
-}
-
-/* candpack zeroes the field when the peer named no instance, so an all-zero
- * id means absent rather than an id that happens to be zero. */
-static void peer_cid_note(struct sig *s)
-{
-	static const uint8_t zero[CANDPACK_CID_LEN];
-	int had = s->have_peer_cid;
-
-	s->have_peer_cid = memcmp(s->peer_cid, zero, sizeof(zero)) != 0;
-	if (s->have_peer_cid && !had)
-		dbg_logf("sig: peer instance %02x%02x%02x%02x%02x%02x%02x%02x",
-			 s->peer_cid[0], s->peer_cid[1], s->peer_cid[2],
-			 s->peer_cid[3], s->peer_cid[4], s->peer_cid[5],
-			 s->peer_cid[6], s->peer_cid[7]);
-}
-
-static void sig_mb_note(const char *tag, uint32_t gen, const char *off,
-			const uint8_t *packed, size_t plen, const char *sdp)
+static void sig_mb_note(const char *tag, const uint8_t *cid, const char *sdp)
 {
 	char flat[SIG_SDP_MAX];
 	size_t i;
 
 	if (!dbg_mailbox_on())
 		return;
-	dbg_hex(tag, packed, plen);
 	for (i = 0; sdp[i] && i < sizeof(flat) - 1; i++)
 		flat[i] = (sdp[i] == '\n' || sdp[i] == '\r') ? '|' : sdp[i];
 	flat[i] = '\0';
-	dbg_logf("mailbox %s gen=%u off=%s sdp=[%s]", tag, (unsigned)gen,
-		 off && off[0] ? off : "-", flat);
+	dbg_logf("mailbox %s %02x%02x%02x%02x sdp=[%s]", tag, cid[0], cid[1],
+		 cid[2], cid[3], flat);
 }
 
 int sig_post(struct sig *s, const uint8_t *data, size_t len)
 {
+	uint8_t packed[RDV_MAX_PAYLOAD];
 	char sdp[SIG_SDP_MAX];
-	uint8_t packed[SIG_MAX_VALUE];
 	int plen, changed;
 
-	/* Pack for the DHT slot: global and shared-private (nested-NAT) reachable
-	 * candidates, dropping only what cannot help off our own L2 segment. */
-	if (len >= sizeof(sdp))
+	if (s->is_host || !s->rc || len >= sizeof(sdp))
 		return -1;
 	memcpy(sdp, data, len);
 	sdp[len] = '\0';
-	sdp_ufrag_of(sdp, s->my_ufrag, sizeof(s->my_ufrag));
-	plen = candpack_encode(sdp, 1, s->my_gen,
-			       s->is_host ? NULL : s->claim_offer,
-			       sig_my_cid(), packed, sizeof(packed));
+	plen = candpack_encode(sdp, 1, s->my_gen, NULL, sig_instance_id(),
+			       packed, sizeof(packed));
 	if (plen <= 0)
 		return -1;
-	/*
-	 * Only a description that says something new puts the wait back to the
-	 * beginning. A re-post of what we already hold -- the same candidates
-	 * offered again -- would otherwise keep pushing the store away for as
-	 * long as anything kept re-posting.
-	 */
 	changed = s->my_packed_len != (size_t)plen ||
 		  memcmp(s->my_packed, packed, (size_t)plen);
 	memcpy(s->my_packed, packed, (size_t)plen);
 	s->my_packed_len = (size_t)plen;
-	sig_stage(s);
-
+	rdv_client_set_live(s->rc, 0);
 	if (changed) {
-		uint64_t ident = sdp_identity(sdp);
-
-		sig_mb_note(s->is_host ? "PUT offer" : "PUT claim", s->my_gen,
-			    s->is_host ? NULL : s->claim_offer, packed,
-			    (size_t)plen, sdp);
-		/* News (rotation, fresh password, rebuilt agent, first offer)
-		 * stores at once; a candidate-only amendment rides the put
-		 * cadence and the peer-change nudge, not a store per candidate. */
-		if (ident != s->my_ident || !s->puts_ok)
-			s->next_put_ms = 0;
-		s->my_ident = ident;
-		s->claim_unwritten = 1;
+		sig_mb_note("PUT offer", s->rc->cid, sdp);
+		s->next_put_ms = 0;
 	}
 	s->next_mcast_ms = 0;
 	return 0;
@@ -579,87 +395,71 @@ int sig_subscribe(struct sig *s, sig_recv_cb *cb, void *arg)
 	return 0;
 }
 
-enum sig_claim sig_claim_status(struct sig *s)
+int sig_answer(struct sig *s, const uint8_t *cid, const uint8_t *data,
+	       size_t len)
 {
-	switch (mailbox_claim_status(&s->mb)) {
-	case MAILBOX_CLAIM_FREE:
-		return SIG_CLAIM_FREE;
-	case MAILBOX_CLAIM_HELD:
-		return SIG_CLAIM_HELD;
-	case MAILBOX_CLAIM_BUSY:
-		return SIG_CLAIM_BUSY;
-	default:
-		return SIG_CLAIM_UNKNOWN;
-	}
+	uint8_t packed[RDV_MAX_PAYLOAD];
+	char sdp[SIG_SDP_MAX];
+	int plen;
+
+	if (!s->is_host || !s->rh || len >= sizeof(sdp))
+		return -1;
+	memcpy(sdp, data, len);
+	sdp[len] = '\0';
+	plen = candpack_encode(sdp, 1, s->my_gen, NULL, sig_instance_id(),
+			       packed, sizeof(packed));
+	if (plen <= 0)
+		return -1;
+	sig_mb_note("PUT answer", cid, sdp);
+	rdv_host_answer(s->rh, cid, packed, (size_t)plen);
+	s->next_put_ms = 0;
+	return 0;
+}
+
+void sig_refuse(struct sig *s, const uint8_t *cid)
+{
+	if (!s->is_host || !s->rh)
+		return;
+	rdv_host_refuse(s->rh, cid, RDV_REFUSE_FULL);
+	s->next_put_ms = 0;
+}
+
+void sig_claimant_gone(struct sig *s, const uint8_t *cid)
+{
+	if (s->rh)
+		rdv_host_forget(s->rh, cid);
+}
+
+int sig_refusal(struct sig *s)
+{
+	return s->rc ? s->rc->refusal : 0;
 }
 
 void sig_withdraw(struct sig *s)
 {
-	mailbox_withdraw(&s->mb);
+	if (s->rc)
+		rdv_client_set_live(s->rc, 1);
 }
-
-int sig_rotate(struct sig *s, const uint8_t *offer, size_t len)
-{
-	int rc = sig_post(s, offer, len);
-
-	if (rc)
-		return rc;
-	mailbox_arm_release(&s->mb);	/* omit the answer slot on the next write */
-	s->have_last = 0;	/* re-deliver the next answer even if identical */
-	return 0;
-}
-
-void sig_release(struct sig *s)
-{
-	mailbox_arm_release(&s->mb);
-	s->next_put_ms = 0;		/* the turnstile is a mutex: due now */
-	/*
-	 * Emptying the slot means the next answer is new business even if it is
-	 * the same bytes, exactly as after a rotate. A replica the release never
-	 * reached keeps serving the claim just let go, and a delivery
-	 * de-duplicated against that copy is one the turnstile never judges
-	 * again -- so the release is never written to it either.
-	 */
-	s->have_last = 0;
-}
-
-void sig_redeliver(struct sig *s)
-{
-	s->have_last = 0;
-}
-
-/*
- * The tombstone's payload: a version byte, so what a later comrade puts in one
- * can grow without an older one reading the addition as a different slot. It is
- * sealed like every other slot, which keeps it to the holders of the invitation
- * -- not because that makes it unforgeable among them (nothing here could), but
- * because a passer-by should learn no more from the end of a session than from
- * the rest of it.
- */
-#define SIG_TOMB_VERSION 1
 
 void sig_end(struct sig *s)
 {
-	uint8_t plain = SIG_TOMB_VERSION;
-	uint8_t sealed[SIG_SEALED_MAX];
-	int n;
-
-	if (!s->is_host || s->ending)
+	if (!s->is_host || !s->rh || s->rh->gone)
 		return;
-	n = msg_seal(sealed, sizeof(sealed), s->keys.sig_key, &plain, 1);
-	if (n < 0)
-		return;
-	mailbox_entomb(&s->mb, sealed, (size_t)n);
-	s->ending = 1;
-	s->next_put_ms = 0;		/* place it now, not on the next round */
+	rdv_host_entomb(s->rh);
+	s->next_hput_ms = 0;		/* place it now, not on the next round */
 	dbg_logf("sig: publishing the tombstone");
+}
+
+static int ending(const struct sig *s)
+{
+	return s->rh && s->rh->gone;
 }
 
 int sig_end_placed(struct sig *s)
 {
 	int placed = 1;
 
-	if (!s->ending)
+	if (!ending(s))
 		return 0;
 	/*
 	 * Only a DHT that is actually up is waited on. One that was never there
@@ -674,21 +474,22 @@ int sig_end_placed(struct sig *s)
 	 * client that finds it punches at a host that is no longer there for as
 	 * long as it is willing to.
 	 */
-	if ((s->flags & SIG_DHT) && s->dht_engaged && dhtnode_ready(s->node)) {
+	if ((s->flags & SIG_DHT) && s->node && dhtnode_ready(s->node)) {
 		placed = s->end_placed_wide;
-		if ((s->rnode4_len || s->rnode6_len) && !s->end_placed_direct)
+		if ((s->fam[0].rnode_len || s->fam[1].rnode_len) &&
+		    !s->end_placed_direct)
 			placed = 0;
 	}
 	return placed;
 }
 
-int sig_tomb_settled(uint64_t tomb_ms, uint64_t offer_ms, uint64_t now)
+int sig_tomb_settled(uint64_t tomb_ms, uint64_t info_ms, uint64_t now)
 {
 	if (!tomb_ms)
 		return 0;
-	/* An offer since the tombstone is a host still serving, whatever the
+	/* Host info since the tombstone is a host still serving, whatever the
 	 * slot says -- so the clock only runs while nothing has answered. */
-	if (offer_ms >= tomb_ms)
+	if (info_ms >= tomb_ms)
 		return 0;
 	return now - tomb_ms >= SIG_TOMB_SETTLE_MS;
 }
@@ -697,7 +498,7 @@ int sig_peer_ended(struct sig *s)
 {
 	if (s->is_host)
 		return 0;
-	return sig_tomb_settled(s->tomb_seen_ms, s->offer_seen_ms, now_ms());
+	return sig_tomb_settled(s->tomb_seen_ms, s->info_seen_ms, now_ms());
 }
 
 void sig_set_direct_port(struct sig *s, uint16_t port)
@@ -721,70 +522,52 @@ int sig_seed_node(struct sig *s, const struct sockaddr *sa, socklen_t len)
 {
 	if (!(s->flags & SIG_DHT))
 		return -1;
-	if (!s->dht_engaged && engage_dht(s))
+	if (!s->node && engage_dht(s))
 		return -1;
 	return bep44_pin_add(s->engine, NULL, sa, len);
 }
 
 void sig_set_family_up(struct sig *s, int family, int up)
 {
-	if (family == 6)
-		s->up6 = up;
-	else
-		s->up4 = up;
+	s->fam[fam_of(family)].up = up;
 }
 
 void sig_set_gen(struct sig *s, uint32_t gen)
 {
 	s->my_gen = gen;
+	if (s->rh) {
+		rdv_host_set_gen(s->rh, gen);
+		s->next_hput_ms = 0;
+	}
 }
 
 void sig_set_family_epoch(struct sig *s, int family, uint32_t epoch)
 {
-	int *seen = family == 6 ? &s->anchor_seen6 : &s->anchor_seen4;
-	int *have = family == 6 ? &s->ack_new6 : &s->ack_new4;
-	uint32_t *ep = family == 6 ? &s->epoch6 : &s->epoch4;
+	struct sig_fam *f = &s->fam[fam_of(family)];
 
-	if (*ep == epoch)
+	if (f->epoch == epoch)
 		return;
-	*ep = epoch;
+	f->epoch = epoch;
 	/* Held evidence was asked for on the network being left. */
-	*seen = 0;
-	*have = 0;
+	f->anchor_seen = 0;
+	f->ack_new = 0;
 }
 
 uint32_t sig_peer_gen(const struct sig *s)
 {
-	return s->peer_gen;
+	return s->rc ? s->rc->host_gen : 0;
 }
 
 const uint8_t *sig_peer_cid(const struct sig *s)
 {
-	return s->have_peer_cid ? s->peer_cid : NULL;
-}
-
-void sig_set_claim_offer(struct sig *s, const char *ufrag)
-{
-	if (!s || s->is_host)
-		return;
-	snprintf(s->claim_offer, sizeof(s->claim_offer), "%s",
-		 ufrag ? ufrag : "");
-}
-
-void sig_claim_offer(const struct sig *s, char *out, size_t n)
-{
-	if (!out || !n)
-		return;
-	out[0] = '\0';
-	if (s && s->is_host)
-		snprintf(out, n, "%s", s->peer_claim_offer);
+	return s->rc && s->rc->have_host ? s->rc->host_cid : NULL;
 }
 
 int sig_locate(struct sig *s)
 {
 	if (!(s->flags & SIG_DHT))
 		return -1;
-	if (!s->dht_engaged && engage_dht(s))
+	if (!s->node && engage_dht(s))
 		return -1;
 	s->locate = 1;
 	return 0;
@@ -793,57 +576,45 @@ int sig_locate(struct sig *s)
 int sig_located(struct sig *s, int family, struct sockaddr *out,
 		socklen_t *out_len)
 {
-	const struct sockaddr_storage *r = family == 6 ? &s->rnode6 : &s->rnode4;
-	socklen_t rl = family == 6 ? s->rnode6_len : s->rnode4_len;
+	const struct sig_fam *f = &s->fam[fam_of(family)];
 
-	if (!s->locate || !rl || *out_len < rl)
+	if (!s->locate || !f->rnode_len || *out_len < f->rnode_len)
 		return 0;
-	memcpy(out, r, rl);
-	*out_len = rl;
+	memcpy(out, &f->rnode, f->rnode_len);
+	*out_len = f->rnode_len;
 	return 1;
-}
-
-int sig_dht_acked(struct sig *s, int family)
-{
-	return family == 6 ? s->acked6 : s->acked4;
 }
 
 int sig_dht_ready(struct sig *s)
 {
-	return s->dht_engaged && dhtnode_ready(s->node);
+	return s->node && dhtnode_ready(s->node);
 }
 
 int sig_take_ack(struct sig *s, int family, struct sockaddr *out,
 		 socklen_t *out_len)
 {
-	int *have = family == 6 ? &s->ack_new6 : &s->ack_new4;
-	const struct sockaddr_storage *n = family == 6 ? &s->ack_node6 :
-							&s->ack_node4;
-	socklen_t nl = family == 6 ? s->ack_node6_len : s->ack_node4_len;
+	struct sig_fam *f = &s->fam[fam_of(family)];
 
-	if (!*have || !nl || *out_len < nl)
+	if (!f->ack_new || !f->ack_node_len || *out_len < f->ack_node_len)
 		return 0;
-	memcpy(out, n, nl);
-	*out_len = nl;
-	*have = 0;
+	memcpy(out, &f->ack_node, f->ack_node_len);
+	*out_len = f->ack_node_len;
+	f->ack_new = 0;
 	return 1;
 }
 
 int sig_take_anchor_seen(struct sig *s, int family)
 {
-	int *seen = family == 6 ? &s->anchor_seen6 : &s->anchor_seen4;
-	int was = *seen;
+	struct sig_fam *f = &s->fam[fam_of(family)];
+	int was = f->anchor_seen;
 
-	*seen = 0;
+	f->anchor_seen = 0;
 	return was;
 }
 
 void sig_relay(struct sig *s, int family, int on)
 {
-	if (family == 6)
-		s->relay6 = on;
-	else
-		s->relay4 = on;
+	s->fam[fam_of(family)].relay = on;
 	if (on)
 		s->locate = 1;		/* the get that follows is what captures */
 }
@@ -853,83 +624,63 @@ void sig_search_again(struct sig *s, int family)
 	/* The node we hold keeps being served while this runs: a rendezvous
 	 * that vanishes is worse than a stale one, and the caller swaps it only
 	 * once a different node has actually answered. */
-	if (family == 6)
-		s->relocate6 = 1;
-	else
-		s->relocate4 = 1;
+	s->fam[fam_of(family)].relocate = 1;
 }
 
 void sig_forget(struct sig *s, int family)
 {
-	struct sockaddr_storage *r = family == 6 ? &s->rnode6 : &s->rnode4;
-	socklen_t *rl = family == 6 ? &s->rnode6_len : &s->rnode4_len;
+	struct sig_fam *f = &s->fam[fam_of(family)];
 
-	if (!*rl)
+	if (!f->rnode_len)
 		return;
-	if (s->dht_engaged)
-		bep44_pin_del(s->engine, (const struct sockaddr *)r, *rl);
-	memset(r, 0, sizeof(*r));
-	*rl = 0;
-	if (family == 6) {
-		s->relocate6 = 0;
-		s->acked6 = 0;
-		s->anchor_seen6 = 0;
-		s->ack_new6 = 0;
-	} else {
-		s->relocate4 = 0;
-		s->acked4 = 0;
-		s->anchor_seen4 = 0;
-		s->ack_new4 = 0;
-	}
-	s->next_put_ms = 0;
+	if (s->node)
+		bep44_pin_del(s->engine, (const struct sockaddr *)&f->rnode,
+			      f->rnode_len);
+	memset(&f->rnode, 0, sizeof(f->rnode));
+	f->rnode_len = 0;
+	f->ack_node_len = 0;
+	f->relocate = 0;
+	f->anchor_seen = 0;
+	f->ack_new = 0;
+	s->next_hput_ms = 0;
 }
 
 int sig_locating(struct sig *s, int family)
 {
-	socklen_t rl = family == 6 ? s->rnode6_len : s->rnode4_len;
-
-	if (!(s->flags & SIG_DHT) || !s->is_host || !s->locate || rl)
+	if (!(s->flags & SIG_DHT) || !s->is_host || !s->locate ||
+	    s->fam[fam_of(family)].rnode_len)
 		return 0;
 	/* Still actively pursued once the other family has proven the DHT
 	 * reachable at all: there is no fixed point past which a family that
 	 * has not answered yet is known to never will, so this stays true
 	 * (still PENDING, not settled to NONE) until it is captured or the
 	 * session ends. */
-	return s->first_locate_ms != 0;
+	return s->located_any;
 }
 
 int sig_reinforce(struct sig *s, int family, const struct sockaddr *sa,
 		  socklen_t len)
 {
-	struct sockaddr_storage *r = family == 6 ? &s->rnode6 : &s->rnode4;
-	socklen_t *rl = family == 6 ? &s->rnode6_len : &s->rnode4_len;
+	struct sig_fam *f = &s->fam[fam_of(family)];
 
-	if ((size_t)len > sizeof(*r))
+	if ((size_t)len > sizeof(f->rnode))
 		return -1;
 	if (!(s->flags & SIG_DHT))
 		return -1;
-	if (!s->dht_engaged && engage_dht(s))
+	if (!s->node && engage_dht(s))
 		return -1;
 	if (bep44_pin_add(s->engine, NULL, sa, len))
 		return -1;
-	if (*rl != len || memcmp(r, sa, len)) {
-		if (family == 6)
-			s->anchor_seen6 = 0;
-		else
-			s->anchor_seen4 = 0;
-	}
-	memcpy(r, sa, len);		/* adopt it as the located rendezvous, ... */
-	*rl = len;
-	if (family == 6)
-		s->relocate6 = 0;
-	else
-		s->relocate4 = 0;
+	if (f->rnode_len != len || memcmp(&f->rnode, sa, len))
+		f->anchor_seen = 0;
+	memcpy(&f->rnode, sa, len);		/* adopt it as the located rendezvous, ... */
+	f->rnode_len = len;
+	f->relocate = 0;
 	s->locate = 1;			/* ... so sig_located returns it and the get
 					 * never re-captures a different one. A
 					 * still-missing family is located as usual;
 					 * once none is missing, dht_pump reinforces. */
-	if (!s->first_locate_ms)	/* paces any locate of a missing family */
-		s->first_locate_ms = now_ms();
+	s->located_any = 1;
 	return 0;
 }
 
@@ -969,16 +720,44 @@ int sig_quiet_due(int asking, int answered, uint64_t idle_ms)
 
 int sig_quiet(struct sig *s)
 {
-	if (!s || !s->dht_engaged)
+	if (!s || !s->node)
 		return 0;
 	/* Never answered is a verdict only where a family is proven to carry
 	 * something: on an isolated LAN the DHT is meant to answer nothing, and
 	 * that is not a signaller to throw away. */
-	if (!s->last_get_ms && !s->up4 && !s->up6)
+	if (!s->last_get_ms && !s->fam[0].up && !s->fam[1].up)
 		return 0;
 	return sig_quiet_due(routes_now(s) != 0, s->last_get_ms != 0,
 			     now_ms() - (s->last_get_ms ? s->last_get_ms :
 							 s->engaged_ms));
+}
+
+static int claim_standing(const struct sig *s)
+{
+	if (!s->rc || !s->rc->have_host)
+		return SIG_CLAIM_UNKNOWN;
+	switch (s->rc->state) {
+	case RDV_CL_OFFERED:
+		return SIG_CLAIM_HELD;
+	case RDV_CL_ANSWERED:
+		return SIG_CLAIM_ANSWERED;
+	case RDV_CL_REFUSED:
+		return SIG_CLAIM_REFUSED;
+	default:
+		return SIG_CLAIM_FREE;
+	}
+}
+
+static int claimants_seen(const struct sig *s)
+{
+	int i;
+
+	if (!s->rh)
+		return 0;
+	for (i = 0; i < RDV_HOST_MAX; i++)
+		if (s->rh->c[i].state != RDV_C_FREE)
+			return 1;
+	return 0;
 }
 
 void sig_mailbox_state(struct sig *s, struct sig_mailbox *out)
@@ -986,26 +765,16 @@ void sig_mailbox_state(struct sig *s, struct sig_mailbox *out)
 	memset(out, 0, sizeof(*out));
 	if (!s)
 		return;
-	out->engaged = s->dht_engaged;
+	out->engaged = s->node != NULL;
 	out->stage = s->rdv_stage;
-	out->have_mine = s->mb.have_mine;
-	/* need_write is set while what is stored is not what we want stored,
-	 * so its absence is the only honest way to say "ours is up there". */
-	out->mine_stored = s->mb.have_mine && s->mb.have_cur && !s->mb.need_write;
-	out->peer_seen = s->mb.is_host ? s->mb.slot_a_len != 0 :
-					 s->mb.slot_o_len != 0;
-	/*
-	 * The highest sequence any copy has been seen at, not the last one
-	 * believed. A read answers from whichever node was quickest, so the
-	 * last one believed steps backwards whenever a lagging copy is taken
-	 * -- which is ordinary, and reads on the panel as the mailbox itself
-	 * going backwards in time. What a reader wants of this number is where
-	 * the container has got to, and that only ever climbs.
-	 */
-	out->seq = s->mb.have_cur ? s->mb.seq_high : -1;
+	out->have_mine = s->is_host ? s->hval_len != 0 : s->my_packed_len != 0;
+	out->mine_stored = s->mine_stored;
+	out->peer_seen = s->is_host ? claimants_seen(s) :
+				      (s->rc && s->rc->have_host);
+	out->seq = s->h_seq;
 	out->gets = s->gets_ok;
 	out->puts = s->puts_ok;
-	out->claim = (int)sig_claim_status(s);
+	out->claim = claim_standing(s);
 	out->last_get_ms = s->last_get_ms;
 	out->last_put_ms = s->last_put_ms;
 	out->engaged_ms = s->engaged_ms;
@@ -1013,300 +782,714 @@ void sig_mailbox_state(struct sig *s, struct sig_mailbox *out)
 
 int sig_rdv_stage(struct sig *s, int family)
 {
-	socklen_t rl = family == 6 ? s->rnode6_len : s->rnode4_len;
-
-	if (rl)
+	if (s->fam[fam_of(family)].rnode_len)
 		return 4;			/* RDV_READY, per family */
 	return s->rdv_stage;			/* 0 cold .. 3 get, engine-wide */
 }
 
-
-/*
- * The peer's slot value -> its packed description. A client reads the host's
- * slot, which carries the key claims are boxed to ahead of the description; a
- * host reads a claim, which is its claimant's ufrag in the clear and then a box
- * only the host can open. Returns the packed length, or -1.
- *
- * `uf`, when asked for, receives the claimant's ufrag -- empty on the host's
- * slot, which has none.
- */
-static int slot_unwrap(struct sig *s, const uint8_t *val, size_t n,
-		       uint8_t *out, size_t out_max, char *uf, size_t uf_max)
+static struct sig_op *op_alloc(struct sig *s, char kind, const uint8_t *cid,
+			       int wide, int is_put)
 {
-	size_t ulen;
+	struct sig_op *op;
+	int i;
 
-	if (uf && uf_max)
-		uf[0] = '\0';
-	if (!s->is_host) {
-		if (n < 32)
-			return -1;
-		if (memcmp(s->peer_claim_pk, val, 32)) {
-			memcpy(s->peer_claim_pk, val, 32);
-			s->have_peer_claim_pk = 1;
-			sig_stage(s);	/* now it can be boxed */
+	for (i = 0; i < SIG_OPS_MAX; i++) {
+		op = &s->ops[i];
+		if (op->busy)
+			continue;
+		memset(op, 0, sizeof(*op));
+		op->s = s;
+		op->kind = kind;
+		if (cid)
+			memcpy(op->cid, cid, RDV_CID_LEN);
+		op->qep[0] = s->fam[0].epoch;
+		op->qep[1] = s->fam[1].epoch;
+		op->wide = (uint8_t)wide;
+		op->is_put = (uint8_t)is_put;
+		op->busy = 1;
+		return op;
+	}
+	return NULL;
+}
+
+/* A read's callback fires once per family that served it, so a context is
+ * released only after the dispatch that finished the operation. */
+static void op_sweep(struct sig *s)
+{
+	int i;
+
+	for (i = 0; i < SIG_OPS_MAX; i++)
+		if (s->ops[i].busy && s->ops[i].done)
+			s->ops[i].busy = 0;
+}
+
+static int rdv_open(const uint8_t key[32], const uint8_t *v, size_t v_len,
+		    struct rdv_msg *m)
+{
+	uint8_t plain[RDV_MAX_MSG];
+	const uint8_t *sealed;
+	size_t slen;
+	int n, rc;
+
+	if (benc_str_get(v, v_len, &sealed, &slen))
+		return -1;
+	n = msg_open(plain, sizeof(plain), key, sealed, slen);
+	if (n < 0)
+		return -1;
+	rc = rdv_decode(m, plain, (size_t)n);
+	if (rc == RDV_ERR_VERSION)
+		dbg_logf("sig: slot message is rdv v%u, this build reads v%u "
+			 "-- ignored", (unsigned)plain[0], (unsigned)RDV_VERSION);
+	return rc;
+}
+
+static int claimant_open(const struct sig *s, const uint8_t *cid,
+			 const uint8_t *v, size_t v_len, struct rdv_msg *m,
+			 int *grade)
+{
+	uint8_t key[32];
+
+	if (s->have_rw) {
+		slot_key(s, SIG_GRADE_RW, cid, key);
+		if (!rdv_open(key, v, v_len, m)) {
+			*grade = SIG_GRADE_RW;
+			return 0;
 		}
-		n -= 32;
-		if (n > out_max)
-			return -1;
-		memcpy(out, val + 32, n);
-		return (int)n;
 	}
-	if (!n)
-		return -1;
-	ulen = val[0];
-	if (1 + ulen > n)
-		return -1;
-	if (uf && uf_max) {
-		if (ulen >= uf_max)
-			return -1;
-		memcpy(uf, val + 1, ulen);
-		uf[ulen] = '\0';
+	slot_key(s, SIG_GRADE_RO, cid, key);
+	if (!rdv_open(key, v, v_len, m)) {
+		*grade = SIG_GRADE_RO;
+		return 0;
 	}
-	return box_open(out, out_max, s->claim_sk, val + 1 + ulen,
-			n - 1 - ulen);
+	return -1;
 }
 
-/* Open the peer's sealed slot and deliver it once, de-duplicated. */
-/*
- * A claim in the turnstile that this host cannot open: the box is not to a key
- * we hold, so there is no claimant to punch at and no description to read. The
- * slot is the mutex, so leaving it there stops every other client from writing
- * one -- and the ordinary release does not settle it, because the copies of the
- * container still carrying those bytes put them straight back. Held against
- * instead, for as long as they keep arriving.
- */
-static void refuse_slot(struct sig *s, const uint8_t *sealed, size_t len)
+static int sdp_of(const struct rdv_msg *m, char *sdp, size_t max)
 {
-	if (!s->is_host || !len)
-		return;
-	if (s->mb.refused_len == len && !memcmp(s->mb.refused, sealed, len))
-		return;			/* already held against; say it once */
-	dbg_logf("sig: the claim holding the slot does not open -- refusing it");
-	mailbox_refuse(&s->mb, sealed, len);
-}
-
-static void deliver_peer(struct sig *s, const uint8_t *sealed, size_t len)
-{
-	uint8_t plain[SIG_MAX_VALUE], packed[SIG_MAX_VALUE];
-	char sdp[SIG_SDP_MAX];
-	int n = msg_open(plain, sizeof(plain), s->keys.sig_key, sealed, len);
 	int slen;
 
-	if (n < 0) {
-		refuse_slot(s, sealed, len);
-		return;
-	}
-	if (s->have_last && s->last_peer_len == (size_t)n &&
-	    !memcmp(s->last_peer, plain, (size_t)n))
-		return;
-	dbg_logf("sig: peer slot delivered (%d bytes)", n);
-	memcpy(s->last_peer, plain, (size_t)n);
-	s->last_peer_len = (size_t)n;
-	s->have_last = 1;
-	/* Theirs received (a host's answer, a client's offer): amend our own
-	 * slot for the peer now engaging rather than at the next put. */
-	s->next_put_ms = 0;
-	n = slot_unwrap(s, plain, (size_t)n, packed, sizeof(packed), NULL, 0);
-	if (n < 0) {
-		refuse_slot(s, sealed, len);
-		return;
-	}
-	slen = candpack_decode(packed, (size_t)n, &s->peer_gen,
-			       s->is_host ? s->peer_claim_offer : NULL,
-			       s->is_host ? sizeof(s->peer_claim_offer) : 0,
-			       s->peer_cid, sdp, sizeof(sdp));
-	peer_cid_note(s);
-	if (slen < 0) {
-		if (slen == CANDPACK_ERR_VERSION)
-			dbg_logf("sig: peer slot packs candpack v%u, this build "
-				 "reads up to v%u -- ignored",
-				 (unsigned)packed[0],
-				 (unsigned)CANDPACK_VERSION);
-		else
-			dbg_logf("sig: peer slot did not decode -- ignored");
-		return;
-	}
-	if (!s->is_host)
-		sdp_ufrag_of(sdp, s->peer_offer_ufrag,
-			     sizeof(s->peer_offer_ufrag));
-	sig_mb_note(s->is_host ? "GET claim" : "GET offer", s->peer_gen,
-		    s->is_host ? s->peer_claim_offer : NULL, packed,
-		    (size_t)n, sdp);
-	if (s->cb)
-		s->cb(s->arg, (const uint8_t *)sdp, (size_t)slen);
+	slen = candpack_decode(m->payload, m->payload_len, NULL, NULL, 0, NULL,
+			       sdp, max);
+	if (slen == CANDPACK_ERR_VERSION)
+		dbg_logf("sig: peer slot packs candpack v%u, this build reads "
+			 "up to v%u -- ignored", (unsigned)m->payload[0],
+			 (unsigned)CANDPACK_VERSION);
+	else if (slen < 0)
+		dbg_logf("sig: peer slot did not decode -- ignored");
+	return slen;
 }
 
 /* Whether an answer from this family speaks for the network it is on now: a
  * reply to a query sent before a move says nothing about the one after it. */
-static int ack_on_net(const struct sig *s, int af)
+static int ack_on_net(const struct sig *s, const struct sig_op *op, int af)
 {
-	return af == AF_INET6 ? s->qep6 == s->epoch6 : s->qep4 == s->epoch4;
+	return op->qep[fam_of_af(af)] == s->fam[fam_of_af(af)].epoch;
 }
 
-static void on_dht_get(void *arg, const uint8_t *v, size_t v_len, int64_t seq,
-		       const struct sockaddr *node, socklen_t node_len)
+static void node_note(struct sig *s, const struct sig_op *op,
+		      const struct sockaddr *node, socklen_t node_len)
 {
-	struct sig *s = arg;
-	uint8_t stale_slot[MAILBOX_SLOT_MAX];
-	const uint8_t *peer;
-	size_t peer_len;
-	int fresh;
+	struct sig_fam *f;
+	int captured = 0;
 
-	if (!v)
+	if (!node || !node_len || (size_t)node_len > sizeof(f->rnode))
 		return;
-	/* Evidence of what the store holds even where the copy itself is not
-	 * taken: a write is judged against the highest sequence, not the last
-	 * one believed. */
-	/*
-	 * Two reads are in flight at once -- the direct one and the convergent
-	 * one -- and they answer from different nodes, so an older container
-	 * lands after a newer one as a matter of course. Copies also fall
-	 * behind and stay there: a store carries one compare-and-swap for every
-	 * node it addresses, so a node below that sequence refuses it and is
-	 * never caught up.
-	 *
-	 * BOTH OF WHICH MAKE AN OLDER COPY WORTH READING AND NEVER WORTH
-	 * WRITING FROM. Worth reading, because a claim written to a node that
-	 * has fallen behind is written nowhere else, and refusing it is how two
-	 * ends whose sequences have diverged never hear each other at all.
-	 * Never worth writing from, because taking its slots as the basis of
-	 * our next store re-asserts a superseded offer or claim over the
-	 * current one -- and the other end, reading that, puts its own back.
-	 * The two then take turns for the rest of the session, with the
-	 * sequence climbing a step for every turn and neither end able to see
-	 * why the mailbox will not settle.
-	 */
-	fresh = !s->mb.seq_high || seq < 0 || seq >= s->mb.seq_high;
-	mailbox_note_seq(&s->mb, seq);
+	if (node->sa_family != AF_INET && node->sa_family != AF_INET6)
+		return;
+	f = &s->fam[fam_of_af(node->sa_family)];
+	/* It answered for itself. Nothing here is said about any other
+	 * node: the convergent store puts the value on every k-close
+	 * node, so several hold it and whichever is quickest replies. */
+	if (ack_on_net(s, op, node->sa_family) && f->rnode_len == node_len &&
+	    !memcmp(&f->rnode, node, node_len))
+		f->anchor_seen = 1;
+	if (ack_on_net(s, op, node->sa_family)) {
+		memcpy(&f->ack_node, node, node_len);
+		f->ack_node_len = node_len;
+		f->ack_new = 1;
+	}
+	if (s->locate && !f->rnode_len) {
+		memcpy(&f->rnode, node, node_len);
+		f->rnode_len = node_len;
+		captured = 1;
+	}
+	if (captured) {
+		bep44_pin_add(s->engine, NULL, node, node_len);
+		s->located_any = 1;
+	}
+}
+
+static void host_slot_read(struct sig *s, const uint8_t *v, size_t v_len,
+			   int64_t seq)
+{
+	struct rdv_msg m;
+	int moved;
+
+	if (rdv_open(s->keys.sig_key, v, v_len, &m))
+		return;
+	if (m.kind != RDV_HOSTINFO && m.kind != RDV_TOMB)
+		return;
 	s->gets_ok++;
 	s->last_get_ms = now_ms();
-	if (fresh)
-		mailbox_parse(&s->mb, v, v_len);
-	else
-		dbg_logf("sig: older container read but not written from "
-			 "(seq %lld, holding %lld)", (long long)seq,
-			 (long long)s->mb.seq_high);
-
-	/* A client recognises its own claimant's claim in the answer slot --
-	 * typically a superseded attempt the host never released -- so the
-	 * turnstile rule lets it overwrite that one rather than wedge itself
-	 * out behind it. */
-	if (fresh && !s->mb.is_host && s->mb.slot_a_len && s->my_ufrag[0]) {
-		uint8_t plain[SIG_MAX_VALUE];
-		char uf[64];
-		int n = msg_open(plain, sizeof(plain), s->keys.sig_key,
-				 s->mb.slot_a, s->mb.slot_a_len);
-		size_t ulen;
-
-		/*
-		 * A claim is boxed to the host, so a client cannot read one --
-		 * not even its own, whose ephemeral secret is long gone. The
-		 * ufrag beside the box is what this rule was ever about: it
-		 * says which claimant holds the slot, and nothing about where.
-		 */
-		if (n > 0) {
-			ulen = plain[0];
-			if (1 + ulen <= (size_t)n && ulen < sizeof(uf)) {
-				memcpy(uf, plain + 1, ulen);
-				uf[ulen] = '\0';
-				mailbox_note_own_answer(&s->mb,
-							uf[0] &&
-							!strcmp(uf,
-								s->my_ufrag));
-			}
-		}
+	if (s->is_host) {
+		if (v_len != s->hval_len || memcmp(v, s->hval, v_len))
+			s->h_stale = 1;
+		else
+			s->mine_stored = 1;
+		if (seq > s->h_seq)
+			s->h_seq = seq;
+		return;
 	}
-
-	/*
-	 * What the container says about the session being over, recorded rather
-	 * than acted on: whether a tombstone is believed depends on how long it
-	 * has stood with nothing contradicting it, which is sig_peer_ended's
-	 * judgement.
-	 *
-	 * When it was FIRST seen, not most recently: the settle window measures
-	 * how long it has stood, and stamping every read would restart the clock
-	 * once a second and never let it run out. A read without one puts the
-	 * clock back, so a tombstone a live host has since erased is forgotten
-	 * rather than held against it.
-	 */
-	if (fresh) {
-		if (!s->mb.slot_x_len)
-			s->tomb_seen_ms = 0;
-		else if (!s->tomb_seen_ms)
+	if (!s->rc)
+		return;
+	if (seq >= s->hcopy_seq) {
+		memcpy(s->hcopy, v, v_len);
+		s->hcopy_len = v_len;
+		s->hcopy_seq = seq;
+	}
+	moved = rdv_client_host_slot(s->rc, &m, seq);
+	if (moved < 0)
+		return;
+	if (seq > s->h_seq)
+		s->h_seq = seq;
+	if (m.kind == RDV_TOMB) {
+		if (!s->tomb_seen_ms)
 			s->tomb_seen_ms = s->last_get_ms;
-		if (!s->is_host && s->mb.slot_o_len)
-			s->offer_seen_ms = s->last_get_ms;
+		return;
 	}
+	s->info_seen_ms = s->last_get_ms;
+	s->tomb_seen_ms = 0;
+	if (moved) {
+		dbg_logf("sig: host instance %02x%02x%02x%02x gen %u",
+			 m.from[0], m.from[1], m.from[2], m.from[3],
+			 (unsigned)m.gen);
+		s->next_put_ms = 0;
+	}
+}
 
-	if (fresh) {
-		peer_len = mailbox_peer_slot(&s->mb, &peer);
-	} else {
-		peer_len = mailbox_peer_slot_in(&s->mb, v, v_len, stale_slot,
-						sizeof(stale_slot));
-		peer = stale_slot;
+static void bell_read(struct sig *s, const uint8_t *v, size_t v_len)
+{
+	struct rdv_msg m;
+
+	if (!s->rh || rdv_open(s->keys.sig_key, v, v_len, &m))
+		return;
+	s->gets_ok++;
+	s->last_get_ms = now_ms();
+	rdv_host_bell(s->rh, &m);
+}
+
+static void claimant_read(struct sig *s, const uint8_t *cid, const uint8_t *v,
+			  size_t v_len)
+{
+	struct rdv_claimant *c;
+	char sdp[SIG_SDP_MAX];
+	struct rdv_msg m;
+	int grade, slen;
+
+	if (!s->rh || claimant_open(s, cid, v, v_len, &m, &grade))
+		return;
+	s->gets_ok++;
+	s->last_get_ms = now_ms();
+	if (memcmp(m.from, cid, RDV_CID_LEN))
+		return;
+	if (!rdv_host_slot(s->rh, &m))
+		return;
+	c = rdv_host_find(s->rh, cid);
+	if (c)
+		c->grade = (uint8_t)grade;
+	slen = sdp_of(&m, sdp, sizeof(sdp));
+	if (slen < 0)
+		return;
+	sig_mb_note("GET offer", cid, sdp);
+	if (s->cb)
+		s->cb(s->arg, cid, (const uint8_t *)sdp, (size_t)slen);
+}
+
+static void answer_read(struct sig *s, const uint8_t *v, size_t v_len)
+{
+	char sdp[SIG_SDP_MAX];
+	struct rdv_msg m;
+	uint8_t key[32];
+	int slen;
+
+	if (!s->rc)
+		return;
+	slot_key(s, my_grade(s), s->rc->cid, key);
+	if (rdv_open(key, v, v_len, &m))
+		return;
+	s->gets_ok++;
+	s->last_get_ms = now_ms();
+	if (!rdv_client_own_slot(s->rc, &m))
+		return;
+	if (m.kind == RDV_REFUSE) {
+		dbg_logf("sig: the host refused us (%u)",
+			 (unsigned)s->rc->refusal);
+		return;
 	}
-	if (peer_len)
-		deliver_peer(s, peer, peer_len);
+	slen = sdp_of(&m, sdp, sizeof(sdp));
+	if (slen < 0)
+		return;
+	sig_mb_note("GET answer", m.from, sdp);
+	if (s->cb)
+		s->cb(s->arg, m.from, (const uint8_t *)sdp, (size_t)slen);
+}
+
+static void on_slot_get(void *arg, const uint8_t *v, size_t v_len, int64_t seq,
+			const struct sockaddr *node, socklen_t node_len)
+{
+	struct sig_op *op = arg;
+	struct sig *s = op->s;
+	int first = !op->done;
+
+	op->done = 1;
+	if (!v)
+		return;
+	if (op->kind == KEYS_SLOT_HOST)
+		node_note(s, op, node, node_len);
+	if (!first)
+		return;
+	switch (op->kind) {
+	case KEYS_SLOT_HOST:
+		host_slot_read(s, v, v_len, seq);
+		break;
+	case KEYS_SLOT_BELL:
+		bell_read(s, v, v_len);
+		break;
+	case KEYS_SLOT_CLAIM:
+		claimant_read(s, op->cid, v, v_len);
+		break;
+	case KEYS_SLOT_ANSWER:
+		answer_read(s, v, v_len);
+		break;
+	default:
+		break;
+	}
+}
+
+static void on_slot_put(void *arg, int stored, const struct sockaddr *node,
+			socklen_t node_len)
+{
+	struct sig_op *op = arg;
+	struct rdv_claimant *c;
+	struct sig *s = op->s;
+
+	(void)node;
+	(void)node_len;
+	op->done = 1;
+	switch (op->kind) {
+	case KEYS_SLOT_HOST:
+		if (!s->is_host)
+			break;
+		if (ending(s)) {
+			dbg_logf("sig: tombstone stored %s -> %d node(s)",
+				 op->wide ? "where the key belongs" :
+					    "on the rendezvous node", stored);
+			if (stored > 0 && op->wide)
+				s->end_placed_wide = 1;
+			else if (stored > 0)
+				s->end_placed_direct = 1;
+			break;
+		}
+		if (stored > 0) {
+			s->mine_stored = 1;
+			s->h_stale = 0;
+		}
+		if (stored > 0 && op->wide) {
+			s->next_hput_ms = now_ms() + SIG_DHT_RESTORE_MS;
+			if (s->rdv_stage < 3)
+				s->rdv_stage = 3;	/* stored: now reading it back */
+		}
+		break;
+	case KEYS_SLOT_ANSWER:
+		if (stored > 0 || !s->rh)
+			break;
+		c = rdv_host_find(s->rh, op->cid);
+		if (c && c->state != RDV_C_GONE)
+			c->pending = 1;
+		break;
+	case KEYS_SLOT_CLAIM:
+		if (stored > 0)
+			s->mine_stored = 1;
+		break;
+	default:
+		break;
+	}
+}
+
+static int merge_mine(void *arg, const uint8_t *cur, size_t cur_len,
+		      int64_t seq, uint8_t *out, size_t *out_len, size_t max)
+{
+	struct sig_op *op = arg;
+
+	(void)cur_len;
+	if (op->seq_seen >= 0 && cur && seq > op->seq_seen)
+		return -1;
+	if (op->val_len > max)
+		return -1;
+	memcpy(out, op->val, op->val_len);
+	*out_len = op->val_len;
+	return 0;
+}
+
+static int slot_get(struct sig *s, char kind, const uint8_t *cid, int wide)
+{
+	char salt[KEYS_SALT_LEN];
+	struct sig_op *op;
+	int rc;
+
+	op = op_alloc(s, kind, cid, wide, 0);
+	if (!op)
+		return -1;
+	slot_salt(s, kind, cid, salt);
+	if (wide)
+		rc = bep44_get(s->engine, s->keys.bep44_pk, salt, on_slot_get,
+			       op);
+	else
+		rc = bep44_get_direct(s->engine, s->keys.bep44_pk, salt,
+				      on_slot_get, op);
+	if (rc)
+		op->busy = 0;
+	return rc;
+}
+
+static int slot_put(struct sig *s, char kind, const uint8_t *cid, int wide,
+		    const uint8_t *val, size_t val_len, int64_t seq_seen)
+{
+	char salt[KEYS_SALT_LEN];
+	struct sig_op *op;
+	int rc;
+
+	if (val_len > SIG_WIRE_MAX)
+		return -1;
+	op = op_alloc(s, kind, cid, wide, 1);
+	if (!op)
+		return -1;
+	memcpy(op->val, val, val_len);
+	op->val_len = val_len;
+	op->seq_seen = seq_seen;
+	slot_salt(s, kind, cid, salt);
+	if (wide)
+		rc = bep44_update(s->engine, s->keys.bep44_sk, s->keys.bep44_pk,
+				  salt, merge_mine, op, on_slot_put, op);
+	else
+		rc = bep44_update_direct(s->engine, s->keys.bep44_sk,
+					 s->keys.bep44_pk, salt, merge_mine, op,
+					 on_slot_put, op);
+	if (rc) {
+		op->busy = 0;
+		return rc;
+	}
+	s->puts_ok++;
+	s->last_put_ms = now_ms();
+	return 0;
+}
+
+/* Two stores of one slot in flight read the same sequence and write the same
+ * next one, so every node refuses the second; stores of different slots are
+ * free to overlap. */
+static int slot_inflight(const struct sig *s, char kind, const uint8_t *cid)
+{
+	const struct sig_op *op;
+	int i;
+
+	for (i = 0; i < SIG_OPS_MAX; i++) {
+		op = &s->ops[i];
+		if (!op->busy || op->done || !op->is_put || op->kind != kind)
+			continue;
+		if (!cid || !memcmp(op->cid, cid, RDV_CID_LEN))
+			return 1;
+	}
+	return 0;
+}
+
+/* A BEP 44 value is bencoded: the sealed envelope travels as one string. */
+static int seal_to(const uint8_t key[32], const struct rdv_out *o,
+		   uint8_t *out, size_t max)
+{
+	uint8_t sealed[SIG_VALUE_MAX];
+	struct benc_buf b;
+	int n;
+
+	n = msg_seal(sealed, sizeof(sealed), key, o->msg, o->len);
+	if (n < 0)
+		return -1;
+	benc_buf_init(&b, out, max);
+	benc_str_add(&b, sealed, (size_t)n);
+	return b.err ? -1 : (int)b.len;
+}
+
+/* The host slot's next statement, sealed and due. */
+static void host_info_seal(struct sig *s)
+{
+	struct rdv_out o;
+	int n;
+
+	if (!rdv_host_next(s->rh, NULL, 0, &o) || o.salt_kind != KEYS_SLOT_HOST)
+		return;
+	n = seal_to(s->keys.sig_key, &o, s->hval, sizeof(s->hval));
+	if (n <= 0)
+		return;
+	s->hval_len = (size_t)n;
+	s->h_stale = 1;
+	s->mine_stored = 0;
+	s->next_hput_ms = 0;
+}
+
+/* Every answer or refusal due goes out now, each to its own slot; one whose
+ * slot is still being written, or that has no route yet, waits a tick. */
+static void host_answers(struct sig *s, unsigned routes)
+{
+	struct rdv_claimant *held[RDV_HOST_MAX];
+	uint8_t val[SIG_WIRE_MAX];
+	struct rdv_claimant *c;
+	int nheld = 0, i, n;
+	struct rdv_msg m;
+	struct rdv_out o;
+	uint8_t key[32];
+
+	while (nheld < RDV_HOST_MAX && rdv_host_next(s->rh, NULL, 0, &o)) {
+		if (o.salt_kind != KEYS_SLOT_ANSWER || rdv_decode(&m, o.msg, o.len))
+			continue;
+		c = rdv_host_find(s->rh, m.to);
+		if (!c)
+			continue;
+		if (!(routes & SIG_ROUTE_DIRECT) ||
+		    slot_inflight(s, KEYS_SLOT_ANSWER, m.to)) {
+			held[nheld++] = c;
+			continue;
+		}
+		slot_key(s, c->grade == SIG_GRADE_RO ? SIG_GRADE_RO : SIG_GRADE_RW,
+			 m.to, key);
+		n = seal_to(key, &o, val, sizeof(val));
+		if (n < 0 ||
+		    slot_put(s, KEYS_SLOT_ANSWER, m.to, 0, val, (size_t)n, -1))
+			held[nheld++] = c;
+	}
+	for (i = 0; i < nheld; i++)
+		held[i]->pending = 1;
+}
+
+static void host_tomb_put(struct sig *s, unsigned routes, uint64_t now)
+{
+	int held = s->fam[0].rnode_len || s->fam[1].rnode_len;
 
 	/*
-	 * The value is signature-checked as ours, so the node that served it is
-	 * a validated, responsive, k-close rendezvous point, and its family has
-	 * acknowledged our publish. Keep the first (fastest) of EACH family and
-	 * pin it: a dual-stack client may live behind only one family, so both
-	 * go in the token. The v4 and v6 DHTs converge independently, so
-	 * capturing per family here -- rather than the first node of any family
-	 * -- lets both be found within one session.
+	 * Both routes have to carry it, because they reach different
+	 * readers: the direct store lands on the node the token names,
+	 * which is where a client holding that invitation looks first,
+	 * and the convergent one lands on whoever is closest to the key
+	 * now, which is where a client with an older token ends up and
+	 * where this host's own last statement is sitting. A tombstone
+	 * only one of them can see leaves the other waiting.
 	 */
-	if (node && node_len && (size_t)node_len <= sizeof(s->rnode4)) {
-		int captured = 0;
-		socklen_t rl = node->sa_family == AF_INET6 ? s->rnode6_len :
-							     s->rnode4_len;
-		const void *r = node->sa_family == AF_INET6 ?
-				(const void *)&s->rnode6 :
-				(const void *)&s->rnode4;
+	if (!s->end_placed_direct && held)
+		slot_put(s, KEYS_SLOT_HOST, NULL, 0, s->hval, s->hval_len, -1);
+	else if ((routes & SIG_ROUTE_WIDE) && !s->end_placed_wide)
+		slot_put(s, KEYS_SLOT_HOST, NULL, 1, s->hval, s->hval_len, -1);
+	s->next_hput_ms = now + SIG_DHT_TOMB_MS;
+}
 
-		/* It answered for itself. Nothing here is said about any other
-		 * node: the convergent store puts the value on every k-close
-		 * node, so several hold it and whichever is quickest replies. */
-		if (ack_on_net(s, node->sa_family) && rl == node_len &&
-		    !memcmp(r, node, node_len)) {
-			if (node->sa_family == AF_INET6)
-				s->anchor_seen6 = 1;
-			else
-				s->anchor_seen4 = 1;
-		}
+static void host_slot_put(struct sig *s, unsigned routes, uint64_t now)
+{
+	int missing, eager;
 
-		if (node->sa_family == AF_INET6) {
-			if (ack_on_net(s, AF_INET6)) {
-				s->acked6 = 1;
-				memcpy(&s->ack_node6, node, node_len);
-				s->ack_node6_len = node_len;
-				s->ack_new6 = 1;
-			}
-			if (s->locate && !s->rnode6_len) {
-				memcpy(&s->rnode6, node, node_len);
-				s->rnode6_len = node_len;
-				captured = 1;
-			}
-		} else if (node->sa_family == AF_INET) {
-			if (ack_on_net(s, AF_INET)) {
-				s->acked4 = 1;
-				memcpy(&s->ack_node4, node, node_len);
-				s->ack_node4_len = node_len;
-				s->ack_new4 = 1;
-			}
-			if (s->locate && !s->rnode4_len) {
-				memcpy(&s->rnode4, node, node_len);
-				s->rnode4_len = node_len;
-				captured = 1;
-			}
-		}
-		if (captured) {
-			bep44_pin_add(s->engine, NULL, node, node_len);
-			if (!s->first_locate_ms)
-				s->first_locate_ms = now_ms();
+	if (s->h_stale && (routes & SIG_ROUTE_DIRECT) &&
+	    (s->fam[0].rnode_len || s->fam[1].rnode_len)) {
+		slot_put(s, KEYS_SLOT_HOST, NULL, 0, s->hval, s->hval_len, -1);
+		s->next_hput_ms = now + SIG_DHT_PUT_MS;
+		return;
+	}
+	/*
+	 * A reachable family with no anchor yet is still being located:
+	 * the convergent store places the host slot on its k-closest nodes
+	 * (idiomatic and discoverable) and the validating get captures
+	 * one as the anchor. It repeats until that family is captured --
+	 * the v6 DHT converges later than v4, so an early store misses
+	 * its k-closest. It keeps retrying for as long as it takes rather
+	 * than giving up on a timing guess: eager for as long as a still-
+	 * missing family's own connectivity is proven up (sig_set_family_up),
+	 * slower otherwise, never stopping outright. An already-anchored
+	 * family is never re-located.
+	 */
+	missing = !s->fam[0].rnode_len || !s->fam[1].rnode_len ||
+		  s->fam[0].relocate || s->fam[1].relocate;
+	if (missing && (routes & SIG_ROUTE_WIDE)) {
+		eager = ((!s->fam[0].rnode_len || s->fam[0].relocate) &&
+			 s->fam[0].up) ||
+			((!s->fam[1].rnode_len || s->fam[1].relocate) &&
+			 s->fam[1].up);
+		if (s->rdv_stage < 2)
+			s->rdv_stage = 2;	/* placing the host slot */
+		slot_put(s, KEYS_SLOT_HOST, NULL, 1, s->hval, s->hval_len, -1);
+		s->next_hput_ms = now + (eager ? SIG_DHT_PUT_MS :
+						 SIG_DHT_PUT_SLOW_MS);
+		return;
+	}
+	if ((routes & SIG_ROUTE_WIDE) && now >= s->next_wide_put_ms) {
+		/*
+		 * The value where the key says it belongs, not only
+		 * where it first landed. Which nodes are closest drifts
+		 * as the DHT churns, and a client that has to converge
+		 * -- an old token, or one that never named a node --
+		 * finds whoever is closest now, so the value has to be
+		 * there and not merely on the handful we pinned once.
+		 */
+		slot_put(s, KEYS_SLOT_HOST, NULL, 1, s->hval, s->hval_len, -1);
+		s->next_wide_put_ms = now + SIG_DHT_WIDE_PUT_MS;
+		s->next_hput_ms = now + SIG_DHT_PUT_MS;
+	}
+}
+
+static void host_pump_puts(struct sig *s, unsigned routes, uint64_t now)
+{
+	if (!s->rh)
+		return;
+	if (s->rh->info_pending)
+		host_info_seal(s);
+	if (!ending(s) && now >= s->next_put_ms) {
+		host_answers(s, routes);
+		s->next_put_ms = now + SIG_DHT_PUT_MS;
+	}
+	if (!s->hval_len || now < s->next_hput_ms ||
+	    slot_inflight(s, KEYS_SLOT_HOST, NULL))
+		return;
+	if (ending(s))
+		host_tomb_put(s, routes, now);
+	else
+		host_slot_put(s, routes, now);
+}
+
+static int relaying(const struct sig *s)
+{
+	return s->fam[0].relay || s->fam[1].relay;
+}
+
+/* Still looking for the node, as opposed to operating one we have. Only the
+ * search is urgent: the peer is waiting on it and has nothing meanwhile. */
+static int relay_locating(const struct sig *s)
+{
+	return (s->fam[0].relay && !s->fam[0].rnode_len) ||
+	       (s->fam[1].relay && !s->fam[1].rnode_len);
+}
+
+static void client_pump_puts(struct sig *s, unsigned routes, uint64_t now)
+{
+	uint8_t val[SIG_WIRE_MAX];
+	struct rdv_out o;
+	uint8_t key[32];
+	int n;
+
+	if (!s->rc || now < s->next_put_ms)
+		return;
+	if ((routes & SIG_ROUTE_DIRECT) &&
+	    rdv_client_next(s->rc, s->my_packed, s->my_packed_len, &o)) {
+		if (o.salt_kind == KEYS_SLOT_BELL)
+			memcpy(key, s->keys.sig_key, 32);
+		else
+			slot_key(s, my_grade(s), s->rc->cid, key);
+		n = seal_to(key, &o, val, sizeof(val));
+		if (n > 0)
+			slot_put(s, o.salt_kind,
+				 o.have_salt_cid ? o.salt_cid : NULL, 0, val,
+				 (size_t)n, -1);
+		s->next_put_ms = now + SIG_DHT_PUT_MS;
+		return;
+	}
+	if (!relaying(s) || !s->hcopy_len ||
+	    slot_inflight(s, KEYS_SLOT_HOST, NULL))
+		return;
+	if (relay_locating(s) && (routes & SIG_ROUTE_WIDE)) {
+		slot_put(s, KEYS_SLOT_HOST, NULL, 1, s->hcopy, s->hcopy_len,
+			 s->hcopy_seq);
+		s->next_put_ms = now + SIG_DHT_PUT_MS;
+	} else if (routes & SIG_ROUTE_DIRECT) {
+		slot_put(s, KEYS_SLOT_HOST, NULL, 0, s->hcopy, s->hcopy_len,
+			 s->hcopy_seq);
+		s->next_put_ms = now + SIG_DHT_RELAY_MS;
+	}
+}
+
+/* The doorbell every other read; between them a claimant's slot worth reading
+ * alternates with the host's own, so the anchor is still proven under load. */
+static void host_read(struct sig *s)
+{
+	struct rdv_claimant *c;
+	unsigned turn;
+	int k, i;
+
+	turn = s->read_turn++ % 4;
+	if (turn == 0 || turn == 2) {
+		slot_get(s, KEYS_SLOT_BELL, NULL, 0);
+		return;
+	}
+	if (turn == 1 && s->rh) {
+		for (k = 0; k < RDV_HOST_MAX; k++) {
+			i = (s->claim_cursor + 1 + k) % RDV_HOST_MAX;
+			c = &s->rh->c[i];
+			if (c->state == RDV_C_FREE)
+				continue;
+			if (c->state != RDV_C_HARVESTED && !c->knock)
+				continue;
+			c->knock = 0;
+			s->claim_cursor = i;
+			slot_get(s, KEYS_SLOT_CLAIM, c->cid, 0);
+			return;
 		}
 	}
+	slot_get(s, KEYS_SLOT_HOST, NULL, 0);
+}
+
+static void client_read(struct sig *s)
+{
+	int want_answer;
+
+	want_answer = s->rc && !s->rc->live && s->rc->have_host &&
+		      s->rc->state != RDV_CL_REFUSED;
+	if ((s->read_turn++ & 1) && want_answer) {
+		slot_get(s, KEYS_SLOT_ANSWER, s->rc->cid, 0);
+		return;
+	}
+	slot_get(s, KEYS_SLOT_HOST, NULL, 0);
+}
+
+static int warming(const struct sig *s)
+{
+	return (s->fam[0].up && !s->fam[0].ack_node_len) ||
+	       (s->fam[1].up && !s->fam[1].ack_node_len);
+}
+
+static void dht_pump(struct sig *s, uint64_t now)
+{
+	unsigned routes = routes_now(s);
+	int seen;
+
+	if (s->routeless != !routes) {
+		s->routeless = !routes;
+		dbg_logf("sig: %s to work the mailbox through",
+			 routes ? "a route" : "no route");
+	}
+	if (!routes)
+		return;
+	if ((routes & SIG_ROUTE_WIDE) && s->rdv_stage < 1)
+		s->rdv_stage = 1;		/* DHT warm: nodes found near key */
+	if (now >= s->next_get_ms) {
+		if (s->is_host)
+			host_read(s);
+		else
+			client_read(s);
+		s->next_get_ms = now + SIG_DHT_GET_MS;
+	}
+	if ((routes & SIG_ROUTE_WIDE) && now >= s->next_wide_get_ms) {
+		slot_get(s, KEYS_SLOT_HOST, NULL, 1);
+		seen = s->is_host ? s->mine_stored : (s->rc && s->rc->have_host);
+		s->next_wide_get_ms = now +
+			((seen && !relay_locating(s) && !warming(s)) ?
+			 SIG_DHT_WIDE_IDLE_MS : SIG_DHT_WIDE_GET_MS);
+	}
+	if (s->is_host)
+		host_pump_puts(s, routes, now);
+	else
+		client_pump_puts(s, routes, now);
 }
 
 /*
@@ -1345,57 +1528,89 @@ static int addr_is_lan_scope(const struct sockaddr *sa)
 	return 0;
 }
 
-/*
- * Open a multicast announcement: the peer's direct port (2 bytes) followed by
- * the routable candpack. Split by role. A client feeds the candidates to ICE and
- * learns the host's direct endpoint for the bypass. A host that demultiplexes
- * the shared lanlink socket (mcast_claims) does NOT feed the candpack to its ICE
- * turnstile -- it can serve a same-segment claimant directly over lanlink, so
- * punching it too would serve the client twice; instead the claimant's endpoint
- * becomes a direct claim. Either way the endpoint is (that source, zone id kept,
- * at the announced port), adopted only from a LAN-scope source of a sealed blob.
- */
-static void deliver_peer_mcast(struct sig *s, const uint8_t *sealed, size_t len,
+static void direct_fire(struct sig *s, const struct sockaddr *src,
+			socklen_t srclen, uint16_t dport, const char *sdp,
+			size_t slen)
+{
+	struct sockaddr_storage ep;
+
+	if (!s->direct_cb || !dport || !addr_is_lan_scope(src) ||
+	    (size_t)srclen > sizeof(ep))
+		return;
+	memcpy(&ep, src, srclen);
+	if (ep.ss_family == AF_INET6)
+		((struct sockaddr_in6 *)&ep)->sin6_port = htons(dport);
+	else
+		((struct sockaddr_in *)&ep)->sin_port = htons(dport);
+	s->direct_cb(s->direct_arg, (struct sockaddr *)&ep, srclen,
+		     (const uint8_t *)sdp, slen);
+}
+
+static int mcast_open(const uint8_t key[32], const char *salt,
+		      const uint8_t *data, size_t len, uint16_t *dport,
+		      struct rdv_msg *m)
+{
+	uint8_t plain[2 + RDV_MAX_MSG];
+	int n;
+
+	n = msg_open_ad(plain, sizeof(plain), key, (const uint8_t *)salt, 1,
+			data, len);
+	if (n < 3)
+		return -1;
+	*dport = (uint16_t)((plain[0] << 8) | plain[1]);
+	return rdv_decode(m, plain + 2, (size_t)n - 2);
+}
+
+static void deliver_host_mcast(struct sig *s, const uint8_t *data, size_t len,
 			       const struct sockaddr *src, socklen_t srclen)
 {
-	uint8_t plain[2 + SIG_MAX_VALUE], packed[SIG_MAX_VALUE];
-	char sdp[SIG_SDP_MAX];
-	struct sockaddr_storage ep;
-	char ps[2];
-	int n, slen;
+	struct rdv_msg m;
 	uint16_t dport;
 
-	ps[0] = peer_slot(s);
-	ps[1] = '\0';
-	n = msg_open_ad(plain, sizeof(plain), s->keys.sig_key,
-			(const uint8_t *)ps, 1, sealed, len);
-	if (n < 3)
+	if (mcast_open(s->keys.sig_key, "h", data, len, &dport, &m))
 		return;
-	dport = (uint16_t)((plain[0] << 8) | plain[1]);
-	n = slot_unwrap(s, plain + 2, (size_t)n - 2, packed, sizeof(packed),
-			NULL, 0);
-	if (n < 0)
+	if (m.kind != RDV_HOSTINFO)
 		return;
-	slen = candpack_decode(packed, (size_t)n, &s->peer_gen, NULL, 0,
-			       s->peer_cid, sdp, sizeof(sdp));
-	peer_cid_note(s);
-	if (slen == CANDPACK_ERR_VERSION)
-		dbg_logf("sig: multicast peer packs candpack v%u, this build "
-			 "reads up to v%u -- ignored", (unsigned)packed[0],
-			 (unsigned)CANDPACK_VERSION);
-	if (slen >= 0 && s->cb && !(s->is_host && s->mcast_claims))
-		s->cb(s->arg, (const uint8_t *)sdp, (size_t)slen);
+	direct_fire(s, src, srclen, dport, "", 0);
+}
 
-	if (slen >= 0 && s->direct_cb && dport && addr_is_lan_scope(src) &&
-	    (size_t)srclen <= sizeof(ep)) {
-		memcpy(&ep, src, srclen);
-		if (ep.ss_family == AF_INET6)
-			((struct sockaddr_in6 *)&ep)->sin6_port = htons(dport);
-		else
-			((struct sockaddr_in *)&ep)->sin_port = htons(dport);
-		s->direct_cb(s->direct_arg, (struct sockaddr *)&ep, srclen,
-			     (const uint8_t *)sdp, (size_t)slen);
+static void deliver_claim_mcast(struct sig *s, const uint8_t *data, size_t len,
+				const struct sockaddr *src, socklen_t srclen)
+{
+	struct rdv_claimant *c;
+	char sdp[SIG_SDP_MAX];
+	const uint8_t *cid;
+	int n, slen, grade;
+	struct rdv_msg m;
+	uint8_t key[32];
+	uint16_t dport;
+
+	if (len <= RDV_CID_LEN)
+		return;
+	cid = data;
+	data += RDV_CID_LEN;
+	len -= RDV_CID_LEN;
+	grade = SIG_GRADE_RW;
+	slot_key(s, grade, cid, key);
+	n = mcast_open(key, "c", data, len, &dport, &m);
+	if (n) {
+		grade = SIG_GRADE_RO;
+		slot_key(s, grade, cid, key);
+		n = mcast_open(key, "c", data, len, &dport, &m);
 	}
+	if (n || m.kind != RDV_OFFER || memcmp(m.from, cid, RDV_CID_LEN))
+		return;
+	slen = sdp_of(&m, sdp, sizeof(sdp));
+	if (slen < 0)
+		return;
+	if (!s->mcast_claims && s->rh && rdv_host_slot(s->rh, &m)) {
+		c = rdv_host_find(s->rh, cid);
+		if (c)
+			c->grade = (uint8_t)grade;
+		if (s->cb)
+			s->cb(s->arg, cid, (const uint8_t *)sdp, (size_t)slen);
+	}
+	direct_fire(s, src, srclen, dport, sdp, (size_t)slen);
 }
 
 static void on_mcast_recv(void *arg, const char *salt, const uint8_t *data,
@@ -1403,431 +1618,75 @@ static void on_mcast_recv(void *arg, const char *salt, const uint8_t *data,
 			  socklen_t srclen)
 {
 	struct sig *s = arg;
-	char ps[2];
 
-	ps[0] = peer_slot(s);
-	ps[1] = '\0';
-	if (!strcmp(salt, ps))
-		deliver_peer_mcast(s, data, len, src, srclen);
+	if (s->is_host && !strcmp(salt, "c"))
+		deliver_claim_mcast(s, data, len, src, srclen);
+	else if (!s->is_host && !strcmp(salt, "h"))
+		deliver_host_mcast(s, data, len, src, srclen);
 }
 
-/* Merge our slot into the value just read, preserving the peer's slot. */
-static int sig_merge(void *arg, const uint8_t *cur, size_t cur_len, int64_t seq,
-		     uint8_t *out, size_t *out_len, size_t max)
+static int mcast_frame(struct sig *s, uint8_t *out, size_t max,
+		       const char **salt)
 {
-	struct sig *s = arg;
+	uint8_t plain[2 + RDV_MAX_MSG];
+	struct rdv_msg m;
+	uint8_t key[32];
+	size_t o;
+	int n;
 
-	return mailbox_merge(&s->mb, cur, cur_len, seq, out, out_len, max);
-}
-
-/* Place the container unchanged, for a store made on the peer's behalf: see
- * mailbox_relay for why neither slot may be written here. */
-static int sig_relay_merge(void *arg, const uint8_t *cur, size_t cur_len,
-			   int64_t seq, uint8_t *out, size_t *out_len,
-			   size_t max)
-{
-	struct sig *s = arg;
-
-	return mailbox_relay(&s->mb, cur, cur_len, seq, out, out_len, max);
-}
-
-/*
- * The convergent store finished (on the k-closest nodes). It does not pick the
- * rendezvous node: a store acknowledgement does not prove a node will serve the
- * value back, and the closest-stored node need not be closest to the key. The
- * rendezvous node is chosen by the validating GET that follows (on_dht_get),
- * which proves a k-close node both holds the value and answers.
- */
-static void on_host_put(void *arg, int stored, const struct sockaddr *node,
-			socklen_t node_len)
-{
-	struct sig *s = arg;
-
-	(void)node;
-	(void)node_len;
-	s->put_inflight = 0;
-	/* Only a store that found a home earns the wide window for the
-	 * validating gets to pick the rendezvous node; one that stored nowhere
-	 * retries at the normal cadence, and so does one a release is waiting
-	 * behind. */
-	if (stored > 0) {
-		if (!s->mb.need_write)
-			s->next_put_ms = now_ms() + SIG_DHT_RESTORE_MS;
-		if (s->rdv_stage < 3)
-			s->rdv_stage = 3;	/* stored: now reading it back */
-	}
-}
-
-/* Every update opens with reads that spend the per-node budget a deferred
- * store is waiting on, so the next one starts only once this one is over. */
-static void on_host_store(void *arg, int stored, const struct sockaddr *node,
-			  socklen_t node_len)
-{
-	struct sig *s = arg;
-
-	(void)stored;
-	(void)node;
-	(void)node_len;
-	s->put_inflight = 0;
-}
-
-/* A tombstone store came back. One node that took it is enough for that route:
- * what matters is that this way in now leads somewhere that answers, not how
- * many copies of the answer there are. */
-static void on_tomb_direct(void *arg, int stored, const struct sockaddr *node,
-			   socklen_t node_len)
-{
-	struct sig *s = arg;
-
-	(void)node;
-	(void)node_len;
-	dbg_logf("sig: tombstone stored on the rendezvous node -> %d node(s)",
-		 stored);
-	s->end_store_inflight = 0;
-	if (stored > 0)
-		s->end_placed_direct = 1;
-}
-
-static void on_tomb_wide(void *arg, int stored, const struct sockaddr *node,
-			 socklen_t node_len)
-{
-	struct sig *s = arg;
-
-	(void)node;
-	(void)node_len;
-	dbg_logf("sig: tombstone stored where the key belongs -> %d node(s)",
-		 stored);
-	s->end_store_inflight = 0;
-	if (stored > 0)
-		s->end_placed_wide = 1;
-}
-
-/* A store has gone out. Counted where it is issued rather than where it is
- * acknowledged, because only the convergent one reports back at all -- and a
- * store nobody answered is exactly what the operator needs to see. Whether it
- * took is the separate question mine_stored answers. */
-static void sig_note_put(struct sig *s)
-{
-	s->puts_ok++;
-	s->last_put_ms = now_ms();
-}
-
-/* Asked to establish a rendezvous for a family we have not captured one on
- * yet. A family we already hold needs no store: what we hold is what the peer
- * is told. */
-/*
- * Rendezvousing on the peer's behalf, for as long as it keeps asking.
- *
- * NOT UNTIL A NODE IS FOUND. The peer cannot reach the family at all, so
- * finding it a node and stopping there leaves it holding an address it can
- * never store to, read from, or replace -- the rendezvous stops being served
- * the moment we look away, and the peer has no way to notice. It has to go on
- * being operated for it: the same store, direct store and direct get another
- * end would run for itself. The ask lapses when the peer stops needing it,
- * which is what ends this.
- */
-static int relaying(const struct sig *s)
-{
-	return s->relay4 || s->relay6;
-}
-
-/* Still looking for the node, as opposed to operating one we have. Only the
- * search is urgent: the peer is waiting on it and has nothing meanwhile. */
-static int relay_locating(const struct sig *s)
-{
-	return (s->relay4 && !s->rnode4_len) || (s->relay6 && !s->rnode6_len);
-}
-
-/*
- * A family this end has, that the DHT has not answered on yet.
- *
- * A client has no reason of its own to exercise a family it is not currently
- * meeting over, and would settle into a trickle on whichever one its token
- * happened to name -- so the other stays cold, and the first thing that needs
- * it (a host that moved, or one that never had it) waits for a warm-up that
- * could have happened long before. Every family this end has is kept engaged
- * until it has answered, whether or not anything wants it yet.
- *
- * A family that never answers keeps this true, and that is the same judgement
- * the host's own locating makes: there is no point past which a family that
- * has not answered is known never to.
- */
-static int warming(const struct sig *s)
-{
-	return (s->up4 && !s->acked4) || (s->up6 && !s->acked6);
-}
-
-/* Past a rotation the host can only release the claim it names, so a re-post
- * would take the mutex from the next joiner for nothing. */
-static int claim_current(const struct sig *s)
-{
-	if (s->claim_unwritten || !s->claim_offer[0])
-		return 1;
-	return !strcmp(s->claim_offer, s->peer_offer_ufrag);
-}
-
-static void dht_pump(struct sig *s, uint64_t now)
-{
-	unsigned routes = routes_now(s);
-
-	if (s->routeless != !routes) {
-		s->routeless = !routes;
-		dbg_logf("sig: %s to work the mailbox through",
-			 routes ? "a route" : "no route");
-	}
-	if (!routes)
-		return;
-	if ((routes & SIG_ROUTE_WIDE) && s->rdv_stage < 1)
-		s->rdv_stage = 1;		/* DHT warm: nodes found near key */
-	if (now >= s->next_get_ms) {
-		/*
-		 * Read directly from the shared rendezvous node: the host from
-		 * the nodes it stored to, the client from the token's pinned
-		 * node. No convergence -- the host paid that once, up front.
-		 */
-		/* What an answer to this will be evidence about. */
-		s->qep4 = s->epoch4;
-		s->qep6 = s->epoch6;
-		bep44_get_direct(s->engine, s->keys.bep44_pk, SIG_SALT,
-				 on_dht_get, s);
-		s->next_get_ms = now + SIG_DHT_GET_MS;
-	}
-	/*
-	 * And the same read the ordinary way. Eagerly until the peer's slot has
-	 * been seen -- which is the case a token with no rendezvous node, or a
-	 * dead one, leaves us in -- then rarely, so a peer that wrote its answer
-	 * to a node we never pinned is still found. The nodes that answer are
-	 * retained, so the direct route takes over as soon as there is one.
-	 */
-	if ((routes & SIG_ROUTE_WIDE) && now >= s->next_wide_get_ms) {
-		const uint8_t *slot;
-
-		s->qep4 = s->epoch4;
-		s->qep6 = s->epoch6;
-		bep44_get(s->engine, s->keys.bep44_pk, SIG_SALT, on_dht_get, s);
-		/*
-		 * Relaying keeps it eager: this read is not looking for the
-		 * peer's slot, it is what turns the store just made into a node
-		 * that has answered here. So does a family still to answer at
-		 * all, which is how both of them get warm rather than only the
-		 * one in use.
-		 */
-		s->next_wide_get_ms = now +
-			((mailbox_peer_slot(&s->mb, &slot) &&
-			  !relay_locating(s) && !warming(s)) ?
-			 SIG_DHT_WIDE_IDLE_MS : SIG_DHT_WIDE_GET_MS);
-	}
-	if (now < s->next_put_ms)
-		return;
-	if (s->ending) {
-		/*
-		 * Both routes have to carry it, because they reach different
-		 * readers: the direct store lands on the node the token names,
-		 * which is where a client holding that invitation looks first,
-		 * and the convergent one lands on whoever is closest to the key
-		 * now, which is where a client with an older token ends up and
-		 * where this host's own last offer is sitting. A tombstone only
-		 * one of them can see leaves the other waiting.
-		 *
-		 * One at a time, though. Both are read-modify-writes of the same
-		 * mutable item, so two in flight read the same sequence and
-		 * write the same next one, and every node refuses the second for
-		 * the compare-and-swap it now loses. Run together they place the
-		 * tombstone exactly once and report the other route as having
-		 * reached nothing -- which is true, and is why the session then
-		 * waits out its whole grace for a store that will never be
-		 * acknowledged.
-		 */
-		if (s->end_store_inflight) {
-			/* Nothing until the one out there answers: the cadence
-			 * is what serialises them, and two of the same route
-			 * collide exactly as the two routes would. */
-		} else if (!s->end_placed_direct &&
-			   (s->rnode4_len || s->rnode6_len)) {
-			sig_note_put(s);
-			s->end_store_inflight = 1;
-			bep44_update_direct(s->engine, s->keys.bep44_sk,
-					    s->keys.bep44_pk, SIG_SALT,
-					    sig_merge, s, on_tomb_direct, s);
-		} else if ((routes & SIG_ROUTE_WIDE) && !s->end_placed_wide) {
-			sig_note_put(s);
-			s->end_store_inflight = 1;
-			bep44_update(s->engine, s->keys.bep44_sk,
-				     s->keys.bep44_pk, SIG_SALT, sig_merge, s,
-				     on_tomb_wide, s);
-		}
-		s->next_put_ms = now + SIG_DHT_TOMB_MS;
-		return;
-	}
+	memset(&m, 0, sizeof(m));
+	plain[0] = (uint8_t)(s->direct_port >> 8);
+	plain[1] = (uint8_t)s->direct_port;
 	if (s->is_host) {
-		/*
-		 * A reachable family with no anchor yet is still being located:
-		 * the convergent store places the mailbox on its k-closest nodes
-		 * (idiomatic and discoverable) and the validating get captures
-		 * one as the anchor. It repeats until that family is captured --
-		 * the v6 DHT converges later than v4, so an early store misses
-		 * its k-closest. It keeps retrying for as long as it takes rather
-		 * than giving up on a timing guess: eager for as long as a still-
-		 * missing family's own connectivity is proven up (sig_set_family_up),
-		 * slower otherwise, never stopping outright. An already-anchored
-		 * family is never re-located.
-		 */
-		int missing = !s->rnode4_len || !s->rnode6_len ||
-			      s->relocate4 || s->relocate6;
-
-		if (s->mb.have_mine && missing && (routes & SIG_ROUTE_WIDE) &&
-		    !s->put_inflight) {
-			int eager = ((!s->rnode4_len || s->relocate4) && s->up4) ||
-				    ((!s->rnode6_len || s->relocate6) && s->up6);
-
-			s->put_inflight = 1;
-			if (s->rdv_stage < 2)
-				s->rdv_stage = 2;	/* placing the mailbox */
-			if (bep44_update(s->engine, s->keys.bep44_sk,
-					 s->keys.bep44_pk, SIG_SALT, sig_merge,
-					 s, on_host_put, s))
-				s->put_inflight = 0;
-			s->next_put_ms = now +
-				(eager ? SIG_DHT_PUT_MS : SIG_DHT_PUT_SLOW_MS);
-		} else if (s->mb.have_mine && (routes & SIG_ROUTE_WIDE) &&
-			   now >= s->next_wide_put_ms && !s->put_inflight) {
-			/*
-			 * The value where the key says it belongs, not only
-			 * where it first landed. Which nodes are closest drifts
-			 * as the DHT churns, and a client that has to converge
-			 * -- an old token, or one that never named a node --
-			 * finds whoever is closest now, so the value has to be
-			 * there and not merely on the handful we pinned once.
-			 */
-			sig_note_put(s);
-			s->put_inflight = 1;
-			if (bep44_update(s->engine, s->keys.bep44_sk,
-					 s->keys.bep44_pk, SIG_SALT, sig_merge,
-					 s, on_host_store, s))
-				s->put_inflight = 0;
-			s->next_wide_put_ms = now + SIG_DHT_WIDE_PUT_MS;
-			s->next_put_ms = now + SIG_DHT_PUT_MS;
-		} else if (s->mb.have_mine && (s->rnode4_len || s->rnode6_len) &&
-			   s->mb.need_write && !s->put_inflight) {
-			/*
-			 * Locating done: keep the anchor warm with a direct
-			 * store -- a round-trip to the pinned node, no
-			 * convergence -- but only when it no longer carries our
-			 * offer (need_write is the GET-driven forget signal), so
-			 * the token never churns and the mailbox never expires.
-			 */
-			sig_note_put(s);
-			s->put_inflight = 1;
-			if (bep44_update_direct(s->engine, s->keys.bep44_sk,
-						s->keys.bep44_pk, SIG_SALT,
-						sig_merge, s, on_host_store, s))
-				s->put_inflight = 0;
-			s->next_put_ms = now + SIG_DHT_PUT_MS;
-		}
-	} else if (mailbox_client_should_claim(&s->mb) && claim_current(s)) {
-		/*
-		 * The claim goes to the pinned rendezvous first: a round trip
-		 * rather than a lookup, so the turnstile is taken as quickly as
-		 * it can be. Only an EMPTY answer slot is claimed (the mutex):
-		 * one already holding an answer belongs to another client, so we
-		 * leave it and back off until the host frees it.
-		 *
-		 * And also, more slowly, where the key says the value belongs.
-		 * The pinned nodes are the ones the TOKEN named, and a host that
-		 * has moved since holds its own anchor elsewhere -- it reads the
-		 * token's nodes only when its convergent get comes round, and a
-		 * claim written nowhere else waits for that. The convergent
-		 * store puts it on whoever is closest now, which is where both
-		 * ends' reads meet however either of them has moved.
-		 *
-		 * NEVER BOTH AT ONCE. They are read-modify-writes of one mutable
-		 * item, so two in flight read the same sequence and write the
-		 * same next one, and every node refuses the second for the
-		 * compare-and-swap it has just lost.
-		 */
-		int wide = s->next_wide_put_ms && now >= s->next_wide_put_ms;
-
-		if (!(routes & SIG_ROUTE_WIDE))
-			wide = 0;
-		dbg_logf("sig: writing claim to the rendezvous%s",
-			 wide ? " (convergent)" : "");
-		sig_note_put(s);
-		s->claim_unwritten = 0;
-		if (wide)
-			bep44_update(s->engine, s->keys.bep44_sk,
-				     s->keys.bep44_pk, SIG_SALT, sig_merge, s,
-				     NULL, NULL);
-		else
-			bep44_update_direct(s->engine, s->keys.bep44_sk,
-					    s->keys.bep44_pk, SIG_SALT,
-					    sig_merge, s, NULL, NULL);
-		/* Eager while the claim is still unplaced, which is the whole
-		 * of the time it matters; the round after it lands is the one
-		 * that stops needing to be written at all. */
-		s->next_wide_put_ms = now + SIG_DHT_WIDE_GET_MS;
-		s->next_put_ms = now + SIG_DHT_PUT_MS;
-	} else if (relaying(s) && !s->put_inflight) {
-		/*
-		 * Rendezvous on the peer's behalf: a host that cannot reach a
-		 * family has asked us to establish and then operate one there.
-		 * The sequence is the host's own -- the convergent store places
-		 * the container on the nodes the key belongs to, and the
-		 * validating get that follows picks whichever of them answers
-		 * -- because a node established any other way would carry a
-		 * weaker promise while being indistinguishable afterwards.
-		 *
-		 * What differs is only what is written: the container as it
-		 * stands, neither slot ours (mailbox_relay). Claiming the
-		 * answer slot here would take the turnstile and hold it for the
-		 * session, locking out every other client, for a store that was
-		 * never about claiming anything.
-		 *
-		 * Once there is a node, the same two routes the peer would run
-		 * for itself: the direct store keeps the container on that node
-		 * and carries the peer's newest offer to it, and the direct get
-		 * -- which every operation already makes to the nodes we hold
-		 * -- is what notices the node going quiet, so netstate can look
-		 * for a replacement and announce it. Which is the whole of the
-		 * migration: the peer follows what we tell it, having no way to
-		 * see the family for itself.
-		 */
-		sig_note_put(s);
-		if (relay_locating(s) && (routes & SIG_ROUTE_WIDE)) {
-			bep44_update(s->engine, s->keys.bep44_sk,
-				     s->keys.bep44_pk, SIG_SALT,
-				     sig_relay_merge, s, NULL, NULL);
-			s->next_put_ms = now + SIG_DHT_PUT_MS;
-		} else {
-			bep44_update_direct(s->engine, s->keys.bep44_sk,
-					    s->keys.bep44_pk, SIG_SALT,
-					    sig_relay_merge, s, NULL, NULL);
-			s->next_put_ms = now + SIG_DHT_RELAY_MS;
-		}
+		if (!s->rh)
+			return -1;
+		m.kind = RDV_HOSTINFO;
+		m.gen = s->rh->gen;
+		memcpy(m.from, s->rh->cid, RDV_CID_LEN);
+		n = rdv_encode(&m, plain + 2, sizeof(plain) - 2);
+		if (n < 0)
+			return -1;
+		*salt = "h";
+		return msg_seal_ad(out, max, s->keys.sig_key,
+				   (const uint8_t *)"h", 1, plain,
+				   (size_t)n + 2);
 	}
+	if (!s->rc || !s->my_packed_len || max < RDV_CID_LEN)
+		return -1;
+	m.kind = RDV_OFFER;
+	m.gen = s->rc->host_gen;
+	memcpy(m.from, s->rc->cid, RDV_CID_LEN);
+	if (s->rc->have_host)
+		memcpy(m.to, s->rc->host_cid, RDV_CID_LEN);
+	memcpy(m.payload, s->my_packed, s->my_packed_len);
+	m.payload_len = (uint16_t)s->my_packed_len;
+	n = rdv_encode(&m, plain + 2, sizeof(plain) - 2);
+	if (n < 0)
+		return -1;
+	memcpy(out, s->rc->cid, RDV_CID_LEN);
+	o = RDV_CID_LEN;
+	slot_key(s, my_grade(s), s->rc->cid, key);
+	n = msg_seal_ad(out + o, max - o, key, (const uint8_t *)"c", 1, plain,
+			(size_t)n + 2);
+	if (n < 0)
+		return -1;
+	*salt = "c";
+	return (int)o + n;
 }
 
 static void mcast_pump(struct sig *s, uint64_t now)
 {
-	char ms[2];
+	uint8_t frame[SIG_MCAST_MAX];
+	const char *salt;
+	int n;
 
-	/*
-	 * Gate on the sealed announcement, not on have_mine. A same-segment client
-	 * withdraws its DHT mailbox answer (clearing have_mine) the instant it
-	 * learns the peer over lanlink, to stop a double-serve -- but the host
-	 * learns that client from exactly this multicast announcement, so stopping
-	 * it on withdraw would race the host's admission (which may not have
-	 * processed the announcement yet). Keep announcing; a host deduplicates a
-	 * claimant it has already admitted.
-	 */
 	/* Nothing is announced once the session is over: what a peer needs to
 	 * hear on a segment is that the offer has stopped. */
-	if (s->ending)
+	if (ending(s) || now < s->next_mcast_ms)
 		return;
-	if (!s->mcast_mine_len || now < s->next_mcast_ms)
-		return;
-	ms[0] = my_slot(s);
-	ms[1] = '\0';
-	sig_mcast_send(s->mc, ms, s->mcast_mine, s->mcast_mine_len);
+	n = mcast_frame(s, frame, sizeof(frame), &salt);
+	if (n > 0)
+		sig_mcast_send(s->mc, salt, frame, (size_t)n);
 	s->next_mcast_ms = now + SIG_MCAST_ANN_MS;
 }
 
@@ -1851,15 +1710,16 @@ void sig_dispatch(struct sig *s, const struct pollfd *fds, int nfds)
 	 * the only rendezvous that survives a change of network, so it has to be
 	 * running before the change rather than started after it.
 	 */
-	if ((s->flags & SIG_DHT) && !s->dht_engaged &&
+	if ((s->flags & SIG_DHT) && !s->node &&
 	    (!s->mc || now - s->start_ms > SIG_DHT_GRACE_MS) &&
 	    now >= s->next_dht_open_ms) {
 		engage_dht(s);
 		s->next_dht_open_ms = now + SIG_DHT_OPEN_MS;
 	}
 
-	if (s->dht_engaged) {
+	if (s->node) {
 		dhtnode_dispatch(s->node, fds, nfds);
 		dht_pump(s, now);
+		op_sweep(s);
 	}
 }

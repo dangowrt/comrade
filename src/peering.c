@@ -1218,12 +1218,6 @@ int peering_model_sig(struct peering_model *pm, struct sig *sig, uint64_t now)
 	pm->sig = sig;
 	if (!sig)
 		return 0;
-	if (pm->have_claim_sk) {
-		if (sig_use_claim_key(sig, pm->claim_sk))
-			return -1;
-	} else if (!sig_claim_key(sig, pm->claim_sk)) {
-		pm->have_claim_sk = 1;
-	}
 	pm->dht_since_ms = now;
 	for (i = 0; i < 2; i++) {
 		sig_set_family_up(sig, famv[i],

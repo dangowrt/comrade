@@ -621,12 +621,6 @@ else()
 	target_link_libraries(comrade_crypto PUBLIC OpenSSL::Crypto comrade_compat)
 endif()
 
-# The rendezvous mailbox: the two-slot container plus turnstile claim logic
-# (bencode only, no crypto or DHT), extracted from sig.c so it is unit-testable.
-add_library(comrade_mailbox STATIC src/mailbox.c)
-target_include_directories(comrade_mailbox PUBLIC src)
-target_link_libraries(comrade_mailbox PUBLIC comrade_crypto)
-
 #
 # jech/dht comes either as a plain source checkout (-DCOMRADE_DHT_DIR, which
 # compiles dht.c straight in) or as an installed shared library, which is
@@ -673,7 +667,7 @@ message(STATUS "DHT: ${COMRADE_DHT_HOW}")
 
 add_library(comrade_sig STATIC src/sig.c src/sig_mcast.c)
 target_include_directories(comrade_sig PUBLIC src)
-target_link_libraries(comrade_sig PUBLIC comrade_dht comrade_mailbox
+target_link_libraries(comrade_sig PUBLIC comrade_dht comrade_rdv comrade_crypto
 	comrade_dbg comrade_compat)
 
 add_library(comrade_nat STATIC src/nat.c)
@@ -1114,10 +1108,6 @@ if(BUILD_TESTING)
 	target_link_libraries(candpack_test comrade_crypto)
 	add_test(NAME candpack_test COMMAND candpack_test)
 
-	add_executable(mailbox_test tests/mailbox_test.c)
-	target_link_libraries(mailbox_test comrade_mailbox)
-	add_test(NAME mailbox_test COMMAND mailbox_test)
-
 	add_executable(roauth_test tests/roauth_test.c)
 	target_link_libraries(roauth_test comrade_crypto comrade_token)
 	add_test(NAME roauth_test COMMAND roauth_test)
@@ -1313,11 +1303,11 @@ if(COMRADE_BUILD_TOOLS)
 		target_link_options(comrade-e2e PRIVATE -static)
 	endif()
 
-	# Concurrent multi-user e2e: one host, N clients racing the turnstile
-	# over a DHT. It runs on every build against the private swarm the
-	# fixture starts; COMRADE_E2E_NET=1 points it at the real mainline DHT
-	# instead, which is a question worth asking deliberately. The
-	# turnstile's race-freedom is proven deterministically by mailbox_test
+	# Concurrent multi-user e2e: one host, N clients joining at once over a
+	# DHT. It runs on every build against the private swarm the fixture
+	# starts; COMRADE_E2E_NET=1 points it at the real mainline DHT instead,
+	# which is a question worth asking deliberately. The rendezvous's
+	# liveness under a hostile store is proven deterministically by rdv_test
 	# either way.
 	if(BUILD_TESTING AND UNIX)
 		# One swarm for the whole run rather than eight nodes per test:
@@ -1499,6 +1489,28 @@ if(COMRADE_BUILD_TOOLS)
 			FIXTURES_REQUIRED swarm
 			ENVIRONMENT COMRADE_SWARM_FILE=${COMRADE_SWARM_FILE})
 
+		# A claimant the grant has no room for is refused in its own slot
+		# and told so (PROTOCOL.md section 4, L2).
+		add_test(NAME refused_e2e
+			COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/refused.sh
+				$<TARGET_FILE:comrade-e2e>
+				$<TARGET_FILE:comrade-dhtseed>)
+		set_tests_properties(refused_e2e PROPERTIES
+			SKIP_RETURN_CODE 77 TIMEOUT 200
+			FIXTURES_REQUIRED swarm
+			ENVIRONMENT COMRADE_SWARM_FILE=${COMRADE_SWARM_FILE})
+
+		# The host restarts under the same invitation and its client
+		# announces itself to the new instance (section 4, L3).
+		add_test(NAME hostrestart_e2e
+			COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/hostrestart.sh
+				$<TARGET_FILE:comrade-e2e>
+				$<TARGET_FILE:comrade-dhtseed>)
+		set_tests_properties(hostrestart_e2e PROPERTIES
+			SKIP_RETURN_CODE 77 TIMEOUT 300
+			FIXTURES_REQUIRED swarm
+			ENVIRONMENT COMRADE_SWARM_FILE=${COMRADE_SWARM_FILE})
+
 		# Each of these stands up its own DHT node and multicast
 		# announcer on this host. Two at a time is what they were
 		# measured to tolerate: the announcer's port comes from the
@@ -1519,6 +1531,7 @@ if(COMRADE_BUILD_TOOLS)
 			PROPERTIES RESOURCE_LOCK comrade_seg)
 		set_tests_properties(rejoin_e2e rdvsync_e2e hostroam_e2e
 			forward_e2e resume_e2e roam_client_e2e
+			refused_e2e hostrestart_e2e
 			PROPERTIES RESOURCE_LOCK comrade_dht)
 	endif()
 endif()
@@ -1536,7 +1549,7 @@ if(BUILD_TESTING)
 		hostreap_test sigquiet_test claimlog_test hbeat_test replay_test
 		rdv_test termfilter_test
 		ctlproto_test netmon_test
-		candpolicy_test candpack_test mailbox_test roauth_test keys_test
+		candpolicy_test candpack_test roauth_test keys_test
 		dhtnode_boot_test
 		connkey_test dataauth_test box_test
 		stunprobe_test path_test probeplane_test pathplane_test

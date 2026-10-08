@@ -14,6 +14,8 @@ struct slot {
 	uint8_t v[HIST][RDV_MAX_MSG];
 	uint8_t cid[RDV_CID_LEN];
 	size_t len[HIST];
+	int64_t seq[HIST];
+	int64_t writes;
 	char kind;
 	int have_cid;
 	int n;
@@ -60,17 +62,20 @@ static void store_write(struct store *st, const struct rdv_out *o)
 	for (i = HIST - 1; i > 0; i--) {
 		memcpy(sl->v[i], sl->v[i - 1], sizeof(sl->v[0]));
 		sl->len[i] = sl->len[i - 1];
+		sl->seq[i] = sl->seq[i - 1];
 	}
 	memcpy(sl->v[0], o->msg, o->len);
 	sl->len[0] = o->len;
+	sl->seq[0] = ++sl->writes;
 	if (sl->n < HIST)
 		sl->n++;
 	st->writes++;
 }
 
-/* `back` revisions old: how a divergent replica is modelled. */
+/* `back` revisions old: how a divergent replica is modelled. `seq` is the
+ * store's sequence for the copy served, as a BEP 44 node reports it. */
 static int store_read(struct store *st, char kind, const uint8_t *cid,
-		      int back, struct rdv_msg *m)
+		      int back, struct rdv_msg *m, int64_t *seq)
 {
 	struct slot *sl;
 
@@ -79,6 +84,8 @@ static int store_read(struct store *st, char kind, const uint8_t *cid,
 		return 0;
 	if (back >= sl->n)
 		back = sl->n - 1;
+	if (seq)
+		*seq = sl->seq[back];
 	return rdv_decode(m, sl->v[back], sl->len[back]) == 0;
 }
 
@@ -98,7 +105,7 @@ static int host_pass(struct rdv_host *h, struct store *st, int back,
 	int i, answered = 0;
 	struct rdv_msg m;
 
-	if (store_read(st, 'd', NULL, back, &m))
+	if (store_read(st, 'd', NULL, back, &m, NULL))
 		rdv_host_bell(h, &m);
 	for (i = 0; i < RDV_HOST_MAX; i++) {
 		if (h->c[i].state == RDV_C_FREE)
@@ -106,7 +113,7 @@ static int host_pass(struct rdv_host *h, struct store *st, int back,
 		if (h->c[i].state != RDV_C_HARVESTED && !h->c[i].knock)
 			continue;
 		h->c[i].knock = 0;
-		if (!store_read(st, 'c', h->c[i].cid, back, &m))
+		if (!store_read(st, 'c', h->c[i].cid, back, &m, NULL))
 			continue;
 		if (rdv_host_slot(h, &m)) {
 			rdv_host_answer(h, m.from, (const uint8_t *)answer,
@@ -122,10 +129,11 @@ static void client_pass(struct rdv_client *c, struct store *st, int back,
 {
 	struct rdv_msg m;
 	struct rdv_out o;
+	int64_t seq;
 
-	if (store_read(st, 'h', NULL, back, &m))
-		rdv_client_host_slot(c, &m);
-	if (store_read(st, 'a', c->cid, back, &m))
+	if (store_read(st, 'h', NULL, back, &m, &seq))
+		rdv_client_host_slot(c, &m, seq);
+	if (store_read(st, 'a', c->cid, back, &m, NULL))
 		rdv_client_own_slot(c, &m);
 	if (rdv_client_next(c, (const uint8_t *)offer, strlen(offer), &o)) {
 		store_write(st, &o);
@@ -149,12 +157,14 @@ static void envelope_checks(void)
 	memcpy(m.from, cid, RDV_CID_LEN);
 	memcpy(m.to, other, RDV_CID_LEN);
 	m.seq = 7;
+	m.re = 6;
 	memcpy(m.payload, "SDP", 3);
 	m.payload_len = 3;
 	n = rdv_encode(&m, buf, sizeof(buf));
 	assert(n == RDV_HDR_LEN + 3);
 	assert(rdv_decode(&d, buf, (size_t)n) == 0);
 	assert(d.kind == RDV_OFFER && d.gen == 0x11223344 && d.seq == 7);
+	assert(d.re == 6);
 	assert(!memcmp(d.from, cid, RDV_CID_LEN));
 	assert(!memcmp(d.to, other, RDV_CID_LEN));
 	assert(d.payload_len == 3 && !memcmp(d.payload, "SDP", 3));
@@ -285,9 +295,9 @@ static void a_refusal_the_host_decides(void)
 		while (rdv_host_next(&h, NULL, 0, &o))
 			store_write(&st, &o);
 		client_pass(&ca, &st, 0, "OA", &msgs);
-		if (store_read(&st, 'd', NULL, 0, &m))
+		if (store_read(&st, 'd', NULL, 0, &m, NULL))
 			rdv_host_bell(&h, &m);
-		if (store_read(&st, 'c', a, 0, &m) && rdv_host_slot(&h, &m))
+		if (store_read(&st, 'c', a, 0, &m, NULL) && rdv_host_slot(&h, &m))
 			rdv_host_refuse(&h, a, RDV_REFUSE_FULL);
 	}
 	assert(ca.state == RDV_CL_REFUSED && ca.refusal == RDV_REFUSE_FULL);
@@ -317,11 +327,11 @@ static void each_claimant_gets_its_own_answer(void)
 			store_write(&st, &o);
 		client_pass(&ca, &st, 0, "OA", &msgs);
 		client_pass(&cb, &st, 0, "OB", &msgs);
-		if (store_read(&st, 'd', NULL, 0, &m))
+		if (store_read(&st, 'd', NULL, 0, &m, NULL))
 			rdv_host_bell(&h, &m);
-		if (store_read(&st, 'c', a, 0, &m) && rdv_host_slot(&h, &m))
+		if (store_read(&st, 'c', a, 0, &m, NULL) && rdv_host_slot(&h, &m))
 			rdv_host_answer(&h, a, (const uint8_t *)"AN-A", 4);
-		if (store_read(&st, 'c', b, 0, &m) && rdv_host_slot(&h, &m))
+		if (store_read(&st, 'c', b, 0, &m, NULL) && rdv_host_slot(&h, &m))
 			rdv_host_answer(&h, b, (const uint8_t *)"AN-B", 4);
 	}
 	assert(ca.state == RDV_CL_ANSWERED && cb.state == RDV_CL_ANSWERED);
@@ -348,7 +358,7 @@ static void an_unchanged_offer_is_answered_once(void)
 	m.gen = 1;
 	memcpy(m.from, hcid, RDV_CID_LEN);
 	m.seq = 1;
-	assert(rdv_client_host_slot(&ca, &m) == 1);
+	assert(rdv_client_host_slot(&ca, &m, 1) == 1);
 
 	/* Bell, offer, bell, offer: the same offer under the same sequence. */
 	for (i = 0; i < 6; i++) {
@@ -413,6 +423,91 @@ static void a_gone_claimant_s_replay_is_ignored(void)
 	assert(c->state == RDV_C_HARVESTED);
 }
 
+static void a_kept_claimant_is_told_nothing_new(void)
+{
+	uint8_t hcid[RDV_CID_LEN], a[RDV_CID_LEN];
+	struct rdv_claimant *c;
+	struct rdv_host h;
+	struct rdv_msg m;
+	struct rdv_out o;
+
+	cid_fill(hcid, 0x20);
+	cid_fill(a, 0x30);
+	rdv_host_init(&h, hcid, 1, 0);
+
+	memset(&m, 0, sizeof(m));
+	m.kind = RDV_OFFER;
+	memcpy(m.from, a, RDV_CID_LEN);
+	memcpy(m.to, hcid, RDV_CID_LEN);
+	m.seq = 1;
+	assert(rdv_host_slot(&h, &m) == 1);
+	rdv_host_answer(&h, a, (const uint8_t *)"AN", 2);
+	assert(rdv_host_next(&h, NULL, 0, &o) == 1 && o.salt_kind == 'h');
+	assert(rdv_host_next(&h, NULL, 0, &o) == 1 && o.salt_kind == 'a');
+	assert(rdv_host_next(&h, NULL, 0, &o) == 0);
+
+	m.seq = 2;
+	assert(rdv_host_slot(&h, &m) == 1);
+	c = rdv_host_find(&h, a);
+	assert(c && c->state == RDV_C_HARVESTED && h.answered == 0);
+	rdv_host_keep(&h, a);
+	assert(c->state == RDV_C_ANSWERED && !c->pending && h.answered == 1);
+	assert(rdv_host_next(&h, NULL, 0, &o) == 0);
+
+	rdv_host_forget(&h, a);
+	rdv_host_keep(&h, a);
+	assert(c->state == RDV_C_GONE && h.answered == 0);
+	assert(rdv_host_next(&h, NULL, 0, &o) == 0);
+}
+
+/* L3 in messages: the instance that replaces a host answers its claimant. */
+static void a_restarted_host_answers_its_claimant_again(void)
+{
+	uint8_t h1[RDV_CID_LEN], h2[RDV_CID_LEN], a[RDV_CID_LEN];
+	int round, msgs = 0;
+	struct rdv_client c;
+	struct rdv_host h;
+	struct rdv_out o;
+	struct store st;
+
+	memset(&st, 0, sizeof(st));
+	cid_fill(h1, 0x40);
+	cid_fill(h2, 0x50);
+	cid_fill(a, 0x60);
+	rdv_host_init(&h, h1, 1, 0);
+	rdv_client_init(&c, a);
+
+	for (round = 0; round < 6; round++) {
+		while (rdv_host_next(&h, NULL, 0, &o)) {
+			store_write(&st, &o);
+			msgs++;
+		}
+		client_pass(&c, &st, round % HIST, "OA", &msgs);
+		host_pass(&h, &st, round % HIST, "AN1");
+	}
+	assert(c.state == RDV_CL_ANSWERED && !memcmp(c.host_cid, h1, RDV_CID_LEN));
+	rdv_client_set_live(&c, 1);
+
+	rdv_host_init(&h, h2, 1, 0);
+	rdv_client_set_live(&c, 0);
+	msgs = 0;
+	for (round = 0; round < 12; round++) {
+		while (rdv_host_next(&h, NULL, 0, &o)) {
+			store_write(&st, &o);
+			store_write(&st, &o);
+			msgs++;
+		}
+		client_pass(&c, &st, round % HIST, "OA", &msgs);
+		host_pass(&h, &st, round % HIST, "AN2");
+	}
+	assert(c.state == RDV_CL_ANSWERED);
+	assert(!memcmp(c.host_cid, h2, RDV_CID_LEN));
+	assert(!memcmp(c.prev_cid, h1, RDV_CID_LEN));
+	assert(c.answer_len == 3 && !memcmp(c.answer, "AN2", 3));
+	printf("rdv_test: a restarted host answered its claimant again, "
+	       "%d messages\n", msgs);
+}
+
 static void a_moved_host_is_re_announced_to(void)
 {
 	uint8_t h1[RDV_CID_LEN], h2[RDV_CID_LEN], a[RDV_CID_LEN];
@@ -430,8 +525,8 @@ static void a_moved_host_is_re_announced_to(void)
 	m.gen = 1;
 	memcpy(m.from, h1, RDV_CID_LEN);
 	m.seq = 1;
-	assert(rdv_client_host_slot(&c, &m) == 1);
-	assert(rdv_client_host_slot(&c, &m) == 0);
+	assert(rdv_client_host_slot(&c, &m, 1) == 1);
+	assert(rdv_client_host_slot(&c, &m, 1) == 0);
 
 	c.state = RDV_CL_ANSWERED;
 	rdv_client_set_live(&c, 1);
@@ -439,26 +534,100 @@ static void a_moved_host_is_re_announced_to(void)
 
 	m.gen = 2;
 	m.seq = 2;
-	assert(rdv_client_host_slot(&c, &m) == 1);
+	assert(rdv_client_host_slot(&c, &m, 2) == 1);
 	assert(c.state == RDV_CL_ANNOUNCING);
 
 	c.state = RDV_CL_ANSWERED;
 	memcpy(m.from, h2, RDV_CID_LEN);
 	m.seq = 3;
-	assert(rdv_client_host_slot(&c, &m) == 1);
+	assert(rdv_client_host_slot(&c, &m, 3) == 1);
 	assert(c.state == RDV_CL_ANNOUNCING);
+
+	/* A replica still serving the first host, below the sequence seen. */
+	m.gen = 1;
+	memcpy(m.from, h1, RDV_CID_LEN);
+	assert(rdv_client_host_slot(&c, &m, 1) == -1);
+	assert(!memcmp(c.host_cid, h2, RDV_CID_LEN) && c.host_gen == 2);
+	memcpy(m.from, h2, RDV_CID_LEN);
+	m.gen = 2;
 
 	c.state = RDV_CL_ANSWERED;
 	rdv_client_set_live(&c, 0);
 	assert(c.state == RDV_CL_ANNOUNCING);
 	assert(rdv_client_next(&c, (const uint8_t *)"O", 1, &o) == 1);
 
-	/* A tombstone stops it: there is nothing left to be answered by. */
+	/* A tombstone stops it, until the host it names writes again. */
 	m.kind = RDV_TOMB;
 	m.seq = 4;
-	rdv_client_host_slot(&c, &m);
+	assert(rdv_client_host_slot(&c, &m, 4) == 0);
 	assert(c.host_gone);
 	assert(rdv_client_next(&c, (const uint8_t *)"O", 1, &o) == 0);
+	m.kind = RDV_HOSTINFO;
+	m.seq = 5;
+	assert(rdv_client_host_slot(&c, &m, 5) == 0);
+	assert(!c.host_gone);
+	assert(rdv_client_next(&c, (const uint8_t *)"O", 1, &o) == 1);
+}
+
+/* A replica still serving the answer to an earlier offer, after the host has
+ * moved and the claimant offered again, must not prime a dead punch. */
+static void an_answer_names_the_offer_it_answers(void)
+{
+	uint8_t hcid[RDV_CID_LEN], a[RDV_CID_LEN];
+	struct rdv_msg m, old;
+	struct rdv_client c;
+	struct rdv_out o;
+
+	cid_fill(hcid, 0x70);
+	cid_fill(a, 0x80);
+	rdv_client_init(&c, a);
+
+	memset(&m, 0, sizeof(m));
+	m.kind = RDV_HOSTINFO;
+	m.gen = 1;
+	memcpy(m.from, hcid, RDV_CID_LEN);
+	m.seq = 1;
+	assert(rdv_client_host_slot(&c, &m, 1) == 1);
+	assert(rdv_client_next(&c, (const uint8_t *)"O", 1, &o) == 1);
+	assert(rdv_client_next(&c, (const uint8_t *)"O", 1, &o) == 1);
+	assert(c.state == RDV_CL_OFFERED);
+
+	m.kind = RDV_ANSWER;
+	memcpy(m.to, a, RDV_CID_LEN);
+	m.seq = 2;
+	m.re = c.offer_seq;
+	memcpy(m.payload, "A1", 2);
+	m.payload_len = 2;
+	assert(rdv_client_own_slot(&c, &m) == 1);
+	old = m;
+
+	/* The same offer answered again with more in it is taken. */
+	m.seq = 3;
+	memcpy(m.payload, "A1+", 3);
+	m.payload_len = 3;
+	assert(rdv_client_own_slot(&c, &m) == 1);
+	assert(c.answer_len == 3);
+
+	m.kind = RDV_HOSTINFO;
+	m.gen = 2;
+	m.seq = 4;
+	memset(m.to, 0, RDV_CID_LEN);
+	assert(rdv_client_host_slot(&c, &m, 2) == 1);
+	assert(c.state == RDV_CL_ANNOUNCING && c.answer_len == 0);
+	assert(rdv_client_next(&c, (const uint8_t *)"O", 1, &o) == 1);
+	assert(rdv_client_next(&c, (const uint8_t *)"O", 1, &o) == 1);
+	assert(c.state == RDV_CL_OFFERED && c.offer_seq != old.re);
+
+	assert(rdv_client_own_slot(&c, &old) == 0);
+	assert(c.state == RDV_CL_OFFERED);
+	m.kind = RDV_ANSWER;
+	memcpy(m.to, a, RDV_CID_LEN);
+	m.seq = 5;
+	m.re = c.offer_seq;
+	memcpy(m.payload, "A2", 2);
+	m.payload_len = 2;
+	assert(rdv_client_own_slot(&c, &m) == 1);
+	assert(c.state == RDV_CL_ANSWERED && !memcmp(c.answer, "A2", 2));
 }
 
 static void stale_and_unaddressed_messages_are_no_ops(void)
@@ -467,6 +636,7 @@ static void stale_and_unaddressed_messages_are_no_ops(void)
 	struct rdv_client c;
 	struct rdv_host h;
 	struct rdv_msg m;
+	struct rdv_out o;
 	int i;
 
 	cid_fill(hcid, 0x80);
@@ -480,15 +650,22 @@ static void stale_and_unaddressed_messages_are_no_ops(void)
 	m.gen = 1;
 	memcpy(m.from, hcid, RDV_CID_LEN);
 	m.seq = 1;
-	assert(rdv_client_host_slot(&c, &m) == 1);
+	assert(rdv_client_host_slot(&c, &m, 1) == 1);
+	assert(rdv_client_next(&c, (const uint8_t *)"O", 1, &o) == 1);
+	assert(rdv_client_next(&c, (const uint8_t *)"O", 1, &o) == 1);
+	assert(c.state == RDV_CL_OFFERED && c.offer_seq);
 
 	m.kind = RDV_ANSWER;
 	memcpy(m.to, b, RDV_CID_LEN);
 	m.seq = 5;
+	m.re = c.offer_seq;
 	assert(rdv_client_own_slot(&c, &m) == 0);
-	assert(c.state == RDV_CL_ANNOUNCING);
+	assert(c.state == RDV_CL_OFFERED);
 
 	memcpy(m.to, a, RDV_CID_LEN);
+	m.re = c.offer_seq - 1;
+	assert(rdv_client_own_slot(&c, &m) == 0);
+	m.re = c.offer_seq;
 	assert(rdv_client_own_slot(&c, &m) == 1);
 	assert(c.state == RDV_CL_ANSWERED);
 
@@ -528,12 +705,15 @@ int main(void)
 {
 	envelope_checks();
 	stale_and_unaddressed_messages_are_no_ops();
+	an_answer_names_the_offer_it_answers();
 	a_moved_host_is_re_announced_to();
 	a_spent_grant_refuses_rather_than_waits();
 	a_refusal_the_host_decides();
 	each_claimant_gets_its_own_answer();
 	an_unchanged_offer_is_answered_once();
 	a_gone_claimant_s_replay_is_ignored();
+	a_kept_claimant_is_told_nothing_new();
+	a_restarted_host_answers_its_claimant_again();
 	liveness_under_a_hostile_store(1, 0);
 	liveness_under_a_hostile_store(3, 0);
 	liveness_under_a_hostile_store(4, 0);

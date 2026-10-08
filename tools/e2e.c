@@ -152,6 +152,7 @@ static void mcast_probe_cb(void *arg, const char *salt, const uint8_t *data,
 
 int main(int argc, char **argv)
 {
+	const char *tok_arg = NULL, *hostkey_path = NULL;
 	int is_host, i, rc, flood = 0, scale = 1;
 	uint8_t tx[SSH_NONCE], rx[SSH_NONCE];
 	const char *stun_arg = NULL;
@@ -159,6 +160,7 @@ int main(int argc, char **argv)
 	struct session_cfg cfg;
 	size_t rx_got = 0, k;
 	sock_t e2e_end[2];
+	uint8_t fp[32];
 
 	/* A peer closing first must not kill the harness outright, the same way
 	 * the product binary arranges for itself (main.c). Without this a client
@@ -236,7 +238,8 @@ int main(int argc, char **argv)
 			"  opts: [--stun-port p] [--timeout s] [--log N]\n"
 			"        [--mcast] [--no-dht] [--roam-ms N] [--roams N] [--roam-hard]\n"
 		"        [--roam-fam 4|6|iface]\n"
-			"        [--blackhole-ms N] [--reap-ms N]\n",
+			"        [--blackhole-ms N] [--reap-ms N]\n"
+			"  host: [--serve N] [--admit N] [--hostkey FILE] [--token TOKEN]\n",
 			argv[0], argv[0]);
 		return 2;
 	}
@@ -253,6 +256,12 @@ int main(int argc, char **argv)
 			cfg.connect_timeout_s = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--serve") && i + 1 < argc)
 			cfg.host_serve_max = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--admit") && i + 1 < argc)
+			cfg.host_admit_max = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--hostkey") && i + 1 < argc)
+			hostkey_path = argv[++i];
+		else if (!strcmp(argv[i], "--token") && i + 1 < argc)
+			tok_arg = argv[++i];
 		else if (!strcmp(argv[i], "--hold-ms") && i + 1 < argc)
 			cfg.test_hold_ms = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--single"))
@@ -309,11 +318,34 @@ int main(int argc, char **argv)
 	else if (strcmp(stun_arg, "none"))
 		cfg.stun_host = stun_arg;
 
-	if (is_host) {
+	if (is_host && tok_arg) {
+		/* A restart under an invitation already handed out: the same
+		 * rendezvous, and the key its holders pinned. */
+		if (token_decode(&cfg.tok, tok_arg) || !hostkey_path) {
+			fprintf(stderr, "error: --token needs a valid token and "
+				"--hostkey\n");
+			return 2;
+		}
+		cfg.hostkey = sshd_hostkey_load(hostkey_path, fp);
+		if (!cfg.hostkey || memcmp(fp, cfg.tok.hostpub, 32)) {
+			fprintf(stderr, "error: %s does not hold the token's host "
+				"key\n", hostkey_path);
+			return 1;
+		}
+		host.tok = cfg.tok;
+		cfg.ssh_command = "cat";
+		cfg.use_pty = 0;
+		cfg.on_token_state = on_token_state;
+	} else if (is_host) {
 		cfg.tok.version = TOKEN_VERSION;
 		cfg.hostkey = sshd_hostkey_new(cfg.tok.hostpub);
 		if (!cfg.hostkey) {
 			fprintf(stderr, "error: host key generation failed\n");
+			return 1;
+		}
+		if (hostkey_path && sshd_hostkey_save(cfg.hostkey, hostkey_path)) {
+			fprintf(stderr, "error: cannot save the host key to %s\n",
+				hostkey_path);
 			return 1;
 		}
 		random_bytes(cfg.tok.rdv, TOKEN_RDV_LEN);
@@ -362,6 +394,10 @@ int main(int argc, char **argv)
 	if (cfg.hostkey)
 		sshd_hostkey_free(cfg.hostkey);
 
+	if (rc == SESSION_FULL) {
+		printf("E2E REFUSED client: the host's grant is spent\n");
+		return 3;
+	}
 	if (rc) {
 		printf("E2E FAIL %s\n", is_host ? "host" : "client");
 		return 1;

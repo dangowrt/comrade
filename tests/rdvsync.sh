@@ -1,6 +1,6 @@
 #!/bin/sh
 # Rendezvous consensus: whatever token a client arrived on, it ends up holding
-# the node the host is actually serving its mailbox from.
+# the node the host is actually serving its slot from.
 #
 # A token is meant to be shareable before either family has a qualified
 # rendezvous node -- that is what the client's DHT warm-up is for -- so the

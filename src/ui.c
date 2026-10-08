@@ -983,7 +983,8 @@ static void um_mailbox(struct ui *u, const struct session_mailbox *m)
 		     m->mine_stored ? "ours stored" :
 		     m->have_mine ? "ours not stored yet" : "nothing to store",
 		     m->peer_seen ? ", peer slot present" : ", no peer slot",
-		     m->claim == SESSION_CLAIM_BUSY ? ", answer slot taken" : "",
+		     m->claim == SESSION_CLAIM_ANSWERED ? ", answered" :
+		     m->claim == SESSION_CLAIM_REFUSED ? ", refused" : "",
 		     (long long)m->seq, m->gets, m->puts);
 }
 

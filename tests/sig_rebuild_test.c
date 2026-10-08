@@ -88,21 +88,23 @@ static int resolve_started(void)
 
 int main(void)
 {
-	uint8_t rdv[TOKEN_RDV_LEN];
+	uint8_t rdv[TOKEN_RDV_LEN], auth[TOKEN_AUTH_LEN];
+	int i, nfds, timeout_ms;
 	struct pollfd fds[8];
 	struct sig *s;
 	uint64_t t0;
-	int i, nfds, timeout_ms;
 
 	for (i = 0; i < TOKEN_RDV_LEN; i++)
 		rdv[i] = (uint8_t)(i * 11 + 3);
+	for (i = 0; i < TOKEN_AUTH_LEN; i++)
+		auth[i] = (uint8_t)(i * 7 + 1);
 
 	/* NULL means only that the caller asked for no transport at all; a
 	 * transport that cannot be brought up now is retried from dispatch. */
-	assert(sig_create(rdv, 0, 1) == NULL);
+	assert(sig_create(rdv, auth, 0, 0, 1) == NULL);
 
 	/* A DHT node needs a UDP socket on one family or the other. */
-	s = sig_create(rdv, SIG_DHT, 1);
+	s = sig_create(rdv, auth, 0, SIG_DHT, 1);
 	assert(s);
 	nfds = sig_prepare(s, fds, 8, &timeout_ms);
 	sig_discard(s);
@@ -115,42 +117,24 @@ int main(void)
 	 * The roam's own sequence. Each round also pins the jech/dht singleton
 	 * invariant sig_rebuild leans on: dht_init and dht_uninit must pair, or
 	 * the next node is never created and prepare offers no descriptor.
-	 *
-	 * AND THE CLAIM KEY SURVIVES IT. A claimant boxes its claim to the key
-	 * it read in the host's offer, so a rebuild that minted a fresh one
-	 * left the host unable to open a claim already in flight -- and a host
-	 * that cannot open a claim releases the slot, erasing one that was
-	 * perfectly good. Every round here is a roam, and the key a session
-	 * carries across them must be the one it started with.
 	 */
-	{
-		uint8_t k0[32], k[32];
-
-		s = sig_create(rdv, SIG_DHT, 1);
-		assert(s && !sig_claim_key(s, k0));
+	for (i = 0; i < ROUNDS; i++) {
+		t0 = now_ms();
+		s = sig_create(rdv, auth, 0, SIG_DHT, 1);
+		assert(s);
+		nfds = sig_prepare(s, fds, 8, &timeout_ms);
+		assert(nfds > 0);
+		/* The bootstrap round is what starts a resolve, so a
+		 * pump is what puts one in flight to be left behind. */
+		sig_dispatch(s, fds, nfds);
 		sig_discard(s);
-
-		for (i = 0; i < ROUNDS; i++) {
-			t0 = now_ms();
-			s = sig_create(rdv, SIG_DHT, 1);
-			assert(s);
-			/* What the session does across its own rebuild. */
-			sig_use_claim_key(s, k0);
-			assert(!sig_claim_key(s, k) && !memcmp(k, k0, 32));
-			nfds = sig_prepare(s, fds, 8, &timeout_ms);
-			assert(nfds > 0);
-			/* The bootstrap round is what starts a resolve, so a
-			 * pump is what puts one in flight to be left behind. */
-			sig_dispatch(s, fds, nfds);
-			sig_discard(s);
-			assert(now_ms() - t0 < ROUND_MAX_MS);
-		}
-		assert(resolve_started());
+		assert(now_ms() - t0 < ROUND_MAX_MS);
 	}
+	assert(resolve_started());
 
 	/* The session's own teardown, which persists the node cache. */
 	t0 = now_ms();
-	s = sig_create(rdv, SIG_DHT, 1);
+	s = sig_create(rdv, auth, 0, SIG_DHT, 1);
 	assert(s);
 	nfds = sig_prepare(s, fds, 8, &timeout_ms);
 	assert(nfds > 0);

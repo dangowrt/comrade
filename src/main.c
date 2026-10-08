@@ -213,6 +213,11 @@ static int session_connect(const char *arg, int ui_mode, int no_mcast,
 		fprintf(stderr, "comrade: the shared session has ended.\n");
 		return 0;
 	}
+	if (rc == SESSION_FULL) {
+		fprintf(stderr, "comrade: the host refused this join: its "
+			"grant is spent\n");
+		return 1;
+	}
 	if (rc) {
 		fprintf(stderr, "comrade: could not connect to the session\n");
 		return 1;

@@ -10,7 +10,7 @@
 #define RDV_VERSION 1
 #define RDV_CID_LEN 8
 #define RDV_MAX_PAYLOAD 900
-#define RDV_HDR_LEN (1 + 1 + 4 + RDV_CID_LEN + RDV_CID_LEN + 4 + 2)
+#define RDV_HDR_LEN (1 + 1 + 4 + RDV_CID_LEN + RDV_CID_LEN + 4 + 4 + 2)
 #define RDV_MAX_MSG (RDV_HDR_LEN + RDV_MAX_PAYLOAD)
 #define RDV_ERR_VERSION (-2)
 #define RDV_HOST_MAX 16
@@ -36,6 +36,7 @@ struct rdv_msg {
 	uint8_t from[RDV_CID_LEN];
 	uint8_t to[RDV_CID_LEN];	/* all-zero addresses whoever reads */
 	uint32_t seq;
+	uint32_t re;			/* the offer this answers, 0 for none */
 	uint8_t payload[RDV_MAX_PAYLOAD];
 	uint16_t payload_len;
 };
@@ -65,6 +66,7 @@ enum rdv_cstate {
 struct rdv_claimant {
 	uint8_t cid[RDV_CID_LEN];
 	uint32_t last_seq;
+	uint32_t answer_re;		/* the offer the pending answer is to */
 	uint8_t state;
 	uint8_t have_seq;
 	uint8_t pending;
@@ -98,6 +100,7 @@ void rdv_host_answer(struct rdv_host *h, const uint8_t cid[RDV_CID_LEN],
 		     const uint8_t *payload, size_t len);
 void rdv_host_refuse(struct rdv_host *h, const uint8_t cid[RDV_CID_LEN],
 		     int reason);
+void rdv_host_keep(struct rdv_host *h, const uint8_t cid[RDV_CID_LEN]);
 void rdv_host_forget(struct rdv_host *h, const uint8_t cid[RDV_CID_LEN]);
 int rdv_host_next(struct rdv_host *h, const uint8_t *info, size_t info_len,
 		  struct rdv_out *o);
@@ -109,9 +112,13 @@ enum rdv_clstate {
 	RDV_CL_REFUSED
 };
 
+#define RDV_PREV_MAX 4
+
 struct rdv_client {
 	uint8_t cid[RDV_CID_LEN];
 	uint8_t host_cid[RDV_CID_LEN];
+	uint8_t prev_cid[RDV_PREV_MAX][RDV_CID_LEN];	/* host instances before */
+	int64_t h_seq;			/* the host slot's highest store sequence */
 	uint32_t host_gen;
 	uint32_t seq;
 	uint32_t offer_seq;
@@ -123,6 +130,7 @@ struct rdv_client {
 	uint8_t turn;			/* alternates bell and offer */
 	uint8_t refusal;
 	uint8_t host_gone;		/* the host said so, in its own slot */
+	uint8_t nprev;
 	uint8_t offer[RDV_MAX_PAYLOAD];
 	uint16_t offer_len;
 	uint8_t answer[RDV_MAX_PAYLOAD];
@@ -130,7 +138,10 @@ struct rdv_client {
 };
 
 void rdv_client_init(struct rdv_client *c, const uint8_t cid[RDV_CID_LEN]);
-int rdv_client_host_slot(struct rdv_client *c, const struct rdv_msg *m);
+/* `seq` is the store's sequence for the copy read, -1 where it has none. -1
+ * back is a copy older than one already acted on, 1 a host new or moved. */
+int rdv_client_host_slot(struct rdv_client *c, const struct rdv_msg *m,
+			 int64_t seq);
 int rdv_client_own_slot(struct rdv_client *c, const struct rdv_msg *m);
 void rdv_client_set_live(struct rdv_client *c, int live);
 int rdv_client_next(struct rdv_client *c, const uint8_t *offer,

@@ -115,8 +115,8 @@ struct session_cfg {
 					 * loop that the product host uses) */
 	int test_stuck_punches;		/* host: force the first N ICE pickups to
 					 * never connect (a wedged punch), so the
-					 * release-on-pickup turnstile can be shown
-					 * not to head-of-line-block (L1-stuck) */
+					 * turnstile can be shown not to
+					 * head-of-line-block (L1-stuck) */
 	int test_roam_ms;		/* report a network change this often, as
 					 * if netmon had seen the interfaces move
 					 * (0 = never), so the rebuild on a roam
@@ -165,6 +165,7 @@ struct session_cfg {
  */
 #define SESSION_ENDED 2			/* we were in it and the host ended it */
 #define SESSION_GONE 3			/* the invitation names one already over */
+#define SESSION_FULL 4			/* the host refused us: its grant is spent */
 
 /* Run the session to completion; returns 0 on success, non-zero on failure. */
 int session_run(const struct session_cfg *cfg);

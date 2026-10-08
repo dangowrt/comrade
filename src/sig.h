@@ -8,27 +8,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "rdv.h"
 #include "sig_mcast.h"		/* struct sig_mcast_if */
 #include "token.h"
-
-/*
- * Signalling over a single shared rendezvous mailbox.
- *
- * The two peers meet at ONE DHT mutable item: a small container with two
- * slots, the host's offer and the client's answer. Because a DHT stores a key
- * on the nodes closest to it, two different keys live on different nodes, so a
- * single shared key is the only way one rendezvous node can serve BOTH
- * directions. Each peer writes its own slot with compare-and-swap so neither
- * clobbers the other; a stale write loses the CAS and is retried after the
- * next read. On a LAN, multicast carries the slots directly instead, with no
- * shared item -- and so with nothing that outlives the host, which is why the
- * tombstone below is a DHT-only thing. A third slot holds it once the session
- * is over, and never stands beside an offer, so the item still carries at most
- * two sealed slots at a time.
- */
-
-#define SIG_MAX_VALUE 440		/* plaintext per slot; two sealed slots
-					 * plus framing fit one BEP44 value */
 
 /* Transports; combine with OR. */
 #define SIG_DHT		0x1	/* BitTorrent mainline DHT (internet-wide) */
@@ -36,18 +18,24 @@
 
 struct sig;
 
-typedef void sig_recv_cb(void *arg, const uint8_t *data, size_t len);
+enum sig_claim {
+	SIG_CLAIM_UNKNOWN = 0,
+	SIG_CLAIM_FREE,
+	SIG_CLAIM_HELD,
+	SIG_CLAIM_BUSY,
+	SIG_CLAIM_ANSWERED,
+	SIG_CLAIM_REFUSED
+};
 
-/*
- * is_host selects which slot is ours: the host writes the offer and reads the
- * answer, the client the reverse. With both transports, multicast runs first
- * and the DHT is engaged once a grace has elapsed, whether or not the link
- * answered in it. A transport that cannot be brought up now is retried from
- * sig_dispatch, so NULL means only that the caller asked for no transport at
- * all.
- */
-struct sig *sig_create(const uint8_t rdv[TOKEN_RDV_LEN], unsigned flags,
-		       int is_host);
+/* A peer's description, and the instance id (RDV_CID_LEN bytes) it came from. */
+typedef void sig_recv_cb(void *arg, const uint8_t *cid, const uint8_t *data,
+			 size_t len);
+
+/* `auth` is the credential this end holds, `auth_ro` whether it is the read-only
+ * one: a claimant's slot is sealed to its class, see keys_slot_key. */
+struct sig *sig_create(const uint8_t rdv[TOKEN_RDV_LEN],
+		       const uint8_t auth[TOKEN_AUTH_LEN], int auth_ro,
+		       unsigned flags, int is_host);
 void sig_destroy(struct sig *s);
 /*
  * Destroy a signaller that is being replaced within this session, so its DHT
@@ -56,60 +44,35 @@ void sig_destroy(struct sig *s);
  */
 void sig_discard(struct sig *s);
 
+/* The state machine this signaller drives, owned above it so that its sequence
+ * numbers outlive a rebuild; handed in before anything is published. */
+void sig_rdv_host(struct sig *s, struct rdv_host *h);
+void sig_rdv_client(struct sig *s, struct rdv_client *c);
+
+const uint8_t *sig_instance_id(void);
+
 int sig_prepare(struct sig *s, struct pollfd *fds, int maxfds, int *timeout_ms);
 void sig_dispatch(struct sig *s, const struct pollfd *fds, int nfds);
 int sig_ready(struct sig *s);
 
-/* Post our endpoints into our mailbox slot; kept alive and merged via CAS. */
 int sig_post(struct sig *s, const uint8_t *data, size_t len);
 
-/* cb fires when the peer's slot appears or changes. */
 int sig_subscribe(struct sig *s, sig_recv_cb *cb, void *arg);
 
-/*
- * Multi-client turnstile. The mailbox is used as a
- * mutex: the host advertises one offer and clears the answer slot to release
- * it; a client claims by writing its answer only into an empty answer slot,
- * with CAS, so exactly one client ever holds a given offer. Which client that
- * is, though, is not something ICE can tell: the host answers a loser's
- * connectivity checks with the credentials every reader of the offer holds. The
- * transport probe (PROTOCOL.md, "Transport probe") is what settles it.
- */
+int sig_answer(struct sig *s, const uint8_t *cid, const uint8_t *data,
+	       size_t len);
+void sig_refuse(struct sig *s, const uint8_t *cid);
+void sig_claimant_gone(struct sig *s, const uint8_t *cid);
 
-/* The client's view of the answer slot in the last mailbox read. */
-enum sig_claim {
-	SIG_CLAIM_UNKNOWN = 0,	/* the mailbox has not been read yet */
-	SIG_CLAIM_FREE,		/* answer slot empty -- claimable */
-	SIG_CLAIM_HELD,		/* our own answer occupies the slot */
-	SIG_CLAIM_BUSY		/* another client's answer occupies the slot */
-};
+int sig_refusal(struct sig *s);
 
-enum sig_claim sig_claim_status(struct sig *s);
-
-/* Client: stop advertising our answer, so a slot the host frees is not
- * re-claimed automatically (e.g. once we start punching or give up). A later
- * sig_post re-arms it. */
 void sig_withdraw(struct sig *s);
 
-/* Host: publish a fresh offer and release (clear) the answer slot in one
- * atomic rotate, readying the turnstile for the next client. */
-int sig_rotate(struct sig *s, const uint8_t *offer, size_t len);
-
 /*
- * Host: let go of the answer slot without rotating an offer, for a claim that
- * will not be served -- one already served, or belonging to a session that has
- * since ended. The slot is the turnstile mutex, so a claim nobody will act on
- * must not keep holding it: no other client can write a claim while it is
- * there, and the host has no reason of its own to write again, so the mailbox
- * simply stops turning. Idempotent, and a no-op on an empty slot.
- */
-void sig_release(struct sig *s);
-
-/*
- * Host: the session behind this invitation is over. Replaces the offer in the
- * DHT mailbox with a tombstone, so a client that comes to join is told the
- * session has ended instead of waiting on an offer nobody will write again.
- * One way; a signaller does not go back to serving.
+ * Host: the session behind this invitation is over. Replaces the host slot in
+ * the DHT with a tombstone, so a client that comes to join is told the session
+ * has ended instead of announcing to a host that will never answer. One way; a
+ * signaller does not go back to serving.
  *
  * Only the DHT carries this, because only the DHT holds anything once we are
  * gone. Link-local discovery is a conversation, not a store: a message left
@@ -128,36 +91,24 @@ void sig_end(struct sig *s);
 int sig_end_placed(struct sig *s);
 
 /*
- * Client: the DHT mailbox says the session has ended.
+ * Client: the host slot says the session has ended.
  *
  * Not the first sight of a tombstone: every holder of the invitation can write
- * the container, so the slot is only believed once it has stood for a few
- * rounds with no offer beside it. A host that is merely being lied about
- * writes its offer again within a second or so, which resets the judgement --
- * and is why a forged tombstone costs a joiner a pause rather than the
- * session.
+ * the host slot, so it is only believed once it has stood for a few rounds
+ * with no host info read since. A host that is merely being lied about writes
+ * its slot again within a second or so, which resets the judgement -- and is
+ * why a forged tombstone costs a joiner a pause rather than the session.
  */
 int sig_peer_ended(struct sig *s);
 
 /*
  * That judgement on its own: a tombstone first seen at `tomb_ms` (0 = none
- * seen), against an offer last seen at `offer_ms` (0 = none), as of `now`.
+ * seen), against host info last seen at `info_ms` (0 = none), as of `now`.
  * Exported so the rule that ends a client's wait can be exercised without a
  * DHT, since being wrong either way is expensive: too eager refuses a live
  * session, too slow leaves the wait it exists to end.
  */
-int sig_tomb_settled(uint64_t tomb_ms, uint64_t offer_ms, uint64_t now);
-
-/*
- * Deliver the peer's slot again even if it has not changed. A peer slot is
- * delivered once per distinct value, so a side that discards what it was given
- * -- a client re-claiming after losing a turnstile round -- would otherwise wait
- * for an offer it has already consumed and the host has no reason to rewrite.
- */
-void sig_redeliver(struct sig *s);
-
-/* The tag the peer's slot last carried, "" if none. */
-void sig_peer_tag(struct sig *s, char *out, size_t n);
+int sig_tomb_settled(uint64_t tomb_ms, uint64_t info_ms, uint64_t now);
 
 /*
  * Link-local direct bypass (multicast only). Our own direct-transport port is
@@ -178,9 +129,9 @@ int sig_subscribe_direct(struct sig *s, sig_direct_cb *cb, void *arg);
 /*
  * Host only: this host demultiplexes the shared lanlink socket itself, so a
  * same-segment multicast claimant is served directly and must NOT also be fed to
- * the ICE turnstile (which would serve it twice). With this set, deliver of a
- * sealed multicast answer fires only the direct callback, not the ICE callback.
- * DHT answers are unaffected (they always feed the turnstile).
+ * the ICE turnstile (which would serve it twice). With this set, a sealed
+ * multicast offer fires only the direct callback, not the ICE callback. Offers
+ * read from the DHT are unaffected (they always feed the turnstile).
  */
 void sig_set_mcast_claims(struct sig *s, int on);
 
@@ -193,8 +144,8 @@ void sig_set_mcast_claims(struct sig *s, int on);
  * sig_seed_node (client): plant a token's rendezvous node as a sticky DHT
  * hint, queried first, with the global DHT bootstrapping alongside as fallback.
  *
- * sig_locate (host): start capturing the fastest node that serves the mailbox
- * back (the node to embed in the token). The candidates are the nodes that
+ * sig_locate (host): start capturing the fastest node that serves the host
+ * slot back (the node to embed in the token). The candidates are the nodes that
  * stored our value; the get validates and ranks them, and sig_located returns
  * the fastest once known.
  */
@@ -213,17 +164,10 @@ void sig_set_family_up(struct sig *s, int family, int up);
  * fresh offer that only rotated credentials from one that changed networks. */
 void sig_set_gen(struct sig *s, uint32_t gen);
 uint32_t sig_peer_gen(const struct sig *s);
-
-/* The peer's instance id (CANDPACK_CID_LEN bytes), NULL while it has named
- * none. Stable across its reconnects and roams, unlike any ICE credential, so
- * it is what tells a returning peer apart. Both roles post and read one. */
+/* Client: the host instance the host slot names, NULL until it has been read.
+ * A restarted host keeps its generation and changes this. */
 const uint8_t *sig_peer_cid(const struct sig *s);
 
-/* Client: name (NULL/"" clears) the offer ufrag our claim answers, packed into
- * the claim only; sig_claim_offer reads a served claim's name back on the host
- * ("" when none), so the turnstile matches it beside the claimant ufrag/pwd. */
-void sig_set_claim_offer(struct sig *s, const char *ufrag);
-void sig_claim_offer(const struct sig *s, char *out, size_t n);
 /* Host: adopt an already-known rendezvous node (from a persisted token) as the
  * located anchor and keep it warm with the direct store, instead of locating a
  * fresh one -- so the token stays stable across idle re-attempts. */
@@ -232,14 +176,6 @@ int sig_reinforce(struct sig *s, int family, const struct sockaddr *sa,
 /* The located rendezvous node for `family` (4 or 6), if one has been captured. */
 int sig_located(struct sig *s, int family, struct sockaddr *out,
 		socklen_t *out_len);
-
-/*
- * Whether the DHT has acknowledged our publish for `family` (4 or 6): true once
- * a validated GET has had a k-close node serve our value back, which is exactly
- * the tokgen "dht_acked" fact. A host with no reach on a family never sees this,
- * so it is the signal that the family is isolated (LAN-only).
- */
-int sig_dht_acked(struct sig *s, int family);
 
 /*
  * The node that served a validated get for `family` since this was last
@@ -278,17 +214,17 @@ void sig_forget(struct sig *s, int family);
 /*
  * Client: establish a rendezvous on `family` for a peer that cannot reach it.
  *
- * The sequence is the one a host runs for itself -- store the container where
+ * The sequence is the one a host runs for itself -- store the host slot where
  * the key says it belongs, read it back, and let whichever node answered be
  * the rendezvous -- because a node found any other way would carry a weaker
  * promise than one the host found, while being indistinguishable from it
  * afterwards. In particular a node proven only by serving a read may still
- * refuse the write a claim is, and the claim would then fail silently against
+ * refuse the write an offer is, and the offer would then fail silently against
  * an anchor that looked sound.
  *
- * What is stored is the container untouched, neither slot ours: see
- * mailbox_relay. Ends by itself once the family has a node; sig_relay(.., 0)
- * ends it early.
+ * What is stored is the host slot exactly as last read, and never over a copy
+ * at a higher sequence. Ends by itself once the family has a node;
+ * sig_relay(.., 0) ends it early.
  */
 void sig_relay(struct sig *s, int family, int on);
 
@@ -304,24 +240,24 @@ void sig_relay(struct sig *s, int family, int on);
 int sig_locating(struct sig *s, int family);
 
 /*
- * What the shared mailbox is doing, for the view.
+ * What the rendezvous is doing, for the view.
  *
- * Both ends meet in one BEP44 item and everything before the punch happens
- * through it, so when a join stalls this is the first place to look: whether
- * our own slot ever reached the DHT, whether the peer's has appeared, and how
- * long since either moved. Without it the operator has a spinner and no way to
- * tell "the offer never got stored" from "the answer never came back".
+ * Everything before the punch happens through its slots, so when a join stalls
+ * this is the first place to look: whether our own slot ever reached the DHT,
+ * whether the peer's has appeared, and how long since either moved. Without it
+ * the operator has a spinner and no way to tell "the offer never got stored"
+ * from "the answer never came back".
  */
 struct sig_mailbox {
 	int engaged;			/* the DHT is up and being asked */
 	int stage;			/* RDV_*: cold, warmup, store, get, ready */
 	int have_mine;			/* we have something to publish */
-	int mine_stored;		/* and the last read showed it stored */
-	int peer_seen;			/* the peer's slot was in that read */
-	int64_t seq;			/* the container's sequence, -1 unread */
+	int mine_stored;
+	int peer_seen;
+	int64_t seq;
 	int gets;			/* validated reads so far */
 	int puts;			/* stores that found a home */
-	int claim;			/* enum sig_claim for the answer slot */
+	int claim;
 	uint64_t last_get_ms;		/* 0 = never */
 	uint64_t last_put_ms;
 	uint64_t engaged_ms;		/* what a silence is measured from while
@@ -334,7 +270,7 @@ void sig_mailbox_state(struct sig *s, struct sig_mailbox *out);
  * not offered as proof of the network moved to. */
 void sig_set_family_epoch(struct sig *s, int family, uint32_t epoch);
 
-/* Which routes the mailbox may be worked through: a convergent store or get
+/* Which routes a slot may be worked through: a convergent store or get
  * walks the DHT and is worth nothing without a routing table, a direct one
  * addresses the rendezvous nodes already held and needs only one of them. */
 #define SIG_ROUTE_DIRECT (1u << 0)
@@ -342,7 +278,7 @@ void sig_set_family_epoch(struct sig *s, int family, uint32_t epoch);
 unsigned sig_routes_open(int node_ready, int rdv_held);
 
 /*
- * Whether the mailbox has gone unanswered for long enough to give up on the
+ * Whether the rendezvous has gone unanswered for long enough to give up on the
  * signaller and build a fresh one. `idle_ms` is the age of the last validated
  * read, or of engaging where there has been none; `asking` is whether any route
  * is open at all, and `answered` whether one ever came back.
@@ -365,34 +301,5 @@ int sig_rdv_stage(struct sig *s, int family);
 
 /* The up, multicast-capable interfaces this signaller services (view only). */
 int sig_link_ifaces(struct sig *s, struct sig_mcast_if *out, int max);
-
-/*
- * Reuse a claim key across signallers, for a caller that rebuilds them.
- *
- * A host mints the key claims are boxed to when the signaller is created,
- * because that is the natural lifetime when a signaller lasts as long as the
- * rendezvous does. It is the WRONG lifetime for a caller that rebuilds: a
- * claimant boxes to the key it read in the offer, and if a rebuild has minted
- * a new one by the time the claim is read back, the box will not open. The
- * host then declares the slot unreadable and RELEASES it -- erasing a claim
- * that was perfectly good -- and the claimant writes another against the new
- * offer, which the next rebuild strands in its turn.
- *
- * A session rebuilds its signaller whenever the network moves: a fresh one
- * binds a new socket and joins the groups on the interfaces that exist now,
- * where the old one stays bound to the one that vanished. So the key is held
- * by whatever outlives the signaller and handed back in, and a claimant that
- * was mid-claim when the host roamed is answered rather than erased.
- *
- * Must be called before the mailbox publishes anything. Ignored on a client,
- * which mints no such key. `sk` is the secret half; the public half is
- * derived. Returns 0 on success (including when ignored), -1 if the public
- * half could not be derived.
- */
-int sig_use_claim_key(struct sig *s, const uint8_t sk[32]);
-
-/* The key this signaller is using, so a caller can keep it for the next one.
- * Returns 0 and fills `sk` on a host, -1 on a client. */
-int sig_claim_key(const struct sig *s, uint8_t sk[32]);
 
 #endif

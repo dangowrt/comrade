@@ -224,15 +224,18 @@ static void det_token(const struct mview *m, FILE *out, int a)
  */
 static void det_mailbox(const struct mview *m, FILE *out, int a)
 {
-	const struct session_mailbox *b = &m->mb;
-	static const char *claims[] = { "unknown", "free", "held", "busy" };
+	static const char *claims[] = { "unknown", "free", "held", "busy",
+					"answered", "refused" };
 	static const char *stages[] = { "cold", "warmup", "store", "get",
 					"ready" };
-	const char *node = b->rdv_proven ? "proven" :
-			   b->rdv_holding ? "proving" : "none";
-	int st = b->stage < 0 ? 0 : b->stage > 4 ? 4 : b->stage;
+	const struct session_mailbox *b = &m->mb;
+	const char *node;
+	int st, cl;
 
 	(void)a;
+	node = b->rdv_proven ? "proven" : b->rdv_holding ? "proving" : "none";
+	st = b->stage < 0 ? 0 : b->stage > 4 ? 4 : b->stage;
+	cl = b->claim < 0 || b->claim > 5 ? 0 : b->claim;
 	fprintf(out, ",\"mailbox\":{\"engaged\":%s,\"dht\":\"%s\","
 		"\"ours\":\"%s\","
 		"\"peer\":\"%s\",\"node\":\"%s\","
@@ -244,7 +247,7 @@ static void det_mailbox(const struct mview *m, FILE *out, int a)
 		b->peer_seen ? "present" : "absent", node,
 		b->rdv_holding ? "true" : "false",
 		b->rdv_proven ? "true" : "false", (long long)b->seq,
-		b->gets, b->puts, claims[b->claim & 3],
+		b->gets, b->puts, claims[cl],
 		b->age_get_s, b->age_put_s);
 }
 

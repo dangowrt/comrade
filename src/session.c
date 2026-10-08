@@ -111,21 +111,12 @@ static int fam_idx(int family)
  * A path is qualified when an authenticated probe has round-tripped on it; the
  * probe cadences, the measurements and the choice between paths are the model
  * in path.h. This bounds only the wait: how long a client keeps probing after
- * its claim has left the answer slot before concluding it was not the pickup.
- * Only ever measured from that moment, never from the start of the attempt: a
- * claim still sitting in the slot is queued, however long the queue, and a
- * timeout that cannot tell those two apart livelocks one case or the other
- * (measured, both ways).
- *
- * Two bounds, because the slot's exit says how it left. A claim the host
- * consumed is in all likelihood being punched right now, and a punch through
- * carrier-grade NAT takes several seconds of checks before the first one
- * lands, so it gets the long wait. One overwritten by a rival claimant is
- * settled -- the host will punch the rival, never this agent -- and waits only
- * long enough to absorb a stale read of the slot.
+ * the host answered it before concluding that punch is dead. Measured from the
+ * answer, never from the start of the attempt: a claimant the host has not
+ * answered yet is queued, however long the queue, and a punch through
+ * carrier-grade NAT takes several seconds of checks before the first lands.
  */
 #define PATH_PROBE_MS 12000
-#define PATH_LOST_MS 2500
 
 /*
  * Post-teardown linger for the bridge. The host keeps flushing generously, to
@@ -246,18 +237,6 @@ struct conn {
 	 * the path id, a keyed digest over 36 bytes taken when an endpoint of
 	 * the pair is learnt or changes.
 	 */
-	/*
-	 * The turnstile's answer slot is the mutex, so it -- not a clock -- says
-	 * whether this client is still in the running. held_seen records that our
-	 * claim reached the slot; released_ms is when it left again, which is the
-	 * host picking somebody up. If that somebody was us a worker now exists and
-	 * a probe answers within a round trip; if it was not, nothing ever will.
-	 * claim_lost records that the slot left HELD by being overwritten (BUSY):
-	 * a rival queued over us, so no pickup of our claim is coming.
-	 */
-	int claim_held_seen;
-	int claim_lost;
-	uint64_t claim_released_ms;
 	int pongs_sent;			/* answered pings (test_drop_pong's count) */
 
 	/*
@@ -318,6 +297,8 @@ struct conn {
 	 */
 	char claim_ufrag[40];
 	pthread_mutex_t claim_lock;
+	uint8_t claim_cid[RDV_CID_LEN];	/* host: the claimant's instance */
+	char answer_sdp[NAT_SDP_MAX];	/* host: what this punch answered with */
 	volatile uint32_t carry_epoch;	/* ++ on a qualified carry switch (roam) */
 	int bh_done;			/* the test hook has fired once, so a
 					 * lift does not re-arm it */
@@ -399,22 +380,20 @@ struct sess {
 	char peer_sdp[NAT_SDP_MAX];
 	volatile int have_peer_sdp;
 	int remote_set;
-	/*
-	 * The ufrag of the newest offer seen in the peer slot, recorded even when
-	 * the agent declines to adopt it. Release-on-pickup rotates a fresh ICE
-	 * identity every time the host serves somebody, and it punches a claim with
-	 * whatever listener is current when it *reads* it -- so a client still
-	 * queued against an older offer would be punched by an agent whose
-	 * credentials it does not hold, and could never pair.
-	 */
-	char cur_offer_ufrag[40];
-	/*
-	 * The offer we last re-gathered because of. Every pickup rotates, so N
-	 * queued clients all go stale at the same instant; without this they
-	 * re-gather in lockstep, collide on the answer slot and make no progress
-	 * (measured: 10 re-claims for 4 pickups, 2 of 4 served).
-	 */
-	char regathered_for[40];
+	/* client: the answer that arrived carries credentials other than the
+	 * ones primed, so the agent is rebuilt around it. */
+	volatile int peer_restart;
+	struct rdv_host rh;		/* host: the rendezvous as it stands */
+	struct rdv_client rc;		/* client: our standing in it */
+	unsigned rdv_run;		/* host: which session_run of this process */
+	uint8_t peer_cid[RDV_CID_LEN];	/* client: the host instance answering */
+	uint8_t served_cid[RDV_CID_LEN];	/* client: the one this session is with */
+	struct {			/* host: claimant offers awaiting a decision,
+					 * one per claimant the rendezvous admits */
+		uint8_t cid[RDV_CID_LEN];
+		char sdp[NAT_SDP_MAX];
+		int used;
+	} offers[RDV_HOST_MAX];
 	char src6_offered[64];		/* v6 source the staged description names */
 	uint32_t src6_epoch;		/* and the v6 network it was named on */
 	struct conn *offer_conn;		/* live conn the peer-offer callback feeds */
@@ -1161,6 +1140,27 @@ static int fan_local_sdp(struct sess *s)
 			       netstate_epoch(&s->pm.ns, 4));
 }
 
+/* The pool grew: every punch in flight is answered again with its own
+ * description fanned across the members, so a late egress address reaches
+ * the claimant it was mapped for. */
+static void host_reanswer(struct sess *s)
+{
+	char sdp[NAT_SDP_MAX];
+	struct conn *c;
+	int i;
+
+	for (i = 0; i < HOST_MAX_WORKERS; i++) {
+		c = s->punching[i];
+		if (!c || !c->answer_sdp[0])
+			continue;
+		snprintf(sdp, sizeof(sdp), "%s", c->answer_sdp);
+		peering_net_fan(&s->net, sdp, sizeof(sdp),
+				netstate_epoch(&s->pm.ns, 4));
+		sig_answer(s->pm.sig, c->claim_cid, (const uint8_t *)sdp,
+			   strlen(sdp));
+	}
+}
+
 /*
  * Whether a global v6 the offer names has been withdrawn: no address of ours,
  * and no translation either.
@@ -1323,7 +1323,7 @@ static void log_offer(const char *sdp, int served, int active, int is_host)
 			 is_host ? "host" : "client", ufrag, active, cands,
 			 reflexive);
 	else
-		dbg_logf("host: offer %.8s published (served=%d active=%d) "
+		dbg_logf("host: answer %.8s published (served=%d active=%d) "
 			 "%d candidate(s), %d reflexive",
 			 ufrag, served, active, cands, reflexive);
 }
@@ -1387,9 +1387,9 @@ static int v6_source_moved(struct sess *s)
  * carrier takes to show all of its egress addresses is not ours to know, so
  * the ones that arrive late are exactly the ones a peer would otherwise never
  * be told about, and being unable to punch to the address the NAT picked for
- * that peer is how a link fails outright. Only our own slot is written
- * (sig_post, not sig_rotate), so the turnstile's answer slot is untouched and
- * the credentials do not change.
+ * that peer is how a link fails outright. Only our own slot is written, which
+ * nobody else writes, so no other party's exchange is disturbed and the
+ * credentials do not change.
  */
 static void pool_pump(struct sess *s)
 {
@@ -1412,9 +1412,11 @@ static void pool_pump(struct sess *s)
 	moved6 = v6_source_moved(s);
 	if (moved6 || (n >= 2 && n > s->net.pool.posted)) {
 		s->net.pool.posted = fan_local_sdp(s);
-		sig_set_claim_offer(s->pm.sig, s->c.pr.ice.remote_ufrag);
-		sig_post(s->pm.sig, (const uint8_t *)local_sdp(s),
-			 strlen(local_sdp(s)));
+		if (s->cfg->is_host)
+			host_reanswer(s);
+		else
+			sig_post(s->pm.sig, (const uint8_t *)local_sdp(s),
+				 strlen(local_sdp(s)));
 		/* The fan is the whole answer to a carrier that picks a
 		 * different egress address per destination, and it reaches a
 		 * peer only through this re-post -- which is not the publish
@@ -1424,9 +1426,8 @@ static void pool_pump(struct sess *s)
 	}
 }
 
-/* Re-post the offer with the candidates libjuice gathered since it was first
- * published: a late srflx otherwise reaches only the dashboard, never the peer's
- * mailbox (fan_local_sdp re-posts the prober's pool, not libjuice's own). */
+/* Take in the candidates libjuice gathered since the ready agent's description
+ * was first taken, so the answer that agent is spent on carries them. */
 static void offer_refresh(struct sess *s)
 {
 	char raw[NAT_SDP_MAX];
@@ -1446,8 +1447,6 @@ static void offer_refresh(struct sess *s)
 		   sizeof(filtered));
 	peering_desc_set(&s->net.desc, filtered);
 	fan_local_sdp(s);
-	sig_post(s->pm.sig, (const uint8_t *)peering_desc_local(&s->net.desc),
-		 strlen(peering_desc_local(&s->net.desc)));
 }
 
 /* A late local candidate was gathered: re-post it to the mailbox, so the peer
@@ -1966,86 +1965,16 @@ static int path_ready(struct conn *c)
 	return pathplane_any_qualified(&c->pr.pl);
 }
 
-/*
- * Has this attempt run out of probing? A client that has qualified nothing by
- * now has almost certainly lost a turnstile round -- its checks were answered by
- * an agent serving somebody else -- and only a fresh identity and a fresh claim
- * recover.
- */
+/* Has this attempt run out of probing? A client the host answered and that has
+ * qualified nothing since is one whose punch died, and only a fresh identity
+ * and a fresh offer recover. */
 static int path_probe_expired(struct conn *c)
-{
-	if (path_ready(c) || !c->claim_released_ms)
-		return 0;
-	return now_ms() - c->claim_released_ms >
-	       (uint64_t)(c->claim_lost ? PATH_LOST_MS : PATH_PROBE_MS);
-}
-
-/*
- * Has the host rotated past the offer this agent is primed against, with this
- * agent out of the running? Only meaningful for a client that has primed one
- * and not yet qualified. A rotation alone proves nothing: release-on-pickup
- * mints a fresh offer the instant the host takes a claim up, so the winner
- * sees its own pickup as a rotation too -- and the rotated offer routinely
- * outruns every signal that could say which one we are, because the claim
- * slot's transitions ride the same eventually-consistent GET (measured: the
- * rotation arrived 2-5s after pickup and aborted every punch slower than
- * that, which through carrier-grade NAT is all of them). So the rotation is
- * read as a loss only once the attempt has had its probe window from the
- * moment this agent was primed, or once the slot has said outright that a
- * rival overwrote us.
- */
-static int offer_moved_on(struct conn *c)
 {
 	const struct sess *s = c->sess;
 
-	if (s->cfg->is_host || path_ready(c))
+	if (path_ready(c) || !s->ice_attempt_start)
 		return 0;
-	if (!c->pr.ice.remote_ufrag[0] || !s->cur_offer_ufrag[0])
-		return 0;
-	if (!strcmp(s->cur_offer_ufrag, c->pr.ice.remote_ufrag))
-		return 0;
-	/* A higher generation than primed us is a move, not a pickup rotation:
-	 * the offer's candidates are new, so re-claim at once with no floor. */
-	if (peering_ice_moved(&c->pr, sig_peer_gen(s->pm.sig)))
-		return strcmp(s->cur_offer_ufrag, s->regathered_for) != 0;
-	/* The long floor is only for a client being punched, whose claim was
-	 * taken up; one never picked up, never in the slot or queued over by a
-	 * rival, re-claims on the short floor, not a punch window it is not in. */
-	if (now_ms() - s->ice_attempt_start <=
-	    (uint64_t)((c->claim_lost || !c->claim_held_seen) ?
-		       PATH_LOST_MS : PATH_PROBE_MS))
-		return 0;
-	/*
-	 * Only a client that has actually reached the answer slot is queued
-	 * against the stale offer; one still working its way in will prime
-	 * against whatever is current when it gets there. And act once per
-	 * rotation, so a burst of joiners does not re-gather in lockstep.
-	 */
-	return strcmp(s->cur_offer_ufrag, s->regathered_for) != 0;
-}
-
-/*
- * Track the claim through the turnstile. Called each pass while a client is
- * waiting for a path; a host has no claim of its own to watch.
- */
-static void claim_watch(struct conn *c)
-{
-	enum sig_claim st;
-
-	if (c->sess->cfg->is_host)
-		return;
-	st = sig_claim_status(c->sess->pm.sig);
-	if (st == SIG_CLAIM_HELD) {
-		c->claim_held_seen = 1;
-		c->claim_lost = 0;
-		c->claim_released_ms = 0;
-		return;
-	}
-	if (c->claim_held_seen && !c->claim_released_ms &&
-	    (st == SIG_CLAIM_FREE || st == SIG_CLAIM_BUSY)) {
-		c->claim_released_ms = now_ms();
-		c->claim_lost = st == SIG_CLAIM_BUSY;
-	}
+	return now_ms() - s->ice_attempt_start > PATH_PROBE_MS;
 }
 
 static void on_transport_recv(void *arg, const uint8_t *data, size_t len)
@@ -2230,6 +2159,42 @@ static int ufrag_admitted(const struct sess *s, const char *ufrag)
 	return 0;
 }
 
+static void offers_drop_ufrag(struct sess *s, const char *ufrag)
+{
+	char u[40];
+	int i;
+
+	for (i = 0; i < RDV_HOST_MAX; i++) {
+		if (!s->offers[i].used)
+			continue;
+		cand_sdp_ufrag(s->offers[i].sdp, u, sizeof(u));
+		if (!strcmp(u, ufrag))
+			s->offers[i].used = 0;
+	}
+}
+
+/* Queue a claimant's offer for the turnstile; a newer one from the same
+ * claimant replaces what it had queued. */
+static void offers_push(struct sess *s, const uint8_t *cid, const char *sdp)
+{
+	int i, slot = -1;
+
+	for (i = 0; i < RDV_HOST_MAX; i++) {
+		if (s->offers[i].used &&
+		    !memcmp(s->offers[i].cid, cid, RDV_CID_LEN)) {
+			slot = i;
+			break;
+		}
+		if (slot < 0 && !s->offers[i].used)
+			slot = i;
+	}
+	if (slot < 0)
+		return;
+	memcpy(s->offers[slot].cid, cid, RDV_CID_LEN);
+	snprintf(s->offers[slot].sdp, sizeof(s->offers[slot].sdp), "%s", sdp);
+	s->offers[slot].used = 1;
+}
+
 /*
  * Host: a sealed multicast answer from a LAN-scope source is a direct claim.
  * Its (source, announced-port) endpoint is where it is served, but its identity
@@ -2242,9 +2207,9 @@ static int ufrag_admitted(const struct sess *s, const char *ufrag)
 static void on_direct_claim(void *arg, const struct sockaddr *src, socklen_t srclen,
 			    const uint8_t *sdp, size_t sdp_len)
 {
-	struct sess *s = arg;
+	char claim_sdp[NAT_SDP_MAX], ufrag[40];
 	struct sockaddr_in6 mapped, qmapped;
-	char claim_sdp[NAT_SDP_MAX], ufrag[40], queued[40];
+	struct sess *s = arg;
 	int i;
 
 	if (!sdp || sdp_len >= NAT_SDP_MAX)
@@ -2261,11 +2226,7 @@ static void on_direct_claim(void *arg, const struct sockaddr *src, socklen_t src
 		return;
 	if (lan_ufrag_claimed(s, ufrag))
 		return;
-	if (s->have_peer_sdp) {
-		cand_sdp_ufrag(s->peer_sdp, queued, sizeof(queued));
-		if (!strcmp(ufrag, queued))
-			s->have_peer_sdp = 0;
-	}
+	offers_drop_ufrag(s, ufrag);
 	for (i = 0; i < s->lan_pending_n; i++)
 		if (lanlink_map_peer((struct sockaddr *)&s->lan_pending[i].sa,
 				     s->lan_pending[i].len, &qmapped) == 0 &&
@@ -2320,29 +2281,57 @@ static void conn_amend_remote(struct conn *c, struct sess *s)
 	peering_ice_amend(&c->pr, filtered);
 }
 
-static void on_peer_offer(void *arg, const uint8_t *data, size_t len)
+static int host_is_multiuser(const struct session_cfg *cfg)
 {
-	struct conn *c = ((struct sess *)arg)->offer_conn;
+	return cfg->is_host && (cfg->sig_flags & (SIG_DHT | SIG_MCAST)) &&
+	       !cfg->test_single_conn;
+}
+
+static int cid_set(const uint8_t cid[RDV_CID_LEN])
+{
+	static const uint8_t zero[RDV_CID_LEN];
+
+	return memcmp(cid, zero, RDV_CID_LEN) != 0;
+}
+
+static void on_peer_offer(void *arg, const uint8_t *cid, const uint8_t *data,
+			  size_t len)
+{
 	char incoming[NAT_SDP_MAX];
 	struct sess *s = arg;
+	struct conn *c;
 	char ufrag[40];
 	int take;
 
-	if (!c)
+	if (len >= sizeof(incoming))
 		return;
+	if (host_is_multiuser(s->cfg)) {
+		memcpy(incoming, data, len);
+		incoming[len] = '\0';
+		offers_push(s, cid, incoming);
+		return;
+	}
+	c = &s->c;
 	take = peering_offer_judge(&c->pr, data, len, incoming,
 				   sizeof(incoming), ufrag, sizeof(ufrag));
-	snprintf(s->cur_offer_ufrag, sizeof(s->cur_offer_ufrag), "%s", ufrag);
+	/* rdv_client_own_slot() has already matched a client's answer to the
+	 * offer standing now, so other credentials are the host's current
+	 * answer rather than an unsolicited restart. Another instance than the
+	 * one serving us is left to the rejoin path. */
+	if (!take && !s->cfg->is_host &&
+	    !(cid_set(s->served_cid) &&
+	      memcmp(cid, s->served_cid, RDV_CID_LEN))) {
+		dbg_logf("session: the host answers under fresh credentials");
+		s->peer_restart = 1;
+		take = 1;
+	}
 	if (!take) {
-		dbg_logf("session: ignore rotated offer while punching");
+		dbg_logf("session: ignore a description under another identity "
+			 "while punching");
 		return;
 	}
+	memcpy(s->peer_cid, cid, RDV_CID_LEN);
 	snprintf(s->peer_sdp, sizeof(s->peer_sdp), "%s", incoming);
-	if (lan_ufrag_claimed(s, ufrag)) {
-		dbg_logf("session: claimant already served over lanlink -- drop");
-		s->have_peer_sdp = 0;
-		return;
-	}
 	s->have_peer_sdp = 1;
 	/* Later arrivals are fresh candidates (multicast trickles one source at
 	 * a time); feed them into the already-primed agent. */
@@ -2381,9 +2370,6 @@ static void conn_gen_ice(struct conn *c)
 	/* What a probe proved was proved for one claimant identity, so a fresh
 	 * one voids every measurement; the endpoints themselves stand. */
 	pathplane_reset_stats(&c->pr.pl, now_ms());
-	c->claim_held_seen = 0;
-	c->claim_lost = 0;
-	c->claim_released_ms = 0;
 	peering_ice_unprime(&c->pr);
 }
 
@@ -2653,26 +2639,34 @@ static void conn_fresh_pwd(struct conn *c)
 	c->pr.ice.pwd[32] = '\0';
 }
 
-static int host_is_multiuser(const struct session_cfg *cfg)
-{
-	return cfg->is_host && (cfg->sig_flags & (SIG_DHT | SIG_MCAST)) &&
-	       !cfg->test_single_conn;
-}
-
 /*
  * Create the signalling and arm it: subscribe the callbacks, advertise the
  * direct transport's port and seed the rendezvous. The lanlink socket itself is
  * not touched here -- it belongs to the session rather than to sig, and worker
  * threads send on it without a lock. Returns 0 on success.
  */
+/* What we publish as our generation: the network's, under which run of this
+ * process a host is on, so a re-serve reads as a move to every claimant. */
+static uint32_t session_gen(const struct sess *s)
+{
+	return (s->rdv_run << 16) |
+	       (__atomic_load_n(&s->netgen, __ATOMIC_RELAXED) & 0xffff);
+}
+
 static int sig_arm(struct sess *s)
 {
 	const struct session_cfg *cfg = s->cfg;
 	struct sig *sig;
 
-	sig = sig_create(cfg->tok.rdv, cfg->sig_flags, cfg->is_host);
+	sig = sig_create(cfg->tok.rdv, cfg->tok.auth,
+			 (cfg->tok.flags & TOKEN_FLAG_RO) != 0, cfg->sig_flags,
+			 cfg->is_host);
 	if (!sig)
 		return -1;
+	if (cfg->is_host)
+		sig_rdv_host(sig, &s->rh);
+	else
+		sig_rdv_client(sig, &s->rc);
 	/* What the model already holds, before anything is published. */
 	if (peering_model_sig(&s->pm, sig, now_ms()))
 		return -1;
@@ -2680,7 +2674,9 @@ static int sig_arm(struct sess *s)
 	/* Our offer carries the generation of the network it was gathered on, so
 	 * a peer tells a move from a mere credential rotation. A rebuild follows
 	 * a move, so the current netgen is what this fresh signaller stamps. */
-	sig_set_gen(s->pm.sig, __atomic_load_n(&s->netgen, __ATOMIC_RELAXED));
+	sig_set_gen(s->pm.sig, session_gen(s));
+	if (cfg->is_host && (cfg->sig_flags & SIG_DHT))
+		sig_locate(s->pm.sig);
 	sig_set_family_epoch(s->pm.sig, 4, netstate_epoch(&s->pm.ns, 4));
 	sig_set_family_epoch(s->pm.sig, 6, netstate_epoch(&s->pm.ns, 6));
 	if (s->lan) {
@@ -2818,6 +2814,7 @@ static void net_change_reset(struct sess *s)
 {
 	s->have_peer_sdp = 0;
 	s->remote_set = 0;
+	s->peer_restart = 0;
 	s->peer_sdp[0] = '\0';
 	peering_net_renew(&s->net);
 }
@@ -2835,16 +2832,28 @@ static void net_change_reset(struct sess *s)
  */
 static void resume_tick(struct conn *c)
 {
-	struct pathplane_sinks k;
 	struct ctlplane_live live;
+	struct pathplane_sinks k;
+	const uint8_t *hcid;
+	int lost, settled;
 	struct sess *s;
 	uint64_t now;
-	int lost, settled;
 	int moved;
 	int n;
 
 	s = c->sess;
 	now = now_ms();
+	/* Another host instance holds no session of ours to come back to, so
+	 * its slot says this one is over, whatever the path still carries. */
+	hcid = sig_peer_cid(s->pm.sig);
+	if (hcid && cid_set(s->served_cid) &&
+	    memcmp(hcid, s->served_cid, RDV_CID_LEN) &&
+	    !__atomic_load_n(&c->peer_fresh, __ATOMIC_RELAXED)) {
+		dbg_logf("resume: a new host instance -- this session is over, "
+			 "rejoining");
+		__atomic_store_n(&c->peer_fresh, 1, __ATOMIC_RELAXED);
+		return;
+	}
 	/* Watch interfaces every tick, not only once lost: a roam onto a limping
 	 * path never trips "lost" (KCP still trickles), so it must be seen here. */
 	net_watch(s, now);
@@ -2882,6 +2891,7 @@ static void resume_tick(struct conn *c)
 		conn_fresh_pwd(c);
 		s->have_peer_sdp = 0;
 		s->remote_set = 0;
+		s->peer_restart = 0;
 		peering_ice_unprime(&c->pr);
 		peering_desc_clear(&s->net.desc);
 		if (nat_setup(c))
@@ -2898,10 +2908,8 @@ static void resume_tick(struct conn *c)
 				   sizeof(filtered));
 			peering_desc_set(&s->net.desc, filtered);
 			s->net.pool.posted = fan_local_sdp(s);
-			sig_set_claim_offer(s->pm.sig, c->pr.ice.remote_ufrag);
 			sig_post(s->pm.sig, (const uint8_t *)local_sdp(s),
 				 strlen(local_sdp(s)));
-			sig_redeliver(s->pm.sig);
 			dbg_logf("resume: claim posted");
 			c->rs_state = 2;
 			c->rs_deadline = now + resume_backoff(c);
@@ -2910,6 +2918,15 @@ static void resume_tick(struct conn *c)
 		}
 		return;
 	default:
+		/* Our own credentials are kept: conn_fresh_pwd() is not called,
+		 * so only the remote half of the pairing moves. */
+		if (s->peer_restart) {
+			s->peer_restart = 0;
+			conn_park_ice(c, now);
+			if (nat_setup(c))
+				return;
+			s->remote_set = 0;
+		}
 		if (s->have_peer_sdp && !s->remote_set) {
 			char filtered[NAT_SDP_MAX];
 			char ufrag[40];
@@ -2921,13 +2938,6 @@ static void resume_tick(struct conn *c)
 				c->pr.ice.remote_gen = sig_peer_gen(s->pm.sig);
 				s->remote_set = 1;
 				dbg_logf("resume: primed offer %s", ufrag);
-				/* Named, and posted only once primed: the host
-				 * punches the agent this end punches, not whatever
-				 * listener a rotation left in the slot. */
-				sig_set_claim_offer(s->pm.sig, c->pr.ice.remote_ufrag);
-				sig_post(s->pm.sig, (const uint8_t *)local_sdp(s),
-					 strlen(local_sdp(s)));
-				dbg_logf("resume: claim posted for %s", ufrag);
 			}
 		}
 		/* Late pool addresses reach the host's in-flight punch only
@@ -2938,17 +2948,14 @@ static void resume_tick(struct conn *c)
 					       netstate_epoch(&s->pm.ns, 4));
 			if (n >= 2 && n > s->net.pool.posted) {
 				s->net.pool.posted = fan_local_sdp(s);
-				sig_set_claim_offer(s->pm.sig, c->pr.ice.remote_ufrag);
 				sig_post(s->pm.sig, (const uint8_t *)local_sdp(s),
 					 strlen(local_sdp(s)));
 				dbg_logf("resume: trickled pool -> %d", n);
 			}
 		}
 		/* A higher generation is the host having moved, its candidates
-		 * gone: re-gather. A same-generation rotation is pickup churn,
-		 * and chasing it aborts a punch still in flight. */
-		if (s->remote_set && s->cur_offer_ufrag[0] &&
-		    peering_ice_rotated(&c->pr, s->cur_offer_ufrag) &&
+		 * gone: re-gather. */
+		if (s->remote_set &&
 		    peering_ice_moved(&c->pr, sig_peer_gen(s->pm.sig))) {
 			c->rs_state = 0;
 			return;
@@ -2965,12 +2972,9 @@ static void resume_tick(struct conn *c)
 			/* Re-post the claim, not only the offer: the host reaps
 			 * the worker on a stale claim, and losing it forces a
 			 * full re-join. Same credentials, punch undisturbed. */
-			if (peering_desc_have(&s->net.desc)) {
-				sig_set_claim_offer(s->pm.sig, c->pr.ice.remote_ufrag);
+			if (peering_desc_have(&s->net.desc))
 				sig_post(s->pm.sig, (const uint8_t *)local_sdp(s),
 					 strlen(local_sdp(s)));
-			}
-			sig_redeliver(s->pm.sig);
 			c->rs_deadline = now + resume_backoff(c);
 		}
 		return;
@@ -3476,10 +3480,10 @@ static int client_regather(struct sess *s)
 	conn_gen_ice(&s->c);
 	s->have_peer_sdp = 0;
 	s->remote_set = 0;
+	s->peer_restart = 0;
 	s->peer_sdp[0] = '\0';
 	peering_desc_clear(&s->net.desc);	/* the old agent's trickle too */
 	s->peer_state = SESSION_PEER_SEEN;
-	sig_redeliver(s->pm.sig);		/* we discarded the offer we were given */
 	return nat_setup(&s->c) ? -1 : 0;
 }
 
@@ -4467,79 +4471,13 @@ static int sig_idle_s(struct sig *sig)
 }
 
 
-/* Offer agents rotated away but kept un-primed, so a claim naming one is
- * punched with the exact agent the client primed. Each is a poll thread. */
-#define OFFER_KEEP_MAX 3
-#define OFFER_KEEP_MS 10000
-struct kept_offer {
-	struct conn *c;
-	uint64_t until_ms;
-};
-
-static void offer_retire(struct sess *s, struct kept_offer *ring,
-			 struct conn **lp, int published, uint64_t now)
-{
-	struct conn *c = *lp;
-	int i;
-
-	*lp = NULL;
-	s->offer_conn = NULL;
-	if (!c)
-		return;
-	if (published)
-		for (i = 0; i < OFFER_KEEP_MAX; i++)
-			if (!ring[i].c) {
-				ring[i].c = c;
-				ring[i].until_ms = now + OFFER_KEEP_MS;
-				return;
-			}
-	conn_free(c);
-}
-
-static void offer_gc(struct kept_offer *ring, uint64_t now)
-{
-	int i;
-
-	for (i = 0; i < OFFER_KEEP_MAX; i++) {
-		if (!ring[i].c)
-			continue;
-		if (now < ring[i].until_ms && !peering_ice_failed(&ring[i].c->pr))
-			continue;
-		conn_free(ring[i].c);
-		ring[i].c = NULL;
-		ring[i].until_ms = 0;
-	}
-}
-
-static void offer_free_all(struct kept_offer *ring)
-{
-	int i;
-
-	for (i = 0; i < OFFER_KEEP_MAX; i++) {
-		conn_free(ring[i].c);
-		ring[i].c = NULL;
-		ring[i].until_ms = 0;
-	}
-}
-
-static int offer_find(struct kept_offer *ring, const char *uf)
-{
-	int i;
-
-	if (!uf || !uf[0])
-		return -1;
-	for (i = 0; i < OFFER_KEEP_MAX; i++)
-		if (ring[i].c && !strcmp(ring[i].c->pr.ice.ufrag, uf))
-			return i;
-	return -1;
-}
-
 static int punch_take(struct sess *s, struct conn *pc, struct conn *resume,
-		      int pslot, const char *cu, const char *cp,
-		      const char *filtered, int stuck)
+		      int pslot, const uint8_t *cid, const char *cu,
+		      const char *cp, const char *filtered, int stuck)
 {
 	if (peering_ice_prime(&pc->pr, filtered, cu, cp))
 		return -1;
+	memcpy(pc->claim_cid, cid, RDV_CID_LEN);
 	if (resume) {
 		__atomic_add_fetch(&resume->resume_pending, 1, __ATOMIC_RELAXED);
 		__atomic_store_n(&resume->resume_last_ms, now_ms(),
@@ -4558,29 +4496,117 @@ static int punch_take(struct sess *s, struct conn *pc, struct conn *resume,
 	return 0;
 }
 
-/*
- * Host turnstile: advertise one offer at a time (a fresh ICE identity per
- * offer) and accept a client's claimed answer. On pickup the listener hands the
- * punch to an in-flight set (punching[]) and rotates a fresh offer at once, so
- * the next client is admitted immediately instead of after the punch completes
- * (release-on-pickup); punch_scan turns a connected punch into a worker and
- * frees a wedged one. DHT/ICE joins are serialised through the single mailbox
- * slot; same-segment multicast claimants are admitted directly over the shared
- * lanlink socket (lan_drain), fully concurrently. The worker sessions run
- * concurrently. Signalling and the rendezvous keep-warm stay on this thread
- * (sig is single-threaded); workers only pump their own transport.
- */
+/* Decide one queued offer: spend the ready agent on it, resume the worker it
+ * names, leave it to the punch it amends, or refuse it. 1 when the ready agent
+ * was spent, so the caller gathers the next. */
+static int host_offer_take(struct sess *s, struct worker *ws,
+			   struct conn *listen, int idx, int served,
+			   int active, int *stuck_left)
+{
+	int pslot = -1, inflight = 0, i, again, adm, lanq, made;
+	const struct session_cfg *cfg = s->cfg;
+	uint8_t *cid = s->offers[idx].cid;
+	char *sdp = s->offers[idx].sdp;
+	struct conn *resume = NULL;
+	char filtered[NAT_SDP_MAX];
+	char cu[40], cp[40];
+	struct conn *w;
+
+	cand_sdp_ufrag(sdp, cu, sizeof(cu));
+	sdp_pwd(sdp, cp);
+	if (!cu[0]) {
+		s->offers[idx].used = 0;
+		return 0;
+	}
+	w = worker_by_ufrag(ws, cu);
+	adm = ufrag_admitted(s, cu);
+	lanq = lan_pending_ufrag(s, cu);
+	again = punch_tried_again(s, cu, cp);
+	made = (w && claim_made(w->pr.ice.remote_pwd, cp)) ||
+	       claim_served_made(&s->served, cu, cp);
+	dbg_logf("host: offer %.8s pwd %.6s: worker=%d again=%d admitted=%d "
+		 "lanq=%d made=%d", cu, cp, w ? 1 : 0, again, adm, lanq, made);
+	punch_amend_repost(s, cu, cp);
+	if (lan_ufrag_claimed(s, cu) || made || lanq || punch_dup(s, cu, cp) ||
+	    (w && !conn_is_lost(w) && conn_is_proven(w))) {
+		dbg_logf("host: offer %.8s already in hand -- the answer stands",
+			 cu);
+		rdv_host_keep(&s->rh, cid);
+		s->offers[idx].used = 0;
+		return 0;
+	}
+	resume = w;
+	if (!resume && !adm && cfg->host_admit_max &&
+	    s->admitted_n >= cfg->host_admit_max) {
+		dbg_logf("host: admission budget spent -- offer %.8s refused",
+			 cu);
+		sig_refuse(s->pm.sig, cid);
+		s->offers[idx].used = 0;
+		return 0;
+	}
+	if (!listen)
+		return 0;
+	for (i = 0; i < HOST_MAX_WORKERS; i++) {
+		if (ws[i].used)
+			inflight++;
+		if (s->punching[i]) {
+			inflight++;
+			continue;
+		}
+		if (pslot < 0)
+			pslot = i;
+	}
+	if (pslot < 0 || inflight >= HOST_MAX_WORKERS)
+		return 0;
+	if (punch_count(s, cu) >= PUNCH_PARALLEL_MAX) {
+		dbg_logf("host: offer %.8s at the cap -- reap the oldest", cu);
+		punch_reap_oldest(s, cu);
+	}
+	dbg_logf(resume ? "host: resume offer -> punch %.8s" :
+			  "host: offer received -> punch %.8s", cu);
+	sdp_filter_peer(sdp, cfg->family, filtered, sizeof(filtered));
+	if (punch_take(s, listen, resume, pslot, cid, cu, cp, filtered,
+		       *stuck_left > 0)) {
+		conn_free(listen);
+		s->offers[idx].used = 0;
+		return 1;
+	}
+	if (*stuck_left > 0)
+		(*stuck_left)--;
+	snprintf(listen->answer_sdp, sizeof(listen->answer_sdp), "%s",
+		 local_sdp(s));
+	sig_answer(s->pm.sig, cid, (const uint8_t *)local_sdp(s),
+		   strlen(local_sdp(s)));
+	log_offer(local_sdp(s), served, active, 1);
+	s->offers[idx].used = 0;
+	return 1;
+}
+
+static int host_offers_drain(struct sess *s, struct worker *ws,
+			     struct conn *listen, int served, int active,
+			     int *stuck_left)
+{
+	int i;
+
+	for (i = 0; i < RDV_HOST_MAX; i++) {
+		if (!s->offers[i].used)
+			continue;
+		if (host_offer_take(s, ws, listen, i, served, active,
+				    stuck_left))
+			return 1;
+	}
+	return 0;
+}
+
+/* Host turnstile: one gathered ICE agent is kept ready and spent on the next
+ * claimant to offer, answered in that claimant's own slot; punch_scan turns a
+ * connected punch into a worker. Signalling stays on this thread. */
 static int host_turnstile(struct sess *s)
 {
 	const struct session_cfg *cfg = s->cfg;
 	const struct session_obs *o = cfg->obs;
-	struct kept_offer kept[OFFER_KEEP_MAX];
 	struct worker ws[HOST_MAX_WORKERS];
 	struct conn *listen = NULL;
-	struct conn *pc;
-	char co[40];
-	int again;
-	int ko;
 	enum { TS_GATHER, TS_WAIT_CLAIM } ts = TS_GATHER;
 	uint64_t deadline = now_ms() + (uint64_t)cfg->connect_timeout_s * 1000;
 	uint64_t last_active = now_ms();
@@ -4591,7 +4617,6 @@ static int host_turnstile(struct sess *s)
 	int stuck_left = cfg->test_stuck_punches;
 
 	memset(ws, 0, sizeof(ws));
-	memset(kept, 0, sizeof(kept));
 	memset(s->punching, 0, sizeof(s->punching));
 	s->last_served_ufrag[0] = '\0';
 	s->have_served = 0;
@@ -4628,7 +4653,6 @@ static int host_turnstile(struct sess *s)
 				listen = NULL;
 				s->offer_conn = NULL;
 			}
-			offer_free_all(kept);
 			if (cfg->test_roam_hard)
 				for (i = 0; i < HOST_MAX_WORKERS; i++)
 					if (ws[i].used)
@@ -4649,9 +4673,9 @@ static int host_turnstile(struct sess *s)
 		if (sig_quiet(s->pm.sig)) {
 			dbg_logf("sig: nothing back from the rendezvous for "
 				 "%ds -- rebuilding", sig_idle_s(s->pm.sig));
-			if (listen)
-				offer_retire(s, kept, &listen,
-					     ts == TS_WAIT_CLAIM, now_ms());
+			conn_free(listen);
+			listen = NULL;
+			s->offer_conn = NULL;
 			if (sig_rebuild(s, "after the rendezvous went quiet"))
 				break;
 			ts = TS_GATHER;
@@ -4704,6 +4728,7 @@ static int host_turnstile(struct sess *s)
 				 */
 				dbg_logf("host: reap worker %.8s",
 					 ws[i].c->claim_ufrag);
+				sig_claimant_gone(s->pm.sig, ws[i].c->claim_cid);
 				if (ws[i].c->claim_ufrag[0] && s->have_served &&
 				    !strcmp(s->last_served_ufrag,
 					    ws[i].c->claim_ufrag)) {
@@ -4776,7 +4801,6 @@ static int host_turnstile(struct sess *s)
 		 * host non-idle. */
 		report_peer_links(s, ws);
 		punch_scan(s, ws, &dash_seq);
-		offer_gc(kept, now_ms());
 		for (i = 0; i < HOST_MAX_WORKERS; i++)
 			if (s->punching[i])
 				active = 1;
@@ -4789,8 +4813,7 @@ static int host_turnstile(struct sess *s)
 		 * taken up.
 		 */
 		pool_pump(s);
-		if (ts == TS_WAIT_CLAIM && listen && !s->have_peer_sdp &&
-		    stun_stall(s)) {
+		if (ts == TS_WAIT_CLAIM && listen && stun_stall(s)) {
 			/* Named, like the claim verdicts: an offer with no
 			 * public address in it looks from here exactly like one
 			 * that works, and this is the only thing that says
@@ -4801,8 +4824,17 @@ static int host_turnstile(struct sess *s)
 				 s->net.rotations + 1, PEERING_ROTATE_MAX);
 			__atomic_add_fetch(&s->net.ice_attempt, 1, __ATOMIC_RELAXED);
 			s->net.rotations++;
-			offer_retire(s, kept, &listen, 1, now_ms());
+			conn_free(listen);
+			listen = NULL;
+			s->offer_conn = NULL;
 			peering_desc_drop(&s->net.desc);
+			ts = TS_GATHER;
+		}
+
+		if (host_offers_drain(s, ws, ts == TS_WAIT_CLAIM ? listen : NULL,
+				      served, active, &stuck_left)) {
+			listen = NULL;
+			s->offer_conn = NULL;
 			ts = TS_GATHER;
 		}
 
@@ -4814,6 +4846,7 @@ static int host_turnstile(struct sess *s)
 					break;
 				s->have_peer_sdp = 0;
 				s->remote_set = 0;
+				s->peer_restart = 0;
 				s->peer_sdp[0] = '\0';
 				peering_desc_drop(&s->net.desc);
 				s->offer_conn = listen;
@@ -4893,184 +4926,12 @@ static int host_turnstile(struct sess *s)
 					break;
 				}
 				s->net.pool.posted = fan_local_sdp(s);
-				sig_rotate(s->pm.sig,
-					   (const uint8_t *)local_sdp(s),
-					   strlen(local_sdp(s)));
-				sig_locate(s->pm.sig);
-				log_offer(local_sdp(s), served, active, 1);
+				dbg_logf("host: agent %.8s ready",
+					 listen->pr.ice.ufrag);
 				ts = TS_WAIT_CLAIM;
 			}
 			break;
 		case TS_WAIT_CLAIM:
-			if (s->have_peer_sdp && !s->remote_set) {
-				struct conn *resume = NULL;
-				char cu[40], cp[40];
-				int pslot = -1, inflight = 0;
-
-				/*
-				 * A claim naming a claimant already on the books is
-				 * one of two things. From a worker that has lost its
-				 * client, it is that client returning -- the ICE
-				 * identity is session-stable -- and the punch it asks
-				 * for is a resumption of the worker's connection, not
-				 * a duplicate join. From anywhere else -- a healthy
-				 * worker, a punch in flight, a queued LAN admission,
-				 * the claimant just served -- it is the eventually-
-				 * consistent DHT re-serving a stale value, ignored as
-				 * before (either would be punched again: double-serve).
-				 */
-				cand_sdp_ufrag(s->peer_sdp, cu, sizeof(cu));
-				sdp_pwd(s->peer_sdp, cp);
-				sig_claim_offer(s->pm.sig, co, sizeof(co));
-				if (cu[0]) {
-					struct conn *w = worker_by_ufrag(ws, cu);
-					int adm = ufrag_admitted(s, cu);
-					int lanq = lan_pending_ufrag(s, cu);
-					int just = s->have_served &&
-						   !strcmp(cu,
-							   s->last_served_ufrag);
-					int made = w && claim_made(w->pr.ice.remote_pwd,
-								   cp);
-
-					again = punch_tried_again(s, cu, cp);
-					if (!made)
-						made = claim_served_made(&s->served,
-									 cu, cp);
-					/* Named, because which of these decided
-					 * it is the whole story when a client
-					 * cannot get in and nobody can say why. */
-					dbg_logf("host: claim %.8s pwd %.6s: "
-						 "worker=%d again=%d admitted=%d "
-						 "lanq=%d justserved=%d made=%d "
-						 "offer=%.8s",
-						 cu, cp, w ? 1 : 0, again, adm,
-						 lanq, just, made,
-						 co[0] ? co : "-");
-
-					punch_amend_repost(s, cu, cp);
-
-					/*
-					 * The very attempt this worker was
-					 * punched for, handed back by the
-					 * mailbox a moment later. A client
-					 * that wants a resumption mints a new
-					 * password for it (conn_fresh_pwd), so
-					 * an unchanged one is the DHT talking,
-					 * not the client -- and punching it
-					 * again disturbs the session it just
-					 * got.
-					 */
-					/* The DHT re-serving a claim already in
-					 * hand: leave it and free the mutex slot. */
-					if (made || punch_dup(s, cu, cp) || lanq) {
-						dbg_logf("host: claim %.8s already "
-							 "in hand -- leaving it",
-							 cu);
-						sig_release(s->pm.sig);
-						s->have_peer_sdp = 0;
-						break;
-					}
-					if (w && !conn_is_lost(w) &&
-					    conn_is_proven(w)) {
-						dbg_logf("host: ignore claim %.8s "
-							 "(healthy worker)", cu);
-						sig_release(s->pm.sig);
-						s->have_peer_sdp = 0;
-						break;
-					}
-					if (punch_count(s, cu) >=
-					    PUNCH_PARALLEL_MAX) {
-						dbg_logf("host: claim %.8s at the "
-							 "cap -- reap the oldest",
-							 cu);
-						punch_reap_oldest(s, cu);
-					}
-					resume = w;
-				}
-				/* Naming no offer means the claimant had primed
-				 * none when it posted, and a pickup rotates this
-				 * one away, so the agent spent here is one it can
-				 * never answer: nat_connected() on such a punch is
-				 * guaranteed by RFC 8445 s7.3 rather than earned. */
-				if (!co[0]) {
-					dbg_logf("host: claim %.8s names no offer "
-						 "-- released", cu);
-					sig_release(s->pm.sig);
-					s->have_peer_sdp = 0;
-					break;
-				}
-				/* Neither listening nor kept: the listener's
-				 * credentials are not the ones it primed, so a
-				 * punch cannot land. */
-				if (co[0] && offer_find(kept, co) < 0 &&
-				    strcmp(co, listen->pr.ice.ufrag)) {
-					dbg_logf("host: claim %.8s names the retired "
-						 "offer %.8s -- released", cu, co);
-					sig_release(s->pm.sig);
-					s->have_peer_sdp = 0;
-					break;
-				}
-				/* A fresh claimant past the admission budget is
-				 * left unserved; a resumption always passes. */
-				if (!resume && !ufrag_admitted(s, cu) &&
-				    cfg->host_admit_max &&
-				    s->admitted_n >= cfg->host_admit_max) {
-					dbg_logf("host: admission budget spent "
-						 "-- claim ignored");
-					sig_release(s->pm.sig);
-					s->have_peer_sdp = 0;
-					break;
-				}
-				/* Room to punch? (a free in-flight slot within the
-				 * combined worker + punch budget). If not, keep the
-				 * claim advertised and pick it up once room frees. */
-				for (i = 0; i < HOST_MAX_WORKERS; i++) {
-					if (ws[i].used)
-						inflight++;
-					if (s->punching[i]) {
-						inflight++;
-						continue;
-					}
-					if (pslot < 0)
-						pslot = i;
-				}
-				if (pslot < 0 || inflight >= HOST_MAX_WORKERS)
-					break;
-				dbg_logf(resume ?
-					 "host: resume claim -> punch (release) %.8s" :
-					 "host: claim received -> punch (release) %.8s",
-					 cu);
-				sdp_filter_peer(s->peer_sdp, cfg->family, filtered,
-					   sizeof(filtered));
-				ko = offer_find(kept, co);
-				pc = ko >= 0 ? kept[ko].c : listen;
-				if (punch_take(s, pc, resume, pslot, cu, cp,
-					       filtered, stuck_left > 0)) {
-					conn_free(pc);
-					if (ko >= 0) {
-						kept[ko].c = NULL;
-						kept[ko].until_ms = 0;
-						break;
-					}
-					listen = NULL;
-					s->offer_conn = NULL;
-					ts = TS_GATHER;
-					break;
-				}
-				if (stuck_left > 0)
-					stuck_left--;
-				if (ko >= 0) {
-					dbg_logf("host: punched %.8s on the kept "
-						 "offer %.8s", cu, co);
-					kept[ko].c = NULL;
-					kept[ko].until_ms = 0;
-					sig_release(s->pm.sig);
-					s->have_peer_sdp = 0;
-				} else {
-					listen = NULL;
-					ts = TS_GATHER;
-				}
-			}
 			break;
 		}
 
@@ -5108,7 +4969,6 @@ static int host_turnstile(struct sess *s)
 
 	s->offer_conn = NULL;
 	conn_free(listen);
-	offer_free_all(kept);
 	/*
 	 * Say the session is over before winding the workers down, and keep
 	 * driving the model while they go. A worker lingers to land its
@@ -5172,11 +5032,13 @@ static int sig_setup(struct sess *s)
 
 int session_run(const struct session_cfg *cfg)
 {
-	struct sess s;
 	enum state st = ST_WAIT_DHT;
+	const uint8_t *cid, *hcid;
+	static unsigned host_runs;
 	struct stream *st_done;
 	uint64_t deadline;
-	int ended = 0;			/* SESSION_ENDED / SESSION_GONE */
+	struct sess s;
+	int ended = 0;
 	int rc;
 
 	memset(&s, 0, sizeof(s));
@@ -5243,6 +5105,17 @@ int session_run(const struct session_cfg *cfg)
 	nat_log_level(cfg->log_level);	/* < 0 silences libjuice (see nat_log_level) */
 
 	conn_gen_ice(&s.c);
+	cid = sig_instance_id();
+	if (!cid) {
+		rc = 1;
+		goto done;
+	}
+	if (cfg->is_host) {
+		s.rdv_run = ++host_runs;
+		rdv_host_init(&s.rh, cid, session_gen(&s), 0);
+	} else {
+		rdv_client_init(&s.rc, cid);
+	}
 
 	if (sig_setup(&s)) {
 		rc = 1;
@@ -5314,6 +5187,10 @@ int session_run(const struct session_cfg *cfg)
 		 */
 		if (!cfg->is_host && sig_peer_ended(s.pm.sig)) {
 			ended = s.was_live ? SESSION_ENDED : SESSION_GONE;
+			break;
+		}
+		if (!cfg->is_host && sig_refusal(s.pm.sig)) {
+			ended = SESSION_FULL;
 			break;
 		}
 		/*
@@ -5425,16 +5302,21 @@ int session_run(const struct session_cfg *cfg)
 					   sizeof(filtered));
 				peering_desc_set(&s.net.desc, filtered);
 				s.net.pool.posted = fan_local_sdp(&s);
-				sig_set_claim_offer(s.pm.sig, s.c.pr.ice.remote_ufrag);
-				sig_post(s.pm.sig,
-					 (const uint8_t *)local_sdp(&s),
-					 strlen(local_sdp(&s)));
-				if (cfg->is_host && (cfg->sig_flags & SIG_DHT))
-					sig_locate(s.pm.sig);
+				if (!cfg->is_host)
+					sig_post(s.pm.sig,
+						 (const uint8_t *)local_sdp(&s),
+						 strlen(local_sdp(&s)));
 				st = ST_SIGNAL;
 			}
 			break;
 		case ST_SIGNAL:
+			/* A segment path needs no answer to be probed on. */
+			if (!cfg->is_host && !s.remote_set &&
+			    conn_lan_paths(&s.c, 0) > 0) {
+				s.ice_attempt_start = now_ms();
+				st = ST_WAIT_ICE;
+				break;
+			}
 			if (s.have_peer_sdp && !s.remote_set) {
 				char ufrag[40];
 
@@ -5460,10 +5342,17 @@ int session_run(const struct session_cfg *cfg)
 				s.net.pool.posted = fan_local_sdp(&s);
 							/* members learnt since
 							 * the ST_GATHER post */
-				sig_set_claim_offer(s.pm.sig, s.c.pr.ice.remote_ufrag);
-				sig_post(s.pm.sig,
-					 (const uint8_t *)local_sdp(&s),
-					 strlen(local_sdp(&s)));
+				if (cfg->is_host) {
+					sig_answer(s.pm.sig, s.peer_cid,
+						   (const uint8_t *)local_sdp(&s),
+						   strlen(local_sdp(&s)));
+				} else {
+					sig_post(s.pm.sig,
+						 (const uint8_t *)local_sdp(&s),
+						 strlen(local_sdp(&s)));
+					memcpy(s.served_cid, s.peer_cid,
+					       RDV_CID_LEN);
+				}
 				s.remote_set = 1;
 				s.ice_attempt_start = now_ms();
 				if (o && o->peer &&
@@ -5475,37 +5364,19 @@ int session_run(const struct session_cfg *cfg)
 			}
 			break;
 		case ST_WAIT_ICE:
-			/*
-			 * ICE connecting does not mean this client is the one
-			 * being served: until the host retires the agent it
-			 * offered, it answers every claimant's checks with the
-			 * credentials they all read, so a client that lost the
-			 * round nominates a pair that belongs to the winner. Only
-			 * a probe round-tripped under our own claimant identity
-			 * settles that, and only the two rules below get a client
-			 * that lost back into the running.
-			 */
-			claim_watch(&s.c);
 			peering_paths(&s.c.pr, now_ms());
-			if (offer_moved_on(&s.c)) {
-				snprintf(s.regathered_for,
-					 sizeof(s.regathered_for), "%s",
-					 s.cur_offer_ufrag);
-				dbg_logf("session: offer rotated past us -- "
-					 "re-claiming against the current one");
+			hcid = sig_peer_cid(s.pm.sig);
+			if (!cfg->is_host &&
+			    (peering_ice_moved(&s.c.pr, sig_peer_gen(s.pm.sig)) ||
+			     (s.remote_set && hcid &&
+			      memcmp(hcid, s.peer_cid, RDV_CID_LEN)))) {
+				dbg_logf("session: the host moved -- offering again");
 				st = client_regather(&s) ? ST_FAIL : ST_GATHER;
 				break;
 			}
-			if (path_probe_expired(&s.c)) {
-				/*
-				 * Nothing answered. On a busy host that means a
-				 * turnstile round this client lost: its checks
-				 * were answered by an agent serving somebody
-				 * else, so re-entering here would only find the
-				 * same pair still nominated.
-				 */
-				dbg_logf("session: claim taken up by another "
-					 "peer -- re-claiming");
+			if (!cfg->is_host && path_probe_expired(&s.c)) {
+				dbg_logf("session: nothing answered -- offering "
+					 "again");
 				st = client_regather(&s) ? ST_FAIL : ST_GATHER;
 				break;
 			}

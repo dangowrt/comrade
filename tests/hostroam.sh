@@ -1,9 +1,10 @@
 #!/bin/sh
-# The HOST roams mid-session: its signalling is rebuilt, its offer rotates,
-# and its old transport goes silent (--roam-hard) exactly as a move onto
-# another network. The healthy client must resume in place -- re-claim under
-# its session identity against the rotated offer and be grafted into the
-# worker the host still runs. Over a private DHT this script starts
+# The HOST roams mid-session: its signalling is rebuilt, its generation moves
+# on, and its old transport goes silent (--roam-hard) exactly as a move onto
+# another network. The healthy client must resume in place -- offer again
+# under its session identity to the moved host, be answered with candidates
+# from the new network and be grafted into the worker the host still runs.
+# Over a private DHT this script starts
 # (tests/swarm.sh); COMRADE_E2E_NET=1 uses the real one.
 E2E="${1:?path to comrade-e2e}"
 SEED="${2:?path to comrade-dhtseed}"
@@ -22,7 +23,14 @@ fi
 tmp="$(mktemp -d)"
 hostpid=""
 clientpid=""
-trap 'kill "$hostpid" "$clientpid" 2>/dev/null; swarm_stop; rm -rf "$tmp"' EXIT
+keep() {
+	if [ "${COMRADE_E2E_KEEP:-0}" = 1 ]; then
+		echo "logs kept in $tmp"
+	else
+		rm -rf "$tmp"
+	fi
+}
+trap 'kill "$hostpid" "$clientpid" 2>/dev/null; swarm_stop; keep' EXIT
 
 COMRADE_DEBUG="$tmp/host.dbg" "$E2E" host --serve 1 --timeout 150 \
 	--roam-ms 5000 --roams 1 --roam-hard \

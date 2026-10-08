@@ -9,7 +9,7 @@ Layering, outermost to innermost:
 
 ```
   token (base58, out of band)
-    -> rendezvous: sealed mailbox on DHT (BEP44) and/or LAN multicast
+    -> rendezvous: sealed slots on DHT (BEP44) and/or LAN multicast
         -> ICE hole punch (libjuice)  |  direct UDP (lanlink, same segment)
             -> KCP reliable stream
                 -> SSH (pinned host key, token auth)
@@ -22,13 +22,13 @@ unmarked is implemented as described. Each mark is removed when its change
 lands.
 
 **Wire compatibility.** Nothing here is stable across 0.1.x. This revision
-changes the probe frame (a sequence number, §9), what a datagram opens with
-(both tags derived from the token rather than fixed, §2), the stream datagram
-(a counter and tag, §9), the mailbox slots (a key in the offer, a box in the
-answer, §4), the packed candidates (a version and a network generation, §7),
-the multicast announcement (the slot letter bound into the seal, §6) and the
-control channel (two new message types and a larger frame bound, §10). Two peers must be built from the same revision; there is no version
-negotiation and none is planned before the format settles.
+(`TOKEN_VERSION = 4`, §3) replaces the one shared rendezvous mailbox with a
+rendezvous of one slot per party (§4, §5), inverts the exchange so that the
+claimant offers first and the host answers each claimant in a slot of its own
+(§12), seals a claimant's slots to its credential class (§4.2), and carries
+the same addressed envelope in the multicast announcements (§6). Two peers
+must be built from the same revision; there is no version negotiation and
+none is planned before the format settles.
 
 ---
 
@@ -51,8 +51,8 @@ below.
   the KDF and BEP44 seed. Interop-critical.
 - **X25519** (RFC 7748): `cc_x25519_public(pk, sk)` and
   `cc_x25519(out, sk, peer)`. A shared secret of all zeros is refused, since it
-  means the peer sent a low-order point. Used only to seal a claim to the host
-  (§4). Interop-critical, and pinned to RFC 7748's own vector by
+  means the peer sent a low-order point. Used by the box below, which no slot
+  of this revision carries. Pinned to RFC 7748's own vector by
   `tests/box_test.c`, because two peers need not share a backend.
 - **SHA-1** (`src/sha1.c`, RFC 3174, standard IVs `0x67452301…`), namespaced
   `cc_sha1_*`. Used only for BEP44 target derivation.
@@ -92,7 +92,9 @@ ad_len=32, pt=plain)`. The nonce is fixed and costs nothing to carry because
 the key is fresh for every box and belongs to exactly one recipient; binding
 both public keys into the KDF is what makes that true. `box_open(sk, ...)`
 recomputes `pk` from `sk`, agrees against the carried `epk`, and fails on a bad
-tag. Used for the answer slot (§4).
+tag. Kept in the key schedule with its vector; a claimant's slots are sealed to
+a key its class derives (§4.2), so nothing on the wire is boxed in this
+revision.
 
 ---
 
@@ -162,9 +164,11 @@ construction and is unreachable in practice.
 and clear of the ephemeral one most systems draw from, so it neither squats on
 a service nor collides with what else the machine binds.
 
-`sig_key` seals every mailbox/multicast payload (§4, §6). `bep44_pk/sk` are the
-BEP44 mutable-item identity (§5). Both peers derive the **same** keys from the
-same token, so the mailbox is a shared rendezvous only they can read or write.
+`sig_key` seals the host slot, the doorbell and the host's announcement (§4,
+§6); a claimant's slots and its announcement are sealed to a key of its
+credential class (§4.2). `bep44_pk/sk` are the BEP44 mutable-item identity
+(§5). Both peers derive the **same** keys from the same token, so the
+rendezvous is a set of items only they can read or write.
 
 ### Per-connection key (`src/keys.c:keys_conn_key`)
 
@@ -210,7 +214,7 @@ Fixed **90-byte** payload (`TOKEN_RAW_LEN`), packed in order:
 
 | field | bytes | meaning |
 |-------|-------|---------|
-| version | 1 | `TOKEN_VERSION = 3` |
+| version | 1 | `TOKEN_VERSION = 4` |
 | flags | 1 | see below |
 | rdv `R` | 16 | rendezvous secret (KDF input, §2) |
 | auth `A` | 16 | session auth secret (SSH password, §10) |
@@ -240,14 +244,14 @@ reaches the DHT over one family only is normal rather than degraded.
 |------|-------|-----------|-------|---------|
 | all-zero | -- | 0 | `PENDING` | the host has not finished determining this family |
 | all-zero | -- | 1 | `NONE` | this family has no path to the DHT |
-| set | 1 | 1 | `RENDEZVOUS` | a DHT node holding the host's mailbox, so the client skips cold convergence (§5) |
+| set | 1 | 1 | `RENDEZVOUS` | a DHT node holding the host's slot, so the client skips cold convergence (§5) |
 | set | 0 | 1 | `DIRECT` | the host's own endpoint, **proven reachable from outside** |
 
 A set slot with `SETTLED` clear does not occur; a decoder treats it as settled.
 
 **The state is advisory.** `R` alone is always sufficient: every address in the
 token is a hint that skips work, never a precondition, and a client that finds
-nothing useful in the slots converges on the mailbox target from the DHT
+nothing useful in the slots converges on the host slot's target from the DHT
 bootstrap (§5). That is what makes the token safe to re-mint. The host mints one
 at t=0 in `PENDING`/`PENDING` and re-emits on every state change, so an
 already-copied string is a snapshot that is never wrong, only sometimes slower.
@@ -308,54 +312,129 @@ silence. Every incompatible change anywhere on the wire bumps it, whether or
 not the 90 bytes above move: a `CANDPACK_VERSION` bump (§7), a different
 seal, a new key schedule, a changed framing. Two peers that disagree below
 the token still read the same 90 bytes, so without the bump they meet in the
-same mailbox, exchange offers and then never complete a punch. That is what
+same rendezvous, exchange offers and then never complete a punch. That is what
 happened between versions 2 and 3, which differ only in §7, and it is the
 failure a protocol-wide version number exists to turn into one clear line at
-the point the token is pasted. Wire compatibility is deliberately unstable
-across 0.x, so the bump costs nothing and is never worth skipping.
+the point the token is pasted. Versions 3 and 4 differ in §4, §5, §6 and §12:
+a version 3 peer looks for one shared mailbox under a salt a version 4 peer
+never writes. Wire compatibility is deliberately unstable across 0.x, so the
+bump costs nothing and is never worth skipping.
 
 ---
 
-## 4. Rendezvous mailbox (`src/mailbox.c`, `src/sig.c`)
+## 4. Rendezvous slots (`src/rdv.c`, `src/sig.c`)
 
-One shared mailbox. The container is a **bencoded dict** with keys in
-sorted order (`mailbox.c:mailbox_build`):
+A rendezvous is a set of BEP 44 mutable items under the invitation's key
+(`bep44_pk`, §2), told apart by salt (`keys.c:keys_slot_salt`). Every slot has
+**one writer**, so no two parties ever read-modify-write one item, and a stale
+read of any slot is merely old:
+
+| slot | salt | writer | reader | carries |
+|---|---|---|---|---|
+| host | `h` | the host | everyone | `HOSTINFO` (instance id, generation), or `TOMB` (§4.1) |
+| doorbell | `d` | every claimant | the host | `BELL`: the id of a claimant wanting in |
+| claimant | `c` + cid | that claimant | the host | `OFFER`: the claimant's candpack (§7) |
+| answer | `a` + cid | the host | that claimant | `ANSWER`: the host's candpack for it, or `REFUSE` |
 
 ```
-  d [ 1:a <sealed answer> ] [ 1:o <sealed offer> ] [ 1:x <sealed tombstone> ] e
+  salt = kind(1) || hex(BLAKE2b_keyed(key=R, len=32,
+                          msg="comrade1 slot " || kind || cid)[0..8])   # 17 chars, no NUL
 ```
 
-- `o` (offer) is written by the **host**, `a` (answer) by the **client**, `x`
-  (tombstone, §4.1) by the host as it goes. `o` and `x` never stand together,
-  so the item carries at most two sealed slots at a time.
-- Each slot value is a **sealed blob** (§1) under `sig_key`, but the offer and
-  the answer do not carry the same thing:
+`cid` is the writer's **instance id**: 8 random bytes minted once per process
+(`sig.c:sig_instance_id`), absent from the `h` and `d` salts. It is what the
+host tells a returning claimant by, since an ICE restart carries fresh
+credentials and a slot name has to survive one.
+
+**The envelope** (`rdv.c:rdv_encode`), the plaintext of every slot:
 
 ```
-  offer  = seal(sig_key,  claim_pk(32) || candpack )
-  answer = seal(sig_key,  ulen(1) || ufrag(ulen) || box(claim_pk, candpack) )
+  version(1)=1 | kind(1) | gen(4) | from(8) | to(8) | seq(4) | re(4) | len(2) | payload(len)
 ```
 
-- `candpack` is the compact ICE description (§7). For the DHT it is packed with
-  `for_dht=1` (segment-local addresses dropped).
-- `claim_pk` is an X25519 public key the host mints once per signaller and whose
-  secret half it alone holds. **A claim is boxed to it** (§1), so the outer seal
-  still says a token holder wrote the slot -- which is what the container's
-  compare-and-swap rests on -- while only the host can read where a claimant
-  is. Every holder of the invitation can read the mailbox, and a read-only link
-  is the one handed to a room, so without this a crowd of mutually untrusting
-  guests published its addresses to itself.
-- The claimant's **ufrag rides in the clear** beside the box. The rule that lets
-  a client overwrite its own superseded claim is about which claimant holds the
-  slot, not where it is; a client cannot open even its own box, the ephemeral
-  secret being gone the moment it is sealed.
+`kind`: `1 HOSTINFO, 2 BELL, 3 OFFER, 4 ANSWER, 5 REFUSE, 6 TOMB`. `from` is
+the sender's instance id, `to` the recipient's or all-zero for whoever reads.
+`gen` is the host's generation (§7, §12) on everything the host writes and,
+on an `OFFER`, the host generation the claimant is answering. `seq` is the
+sender's statement number; `re` is, on an `ANSWER` or `REFUSE`, the `seq` of
+the `OFFER` it answers, and 0 elsewhere; `len <= RDV_MAX_PAYLOAD = 900`.
+`HOSTINFO`, `TOMB` and `BELL` carry no payload; `REFUSE` carries one byte,
+`1 full` (the grant is spent) or `2 clash` (two claimants under one id).
+
+**Sealing.** `h` and `d` are `seal(sig_key, envelope)` (§1): every holder of
+the invitation reads and writes them. `c` and `a` are sealed to the claimant's
+class, §4.2. A sealed slot is at most `932 + 40 = 972` bytes, inside
+`BEP44_MAX_VALUE = 1000` (`rdv.c`, static assertion), so a claimant's slot
+carries up to 900 bytes of packed description.
+
+**The exchange** (the claimant offers first):
+
+1. The host publishes `HOSTINFO` in `h` when it starts and again whenever its
+   generation changes, and otherwise only refreshes it byte for byte (§5). It
+   is **never invalidated**: nothing a claimant reads there goes stale under it.
+2. A claimant reads `h`, learns the host's id and generation, and then, on
+   every `SIG_DHT_PUT_MS` tick and alternating, rings the doorbell (`BELL`,
+   `from` its id, `to` the host's) and writes its `OFFER` into `c` + cid. It
+   keeps doing so for as long as it has **no live path** (`sig_withdraw` stops
+   it, `sig_post` re-arms it) and the host has neither answered nor refused.
+3. The host reads `d` every other tick and admits the claimant it names; a bell
+   from a claimant already known marks that claimant's slot worth reading
+   (`rdv_host_bell`). It reads the `c` slot of every admitted claimant awaiting
+   an answer, and of one that rang again, one slot per tick. An `OFFER` with a
+   sequence above the last one taken from that claimant is handed to the
+   turnstile (§12), which mints an ICE agent for that claimant alone and
+   answers with its candpack in `a` + cid, or writes `REFUSE` there when the
+   grant is spent.
+4. The claimant reads `a` + cid, alternating with `h`. An `ANSWER` addressed to
+   it, from the host instance it offered to, answering the offer it has
+   standing now (`re`), with a sequence above the last it took, is primed into
+   its agent; a `REFUSE` to that offer ends the join (`SESSION_FULL`). An
+   answer to an earlier offer, however fresh the copy, is a no-op: a replica
+   still serving it would otherwise prime a punch at an agent the host has
+   since spent.
+
+**The invariant.** No protocol state is derived by comparing a replicated
+value against local expectation: a peer advances only on a statement addressed
+to it, from the sender it expects, answering what it asked, with a sequence
+above the last it took from that sender, so a stale or replayed read is a
+no-op and a duplicate delivery is idempotent (`rdv_test.c` drives both state
+machines against a store that serves each reader a different revision,
+delivers everything twice and partitions a claimant). The four rules that
+make the shared doorbell safe:
+
+- **L1** a claimant announces *while* it has no live path. A bell overwritten
+  by a rival before the host read it costs one round; ringing once would have
+  deadlocked the loser.
+- **L2** the host harvests on its own cadence whatever its load, and never
+  answers with silence: a harvested claimant gets an `ANSWER` or a `REFUSE`.
+- **L3** the host slot carries the host's instance id and generation, and a
+  claimant that sees either change treats its next offer as a new statement
+  (`rdv_client_host_slot` resets the offer sequence), so a host that
+  restarted, roamed or re-served is announced to again by a claimant whose
+  answer it no longer knows about.
+- **L4** nothing is inferred from absence.
+
+An **unchanged offer keeps its sequence** (`rdv.c:offer_seq`): a repeat is a
+refresh of what is stored, and the host answers a sequence once. A changed
+one, new candidates, a fresh password for a resume (§11), a regathered agent,
+takes the next, and that is what asks the host again. Measured in messages,
+which a bound in seconds could meet by polling harder: one claimant is
+answered after 4, three after 14, four after 24, three across a six-round
+partition after 14, and one whose host restarted is answered again after 6
+(`rdv_test`). Under the same store the one shared answer slot this replaces
+served one of three claimants 60 times and the other two never.
 
 ### 4.2 Who may read whom (`keys.c:keys_slot_key`)
 
-The one-slot-per-claimant rendezvous seals each claimant's slot under a key
-derived from the **auth secret of that claimant's credential class** together
-with its instance id, rather than under the session-wide `sig_key`. The
-intended reach follows from `keys_derive_ro_auth` being one-way:
+A claimant's `c` and `a` slots, and its multicast announcement (§6), are
+sealed under a key derived from the **auth secret of that claimant's
+credential class** together with its instance id:
+
+```
+  slot_key(32) = BLAKE2b_keyed(key=A_class, len=16, msg="comrade1 slot key" || cid)
+```
+
+The intended reach follows from `keys_derive_ro_auth` being one-way:
 
 | reader | may read |
 |---|---|
@@ -364,8 +443,9 @@ intended reach follows from `keys_derive_ro_auth` being one-way:
 
 A read-write holder's slot key comes from `A_rw`, which a read-only holder
 cannot derive from the `A_ro` it was given, so **a read-only guest cannot read a
-read-write holder's slot.** The host holds `A_rw` and so derives both classes,
-which is what lets it answer either.
+read-write holder's slot.** The host holds `A_rw` and so derives both classes:
+it opens a claimant's slot under `A_rw` first and `A_ro` second, remembers
+which opened it, and seals its answer under the same (`sig.c:claimant_open`).
 
 **Accepted flaw, documented rather than fixed:** two read-only holders *can*
 read each other. Both derive from the same `A_ro`, and instance ids travel in
@@ -375,63 +455,50 @@ each guest, which a one-way token cannot carry. A room handed one read-only link
 is therefore a room whose guests can see each other's addresses, though not
 those of any read-write holder.
 
-Publishing (`sig.c:sig_post` → `sig_stage`): pack the local SDP → `candpack`,
-then build the slot value for this role and seal it. A client can only box once
-it has seen the host's slot, so the value is built **when it can be** rather
-than when it is posted; nothing is lost by waiting, because a write is only ever
-decided against a container that has been read
-(`mailbox.c:recompute_need_write`). Reading a peer slot: `msg_open(sig_key, …)`
-→ `slot_unwrap` (take `claim_pk` as a client, open the box as a host) →
-`candpack` → rebuilt SDP handed to libjuice.
-
-What this does **not** hide is occupancy: the slot being non-empty is the
-turnstile mutex (§12), so any holder can still see a claim is in progress and
-can still take the slot. Closing that would mean single-use or per-guest
-mailboxes, and the one-token-one-BEP44-key property is worth more than
-protecting against an authenticated holder delaying an exchange it can no
-longer read.
-
-The host can release the answer slot on offer rotation
-(`mailbox.c`: `clear_peer` drops `a` once, `mailbox_arm_release`).
+What this does **not** hide is presence: the doorbell and the host slot are
+readable by every holder, so any holder can see that a claimant exists and
+which host instance is serving, and any holder can write the doorbell or the
+host slot. Those cost a claimant a retry (L1) and a joiner a pause (§4.1); the
+one-token-one-BEP44-key property is worth more than protecting against an
+authenticated holder delaying an exchange it cannot read.
 
 ### 4.1 Tombstone: the session has ended
 
 An invitation says where to meet a host that is still there and, on its own,
 can say nothing else -- so a token outliving its session sends every holder
-into a wait with no end. The `x` slot is the missing answer.
-
-```
-  tombstone = seal(sig_key, version(1) = 1)
-```
+into a wait with no end. A `TOMB` in the host slot is the missing answer.
 
 - The **host** writes it as the session ends (`sig_end`, from
-  `session.c:session_entomb_start`), replacing the container: no offer to answer and
-  no claim to serve, since a session cannot be both live and over. It is sealed
-  like every other slot -- not because that makes it unforgeable among the
-  holders of the invitation, but because a passer-by should learn no more from
-  the end of a session than from the rest of it.
+  `session.c:session_entomb_start`), in place of its `HOSTINFO`: a session
+  cannot be both live and over. It is sealed like every other slot -- not
+  because that makes it unforgeable among the holders of the invitation, but
+  because a passer-by should learn no more from the end of a session than from
+  the rest of it.
 - It is published from **inside the session**, while the rendezvous node is
   still warm and pinned; a process that had already torn its signalling down
   would have to converge on the DHT from cold to say one word. Both routes are
   used and **both are waited for** (`sig_end_placed`): the direct store reaches
   the node a token names, and the convergent store reaches whoever is closest to
   the key -- which is where a token naming no node leads a client, and where
-  this host's own last offer is sitting. Leaving before the second lands leaves
-  that offer standing, and a client that finds it punches at nothing. They go
-  out **one at a time**: both are read-modify-writes of the same mutable item,
-  so two in flight read the same sequence, write the same next one, and every
-  node refuses the second on the compare-and-swap it has just lost -- which
-  reads back as one route having reached nothing at all.
-- A **live host erases** any `x` it reads (`recompute_need_write`), which is
-  what makes the slot self-healing. Every holder of the invitation can write
-  this container, so a forged tombstone must not outlive the next write of the
-  host it lies about -- roughly a second, while one is serving.
+  this host's own last statement is sitting. They go out one at a time, on the
+  tombstone's own cadence (`SIG_DHT_TOMB_MS 300`).
+- A **live host re-stores its slot** whenever a read shows anything else there
+  (`sig.c:host_slot_read`, `h_stale`), which is what makes the slot
+  self-healing. Every holder of the invitation can write it, so a forged
+  tombstone must not outlive the next write of the host it lies about --
+  roughly a second, while one is serving.
 - A **client** therefore does not act on first sight. `sig_peer_ended` believes
-  the slot once it has stood `SIG_TOMB_SETTLE_MS` (4 s) with no offer seen
-  since, timed from when it was **first** seen rather than most recently, so
-  the clock runs out rather than restarting on every read. A read with no
-  tombstone puts the clock back. The cost of forging one is therefore a joiner's
-  pause, not the session.
+  the tombstone once it has stood `SIG_TOMB_SETTLE_MS` (4 s) with no `HOSTINFO`
+  read since, timed from when it was **first** seen rather than most recently,
+  so the clock runs out rather than restarting on every read. A `HOSTINFO` read
+  puts the clock back. A copy at a BEP44 sequence below the highest the client
+  has seen for the host slot moves neither clock, nor the client's idea of
+  which instance is serving, when it comes from an instance the client has
+  already dealt with (`rdv_client_host_slot`); a lagging replica can therefore
+  neither forge an end, hide one, nor pull a claimant back to a host it has
+  left. One it has never met counts whatever its sequence, since a host that
+  restarted may write below its predecessor. The cost of forging a tombstone is
+  therefore a joiner's pause, not the session.
 - It is a **DHT-only** thing, because only the DHT holds anything once the host
   is gone. Link-local discovery is a conversation and not a store: a message
   left there reaches whoever happens to be listening at that instant, which is
@@ -454,16 +521,17 @@ Standard BitTorrent mainline DHT (jech/dht for the Kademlia routing) with
 **BEP44 mutable items** implemented in-tree (`src/bep44.c`); jech/dht itself
 carries no BEP44 support.
 
-- **Salt**: `SIG_SALT = "m"` (`sig.c`), one shared mailbox per token.
+- **Salt**: one per slot, `keys_slot_salt` (§4): `h`, `d`, `c` + cid and
+  `a` + cid, each 17 bytes.
 - **Target** (`bep44.c:bep44_target`): `SHA1( bep44_pk[32] || salt )` = 20 bytes.
 - **Signed buffer** (`bep44.c:bep44_sig_buffer`), exactly:
   `4:salt<len>:<salt> 3:seq i<seq>e 1:v<raw value>` (the `salt` fragment omitted
-  when empty; here salt is `"m"` so `4:salt1:m`). `<raw value>` is the mailbox
-  container dict from §4, inserted verbatim after the `1:v` marker.
+  when empty; here every salt is 17 bytes, so `4:salt17:<salt>`). `<raw value>`
+  is the sealed envelope from §4, inserted verbatim after the `1:v` marker.
 - **Signature**: `Ed25519_sign(bep44_sk, signed_buffer)` = 64 bytes.
 - **put** KRPC (`bep44.c:put_send`), `a` dict keys in sorted order:
-  `cas` (opt), `id`(20, node id), `k`(32, `bep44_pk`), `salt`(`"m"`),
-  `seq`(int), `sig`(64), `token`(write token from the node), `v`(raw container).
+  `cas` (opt), `id`(20, node id), `k`(32, `bep44_pk`), `salt`,
+  `seq`(int), `sig`(64), `token`(write token from the node), `v`(raw value).
 - **seq/cas rule** (`bep44.c:store_seq`, `node_cas`): the value is stored at
   `seq = best_seq + 1`, `best_seq` being the highest sequence the lookup found,
   or at `best_seq` itself when the bytes to store are exactly the ones found (a
@@ -472,9 +540,17 @@ carries no BEP44 support.
   that node reported holding in the lookup, the lookup's best for a node that
   reported none, and omitted where nothing was found at all. A node whose copy
   fell behind is thereby caught up rather than refusing every later store with
-  301, and whatever a peer wrote to it alone is still read from it. Both roles
-  put and both use CAS -- the host on offer rotation, the client on the answer
-  write -- not the client alone.
+  301, and whatever a peer wrote to it alone is still read from it.
+- **Every write is of the writer's own slot** (`sig.c:slot_put`,
+  `merge_mine`): the lookup earns the write tokens and finds the stored
+  sequence, and the value stored is exactly what this end means to say,
+  whatever the store held. Nothing of another party's is ever merged, since no
+  other party writes the slot. The one shared slot, the doorbell, is
+  last-writer-wins: two bells in one round cost the loser a retry on its next
+  tick (L1, §4), never a session. A client that relays the host slot for a
+  family the host cannot reach (`sig_relay`, §10) re-stores the host's bytes
+  exactly as last read, and stands down where the store already holds a copy
+  at a higher sequence than the one it read.
 - **Transaction id** (`bep44.c:tid_bytes`): every KRPC query tags `t` with four
   bytes, `'p' 'm'` then a **16-bit little-endian** per-request counter; a reply is
   matched back to its pending request by that id.
@@ -483,12 +559,34 @@ carries no BEP44 support.
   misses). The chosen rendezvous node(s) can be embedded in the token
   (`EPx_RDV`) so a client skips cold convergence.
 
-Turnstile / mutex (host, `session.c:host_turnstile`, `mailbox.c`): the host
-advertises one offer at a time with a fresh ICE identity; a client claims by
-writing its sealed answer into slot `a` (CAS). `mailbox_claim_status` →
-`FREE`/`HELD`/`BUSY`; `mailbox_client_should_claim` gates the write. The host
-rotates the offer and releases `a` **on pickup** (when it adopts the claim), not
-after the punch completes; see §12. Workers run concurrently.
+**Reads** (`sig.c:host_read`, `client_read`), one direct get per
+`SIG_DHT_GET_MS` to the pinned and retained nodes: the host cycles the
+doorbell, a claimant slot worth reading or its own slot, the doorbell, its own
+slot, so a claimant is harvested within two ticks and the anchor is still
+proven under load; a client alternates the host slot with its own answer slot
+while it has no live path, and reads the host slot alone once it has. Both
+also read the host slot convergently, every `SIG_DHT_WIDE_GET_MS 4000` until
+it has been seen and every `SIG_DHT_WIDE_IDLE_MS 20000` after, which is how a
+token naming no node, or a dead one, still finds the host, and how the nodes
+each end holds converge on the ones closest to the host slot's key.
+
+**The rendezvous node is the one that served the host slot back**
+(`sig.c:node_note`): the host captures and pins the first of each family to do
+so and the token names it (§3), and either end's `netstate` is told which node
+answered a validated read, which is the proof the anchor stays qualified on.
+
+**Writes** (`sig.c:host_pump_puts`, `client_pump_puts`), at most one in flight
+per slot (`slot_inflight`) and otherwise free to overlap, so an answer never
+waits behind a convergent store of the host slot: the host stores its slot
+convergently while a reachable family has no anchor yet (`SIG_DHT_PUT_MS`
+apart while that family's connectivity is proven, `SIG_DHT_PUT_SLOW_MS 20000`
+otherwise), every `SIG_DHT_WIDE_PUT_MS 45000` after as a refresh, and directly
+whenever a read shows something else where its slot should be; it writes every
+answer or refusal pending directly to its claimant's slot on each
+`SIG_DHT_PUT_MS` tick. A claimant writes its bell and offer directly,
+alternating, every `SIG_DHT_PUT_MS`. Nothing a claimant writes goes out
+convergently: the nodes it has retained from reading the host slot are the
+host's own.
 
 Timings (`sig.c`): `SIG_DHT_GET_MS 1000`, `SIG_DHT_PUT_MS 1000`,
 `SIG_DHT_RESTORE_MS 8000`, `SIG_DHT_GRACE_MS 2000`, `SIG_DHT_OPEN_MS 1000`.
@@ -499,7 +597,7 @@ running for the session's whole life. A multicast announcement arriving first
 does not suppress it. The DHT is the only rendezvous that survives a change of
 network, so it has to be running *before* the change rather than started after
 it: a host and a client that meet on an isolated LAN and later roam apart depend
-on a mailbox published while they were still together, and on the warm
+on a host slot published while they were still together, and on the warm
 rendezvous nodes they exchanged over `CTLM_RDV` (§10, §11). A LAN-only session
 therefore pays a socket and periodic bootstrap traffic that will not succeed;
 that is the price of being able to leave the LAN, and the only opt-out is the
@@ -509,8 +607,8 @@ operator's explicit `--no-dht` (§13).
 
 ## 6. Multicast / lanlink (`src/sig_mcast.c`, `src/lanlink.c`)
 
-For isolated LANs, the same sealed candpack is announced over link-local
-multicast, plus a direct UDP transport port.
+For isolated LANs, the host's presence and each claimant's offer are announced
+over link-local multicast, each with a direct UDP transport port.
 
 Multicast (`sig_mcast.c`):
 - Groups: v6 `MCAST_V6 = ff02::da7a`, v4 `MCAST_V4 = 224.0.0.224`. The **port
@@ -520,30 +618,32 @@ Multicast (`sig_mcast.c`):
   of them. `MCAST_PORT = 47654` remains only as the fallback for a caller with
   no session to derive from (the `mcast-probe` interface check).
 - Packet: `MCAST_MAGIC "pMc1"` (4 bytes) `|| salt_len(1) || salt || payload`.
-- **Salt = the sender's own role slot character**: `"o"` (host) or `"a"`
-  (client); a receiver listens for the *peer's* slot char (`sig.c` `peer_slot`,
-  `ps`).
-- `payload` = `seal_ad(sig_key, ad=salt(1), mcast_plain)`. The salt frames the
-  value on the wire outside the seal and is what says whether a description is
-  an offer or an answer, so it is **bound into the tag**: without that, a frame
-  captured from one slot opens in the other and a client can be handed its own
-  description as the peer's.
-- `mcast_plain` (`sig.c:sig_stage`) = `direct_port(2, BE) || slot value`, where
-  the slot value is **exactly what the DHT slot carries** (§4) -- `claim_pk ||
-  candpack` from a host, `ulen || ufrag || box(...)` from a client -- built from
-  the same packed buffer, not a wider `for_dht=0` one. So a claim announced on
-  the segment is sealed to the host just as one in the mailbox is. The peer takes
-  the sender address from the packet source and the direct port from the payload.
+- **Salt = the sender's role**: `"h"` from a host, `"c"` from a claimant; a
+  receiver listens for the *other* role's (`sig.c:on_mcast_recv`), which is
+  also how it ignores its own announcements looping back.
+- A host's `payload` = `seal_ad(sig_key, ad="h", direct_port(2, BE) ||
+  envelope)`, the envelope a `HOSTINFO` exactly as in its DHT slot (§4), so a
+  segment hears which instance and generation is serving and where its lanlink
+  socket is. It carries no description: a host gathers for a claimant, never
+  ahead of one.
+- A claimant's `payload` = `cid(8) || seal_ad(slot_key, ad="c", direct_port(2,
+  BE) || envelope)`, the envelope its `OFFER` with the candpack packed for the
+  DHT (`for_dht=1`), sealed to its class (§4.2) under the key the clear `cid`
+  lets the host derive. So an offer announced on the segment is readable by
+  exactly who may read it in the DHT.
+- The salt frames the value on the wire outside the seal and is **bound into
+  the tag** as associated data, so a frame captured under one role does not
+  open under the other.
 
-**Role split on receive** (`sig.c:deliver_peer_mcast`): both roles adopt an
-endpoint only from a packet whose seal verifies under `sig_key` **and** whose
-source is **LAN-scope** (`addr_is_lan_scope`: link-local, RFC1918
-`10/8` / `172.16/12` / `192.168/16` / `169.254/16`, ULA `fc00::/7`, and loopback
-`::1` / `127/8` for a same-host peer). The source class is not the trust boundary -- the
-seal is; it only decides who gets the ICE-free bypass. A **client** feeds the
-candpack to its ICE agent and learns the host's direct endpoint. A **host** that
-demultiplexes the shared lanlink socket (`mcast_claims`) does **not** feed the
-candpack to its ICE turnstile -- it can serve a same-segment claimant directly
+**Role split on receive** (`sig.c:deliver_host_mcast`,
+`deliver_claim_mcast`): both roles adopt an endpoint only from a packet whose
+seal verifies **and** whose source is **LAN-scope** (`addr_is_lan_scope`:
+link-local, RFC1918 `10/8` / `172.16/12` / `192.168/16` / `169.254/16`, ULA
+`fc00::/7`, and loopback `::1` / `127/8` for a same-host peer). The source class
+is not the trust boundary -- the seal is; it only decides who gets the ICE-free
+bypass. A **client** learns the host's direct endpoint and nothing for ICE. A
+**host** that demultiplexes the shared lanlink socket (`mcast_claims`) does
+**not** feed the offer to ICE -- it can serve a same-segment claimant directly
 over lanlink, so punching it too would serve the client twice; instead the
 claimant's `(source, announced-port)` becomes a direct claim (§12). The v6 zone
 id is preserved for a link-local peer.
@@ -590,16 +690,16 @@ candpack binary layout (`candpack.c`, `CANDPACK_VERSION = 4`):
 which bumps on every move; a client tells a moved offer, whose candidates are
 new, from one that only rotated credentials, and re-claims at once on a move.
 
-`offer_ufrag` (v3) names the peer offer a claim answers; an offer names none and
-packs `offer_len = 0`. `cid` (v4) is the claimant's instance id, 8 bytes minted
-once per comrade process, or `cid_len = 0` naming none. ICE credentials cannot
-say that two claims came from one client, because a reconnect is an ICE restart
-and carries fresh ones; the instance id is what a host tells a reconnecting
-client by, and it rides inside the box (§8), so only the host reads it and a
-room of guests cannot correlate each other. Decoding accepts versions 2 through
-4, taking the fields a older packing lacks as absent. A `CANDPACK_VERSION`
-bump that older peers cannot decode also bumps `TOKEN_VERSION` (§3), which is
-where a mismatch is caught and named.
+`offer_ufrag` (v3) named the offer a claim answered under the shared mailbox;
+this revision packs `offer_len = 0` everywhere, the slot a description is read
+from saying who it answers. `cid` (v4) is the sender's instance id, the same 8
+bytes the envelope's `from` carries (§4), or `cid_len = 0` naming none. ICE
+credentials cannot say that two offers came from one client, because a
+reconnect is an ICE restart and carries fresh ones; the instance id is what a
+host tells a reconnecting client by. Decoding accepts versions 2 through 4,
+taking the fields a older packing lacks as absent. A `CANDPACK_VERSION` bump
+that older peers cannot decode also bumps `TOKEN_VERSION` (§3), which is where
+a mismatch is caught and named.
 
 `type`: `0 host, 1 srflx, 2 prflx, 3 relay`. `family`: `4` or `6`. Only
 `component 1`, `UDP` candidates are packed. Decode rebuilds
@@ -611,10 +711,10 @@ where a mismatch is caught and named.
 ## 8. ICE / NAT (`src/nat.c`, libjuice 1.7.3)
 
 libjuice agent per connection: gather → exchange the bundled SDP as candpack via
-the mailbox/multicast → connectivity checks → connected/failed. STUN
+the rendezvous slots/multicast → connectivity checks → connected/failed. STUN
 server-reflexive candidates gathered from the community STUN pool
 (`src/stunlist.c`, baked-in list). Nested NAT handled by publishing the private
-v4 (mailbox sealed) + libjuice RFC 8445 peer-reflexive source learning. KCP
+v4 (slots sealed) + libjuice RFC 8445 peer-reflexive source learning. KCP
 output sends via the peer's own agent (`juice_send` targets that agent's
 remote).
 
@@ -699,7 +799,7 @@ nothing else, and plays no part in choosing between paths. A connection tracks u
 to `PATH_TABLE_MAX` of them and carries KCP over exactly one at a time.
 
 Path management is **symmetric and role-free**. comrade's application model has a
-host and a client -- one owns the tmux, one claims the turnstile (§12) -- but
+host and a client -- one owns the tmux, one asks to be admitted (§12) -- but
 that asymmetry ends at admission. Both ends run identical path code: both probe,
 both measure, both rank, and both arrive at the same choice without either
 deciding for the other.
@@ -911,11 +1011,12 @@ the newcomer, since a probe that arrived is evidence its source works where a
 path that has stopped answering is evidence of the opposite.
 
 **Why the ufrag suffices.** It is not a secret between token holders -- it
-travels in the mailbox slot every holder of `R` can read and unseal (§4, §12) --
-and it does not need to be. Everyone holding a token can reach the machine
-anyway, and the read-only grade shares the same `R`, so `sig_key` and every
-capability it confers (mailbox reads, sealed announcements, turnstile claims) are
-already common to both grades. Disruption between token holders is out of scope;
+travels in a slot every holder of the claimant's class can read and unseal
+(§4, §12) -- and it does not need to be. Everyone holding a token can reach the
+machine anyway, and the read-only grade shares the same `R`, so `sig_key` and
+every capability it confers (host slot and doorbell reads and writes, the
+host's announcement) are already common to both grades. Disruption between
+token holders is out of scope;
 the boundary the seal defends is the **stranger**, who holds no `R`, can seal
 nothing, and cannot attach to anything.
 
@@ -1045,10 +1146,10 @@ this message has one to be written and bridged in. It matters because the two wa
 the channel closing: the guest detached, and there is a session to rejoin; or
 the shared session ended, and there is not. This is the one statement about the
 end that cannot be forged, since it arrives inside the authenticated SSH
-session, and it beats the mailbox tombstone (§4.1) by the time a DHT store
+session, and it beats the host slot's tombstone (§4.1) by the time a DHT store
 takes. A guest that hears it leaves with `SESSION_ENDED` rather than
-re-claiming; a peer on a build that does not know the type ignores the frame and
-falls back to the tombstone.
+offering again; a peer on a build that does not know the type ignores the frame
+and falls back to the tombstone.
 
 `CTLM_KEY 6` payload `half(32)` = `CTL_KEY_PLEN`, and `CTLM_KEYOK 7` with no
 payload, carry the per-connection key exchange (§2). Each end sends its half as
@@ -1102,12 +1203,13 @@ the largest message, and the reframer rejects anything claiming more.
   `PATH_DEAD_MS 8000`, so a host never reaps a client that is mid-switch.
 - **Total loss resumes in place; a new join is the last resort.** Where no
   path is warm and nothing has been heard for `RESUME_AFTER_MS 3000`, the
-  client re-runs the claim half of the join from inside the live connection
+  client re-runs the offer half of the join from inside the live connection
   (`resume_tick`): the signalling is rebuilt if the network moved, a fresh
   agent gathers under the connection's **session-stable ufrag** with a fresh
-  password (an unchanged claim would be deduplicated away by the peer's
-  redelivery guard), and the claim is posted again. The host recognises the
-  claimant and grafts the punch into the worker it already runs (§12), so the
+  password (an unchanged offer keeps its sequence and is a refresh the host
+  has already answered, §4), and the offer is written again. The host
+  recognises the claimant and grafts the punch into the worker it already
+  runs (§12), so the
   SSH session, the port forwards and their carried TCP streams ride out the
   outage on KCP retransmission; each attempt runs `RESUME_ATTEMPT_MS 10000`
   before regathering. Only when that keeps failing does the interactive client
@@ -1141,90 +1243,68 @@ tmux session. `host_is_multiuser = is_host && (sig_flags & (SIG_DHT | SIG_MCAST)
 serves over multicast alone runs the turnstile too. A worker's `conn_run(conn, drive_sig=0)` does not pump sig; the
 turnstile owns rendezvous. Heartbeat reaps vanished clients.
 
-**DHT/ICE path, release-on-pickup.** The host advertises one offer at a time with
-**single-use per-offer ICE credentials**; a client claims via the `a` slot (CAS).
-On pickup the host sets the claimant's remote description, moves the listening
-conn into an in-flight set `punching[]`, and **immediately rotates a fresh offer**
-(fresh credentials; one mailbox write clears `a` and installs the new offer),
-admitting the next client without waiting for the punch. `punch_scan` then
-advances each in-flight punch: a connected one becomes a worker (its dashboard row
-opens there); a failed one, or one past `ICE_ATTEMPT_MS = 90000`, is freed. A
-stuck punch therefore never head-of-line-blocks the next joiner. A **stale-claim
-guard keyed by the claimant's ICE ufrag** (`have_served`/`last_served_ufrag`, plus
-`ufrag_admitted` over `punching[]` and `lan_ufrag_claimed` over the direct path)
-ignores a lagging DHT re-read of an already-served or in-flight answer, so no
-client is punched twice.
+**DHT/ICE path: an agent per claimant.** The host keeps **one gathered ICE
+agent ready** (`TS_GATHER` → `TS_WAIT_CLAIM`) and publishes nothing of it. A
+claimant's `OFFER` arriving in its own slot (§4) is queued
+(`session.c:offers_push`, replacing an older one from the same claimant) and
+decided on the next pass (`host_offer_take`): the ready agent is primed with
+the claimant's description, moved into the in-flight set `punching[]` under
+the claimant's ufrag and instance id, and its own description is written as
+the `ANSWER` in that claimant's slot (`sig_answer`); the host then gathers the
+next agent. So every claimant is answered with **credentials minted for it
+alone**, nothing is shared between claimants, and nothing is rotated.
+`punch_scan` advances each in-flight punch: a connected one becomes a worker
+(its dashboard row opens there); a failed one, or one past `HOST_PUNCH_MS`
+(`ICE_ATTEMPT_MS` for a resumption of a proven worker), is freed. A stuck punch
+never blocks the next joiner, since the next joiner has an agent of its own.
+A punch in flight gains the egress addresses the pool learns later by being
+answered again with its description fanned across them (`host_reanswer`).
 
-**Losing a round.** One offer is readable by every client that reads the mailbox
-before the rotate, and its ICE credentials stay valid at the host until that
-agent is retired -- so a client that lost the CAS still completes a connectivity
-check, against an agent that is punching or serving somebody else. ICE reporting
-a pair therefore says nothing about who is being served; only the probe does, and
-a loser is never answered because the worker checks the claimant ufrag. A client
-that has qualified nothing recovers by re-claiming with a fresh ICE identity
-(`session.c:client_regather`), triggered by either of:
+**What the host does with an offer** (`host_offer_take`, in order): an offer
+whose claimant is already served over lanlink, already being punched under the
+same password, queued for LAN admission, or served by a healthy worker, is
+left as it stands (`rdv_host_keep`: the earlier answer holds, and the claimant
+is told nothing new); an offer under a **new password** from a claimant
+already being punched replaces that punch (`punch_tried_again`); at
+`PUNCH_PARALLEL_MAX` punches for one claimant the oldest is reaped; a fresh
+claimant past `--max-clients` is **refused in its slot** (`sig_refuse`,
+`REFUSE full`), which ends its join with `SESSION_FULL`; everything else is
+answered as above once an agent is ready and a punch slot is free, and waits
+in the queue meanwhile. An offer is replayed by nothing: the slot's sequence
+filters a lagging copy before the turnstile sees it (§4).
 
-- **its claim leaving the answer slot** without a path qualifying within
-  `PATH_PROBE_MS`. The slot is the mutex, so a claim still in it is queued
-  however long the queue -- which a clock cannot tell apart, and a clock-driven
-  re-claim livelocks one case or the other (measured, both directions).
-- **the offer rotating past the one its agent is primed against**. Release-on-
-  pickup mints a fresh ICE identity every time somebody is served, so a queued
-  client would be punched by a listener whose credentials it never had. Acted on
-  once per rotation, so a burst of joiners does not re-gather in lockstep.
+**A client that has qualified nothing** within `PATH_PROBE_MS` of priming the
+host's answer regathers with a fresh ICE identity
+(`session.c:client_regather`), which writes a new offer the host answers with
+a new agent; so does one whose host moved (a higher generation in the host
+slot, §4 L3) or whose SSH bring-up failed outright. A host never regathers for
+a claimant on its own: it answers what it is offered.
 
-A claim is written once, and written again only while the offer it names is
-still the one advertised: a slot found empty then is a write that never landed.
-Once the host has rotated past that offer it can only release the claim, so
-re-posting it would take the mutex from the next joiner for nothing, and the
-rules above re-claim with a fresh one instead. A claim amended with late
-candidates is posted again whatever the offer, and the host trickles those into
-the punch in flight.
-
-A client also re-claims when an SSH bring-up fails outright. A host never
-re-gathers: the turnstile owns its offer, and it retries its own listener. The
-direct LAN path is exempt from all of it -- its admission queue is per claimant
-and there is no shared offer to lose.
-
-Because a re-claiming client discards the offer it was given, and the host has no
-reason to rewrite an offer nobody has taken, `sig_redeliver()` makes the next
-read deliver the current offer again rather than dedupe it away.
-
-**A claim that answers a retired offer is released, not punched.** Release-on-
-pickup hands the offer's agent to the claimant it picked up, so a second claim
-naming that offer can only be paired with the listener that replaced it, whose
-credentials the claimant never primed: that punch cannot land, and taking it up
-costs a punch slot for `HOST_PUNCH_MS` and a rotation that strands every other
-queued claimant once more. The host frees the answer slot at once instead, and
-the claimant's release rule above re-claims against the current offer. An offer
-rotated away without a pickup (a STUN rotation, a quiet rendezvous) stays in a
-kept ring for `OFFER_KEEP_MS`, and a claim naming one of those is punched with
-the exact agent it primed. The joiners `turnstile_stuck.sh` protects read the
-offer minted at the wedged pickup and claim that one, so they are served as
-before.
-
-**A claim naming a claimant the host already serves is a resumption.** The
-ufrag is session-stable, so it names the same client across its claims. If the
-worker serving it has lost its client, the claim is that client returning, and
-its punch ends in a graft rather than a worker: the punched agent's callbacks
-are re-pointed at the worker's connection -- packets land in its stream from
-that instant -- and the agent is parked for the worker's own thread to adopt
-as the sending one, since `c->nat` belongs to that thread. The punch shell is
-dissolved with no worker, no dashboard row and no registration of its own, and
-the worker's reap is held off while the punch runs. From a *healthy* worker
-the same claim is the eventually-consistent DHT re-serving a stale value and
-is ignored, as are claims whose punch is already in flight, and resumptions
+**An offer from a claimant the host already serves is a resumption.** The
+ufrag is session-stable, so it names the same client across its offers, as the
+instance id does across its sessions. If the worker serving it has lost its
+client, the offer is that client returning, and its punch ends in a graft
+rather than a worker: the punched agent's callbacks are re-pointed at the
+worker's connection -- packets land in its stream from that instant -- and the
+agent is parked for the worker's own thread to adopt as the sending one, since
+`c->nat` belongs to that thread. The punch shell is dissolved with no worker,
+no dashboard row and no registration of its own, and the worker's reap is held
+off while the punch runs. From a *healthy* worker the same offer is left
+standing, as are offers whose punch is already in flight, and resumptions
 inside `RESUME_ATTEMPT_MS` of the last -- the window between a graft and its
-first probe, where the worker still reads as lost. Anyone holding the token
-can claim any ufrag, but a resumption moves packets, not trust: the SSH
-session inside the stream authenticates end to end, so a forged resumption
-redirects the transport at worst -- a denial no cheaper than the claim spam
-the shared-secret model already admits (see the slot limit below).
+first probe, where the worker still reads as lost. When a worker is reaped its
+claimant is forgotten (`sig_claimant_gone`), keeping only the sequence that
+filters a replay of its last offer, so the same instance coming back is
+admitted afresh. Anyone holding the token can offer under any ufrag, but a
+resumption moves packets, not trust: the SSH session inside the stream
+authenticates end to end, so a forged resumption redirects the transport at
+worst -- a denial no cheaper than the offer spam the shared-secret model
+already admits (see the slot limit below).
 
-Concurrent DHT admission is partial beyond two clients: the turnstile is serial
-by construction, so N clients cost N rotations and each rotation strands the
-others. The LAN path has no such limit -- no shared offer -- and admits N
-concurrently.
+Admission is concurrent on both paths: N claimants cost N agents and N
+answers, each in its own slot, and no claimant's progress waits on another's
+punch. What bounds it is the host's read cadence (§5: one claimant slot every
+other tick) and the one gathered agent kept ready at a time.
 
 **LAN direct path, admission queue.** A sealed multicast answer from a LAN-scope
 source becomes a direct claim (§6): `on_direct_claim` appends its
@@ -1248,7 +1328,7 @@ vanished claimants to free slots.
 
 ---
 
-## 13. UX and CLI (`src/main.c`, `src/ui.c`, `src/statusbar.c`, `src/host.c`)
+## 13. UX and CLI (`src/main.c`, `src/ui.c`, `src/host.c`)
 
 CLI surface:
 
@@ -1282,7 +1362,7 @@ draws one row per client.
   connection **service** runs beside it, detached from the terminal so it keeps
   serving while the operator is inside the shared tmux (`host.c`: `run_service`
   re-serves until the tmux session dies).
-- **Status row** (`statusbar.c`): connection health (green live / amber if smoothed
+- **Status row** (`ui.c:ui_render_status`): connection health (green live / amber if smoothed
   RTT over `RTT_WARN_MS 250` / down), RTT, the path in use and its warm
   alternatives (§9), and the rendezvous state; address scope shown as LAN / CGNAT / GLOBAL (`session.c:addr_scope`).
 - **Session lifecycle** -- a live session is always on screen, as the shared

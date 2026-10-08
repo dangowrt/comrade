@@ -99,8 +99,8 @@ properties of the session being started, and a session lasts exactly as
 long as the terminal that started it, so there is never a running one to
 give them to a second time.
 
-A host on an isolated LAN reaches no DHT, so its mailbox is published
-nowhere and its token carries no rendezvous node. Joining such a host
+A host on an isolated LAN reaches no DHT, so its rendezvous slot is
+published nowhere and its token carries no rendezvous node. Joining such a host
 with `--no-multicast` cannot connect: the client searches a DHT the host
 never reached, and sends none of the sealed multicast announcements the
 host needs to authenticate it and spawn its worker. On a LAN with no
@@ -137,20 +137,21 @@ One invitation can be handed to several people, and a read-only link is
 the one you hand to a room, so what one holder can do to another matters
 as much as what an outsider can do:
 
-- **A holder cannot read another's claim.** The rendezvous mailbox is
-  readable by everyone holding the invitation, so a claim -- which names
-  the addresses a peer can be reached at -- is sealed to the host, whose
-  key nobody else has. A read-only link given to twenty people does not
-  publish each attendee's address to the other nineteen.
+- **A read-only guest cannot read a read-write holder's offer.** Each
+  joiner converses with the host in a rendezvous slot of its own, and that
+  slot -- which names the addresses the joiner can be reached at -- is
+  sealed under a key derived from its own class of credential, which a
+  read-only link cannot derive the read-write one from. Two guests holding
+  the same read-only link can read each other's slots, which is a known
+  limit of a one-way token and is documented as such in PROTOCOL.md.
 - **A holder cannot reach another's session.** Once two ends are talking
   they agree a key of their own inside the SSH session and everything on
   the direct link is keyed to that pair, so the invitation buys the right
   to start a session and nothing over one already running.
-- **A holder can still take a turn.** Joining is a queue, and occupancy
-  cannot be hidden from the people entitled to queue: a holder can claim
-  repeatedly and delay others. It needs a valid invitation, it delays
-  rather than discloses, and it shows up as a rendezvous that will not
-  settle.
+- **A holder can still delay.** The doorbell and the host's own slot are
+  writable by everyone holding the invitation, so a holder can overwrite
+  them and cost the others a retry. It needs a valid invitation, it delays
+  rather than discloses, and nobody's slot is ever taken from under them.
 
 > Treat the session token like a credential: anyone who has it can use it
 > to attempt to join the session.
@@ -192,11 +193,12 @@ forwarding paths are implemented and tested on real networks. The
 remaining work is primarily hardening, additional packaging, and a
 handful of protocol and platform improvements.
 
-- **Connection establishment** across every covered path: rendezvous on
-  a single shared BEP 44 mailbox, with a one-time host-side DHT
-  convergence captured in the token so a client joins in about two
-  seconds; ICE hole punching; and a direct UDP transport (lanlink) that
-  carries same-segment link-local peers, including under the multi-user
+- **Connection establishment** across every covered path: rendezvous
+  through BEP 44 slots with one writer each (the host's, a shared doorbell,
+  and one per joiner), with a one-time host-side DHT convergence captured
+  in the token so a client joins in about two seconds; ICE hole punching;
+  and a direct UDP transport (lanlink) that carries same-segment link-local
+  peers, including under the multi-user
   turnstile. Validated between local processes, on two real boxes on
   different ISPs across IPv6-direct, IPv6/IPv4 via STUN and nested NAT,
   and on a real macOS peer for same-host multicast and the link-local
@@ -212,10 +214,10 @@ handful of protocol and platform improvements.
   `comrade stop` ends one. Both ends paint a live status row: connection
   health, RTT, the in-use path, and the rendezvous state.
 - **Multi-user.** One host serves up to `HOST_MAX_WORKERS` (16)
-  concurrent clients on the single shared tmux session. DHT/ICE joins
-  pass through a turnstile on the rendezvous mailbox with single-use
-  per-offer ICE credentials, releasing the offer on pickup so a stuck
-  punch never head-of-line-blocks the next joiner; same-segment clients
+  concurrent clients on the single shared tmux session. Each DHT/ICE
+  joiner offers in a rendezvous slot of its own and is answered there with
+  an ICE agent minted for it alone, so a stuck punch never
+  head-of-line-blocks the next joiner; same-segment clients
   are admitted concurrently over the direct link-local transport
   alongside the DHT/ICE ones. A worker serves each connected client, and
   vanished clients are reaped by heartbeat.

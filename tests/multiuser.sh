@@ -1,9 +1,9 @@
 #!/bin/sh
-# Multi-user end-to-end driver: one host serves N clients concurrently through
-# the turnstile, each client running the echo oracle over
+# Multi-user end-to-end driver: one host serves N clients concurrently, each
+# answered in a slot of its own and each client running the echo oracle over
 # the real path. This exercises the concurrent worker layer that the unit tests
-# (mailbox_test) cannot reach: several real ICE punches and KCP streams against
-# one host at once.
+# (rdv_test) cannot reach: several real ICE punches and KCP streams against one
+# host at once.
 #
 # The peers meet through a private DHT this script starts (tests/swarm.sh), so
 # what it measures is comrade and not how busy the public one was. Set

@@ -18,7 +18,7 @@
 /* NET_SCOPE_*, NET_VIA_* and NET_CONN_* belong to the reachability model that
  * decides them, and are shared with the view from there. */
 enum {					/* peer lifecycle for obs.peer */
-	SESSION_PEER_SEEN,		/* mailbox read: peer endpoints known */
+	SESSION_PEER_SEEN,		/* rendezvous read: peer endpoints known */
 	SESSION_PEER_PUNCHING,		/* negotiating a path */
 	SESSION_PEER_LIVE,		/* a path carries the session */
 	SESSION_PEER_GONE		/* this peer's connection ended (reaped) */
@@ -32,22 +32,22 @@ enum {					/* what is known about a rendezvous node */
 enum {					/* per-family rendezvous progress (spinner) */
 	RDV_COLD,			/* the DHT is not warm yet */
 	RDV_WARMUP,			/* finding nodes close to the key */
-	RDV_STORE,			/* placing the mailbox on them */
+	RDV_STORE,			/* placing the host slot on them */
 	RDV_GET,			/* reading it back */
 	RDV_READY			/* the rendezvous node is captured */
 };
 
 /*
- * The shared BEP44 mailbox, as the controller sees it. Mirrors sig's own view
- * so the display never reaches into sig.
+ * The BEP44 rendezvous, as the controller sees it. Mirrors sig's own view so
+ * the display never reaches into sig.
  */
 struct session_mailbox {
 	int engaged;			/* the DHT is up and being asked */
 	int stage;			/* RDV_* */
 	int have_mine;			/* we have something to publish */
-	int mine_stored;		/* the last read showed it stored */
-	int peer_seen;			/* the peer's slot was in that read */
-	int64_t seq;			/* container sequence, -1 unread */
+	int mine_stored;		/* our slot's last store was acknowledged */
+	int peer_seen;			/* the other end has been heard from */
+	int64_t seq;			/* host slot sequence, -1 unread */
 	int gets;			/* validated reads */
 	int puts;			/* stores that found a home */
 	int claim;			/* SESSION_CLAIM_* */
@@ -64,11 +64,13 @@ struct session_mailbox {
 	int age_put_s;
 };
 
-enum {					/* the answer slot, from where we sit */
+enum {					/* our standing as a claimant */
 	SESSION_CLAIM_UNKNOWN,		/* nothing read yet */
-	SESSION_CLAIM_FREE,		/* empty: a client may take it */
-	SESSION_CLAIM_HELD,		/* ours is in it */
-	SESSION_CLAIM_BUSY		/* somebody else's is */
+	SESSION_CLAIM_FREE,		/* announcing, nothing holds us */
+	SESSION_CLAIM_HELD,		/* our offer is in our slot */
+	SESSION_CLAIM_BUSY,		/* retired; never reported now */
+	SESSION_CLAIM_ANSWERED,		/* the host answered in our slot */
+	SESSION_CLAIM_REFUSED		/* the host refused us: its grant is spent */
 };
 
 struct session_obs {

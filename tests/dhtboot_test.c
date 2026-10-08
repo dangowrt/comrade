@@ -79,7 +79,7 @@ int main(void)
 		rdv[i] = (uint8_t)(i * 7 + 1);
 	setenv("COMRADE_DHT_BOOTSTRAP", "nowhere.invalid:6881", 1);
 
-	s = sig_create(rdv, SIG_DHT, 1);
+	s = sig_create(rdv, rdv, 0, SIG_DHT, 1);
 	if (!s || sig_prepare(s, fds, 8, &timeout_ms) <= 0) {
 		printf("skipped: no DHT node could be created on this host\n");
 		return 77;

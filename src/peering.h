@@ -421,13 +421,6 @@ struct peering_model {
 	int dht;			/* the mailbox is served by a DHT: a
 					 * rendezvous can be named, and asked
 					 * for */
-	/*
-	 * The key a claimant boxes its claim to, held here and not by the
-	 * signaller: a signaller is rebuilt on every move, and the claim a
-	 * peer had in flight when this end roamed is boxed to the old one.
-	 */
-	uint8_t claim_sk[32];
-	int have_claim_sk;
 	uint64_t dht_since_ms;		/* when this attempt began: armed with
 					 * the signaller, so a rebuild is a
 					 * fresh attempt and a fresh grace */
@@ -466,15 +459,11 @@ struct peering_settle {
  *
  * A fresh one knows nothing, and it is created more often than once, every
  * move making one, so what the model already holds is told to it here, BEFORE
- * ANYTHING IS PUBLISHED: the claim key, since a claimant boxes to the key it
- * read in the offer and a fresh key would strand the claim in flight, the host
- * being unable to open it, calling the slot unreadable and releasing it,
- * erasing a claim that was perfectly good; which families are proven, since
- * what a signaller drives its convergence eagerness from is only ever
- * published when it changes, and a family that came through the move still
- * proven would otherwise sit in the slow tier for the rest of the session; and
- * a peer's standing request that this end rendezvous for it. Returns -1 when
- * the claim key could not be installed, which leaves the signaller unusable.
+ * ANYTHING IS PUBLISHED: which families are proven, since what a signaller
+ * drives its convergence eagerness from is only ever published when it
+ * changes, and a family that came through the move still proven would
+ * otherwise sit in the slow tier for the rest of the session; and a peer's
+ * standing request that this end rendezvous for it.
  *
  * The rendezvous itself is seeded separately, since where its node comes from
  * is the playbook's.

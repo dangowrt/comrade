@@ -1,7 +1,8 @@
 #!/bin/sh
 # A total transport outage mid-session must resume in place: the client
-# re-claims under its session-stable identity, the host grafts the punch into
-# the worker it already runs, and the SSH session above never ends. Staged
+# offers again under its session-stable identity, the host answers in the
+# client's slot and grafts the punch into the worker it already runs, and the
+# SSH session above never ends. Staged
 # with --blackhole-all (both directions muted) and a lift, over the DHT --
 # the rendezvous that needs no shared segment. It meets through a private DHT
 # this script starts (tests/swarm.sh); COMRADE_E2E_NET=1 uses the real one.
@@ -22,7 +23,14 @@ fi
 tmp="$(mktemp -d)"
 hostpid=""
 clientpid=""
-trap 'kill "$hostpid" "$clientpid" 2>/dev/null; swarm_stop; rm -rf "$tmp"' EXIT
+keep() {
+	if [ "${COMRADE_E2E_KEEP:-0}" = 1 ]; then
+		echo "logs kept in $tmp"
+	else
+		rm -rf "$tmp"
+	fi
+}
+trap 'kill "$hostpid" "$clientpid" 2>/dev/null; swarm_stop; keep' EXIT
 
 COMRADE_DEBUG="$tmp/host.dbg" "$E2E" host --serve 1 --timeout 150 \
 	> "$tmp/host.out" 2> "$tmp/host.err" &

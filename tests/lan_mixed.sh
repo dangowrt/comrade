@@ -14,9 +14,9 @@
 #      dead (the B1/B5 degeneration), so this alone rejects an all-ICE regression.
 #      It HOLDS its session open so its lanlink worker is provably live while (2)
 #      happens.
-#   2. The host ENGAGES the ICE turnstile for the DHT claimant -- it picks up B's
-#      sealed answer and starts a punch ("claim received -> punch" in the host
-#      debug log) -- concurrently with A's live lanlink worker. This is the
+#   2. The host ENGAGES the ICE turnstile for the DHT claimant -- it takes up B's
+#      offer and starts a punch ("offer received -> punch" in the host debug
+#      log) -- concurrently with A's live lanlink worker. This is the
 #      coexistence proof and it does NOT depend on B's hole-punch completing,
 #      which is the flaky part over localhost (DHT rendezvous + ICE punch; the
 #      same flake multiuser.sh shows).
@@ -105,7 +105,7 @@ rc=0
 grep -q "E2E PASS client" "$tmp/a.out" 2>/dev/null || {
 	echo "LAN client did not connect over lanlink (STRICT failure):"
 	cat "$tmp/a.out" "$tmp/a.err"; rc=1; }
-if ! grep -q "claim received -> punch" "$tmp/host.log" 2>/dev/null; then
+if ! grep -q "offer received -> punch" "$tmp/host.log" 2>/dev/null; then
 	echo "host never engaged the ICE turnstile for the DHT claimant (STRICT):"
 	tail -8 "$tmp/host.log" 2>/dev/null; tail -4 "$tmp/b.err" 2>/dev/null
 	echo "what B was doing:"; tail -8 "$tmp/b.log" 2>/dev/null

@@ -1,25 +1,22 @@
 #!/bin/sh
-# Release-on-pickup: a wedged ICE punch must not head-of-line-block the next
-# joiner.
+# A wedged ICE punch must not head-of-line-block the next joiner.
 #
 # The host is told to wedge its FIRST ICE pickup (--stuck 1): that punch never
-# connects, modelling a client whose hole-punch hangs. A head-start client claims
-# first and becomes the wedged one (the host holds it in its in-flight punch set
-# and never serves it). Several more clients then join DURING the hang. With
-# release-on-pickup the host rotates a fresh offer the instant it picks the wedge
-# up, so those later joiners are admitted and connect while it hangs. Without it
-# the host would sit on the wedged punch, never re-advertise, and NO later client
-# could ever be admitted -- so a single later joiner connecting here is proof of
-# the fix and is impossible without it.
+# connects, modelling a client whose hole-punch hangs. A head-start client is
+# answered first and becomes the wedged one (the host holds it in its in-flight
+# punch set and never serves it). Several more clients then join DURING the
+# hang. Every claimant is answered with an agent of its own, so those later
+# joiners are admitted and connect while it hangs; a host whose one agent was
+# tied up in the wedge could admit nobody, so a single later joiner connecting
+# here is the proof.
 #
 # Determinism: the wedge is host-controlled (not a real, timing-dependent libjuice
 # hang), so the "a joiner is admitted during the hang" property is exact. The only
 # non-determinism is the live-DHT/ICE signalling of the joiners themselves (as in
-# multiuser.sh, which the pure-DHT turnstile shares), so the case is network-gated
-# and uses several later joiners to give a non-flaky one a chance. The assertion
-# waits only on the later joiners (not the wedged one, which by design never
-# completes) and can only PASS when release-on-pickup works: a DHT flake can make
-# it fail, never falsely pass, so it cannot mask a regression.
+# multiuser.sh), so the case uses several later joiners to give a non-flaky one a
+# chance. The assertion waits only on the later joiners (not the wedged one,
+# which by design never completes): a DHT flake can make it fail, never falsely
+# pass, so it cannot mask a regression.
 #
 # Usage: turnstile_stuck.sh <path-to-comrade-e2e>
 set -u
