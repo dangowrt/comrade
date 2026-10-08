@@ -350,6 +350,31 @@ sorted order (`mailbox.c:mailbox_build`):
   slot, not where it is; a client cannot open even its own box, the ephemeral
   secret being gone the moment it is sealed.
 
+### 4.2 Who may read whom (`keys.c:keys_slot_key`)
+
+The one-slot-per-claimant rendezvous seals each claimant's slot under a key
+derived from the **auth secret of that claimant's credential class** together
+with its instance id, rather than under the session-wide `sig_key`. The
+intended reach follows from `keys_derive_ro_auth` being one-way:
+
+| reader | may read |
+|---|---|
+| read-write holder | the host, and other read-write holders |
+| read-only holder | the host only |
+
+A read-write holder's slot key comes from `A_rw`, which a read-only holder
+cannot derive from the `A_ro` it was given, so **a read-only guest cannot read a
+read-write holder's slot.** The host holds `A_rw` and so derives both classes,
+which is what lets it answer either.
+
+**Accepted flaw, documented rather than fixed:** two read-only holders *can*
+read each other. Both derive from the same `A_ro`, and instance ids travel in
+the clear through the doorbell, so one read-only guest can compute another's
+slot key. Closing it would need a per-claimant secret the host alone shares with
+each guest, which a one-way token cannot carry. A room handed one read-only link
+is therefore a room whose guests can see each other's addresses, though not
+those of any read-write holder.
+
 Publishing (`sig.c:sig_post` → `sig_stage`): pack the local SDP → `candpack`,
 then build the slot value for this role and seal it. A client can only box once
 it has seen the host's slot, so the value is built **when it can be** rather

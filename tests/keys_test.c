@@ -80,6 +80,40 @@ static void slot_salt_checks(void)
 	assert(!strcmp(a, b));
 }
 
+/* A read-only holder cannot derive a read-write holder's slot key, which is
+ * what keeps the two classes from reading each other. */
+static void slot_key_checks(void)
+{
+	uint8_t rw[TOKEN_AUTH_LEN], ro[TOKEN_AUTH_LEN];
+	uint8_t k1[32], k2[32], k3[32];
+	uint8_t cid_a[8], cid_b[8];
+	int i;
+
+	for (i = 0; i < TOKEN_AUTH_LEN; i++)
+		rw[i] = (uint8_t)(i + 3);
+	keys_derive_ro_auth(ro, rw);
+	assert(memcmp(ro, rw, TOKEN_AUTH_LEN));
+	for (i = 0; i < 8; i++) {
+		cid_a[i] = (uint8_t)(0x10 + i);
+		cid_b[i] = (uint8_t)(0x20 + i);
+	}
+
+	keys_slot_key(k1, rw, cid_a, sizeof(cid_a));
+	keys_slot_key(k2, rw, cid_b, sizeof(cid_b));
+	assert(memcmp(k1, k2, sizeof(k1)));
+
+	/* The same claimant under the other class lands on a different key. */
+	keys_slot_key(k3, ro, cid_a, sizeof(cid_a));
+	assert(memcmp(k1, k3, sizeof(k1)));
+
+	keys_slot_key(k2, rw, cid_a, sizeof(cid_a));
+	assert(!memcmp(k1, k2, sizeof(k1)));
+	for (i = 0; i < 32; i++)
+		if (k1[i])
+			break;
+	assert(i < 32);
+}
+
 int main(void)
 {
 	struct session_keys k, again;
@@ -125,5 +159,6 @@ int main(void)
 		assert(k.mcast_port >= 32768 && k.mcast_port < 32768 + 16384);
 	}
 	slot_salt_checks();
+	slot_key_checks();
 	return 0;
 }

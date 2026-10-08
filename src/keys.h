@@ -54,6 +54,12 @@ int keys_derive(struct session_keys *keys, const uint8_t rdv[TOKEN_RDV_LEN]);
 
 void keys_slot_salt(char out[KEYS_SALT_LEN], const uint8_t rdv[TOKEN_RDV_LEN],
 		    char kind, const uint8_t *cid, size_t cid_len);
+
+/* The key a claimant's slot is sealed under, from the auth secret of that
+ * claimant's credential class: a read-only holder cannot derive a read-write
+ * holder's, since keys_derive_ro_auth is one-way (PROTOCOL.md section 4). */
+void keys_slot_key(uint8_t out[32], const uint8_t auth[TOKEN_AUTH_LEN],
+		   const uint8_t *cid, size_t cid_len);
 /*
  * The key one connection's probes are sealed under: the session key, which
  * says a token holder is speaking, and a random half from each end, which says
