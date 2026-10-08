@@ -121,6 +121,10 @@ struct sshd_opts {
  */
 void *sshd_hostkey_new(uint8_t fp[32]);
 void sshd_hostkey_free(void *hostkey);
+/* Keep a host key across processes, for a host that restarts under the same
+ * invitation; load fills fp as sshd_hostkey_new does. 0 or NULL on failure. */
+int sshd_hostkey_save(void *hostkey, const char *path);
+void *sshd_hostkey_load(const char *path, uint8_t fp[32]);
 
 /*
  * Serve exactly one SSH session on fd; blocks until the session ends.

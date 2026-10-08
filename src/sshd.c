@@ -35,12 +35,29 @@ static int ct_equal(const void *a, const void *b, size_t len)
 	return d == 0;
 }
 
-void *sshd_hostkey_new(uint8_t fp[32])
+static int hostkey_fp(ssh_key key, uint8_t fp[32])
 {
 	unsigned char *hash = NULL;
-	size_t hlen = 0;
-	ssh_key key = NULL;
 	ssh_key pub = NULL;
+	size_t hlen = 0;
+	int rc = -1;
+
+	if (ssh_pki_export_privkey_to_pubkey(key, &pub) != SSH_OK)
+		return -1;
+	if (ssh_get_publickey_hash(pub, SSH_PUBLICKEY_HASH_SHA256,
+				   &hash, &hlen) == 0 && hlen == 32) {
+		memcpy(fp, hash, 32);
+		rc = 0;
+	}
+	if (hash)
+		ssh_clean_pubkey_hash(&hash);
+	ssh_key_free(pub);
+	return rc;
+}
+
+void *sshd_hostkey_new(uint8_t fp[32])
+{
+	ssh_key key = NULL;
 
 	/* ssh_pki_generate() is deprecated on new libssh and the only option on
 	 * the older releases distributions still ship; the build probes for the
@@ -52,31 +69,38 @@ void *sshd_hostkey_new(uint8_t fp[32])
 	if (ssh_pki_generate(SSH_KEYTYPE_ED25519, 0, &key) != SSH_OK)
 		return NULL;
 #endif
-	if (ssh_pki_export_privkey_to_pubkey(key, &pub) != SSH_OK)
-		goto fail;
-	if (ssh_get_publickey_hash(pub, SSH_PUBLICKEY_HASH_SHA256,
-				   &hash, &hlen) != 0)
-		goto fail;
-	if (hlen != 32)
-		goto fail;
-	memcpy(fp, hash, 32);
-	ssh_clean_pubkey_hash(&hash);
-	ssh_key_free(pub);
-	return key;
-fail:
-	if (hash)
-		ssh_clean_pubkey_hash(&hash);
-	if (pub)
-		ssh_key_free(pub);
-	if (key)
+	if (hostkey_fp(key, fp)) {
 		ssh_key_free(key);
-	return NULL;
+		return NULL;
+	}
+	return key;
 }
 
 void sshd_hostkey_free(void *hostkey)
 {
 	if (hostkey)
 		ssh_key_free((ssh_key)hostkey);
+}
+
+int sshd_hostkey_save(void *hostkey, const char *path)
+{
+	if (ssh_pki_export_privkey_file((ssh_key)hostkey, NULL, NULL, NULL,
+					path) != SSH_OK)
+		return -1;
+	return 0;
+}
+
+void *sshd_hostkey_load(const char *path, uint8_t fp[32])
+{
+	ssh_key key = NULL;
+
+	if (ssh_pki_import_privkey_file(path, NULL, NULL, NULL, &key) != SSH_OK)
+		return NULL;
+	if (hostkey_fp(key, fp)) {
+		ssh_key_free(key);
+		return NULL;
+	}
+	return key;
 }
 
 /* A terminal type is a short name; accept only a safe charset so it can be
