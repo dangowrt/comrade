@@ -13,7 +13,7 @@
 #define RDV_HDR_LEN (1 + 1 + 4 + RDV_CID_LEN + RDV_CID_LEN + 4 + 2)
 #define RDV_MAX_MSG (RDV_HDR_LEN + RDV_MAX_PAYLOAD)
 #define RDV_ERR_VERSION (-2)
-#define RDV_HOST_MAX 8
+#define RDV_HOST_MAX 16
 
 enum rdv_kind {
 	RDV_HOSTINFO = 1,
@@ -58,7 +58,8 @@ enum rdv_cstate {
 	RDV_C_FREE = 0,
 	RDV_C_HARVESTED,
 	RDV_C_ANSWERED,
-	RDV_C_REFUSED
+	RDV_C_REFUSED,
+	RDV_C_GONE			/* served and gone; its sequence is kept */
 };
 
 struct rdv_claimant {
@@ -68,6 +69,10 @@ struct rdv_claimant {
 	uint8_t have_seq;
 	uint8_t pending;
 	uint8_t refusal;
+	uint8_t grade;			/* the credential class its slot opened under */
+	uint8_t knock;			/* rang again: its slot is worth a read */
+	uint8_t answer[RDV_MAX_PAYLOAD];
+	uint16_t answer_len;
 };
 
 struct rdv_host {
@@ -87,8 +92,13 @@ void rdv_host_set_gen(struct rdv_host *h, uint32_t gen);
 void rdv_host_entomb(struct rdv_host *h);
 void rdv_host_bell(struct rdv_host *h, const struct rdv_msg *m);
 int rdv_host_slot(struct rdv_host *h, const struct rdv_msg *m);
+struct rdv_claimant *rdv_host_find(struct rdv_host *h,
+				   const uint8_t cid[RDV_CID_LEN]);
 void rdv_host_answer(struct rdv_host *h, const uint8_t cid[RDV_CID_LEN],
 		     const uint8_t *payload, size_t len);
+void rdv_host_refuse(struct rdv_host *h, const uint8_t cid[RDV_CID_LEN],
+		     int reason);
+void rdv_host_forget(struct rdv_host *h, const uint8_t cid[RDV_CID_LEN]);
 int rdv_host_next(struct rdv_host *h, const uint8_t *info, size_t info_len,
 		  struct rdv_out *o);
 
@@ -104,6 +114,7 @@ struct rdv_client {
 	uint8_t host_cid[RDV_CID_LEN];
 	uint32_t host_gen;
 	uint32_t seq;
+	uint32_t offer_seq;
 	uint32_t answer_seq;
 	uint8_t state;
 	uint8_t have_host;
@@ -112,6 +123,8 @@ struct rdv_client {
 	uint8_t turn;			/* alternates bell and offer */
 	uint8_t refusal;
 	uint8_t host_gone;		/* the host said so, in its own slot */
+	uint8_t offer[RDV_MAX_PAYLOAD];
+	uint16_t offer_len;
 	uint8_t answer[RDV_MAX_PAYLOAD];
 	uint16_t answer_len;
 };

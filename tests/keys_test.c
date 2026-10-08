@@ -42,8 +42,8 @@ static int is_wg(uint32_t first_four_le)
 static void slot_salt_checks(void)
 {
 	char host[KEYS_SALT_LEN], bell[KEYS_SALT_LEN], a[KEYS_SALT_LEN];
+	char b[KEYS_SALT_LEN], a2[KEYS_SALT_LEN], an[KEYS_SALT_LEN];
 	uint8_t rdv[TOKEN_RDV_LEN], rdv2[TOKEN_RDV_LEN];
-	char b[KEYS_SALT_LEN], a2[KEYS_SALT_LEN];
 	uint8_t cid_a[8], cid_b[8];
 	int i;
 
@@ -61,6 +61,7 @@ static void slot_salt_checks(void)
 	keys_slot_salt(a, rdv, KEYS_SLOT_CLAIM, cid_a, sizeof(cid_a));
 	keys_slot_salt(b, rdv, KEYS_SLOT_CLAIM, cid_b, sizeof(cid_b));
 	keys_slot_salt(a2, rdv2, KEYS_SLOT_CLAIM, cid_a, sizeof(cid_a));
+	keys_slot_salt(an, rdv, KEYS_SLOT_ANSWER, cid_a, sizeof(cid_a));
 
 	/* Shape: kind letter, 16 hex digits, NUL, and nothing else. */
 	assert(strlen(host) == KEYS_SALT_LEN - 1);
@@ -74,6 +75,9 @@ static void slot_salt_checks(void)
 	assert(strcmp(host, bell) && strcmp(host, a) && strcmp(bell, a));
 	assert(strcmp(a, b));
 	assert(strcmp(a, a2));
+	/* A claimant's offer and the answer to it are two slots: one writer each. */
+	assert(an[0] == KEYS_SLOT_ANSWER && strcmp(a, an) &&
+	       strcmp(a + 1, an + 1));
 
 	/* Deterministic: the same inputs name the same slot every time. */
 	keys_slot_salt(b, rdv, KEYS_SLOT_CLAIM, cid_a, sizeof(cid_a));

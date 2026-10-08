@@ -47,10 +47,11 @@ int keys_derive(struct session_keys *keys, const uint8_t rdv[TOKEN_RDV_LEN]);
 /* A rendezvous slot's BEP 44 salt: a kind letter then eight derived bytes in
  * hex, so it stays NUL-free for the bep44 string API. `cid` names a claimant's
  * own slot and is NULL for the kinds there is one of. */
-#define KEYS_SLOT_HOST  'h'
-#define KEYS_SLOT_BELL  'd'
-#define KEYS_SLOT_CLAIM 'c'
-#define KEYS_SALT_LEN   18
+#define KEYS_SLOT_HOST   'h'
+#define KEYS_SLOT_BELL   'd'
+#define KEYS_SLOT_CLAIM  'c'
+#define KEYS_SLOT_ANSWER 'a'		/* the host's answer to that claimant */
+#define KEYS_SALT_LEN    18
 
 void keys_slot_salt(char out[KEYS_SALT_LEN], const uint8_t rdv[TOKEN_RDV_LEN],
 		    char kind, const uint8_t *cid, size_t cid_len);
