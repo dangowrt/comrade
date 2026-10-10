@@ -543,6 +543,37 @@ static void dist_calc(uint8_t dist[20], const uint8_t id[20],
 		dist[i] = id[i] ^ target[i];
 }
 
+/* One endpoint, however the structure was filled in: BSD keeps sin_len in the
+ * first byte, set by the kernel and by getaddrinfo but left zero in an address
+ * built here, so the same endpoint compares unequal byte-wise across the two. */
+static int addr_eq(const struct sockaddr *a, socklen_t alen,
+		   const struct sockaddr_storage *b, socklen_t blen)
+{
+	const struct sockaddr_in6 *a6, *b6;
+	const struct sockaddr_in *a4, *b4;
+
+	if (!a || !b || a->sa_family != b->ss_family)
+		return 0;
+	if (a->sa_family == AF_INET) {
+		if (alen < (socklen_t)sizeof(*a4) ||
+		    blen < (socklen_t)sizeof(*b4))
+			return 0;
+		a4 = (const struct sockaddr_in *)a;
+		b4 = (const struct sockaddr_in *)b;
+		return a4->sin_port == b4->sin_port &&
+		       !memcmp(&a4->sin_addr, &b4->sin_addr, 4);
+	}
+	if (a->sa_family != AF_INET6)
+		return 0;
+	if (alen < (socklen_t)sizeof(*a6) || blen < (socklen_t)sizeof(*b6))
+		return 0;
+	a6 = (const struct sockaddr_in6 *)a;
+	b6 = (const struct sockaddr_in6 *)b;
+	return a6->sin6_port == b6->sin6_port &&
+	       a6->sin6_scope_id == b6->sin6_scope_id &&
+	       !memcmp(&a6->sin6_addr, &b6->sin6_addr, 16);
+}
+
 static int node_insert(struct b44_op *op, const uint8_t *id,
 		       const struct sockaddr *sa, socklen_t salen, int pinned)
 {
@@ -564,8 +595,7 @@ static int node_insert(struct b44_op *op, const uint8_t *id,
 		memset(dist, 0xff, sizeof(dist));
 
 	for (i = 0; i < op->nnodes; i++) {
-		if (op->nodes[i].sslen == salen &&
-		    !memcmp(&op->nodes[i].ss, sa, salen))
+		if (addr_eq(sa, salen, &op->nodes[i].ss, op->nodes[i].sslen))
 			return 0;
 		if (id && !memcmp(op->nodes[i].id, id, 20))
 			return 0;
@@ -948,7 +978,7 @@ static void retain_add(struct bep44_engine *e, const uint8_t id[20],
 		return;
 	for (i = 0; i < B44_RETAINED_MAX; i++) {
 		r = &e->retained[i];
-		if (r->in_use && r->sslen == salen && !memcmp(&r->ss, sa, salen))
+		if (r->in_use && addr_eq(sa, salen, &r->ss, r->sslen))
 			return;
 	}
 	r = &e->retained[e->retain_next];
@@ -976,12 +1006,11 @@ static uint64_t *seed_bucket(struct bep44_engine *e, const struct sockaddr *sa,
 	int i;
 
 	for (i = 0; i < e->npinned; i++)
-		if (e->pinned[i].sslen == len &&
-		    !memcmp(&e->pinned[i].ss, sa, (size_t)len))
+		if (addr_eq(sa, len, &e->pinned[i].ss, e->pinned[i].sslen))
 			return &e->pinned[i].tat_ms;
 	for (i = 0; i < B44_RETAINED_MAX; i++)
-		if (e->retained[i].in_use && e->retained[i].sslen == len &&
-		    !memcmp(&e->retained[i].ss, sa, (size_t)len))
+		if (e->retained[i].in_use &&
+		    addr_eq(sa, len, &e->retained[i].ss, e->retained[i].sslen))
 			return &e->retained[i].tat_ms;
 	return NULL;
 }
@@ -1493,7 +1522,7 @@ static void pin_learn_id(struct bep44_engine *e, const struct sockaddr *from,
 	for (i = 0; i < e->npinned; i++) {
 		struct b44_seed *p = &e->pinned[i];
 
-		if (p->sslen != fromlen || memcmp(&p->ss, from, fromlen))
+		if (!addr_eq(from, fromlen, &p->ss, p->sslen))
 			continue;
 		p->last_ok_ms = now_ms();	/* it is still there */
 		if (!p->has_id) {
@@ -2537,8 +2566,7 @@ int bep44_input(struct bep44_engine *e, const uint8_t *buf, size_t len,
 			 * and poison the op node set (mailbox values stay
 			 * Ed25519-verified regardless). */
 			node = &op->nodes[op->reqs[i].node];
-			if (fromlen != node->sslen ||
-			    memcmp(from, &node->ss, (size_t)node->sslen))
+			if (!addr_eq(from, fromlen, &node->ss, node->sslen))
 				continue;
 			reply_handle(op, &op->reqs[i], buf, len, is_error,
 				     from, fromlen);
@@ -2647,8 +2675,7 @@ int bep44_seed_add(struct bep44_engine *e, const uint8_t id[20],
 		return -1;
 	for (i = 0; i < B44_SEEDS_MAX; i++) {
 		seed = &e->seeds[i];
-		if (seed->in_use && seed->sslen == salen &&
-		    !memcmp(&seed->ss, sa, salen))
+		if (seed->in_use && addr_eq(sa, salen, &seed->ss, seed->sslen))
 			return 0;
 	}
 	seed = &e->seeds[e->seed_next];
@@ -2675,7 +2702,7 @@ int bep44_pin_add(struct bep44_engine *e, const uint8_t id[20],
 		return -1;
 	for (i = 0; i < e->npinned; i++) {
 		p = &e->pinned[i];
-		if (p->sslen == salen && !memcmp(&p->ss, sa, salen))
+		if (addr_eq(sa, salen, &p->ss, p->sslen))
 			return 0;		/* already pinned */
 	}
 	if (e->npinned >= B44_PINNED_MAX) {
@@ -2724,7 +2751,7 @@ void bep44_pin_del(struct bep44_engine *e, const struct sockaddr *sa,
 	for (i = 0; i < e->npinned; i++) {
 		struct b44_seed *p = &e->pinned[i];
 
-		if (p->sslen != salen || memcmp(&p->ss, sa, salen))
+		if (!addr_eq(sa, salen, &p->ss, p->sslen))
 			continue;
 		memmove(&e->pinned[i], &e->pinned[i + 1],
 			(size_t)(e->npinned - i - 1) * sizeof(e->pinned[0]));

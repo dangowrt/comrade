@@ -601,6 +601,79 @@ static void a_store_held_back_everywhere_waits(void)
 	assert(op->nodes[0].state == B44_NODE_STORE_INFLIGHT);
 }
 
+/* An address the kernel filled in and one built here naming the same endpoint
+ * have to compare equal: on BSD the first carries sin_len and the second leaves
+ * it zero, which stopped a reply being matched to the request it answered. */
+static void an_address_compares_equal_whatever_filled_it_in(void)
+{
+	struct sockaddr_storage hs, ks;
+	struct sockaddr_in hand, k4;
+	socklen_t klen;
+	uint16_t port;
+	sock_t s;
+
+	s = socket(AF_INET, SOCK_DGRAM, 0);
+	assert(sock_valid(s));
+	addr4_make(&hand, INADDR_LOOPBACK, 0);
+	assert(!bind(s, (struct sockaddr *)&hand, sizeof(hand)));
+	memset(&ks, 0, sizeof(ks));
+	klen = (socklen_t)sizeof(ks);
+	assert(!getsockname(s, (struct sockaddr *)&ks, &klen));
+	memcpy(&k4, &ks, sizeof(k4));
+	port = ntohs(k4.sin_port);
+	assert(port);
+
+	addr4_make(&hand, INADDR_LOOPBACK, port);
+	memset(&hs, 0, sizeof(hs));
+	memcpy(&hs, &hand, sizeof(hand));
+	assert(addr_eq((struct sockaddr *)&hand, sizeof(hand), &ks, klen));
+	assert(addr_eq((struct sockaddr *)&ks, klen, &hs, sizeof(hand)));
+
+	addr4_make(&hand, INADDR_LOOPBACK, (uint16_t)(port ^ 1));
+	assert(!addr_eq((struct sockaddr *)&hand, sizeof(hand), &ks, klen));
+	addr4_make(&hand, 0x7f000002, port);
+	assert(!addr_eq((struct sockaddr *)&hand, sizeof(hand), &ks, klen));
+	sock_close(s);
+}
+
+/* BSD carries sin6_len in the same way; skipped where no v6 socket binds. */
+static void a_v6_address_compares_equal_whatever_filled_it_in(void)
+{
+	static const uint8_t lo6[16] = { 0, 0, 0, 0, 0, 0, 0, 0,
+					 0, 0, 0, 0, 0, 0, 0, 1 };
+	struct sockaddr_storage hs, ks;
+	struct sockaddr_in6 hand, k6;
+	socklen_t klen;
+	sock_t s;
+
+	s = socket(AF_INET6, SOCK_DGRAM, 0);
+	if (!sock_valid(s))
+		return;
+	memset(&hand, 0, sizeof(hand));
+	hand.sin6_family = AF_INET6;
+	memcpy(&hand.sin6_addr, lo6, sizeof(lo6));
+	if (bind(s, (struct sockaddr *)&hand, sizeof(hand))) {
+		sock_close(s);
+		return;
+	}
+	memset(&ks, 0, sizeof(ks));
+	klen = (socklen_t)sizeof(ks);
+	assert(!getsockname(s, (struct sockaddr *)&ks, &klen));
+	memcpy(&k6, &ks, sizeof(k6));
+	assert(k6.sin6_port);
+
+	hand.sin6_port = k6.sin6_port;
+	hand.sin6_scope_id = k6.sin6_scope_id;
+	memset(&hs, 0, sizeof(hs));
+	memcpy(&hs, &hand, sizeof(hand));
+	assert(addr_eq((struct sockaddr *)&hand, sizeof(hand), &ks, klen));
+	assert(addr_eq((struct sockaddr *)&ks, klen, &hs, sizeof(hand)));
+
+	hand.sin6_port = (uint16_t)(k6.sin6_port ^ htons(1));
+	assert(!addr_eq((struct sockaddr *)&hand, sizeof(hand), &ks, klen));
+	sock_close(s);
+}
+
 int main(void)
 {
 	void (*tests[])(void) = {
@@ -613,6 +686,8 @@ int main(void)
 		peers_behind_one_address_are_not_banned_for_normal_use,
 		a_store_held_back_everywhere_waits,
 		a_reply_is_recorded_against_its_own_node,
+		an_address_compares_equal_whatever_filled_it_in,
+		a_v6_address_compares_equal_whatever_filled_it_in,
 	};
 	size_t i;
 
