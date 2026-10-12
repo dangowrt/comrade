@@ -4401,6 +4401,21 @@ static void punch_scan(struct sess *s, struct worker *ws, int *dash_seq)
 	}
 }
 
+static void punch_release(struct sess *s, int i)
+{
+	struct conn *c = s->punching[i];
+
+	if (!c)
+		return;
+	if (c->punch_resume)
+		__atomic_sub_fetch(&c->punch_resume->resume_pending, 1,
+				   __ATOMIC_RELAXED);
+	else if (s->admitted_n > 0)
+		s->admitted_n--;
+	s->punching[i] = NULL;
+	conn_free(c);
+}
+
 /* Free the longest-running punch for a claimant, to admit a fresher one at the
  * parallel cap: the oldest is on the oldest offer generation, so it is the one
  * a returning client is least likely to still be answering. */
@@ -4421,14 +4436,23 @@ static void punch_reap_oldest(struct sess *s, const char *ufrag)
 	}
 	if (victim < 0)
 		return;
-	c = s->punching[victim];
-	if (c->punch_resume)
-		__atomic_sub_fetch(&c->punch_resume->resume_pending, 1,
-				   __ATOMIC_RELAXED);
-	else if (s->admitted_n > 0)
-		s->admitted_n--;
-	s->punching[victim] = NULL;
-	conn_free(c);
+	punch_release(s, victim);
+}
+
+/* A claimant offering a new password has stopped answering the old one, so a
+ * punch still running on it can only fail. */
+static void punch_reap_stale(struct sess *s, const char *ufrag, const char *pwd)
+{
+	struct conn *c;
+	int i;
+
+	for (i = 0; i < HOST_MAX_WORKERS; i++) {
+		c = s->punching[i];
+		if (!c || strcmp(c->punch_ufrag, ufrag))
+			continue;
+		if (strcmp(c->pr.ice.remote_pwd, pwd))
+			punch_release(s, i);
+	}
 }
 
 /*
@@ -4560,6 +4584,8 @@ static int host_offer_take(struct sess *s, struct worker *ws,
 	}
 	if (!listen)
 		return 0;
+	if (again)
+		punch_reap_stale(s, cu, cp);
 	for (i = 0; i < HOST_MAX_WORKERS; i++) {
 		if (ws[i].used)
 			inflight++;
