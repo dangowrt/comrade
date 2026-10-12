@@ -4693,6 +4693,11 @@ static int host_turnstile(struct sess *s)
 				listen = NULL;
 				s->offer_conn = NULL;
 			}
+			/* Gathered on the network that has gone, so none of
+			 * them can complete; the workers behind them stay. */
+			for (i = 0; i < HOST_MAX_WORKERS; i++)
+				punch_release(s, i);
+
 			if (cfg->test_roam_hard)
 				for (i = 0; i < HOST_MAX_WORKERS; i++)
 					if (ws[i].used)
