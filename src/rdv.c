@@ -160,21 +160,42 @@ static struct rdv_claimant *host_admit(struct rdv_host *h,
 	return c;
 }
 
-void rdv_host_bell(struct rdv_host *h, const struct rdv_msg *m)
+/* Whose answer stands in the cell, if anyone's but this one's. */
+static int answer_stands(const struct rdv_host *h, int skip)
 {
-	struct rdv_claimant *c;
+	int i;
 
-	if (m->kind != RDV_BELL)
-		return;
-	if (!memcmp(m->from, rdv_zero, RDV_CID_LEN))
-		return;
-	if (!rdv_addressed_to(m->to, h->cid))
-		return;
-	c = rdv_host_find(h, m->from);
+	for (i = 0; i < RDV_HOST_MAX; i++)
+		if (i != skip && h->c[i].holds)
+			return 1;
+	return 0;
+}
+
+int rdv_host_cell_held(const struct rdv_host *h)
+{
+	return answer_stands(h, -1);
+}
+
+int rdv_host_busy(const struct rdv_host *h)
+{
+	int i;
+
+	for (i = 0; i < RDV_HOST_MAX; i++)
+		if (h->c[i].state == RDV_C_HARVESTED || h->c[i].pending ||
+		    h->c[i].holds)
+			return 1;
+	return 0;
+}
+
+void rdv_host_release(struct rdv_host *h, const uint8_t cid[RDV_CID_LEN])
+{
+	struct rdv_claimant *c = rdv_host_find(h, cid);
+
 	if (c)
-		c->knock = 1;
-	else
-		host_admit(h, m->from);
+		c->holds = 0;
+	if (c && c->pending)
+		return;
+	h->info_pending = 1;
 }
 
 int rdv_host_slot(struct rdv_host *h, const struct rdv_msg *m)
@@ -182,6 +203,8 @@ int rdv_host_slot(struct rdv_host *h, const struct rdv_msg *m)
 	struct rdv_claimant *c;
 
 	if (m->kind != RDV_OFFER)
+		return 0;
+	if (!memcmp(m->from, rdv_zero, RDV_CID_LEN))
 		return 0;
 	if (!rdv_addressed_to(m->to, h->cid))
 		return 0;
@@ -193,6 +216,8 @@ int rdv_host_slot(struct rdv_host *h, const struct rdv_msg *m)
 		return 0;
 	c->last_seq = m->seq;
 	c->have_seq = 1;
+	/* Its ask is in the cell, so whatever was answered there is gone. */
+	c->holds = 0;
 	if (c->state == RDV_C_ANSWERED) {
 		/* It asks again, so the answer it holds is of no use to it. */
 		c->state = RDV_C_HARVESTED;
@@ -229,6 +254,18 @@ void rdv_host_answer(struct rdv_host *h, const uint8_t cid[RDV_CID_LEN],
 	c->answer_len = (uint16_t)len;
 }
 
+/* Given back: an emission the caller could not send leaves the cell carrying
+ * nothing of ours, whatever it was told at the time. */
+void rdv_host_unsent(struct rdv_host *h, const uint8_t cid[RDV_CID_LEN])
+{
+	struct rdv_claimant *c = rdv_host_find(h, cid);
+
+	if (!c || c->state == RDV_C_GONE)
+		return;
+	c->pending = 1;
+	c->holds = 0;
+}
+
 void rdv_host_refuse(struct rdv_host *h, const uint8_t cid[RDV_CID_LEN],
 		     int reason)
 {
@@ -251,10 +288,21 @@ void rdv_host_keep(struct rdv_host *h, const uint8_t cid[RDV_CID_LEN])
 
 	if (!c || c->state == RDV_C_GONE)
 		return;
+	/* Nothing was ever answered to it, so there is no answer to state
+	 * again, and an empty one reads as malformed at the other end. */
+	if (c->state != RDV_C_REFUSED && !c->answer_len)
+		return;
 	if (c->state != RDV_C_ANSWERED)
 		h->answered++;
 	c->state = RDV_C_ANSWERED;
-	c->pending = 0;
+	/* Reading its ask again means the cell has lost the answer to it, since
+	 * one standing there would have been read instead. The same answer
+	 * stands, so it is stated again, against the ask in hand now. An
+	 * answer already owed stays owed: keeping cancels nothing. */
+	if (!c->pending)
+		c->pending = !c->holds;
+	if (c->pending)
+		c->answer_re = c->last_seq;
 }
 
 void rdv_host_forget(struct rdv_host *h, const uint8_t cid[RDV_CID_LEN])
@@ -267,16 +315,14 @@ void rdv_host_forget(struct rdv_host *h, const uint8_t cid[RDV_CID_LEN])
 		h->answered--;
 	c->state = RDV_C_GONE;
 	c->pending = 0;
-	c->knock = 0;
+	c->holds = 0;
 	c->answer_len = 0;
+	h->info_pending = 1;
 }
 
-static void out_slot(struct rdv_out *o, char kind, const uint8_t *cid)
+static void out_slot(struct rdv_out *o, int seal)
 {
-	o->salt_kind = kind;
-	o->have_salt_cid = cid ? 1 : 0;
-	if (cid)
-		memcpy(o->salt_cid, cid, RDV_CID_LEN);
+	o->seal = (uint8_t)seal;
 }
 
 int rdv_host_next(struct rdv_host *h, const uint8_t *info, size_t info_len,
@@ -287,7 +333,7 @@ int rdv_host_next(struct rdv_host *h, const uint8_t *info, size_t info_len,
 
 	memset(o, 0, sizeof(*o));
 	memset(&m, 0, sizeof(m));
-	if (h->info_pending) {
+	if (h->info_pending && (h->gone || !rdv_host_cell_held(h))) {
 		if (info_len > RDV_MAX_PAYLOAD)
 			return 0;
 		m.kind = h->gone ? RDV_TOMB : RDV_HOSTINFO;
@@ -302,12 +348,12 @@ int rdv_host_next(struct rdv_host *h, const uint8_t *info, size_t info_len,
 		if (n < 0)
 			return 0;
 		o->len = (size_t)n;
-		out_slot(o, 'h', NULL);
+		out_slot(o, RDV_SEAL_INFO);
 		h->info_pending = 0;
 		return 1;
 	}
 	for (i = 0; i < RDV_HOST_MAX; i++) {
-		if (!h->c[i].pending)
+		if (!h->c[i].pending || answer_stands(h, i))
 			continue;
 		m.kind = h->c[i].state == RDV_C_REFUSED ? RDV_REFUSE :
 							  RDV_ANSWER;
@@ -327,8 +373,9 @@ int rdv_host_next(struct rdv_host *h, const uint8_t *info, size_t info_len,
 		if (n < 0)
 			return 0;
 		o->len = (size_t)n;
-		out_slot(o, 'a', h->c[i].cid);
+		out_slot(o, RDV_SEAL_CLASS);
 		h->c[i].pending = 0;
+		h->c[i].holds = 1;
 		return 1;
 	}
 	return 0;
@@ -370,12 +417,13 @@ static int client_copy_acts(struct rdv_client *c, const struct rdv_msg *m,
 int rdv_client_host_slot(struct rdv_client *c, const struct rdv_msg *m,
 			 int64_t seq)
 {
-	int moved;
+	int moved, fresh;
 
 	if (m->kind != RDV_TOMB && m->kind != RDV_HOSTINFO)
 		return 0;
 	if (!memcmp(m->from, rdv_zero, RDV_CID_LEN))
 		return 0;
+	fresh = seq < 0 || seq > c->h_seq;
 	if (!client_copy_acts(c, m, seq))
 		return -1;
 	if (m->kind == RDV_TOMB) {
@@ -385,6 +433,11 @@ int rdv_client_host_slot(struct rdv_client *c, const struct rdv_msg *m,
 		return 0;
 	}
 	c->host_gone = 0;
+	/* A statement written since we last looked, while we are still
+	 * unanswered: the offer we left in the cell is gone, so asking again
+	 * is a new question and not a replay of one already read. */
+	if (fresh && c->state == RDV_CL_OFFERED)
+		c->reask = 1;
 	moved = !c->have_host || memcmp(c->host_cid, m->from, RDV_CID_LEN) ||
 		m->gen != c->host_gen;
 	if (!moved)
@@ -419,9 +472,14 @@ int rdv_client_own_slot(struct rdv_client *c, const struct rdv_msg *m)
 		return 0;
 	if (c->have_host && memcmp(m->from, c->host_cid, RDV_CID_LEN))
 		return 0;
-	/* Only an answer to the offer standing now: a replica still serving the
-	 * answer to an earlier one would otherwise prime a dead punch. */
-	if (!c->offer_seq || m->re != c->offer_seq)
+	/* The offer standing now, or the one it just superseded: a host that
+	 * read the earlier ask answers it, and refusing that answer leaves
+	 * both ends asking and answering past each other. Anything older is a
+	 * replica serving a dead punch. */
+	if (!c->offer_seq)
+		return 0;
+	if (m->re != c->offer_seq &&
+	    !(c->prev_offer_seq && m->re == c->prev_offer_seq))
 		return 0;
 	if (c->have_answer_seq && m->seq <= c->answer_seq)
 		return 0;
@@ -447,17 +505,20 @@ void rdv_client_set_live(struct rdv_client *c, int live)
 		c->state = RDV_CL_ANNOUNCING;
 }
 
-/* An unchanged offer keeps its sequence: the host answers a sequence once, and
- * a repeat is a refresh of what is stored, not a claimant asking again. */
+/* An unchanged offer keeps its sequence while it still stands, since the host
+ * answers a sequence once; one the cell has lost is asked afresh instead, or
+ * the host would read a replay and never answer it. */
 static uint32_t offer_seq(struct rdv_client *c, const uint8_t *offer,
 			  size_t offer_len)
 {
-	if (c->offer_seq && c->offer_len == offer_len &&
+	if (!c->reask && c->offer_seq && c->offer_len == offer_len &&
 	    (!offer_len || !memcmp(c->offer, offer, offer_len)))
 		return c->offer_seq;
+	c->reask = 0;
 	if (offer && offer_len)
 		memcpy(c->offer, offer, offer_len);
 	c->offer_len = (uint16_t)offer_len;
+	c->prev_offer_seq = c->offer_seq;
 	c->offer_seq = ++c->seq;
 	return c->offer_seq;
 }
@@ -474,25 +535,10 @@ int rdv_client_next(struct rdv_client *c, const uint8_t *offer,
 		return 0;
 	if (c->state == RDV_CL_ANSWERED)
 		return 0;
-	/*
-	 * The doorbell is last-writer-wins, so a bell rung once can be
-	 * overwritten before the host ever reads it. Keep ringing until
-	 * answered, alternating with the offer so one write goes out a round.
-	 */
-	c->turn = c->turn ? 0 : 1;
-	if (!c->have_host || c->turn) {
-		m.kind = RDV_BELL;
-		memcpy(m.from, c->cid, RDV_CID_LEN);
-		if (c->have_host)
-			memcpy(m.to, c->host_cid, RDV_CID_LEN);
-		m.seq = ++c->seq;
-		n = rdv_encode(&m, o->msg, sizeof(o->msg));
-		if (n < 0)
-			return 0;
-		o->len = (size_t)n;
-		out_slot(o, 'd', NULL);
-		return 1;
-	}
+	/* Replacing the host's own statement with an offer is the announcement:
+	 * there is nothing to ring before the host has been read. */
+	if (!c->have_host)
+		return 0;
 	if (offer_len > RDV_MAX_PAYLOAD)
 		return 0;
 	m.kind = RDV_OFFER;
@@ -508,7 +554,7 @@ int rdv_client_next(struct rdv_client *c, const uint8_t *offer,
 	if (n < 0)
 		return 0;
 	o->len = (size_t)n;
-	out_slot(o, 'c', c->cid);
+	out_slot(o, RDV_SEAL_CLASS);
 	c->state = RDV_CL_OFFERED;
 	return 1;
 }

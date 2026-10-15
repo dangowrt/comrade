@@ -37,51 +37,32 @@ static int is_wg(uint32_t first_four_le)
 	return first_four_le >= 1 && first_four_le <= 4;
 }
 
-/* Every slot salt is NUL-free and distinct: a host slot, a doorbell and one
- * slot per claimant, none of them colliding across invitations. */
+/* One token names one cell: the salt is NUL-free, takes neither a kind nor an
+ * instance, and differs between invitations. */
 static void slot_salt_checks(void)
 {
-	char host[KEYS_SALT_LEN], bell[KEYS_SALT_LEN], a[KEYS_SALT_LEN];
-	char b[KEYS_SALT_LEN], a2[KEYS_SALT_LEN], an[KEYS_SALT_LEN];
+	char one[KEYS_SALT_LEN], again[KEYS_SALT_LEN], other[KEYS_SALT_LEN];
 	uint8_t rdv[TOKEN_RDV_LEN], rdv2[TOKEN_RDV_LEN];
-	uint8_t cid_a[8], cid_b[8];
 	int i;
 
 	for (i = 0; i < TOKEN_RDV_LEN; i++) {
 		rdv[i] = (uint8_t)(i + 1);
 		rdv2[i] = (uint8_t)(i + 2);
 	}
-	for (i = 0; i < 8; i++) {
-		cid_a[i] = (uint8_t)(0x10 + i);
-		cid_b[i] = (uint8_t)(0x20 + i);
-	}
 
-	keys_slot_salt(host, rdv, KEYS_SLOT_HOST, NULL, 0);
-	keys_slot_salt(bell, rdv, KEYS_SLOT_BELL, NULL, 0);
-	keys_slot_salt(a, rdv, KEYS_SLOT_CLAIM, cid_a, sizeof(cid_a));
-	keys_slot_salt(b, rdv, KEYS_SLOT_CLAIM, cid_b, sizeof(cid_b));
-	keys_slot_salt(a2, rdv2, KEYS_SLOT_CLAIM, cid_a, sizeof(cid_a));
-	keys_slot_salt(an, rdv, KEYS_SLOT_ANSWER, cid_a, sizeof(cid_a));
+	keys_slot_salt(one, rdv);
+	keys_slot_salt(again, rdv);
+	keys_slot_salt(other, rdv2);
 
-	/* Shape: kind letter, 16 hex digits, NUL, and nothing else. */
-	assert(strlen(host) == KEYS_SALT_LEN - 1);
-	assert(host[0] == KEYS_SLOT_HOST && bell[0] == KEYS_SLOT_BELL);
-	assert(a[0] == KEYS_SLOT_CLAIM && b[0] == KEYS_SLOT_CLAIM);
+	/* Shape: a letter, 16 hex digits, NUL, and nothing else. */
+	assert(strlen(one) == KEYS_SALT_LEN - 1);
+	assert(one[0] == 'r');
 	for (i = 1; i < KEYS_SALT_LEN - 1; i++)
-		assert(strchr("0123456789abcdef", host[i]) != NULL);
+		assert(strchr("0123456789abcdef", one[i]) != NULL);
 
-	/* Kinds differ, claimants differ, and one claimant's slot differs
-	 * between two invitations, so no slot is shared by accident. */
-	assert(strcmp(host, bell) && strcmp(host, a) && strcmp(bell, a));
-	assert(strcmp(a, b));
-	assert(strcmp(a, a2));
-	/* A claimant's offer and the answer to it are two slots: one writer each. */
-	assert(an[0] == KEYS_SLOT_ANSWER && strcmp(a, an) &&
-	       strcmp(a + 1, an + 1));
-
-	/* Deterministic: the same inputs name the same slot every time. */
-	keys_slot_salt(b, rdv, KEYS_SLOT_CLAIM, cid_a, sizeof(cid_a));
-	assert(!strcmp(a, b));
+	/* Deterministic, and one invitation's cell is not another's. */
+	assert(!strcmp(one, again));
+	assert(strcmp(one, other));
 }
 
 /* A read-only holder cannot derive a read-write holder's slot key, which is
@@ -90,27 +71,21 @@ static void slot_key_checks(void)
 {
 	uint8_t rw[TOKEN_AUTH_LEN], ro[TOKEN_AUTH_LEN];
 	uint8_t k1[32], k2[32], k3[32];
-	uint8_t cid_a[8], cid_b[8];
 	int i;
 
 	for (i = 0; i < TOKEN_AUTH_LEN; i++)
 		rw[i] = (uint8_t)(i + 3);
 	keys_derive_ro_auth(ro, rw);
 	assert(memcmp(ro, rw, TOKEN_AUTH_LEN));
-	for (i = 0; i < 8; i++) {
-		cid_a[i] = (uint8_t)(0x10 + i);
-		cid_b[i] = (uint8_t)(0x20 + i);
-	}
 
-	keys_slot_key(k1, rw, cid_a, sizeof(cid_a));
-	keys_slot_key(k2, rw, cid_b, sizeof(cid_b));
-	assert(memcmp(k1, k2, sizeof(k1)));
-
-	/* The same claimant under the other class lands on a different key. */
-	keys_slot_key(k3, ro, cid_a, sizeof(cid_a));
+	/* The two classes land on different keys, which is what keeps a
+	 * read-only holder out of a read-write holder's statements. */
+	keys_slot_key(k1, rw);
+	keys_slot_key(k3, ro);
 	assert(memcmp(k1, k3, sizeof(k1)));
 
-	keys_slot_key(k2, rw, cid_a, sizeof(cid_a));
+	/* No instance id enters it, so one class has one key, deterministically. */
+	keys_slot_key(k2, rw);
 	assert(!memcmp(k1, k2, sizeof(k1)));
 	for (i = 0; i < 32; i++)
 		if (k1[i])

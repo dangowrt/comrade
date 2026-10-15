@@ -142,16 +142,17 @@ as much as what an outsider can do:
   slot -- which names the addresses the joiner can be reached at -- is
   sealed under a key derived from its own class of credential, which a
   read-only link cannot derive the read-write one from. Two guests holding
-  the same read-only link can read each other's slots, which is a known
+  the same read-only link can read each other's statements, which is a known
   limit of a one-way token and is documented as such in PROTOCOL.md.
 - **A holder cannot reach another's session.** Once two ends are talking
   they agree a key of their own inside the SSH session and everything on
   the direct link is keyed to that pair, so the invitation buys the right
   to start a session and nothing over one already running.
-- **A holder can still delay.** The doorbell and the host's own slot are
-  writable by everyone holding the invitation, so a holder can overwrite
-  them and cost the others a retry. It needs a valid invitation, it delays
-  rather than discloses, and nobody's slot is ever taken from under them.
+- **A holder can still delay.** The rendezvous cell is writable by everyone
+  holding the invitation, so a holder can overwrite it and cost the others a
+  retry. It needs a valid invitation, it delays rather than discloses, and
+  every statement says who made it and what it answers, so an overwritten
+  one is re-made rather than lost.
 
 > Treat the session token like a credential: anyone who has it can use it
 > to attempt to join the session.
@@ -194,8 +195,8 @@ remaining work is primarily hardening, additional packaging, and a
 handful of protocol and platform improvements.
 
 - **Connection establishment** across every covered path: rendezvous
-  through BEP 44 slots with one writer each (the host's, a shared doorbell,
-  and one per joiner), with a one-time host-side DHT convergence captured
+  through one BEP 44 cell written in turns by the host and each joiner,
+  with a one-time host-side DHT convergence captured
   in the token so a client joins in about two seconds; ICE hole punching;
   and a direct UDP transport (lanlink) that carries same-segment link-local
   peers, including under the multi-user

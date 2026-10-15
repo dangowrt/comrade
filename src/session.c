@@ -2270,14 +2270,15 @@ static void host_lan_recv(void *arg, const struct sockaddr *src, socklen_t srcle
 		probe_adopt(s, data, len, &mapped);
 }
 
-static void conn_amend_remote(struct conn *c, struct sess *s)
+/* `sdp` is named rather than read off the session, which holds one peer
+ * description for every claimant a host serves. */
+static void conn_amend_remote(struct conn *c, struct sess *s, const char *sdp)
 {
 	char filtered[NAT_SDP_MAX];
 
-	if (!c)
+	if (!c || !sdp || !sdp[0])
 		return;
-	sdp_filter_peer(s->peer_sdp, s->cfg->family, filtered,
-			sizeof(filtered));
+	sdp_filter_peer(sdp, s->cfg->family, filtered, sizeof(filtered));
 	peering_ice_amend(&c->pr, filtered);
 }
 
@@ -2336,7 +2337,7 @@ static void on_peer_offer(void *arg, const uint8_t *cid, const uint8_t *data,
 	/* Later arrivals are fresh candidates (multicast trickles one source at
 	 * a time); feed them into the already-primed agent. */
 	if (s->remote_set)
-		conn_amend_remote(c, s);
+		conn_amend_remote(c, s, incoming);
 }
 
 /*
@@ -2423,6 +2424,21 @@ static int nat_setup(struct conn *c)
 	return 0;
 }
 
+/* libjuice refuses a restart on a live agent, so a peer answering under
+ * credentials we are not paired with needs a fresh one. Our own credentials
+ * are kept: only the remote half of the pairing moves. */
+static int conn_take_peer_restart(struct sess *s, struct conn *c, uint64_t now)
+{
+	if (!s->peer_restart)
+		return 0;
+	s->peer_restart = 0;
+	conn_park_ice(c, now);
+	if (nat_setup(c))
+		return -1;
+	s->remote_set = 0;
+
+	return 0;
+}
 
 static void pump_once(struct sess *s, int timeout_cap_ms)
 {
@@ -2932,15 +2948,8 @@ static void resume_tick(struct conn *c)
 		}
 		return;
 	default:
-		/* Our own credentials are kept: conn_fresh_pwd() is not called,
-		 * so only the remote half of the pairing moves. */
-		if (s->peer_restart) {
-			s->peer_restart = 0;
-			conn_park_ice(c, now);
-			if (nat_setup(c))
-				return;
-			s->remote_set = 0;
-		}
+		if (conn_take_peer_restart(s, c, now))
+			return;
 		if (s->have_peer_sdp && !s->remote_set) {
 			char filtered[NAT_SDP_MAX];
 			char ufrag[40];
@@ -3501,6 +3510,16 @@ static int client_regather(struct sess *s)
 	return nat_setup(&s->c) ? -1 : 0;
 }
 
+/* Rotating the pool server needs a fresh agent, since the server is chosen at
+ * creation, but not a fresh identity: an answer in flight was written to the
+ * credentials this keeps. */
+static int client_regather_same(struct sess *s)
+{
+	conn_ice_stop(&s->c);
+	peering_desc_clear(&s->net.desc);
+	return nat_setup(&s->c) ? -1 : 0;
+}
+
 /*
  * The current agent's STUN attempt has run its course with no reflexive v4
  * while one is called for (a private/CGNAT v4 and no public one on the
@@ -3931,6 +3950,7 @@ struct worker {
 	pthread_mutex_t done_lock;
 	int done;
 	int used;
+	int released;
 };
 
 static void worker_set_done(struct worker *w)
@@ -4015,6 +4035,7 @@ static int worker_spawn(struct worker *ws, struct conn *c)
 			if (pthread_mutex_init(&ws[i].done_lock, NULL))
 				return -1;
 			ws[i].done = 0;
+			ws[i].released = 0;
 			ws[i].used = 1;
 			/* The DHT host's clock starts here, where a client is
 			 * actually being served. Anything else armed at the
@@ -4119,12 +4140,12 @@ static struct conn *punch_by_ufrag(struct sess *s, const char *ufrag)
 }
 
 static void punch_amend_repost(struct sess *s, const char *ufrag,
-			       const char *pwd)
+			       const char *pwd, const char *sdp)
 {
 	struct conn *pc = punch_by_ufrag(s, ufrag);
 
 	if (pc && !strcmp(pc->pr.ice.remote_pwd, pwd))
-		conn_amend_remote(pc, s);
+		conn_amend_remote(pc, s, sdp);
 }
 
 /* Is a punch for this exact claim (ufrag and password) already in flight? A
@@ -4412,6 +4433,10 @@ static void punch_release(struct sess *s, int i)
 				   __ATOMIC_RELAXED);
 	else if (s->admitted_n > 0)
 		s->admitted_n--;
+	/* Its punch has ended, so the cell is the host's again and the next
+	 * claimant can take its turn (PROTOCOL.md 4). */
+	if (cid_set(c->claim_cid))
+		rdv_host_release(&s->rh, c->claim_cid);
 	s->punching[i] = NULL;
 	conn_free(c);
 }
@@ -4564,9 +4589,13 @@ static int host_offer_take(struct sess *s, struct worker *ws,
 	       claim_served_made(&s->served, cu, cp);
 	dbg_logf("host: offer %.8s pwd %.6s: worker=%d again=%d admitted=%d "
 		 "lanq=%d made=%d", cu, cp, w ? 1 : 0, again, adm, lanq, made);
-	punch_amend_repost(s, cu, cp);
-	if (lan_ufrag_claimed(s, cu) || made || lanq || punch_dup(s, cu, cp) ||
-	    (w && !conn_is_lost(w) && conn_is_proven(w))) {
+	punch_amend_repost(s, cu, cp, sdp);
+	/* A worker whose credentials this ask names is already punching for
+	 * it, so what it is owed is that punch's answer again: a fresh agent
+	 * would restart the claimant's ICE under new credentials and leave
+	 * both ends chasing each other instead of finishing. */
+	if (lan_ufrag_claimed(s, cu) || lanq || punch_dup(s, cu, cp) ||
+	    (w && !conn_is_lost(w) && (conn_is_proven(w) || made))) {
 		dbg_logf("host: offer %.8s already in hand -- the answer stands",
 			 cu);
 		rdv_host_keep(&s->rh, cid);
@@ -4804,6 +4833,14 @@ static int host_turnstile(struct sess *s)
 			if (!ws[i].used)
 				continue;
 			active = 1;
+			/* A pong is the first word that can only come from a
+			 * claimant which read its answer, so this is the
+			 * earliest the cell may be taken back (PROTOCOL.md 4). */
+			if (!ws[i].released && conn_is_proven(ws[i].c) &&
+			    cid_set(ws[i].c->claim_cid)) {
+				ws[i].released = 1;
+				rdv_host_release(&s->rh, ws[i].c->claim_cid);
+			}
 			/* Relay the pair actually carrying this worker now, so the
 			 * dashboard tracks ICE re-nomination instead of freezing the
 			 * address captured at connect. status.peer is the in-use
@@ -5276,14 +5313,20 @@ int session_run(const struct session_cfg *cfg)
 			st = client_regather(&s) ? ST_FAIL : ST_GATHER;
 		}
 		/*
-		 * No peer has answered yet and the pool server this attempt drew
-		 * produced no public v4: re-claim through the next one. Once an
-		 * answer is in play the ICE retry path below owns rotation.
+		 * The pool server this attempt drew produced no public v4: ask
+		 * the next one. Nothing has answered that we have read, but the
+		 * host answers in milliseconds and the cell takes seconds to
+		 * carry it, so an answer to the identity we hold may be on its
+		 * way: the rotation keeps it.
 		 */
 		if ((st == ST_GATHER || st == ST_SIGNAL) && stun_stall(&s)) {
+			dbg_logf("stun: no public v4 through pool server %d -- "
+				 "asking the next (%d of %d)",
+				 s.net.ice_attempt % s.stun_count,
+				 s.net.rotations + 1, PEERING_ROTATE_MAX);
 			__atomic_add_fetch(&s.net.ice_attempt, 1, __ATOMIC_RELAXED);
 			s.net.rotations++;
-			st = client_regather(&s) ? ST_FAIL : ST_GATHER;
+			st = client_regather_same(&s) ? ST_FAIL : ST_GATHER;
 		}
 		pool_pump(&s);
 		if (now_ms() >= s.c.next_status_ms) {
@@ -5364,6 +5407,10 @@ int session_run(const struct session_cfg *cfg)
 				st = ST_WAIT_ICE;
 				break;
 			}
+			if (conn_take_peer_restart(&s, &s.c, now_ms())) {
+				st = ST_FAIL;
+				break;
+			}
 			if (s.have_peer_sdp && !s.remote_set) {
 				char ufrag[40];
 
@@ -5412,6 +5459,16 @@ int session_run(const struct session_cfg *cfg)
 			break;
 		case ST_WAIT_ICE:
 			peering_paths(&s.c.pr, now_ms());
+			/* The wait is where a peer that has restarted finds us,
+			 * and the pairing it names is ST_SIGNAL's to make. */
+			if (s.peer_restart) {
+				if (conn_take_peer_restart(&s, &s.c, now_ms())) {
+					st = ST_FAIL;
+					break;
+				}
+				st = ST_SIGNAL;
+				break;
+			}
 			hcid = sig_peer_cid(s.pm.sig);
 			if (!cfg->is_host &&
 			    (peering_ice_moved(&s.c.pr, sig_peer_gen(s.pm.sig)) ||

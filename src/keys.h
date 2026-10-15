@@ -44,23 +44,22 @@ struct session_keys {
 
 int keys_derive(struct session_keys *keys, const uint8_t rdv[TOKEN_RDV_LEN]);
 
-/* A rendezvous slot's BEP 44 salt: a kind letter then eight derived bytes in
- * hex, so it stays NUL-free for the bep44 string API. `cid` names a claimant's
- * own slot and is NULL for the kinds there is one of. */
-#define KEYS_SLOT_HOST   'h'
-#define KEYS_SLOT_BELL   'd'
-#define KEYS_SLOT_CLAIM  'c'
-#define KEYS_SLOT_ANSWER 'a'		/* the host's answer to that claimant */
+/* The rendezvous cell's BEP 44 salt: a letter then eight derived bytes in hex,
+ * so it stays NUL-free for the bep44 string API. One token, one salt, one
+ * target, so the node a token names is honestly among that target's k-closest. */
 #define KEYS_SALT_LEN    18
 
-void keys_slot_salt(char out[KEYS_SALT_LEN], const uint8_t rdv[TOKEN_RDV_LEN],
-		    char kind, const uint8_t *cid, size_t cid_len);
+void keys_slot_salt(char out[KEYS_SALT_LEN], const uint8_t rdv[TOKEN_RDV_LEN]);
 
-/* The key a claimant's slot is sealed under, from the auth secret of that
- * claimant's credential class: a read-only holder cannot derive a read-write
- * holder's, since keys_derive_ro_auth is one-way (PROTOCOL.md section 4). */
-void keys_slot_key(uint8_t out[32], const uint8_t auth[TOKEN_AUTH_LEN],
-		   const uint8_t *cid, size_t cid_len);
+/* The host's own statements in the cell are sealed under the session key, which
+ * every token holder of either class derives.
+ *
+ * The key a claimant's statements are sealed under, from the auth secret of its
+ * credential class alone: a read-only holder cannot derive a read-write
+ * holder's, since keys_derive_ro_auth is one-way (PROTOCOL.md section 4.2).
+ * No instance id enters it, so the host opens a statement from a claimant it
+ * has never met by trying each class. */
+void keys_slot_key(uint8_t out[32], const uint8_t auth[TOKEN_AUTH_LEN]);
 /*
  * The key one connection's probes are sealed under: the session key, which
  * says a token holder is speaking, and a random half from each end, which says
@@ -101,8 +100,8 @@ int msg_open_ad(uint8_t *dst, size_t dst_len, const uint8_t key[32],
  * A claim in the mailbox names where a peer is, and the mailbox is read by
  * every holder of the invitation -- which, for a read-only link handed to a
  * room, is a crowd with no reason to trust each other. So a claim is boxed to
- * a key the host publishes in its own slot and whose secret half it alone
- * holds: the outer seal still says a token holder wrote the slot, and this
+ * a key the host publishes in its own statement and whose secret half it alone
+ * holds: the outer seal still says a token holder wrote the cell, and this
  * says only the host may read it.
  *
  *   box = [ephemeral public key 32][tag 16][ciphertext]

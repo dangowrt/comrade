@@ -32,7 +32,7 @@ enum {					/* what is known about a rendezvous node */
 enum {					/* per-family rendezvous progress (spinner) */
 	RDV_COLD,			/* the DHT is not warm yet */
 	RDV_WARMUP,			/* finding nodes close to the key */
-	RDV_STORE,			/* placing the host slot on them */
+	RDV_STORE,			/* placing the cell on them */
 	RDV_GET,			/* reading it back */
 	RDV_READY			/* the rendezvous node is captured */
 };
@@ -45,9 +45,9 @@ struct session_mailbox {
 	int engaged;			/* the DHT is up and being asked */
 	int stage;			/* RDV_* */
 	int have_mine;			/* we have something to publish */
-	int mine_stored;		/* our slot's last store was acknowledged */
+	int mine_stored;		/* our last store was acknowledged */
 	int peer_seen;			/* the other end has been heard from */
-	int64_t seq;			/* host slot sequence, -1 unread */
+	int64_t seq;			/* the cell's store sequence, -1 unread */
 	int gets;			/* validated reads */
 	int puts;			/* stores that found a home */
 	int claim;			/* SESSION_CLAIM_* */

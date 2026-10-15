@@ -37,7 +37,7 @@
 /*
  * How long a tombstone must stand unanswered before a client believes it.
  *
- * Every holder of the invitation can write the host slot, so the slot alone is
+ * Every holder of the invitation can write the cell, so the cell alone is
  * not proof: a live host takes it back on its next write, roughly once a
  * second while it is serving. Waiting a few of those rounds is what separates
  * a session that ended from one somebody is lying about.
@@ -55,18 +55,17 @@
  * turns meeting into one round trip instead of a lookup. A token that names
  * none of them -- minted before the host had found any -- or names one that
  * has since gone must still work, or the invite someone copied an hour ago is
- * worthless. So the host slot is also reached the ordinary way, by converging
- * on its key, whenever the direct route has not produced it.
- *
- * Only the host slot: a client that finds it this way retains the nodes that
- * served it, which are the host's own, and writes its bell and offer there.
+ * worthless. So the cell is also reached the ordinary way, by converging on
+ * its key, whenever the direct route has not produced it. A client that finds
+ * it this way retains the nodes that served it, which are the host's own, and
+ * writes its offer there.
  */
 
-#define SIG_DHT_WIDE_GET_MS 4000	/* while the host slot is still unseen */
+#define SIG_DHT_WIDE_GET_MS 4000	/* while the cell is still unseen */
 #define SIG_DHT_WIDE_IDLE_MS 20000	/* once it has been, as a safety net */
 #define SIG_DHT_RELAY_MS 4000		/* operating a rendezvous the peer cannot
 					 * reach: often enough that a change to
-					 * its slot reaches the family within a
+					 * the cell reaches the family within a
 					 * round of being made */
 #define SIG_DHT_WIDE_PUT_MS 45000	/* keep the value on whoever is closest
 					 * now, not only where it first landed */
@@ -163,7 +162,7 @@ struct sig {
 
 	uint64_t next_get_ms;
 	uint64_t next_put_ms;
-	uint64_t next_hput_ms;		/* the host slot's own store schedule */
+	uint64_t next_hput_ms;		/* the host statement's store schedule */
 	uint64_t next_wide_get_ms;
 	uint64_t next_wide_put_ms;
 	uint64_t next_mcast_ms;
@@ -329,11 +328,9 @@ int sig_ready(struct sig *s)
 	return s->node && routes_now(s) != 0;
 }
 
-static void slot_key(const struct sig *s, int grade, const uint8_t *cid,
-		     uint8_t out[32])
+static void slot_key(const struct sig *s, int grade, uint8_t out[32])
 {
-	keys_slot_key(out, grade == SIG_GRADE_RO ? s->auth_ro : s->auth, cid,
-		      RDV_CID_LEN);
+	keys_slot_key(out, grade == SIG_GRADE_RO ? s->auth_ro : s->auth);
 }
 
 static int my_grade(const struct sig *s)
@@ -341,10 +338,9 @@ static int my_grade(const struct sig *s)
 	return s->have_rw ? SIG_GRADE_RW : SIG_GRADE_RO;
 }
 
-static void slot_salt(const struct sig *s, char kind, const uint8_t *cid,
-		      char out[KEYS_SALT_LEN])
+static void slot_salt(const struct sig *s, char out[KEYS_SALT_LEN])
 {
-	keys_slot_salt(out, s->rdv, kind, cid, cid ? RDV_CID_LEN : 0);
+	keys_slot_salt(out, s->rdv);
 }
 
 static void sig_mb_note(const char *tag, const uint8_t *cid, const char *sdp)
@@ -466,13 +462,6 @@ int sig_end_placed(struct sig *s)
 	 * -- an isolated LAN, or a network that has just gone -- has no store to
 	 * make, and holding the operator's shell for one that was never going to
 	 * happen would tax every quit for a case that cannot succeed.
-	 *
-	 * The convergent store is always waited on, even where a rendezvous node
-	 * is held and answered first. The k-closest nodes are where a token
-	 * naming no node leads a client, and they are also holding this host's
-	 * last offer: leaving early means leaving that offer standing, and a
-	 * client that finds it punches at a host that is no longer there for as
-	 * long as it is willing to.
 	 */
 	if ((s->flags & SIG_DHT) && s->node && dhtnode_ready(s->node)) {
 		placed = s->end_placed_wide;
@@ -843,20 +832,21 @@ static int rdv_open(const uint8_t key[32], const uint8_t *v, size_t v_len,
 	return rc;
 }
 
-static int claimant_open(const struct sig *s, const uint8_t *cid,
-			 const uint8_t *v, size_t v_len, struct rdv_msg *m,
-			 int *grade)
+/* No instance id enters a class key, so a claimant the host has never met is
+ * opened by trying each class and reading its cid from inside the seal. */
+static int claimant_open(const struct sig *s, const uint8_t *v, size_t v_len,
+			 struct rdv_msg *m, int *grade)
 {
 	uint8_t key[32];
 
 	if (s->have_rw) {
-		slot_key(s, SIG_GRADE_RW, cid, key);
+		slot_key(s, SIG_GRADE_RW, key);
 		if (!rdv_open(key, v, v_len, m)) {
 			*grade = SIG_GRADE_RW;
 			return 0;
 		}
 	}
-	slot_key(s, SIG_GRADE_RO, cid, key);
+	slot_key(s, SIG_GRADE_RO, key);
 	if (!rdv_open(key, v, v_len, m)) {
 		*grade = SIG_GRADE_RO;
 		return 0;
@@ -919,16 +909,18 @@ static void node_note(struct sig *s, const struct sig_op *op,
 	}
 }
 
-static void host_slot_read(struct sig *s, const uint8_t *v, size_t v_len,
-			   int64_t seq)
+/* Nonzero when the cell holds something other than the host's own statement,
+ * for the caller to try the class keys on. */
+static int host_slot_read(struct sig *s, const uint8_t *v, size_t v_len,
+			  int64_t seq)
 {
 	struct rdv_msg m;
 	int moved;
 
 	if (rdv_open(s->keys.sig_key, v, v_len, &m))
-		return;
+		return 1;
 	if (m.kind != RDV_HOSTINFO && m.kind != RDV_TOMB)
-		return;
+		return 1;
 	s->gets_ok++;
 	s->last_get_ms = now_ms();
 	if (s->is_host) {
@@ -938,10 +930,10 @@ static void host_slot_read(struct sig *s, const uint8_t *v, size_t v_len,
 			s->mine_stored = 1;
 		if (seq > s->h_seq)
 			s->h_seq = seq;
-		return;
+		return 0;
 	}
 	if (!s->rc)
-		return;
+		return 0;
 	if (seq >= s->hcopy_seq) {
 		memcpy(s->hcopy, v, v_len);
 		s->hcopy_len = v_len;
@@ -949,13 +941,13 @@ static void host_slot_read(struct sig *s, const uint8_t *v, size_t v_len,
 	}
 	moved = rdv_client_host_slot(s->rc, &m, seq);
 	if (moved < 0)
-		return;
+		return 0;
 	if (seq > s->h_seq)
 		s->h_seq = seq;
 	if (m.kind == RDV_TOMB) {
 		if (!s->tomb_seen_ms)
 			s->tomb_seen_ms = s->last_get_ms;
-		return;
+		return 0;
 	}
 	s->info_seen_ms = s->last_get_ms;
 	s->tomb_seen_ms = 0;
@@ -965,44 +957,33 @@ static void host_slot_read(struct sig *s, const uint8_t *v, size_t v_len,
 			 (unsigned)m.gen);
 		s->next_put_ms = 0;
 	}
+	return 0;
 }
 
-static void bell_read(struct sig *s, const uint8_t *v, size_t v_len)
-{
-	struct rdv_msg m;
-
-	if (!s->rh || rdv_open(s->keys.sig_key, v, v_len, &m))
-		return;
-	s->gets_ok++;
-	s->last_get_ms = now_ms();
-	rdv_host_bell(s->rh, &m);
-}
-
-static void claimant_read(struct sig *s, const uint8_t *cid, const uint8_t *v,
-			  size_t v_len)
+static void claimant_read(struct sig *s, const uint8_t *v, size_t v_len)
 {
 	struct rdv_claimant *c;
 	char sdp[SIG_SDP_MAX];
 	struct rdv_msg m;
 	int grade, slen;
 
-	if (!s->rh || claimant_open(s, cid, v, v_len, &m, &grade))
+	if (!s->rh || claimant_open(s, v, v_len, &m, &grade))
 		return;
 	s->gets_ok++;
 	s->last_get_ms = now_ms();
-	if (memcmp(m.from, cid, RDV_CID_LEN))
+	if (m.kind != RDV_OFFER)
 		return;
 	if (!rdv_host_slot(s->rh, &m))
 		return;
-	c = rdv_host_find(s->rh, cid);
+	c = rdv_host_find(s->rh, m.from);
 	if (c)
 		c->grade = (uint8_t)grade;
 	slen = sdp_of(&m, sdp, sizeof(sdp));
 	if (slen < 0)
 		return;
-	sig_mb_note("GET offer", cid, sdp);
+	sig_mb_note("GET offer", m.from, sdp);
 	if (s->cb)
-		s->cb(s->arg, cid, (const uint8_t *)sdp, (size_t)slen);
+		s->cb(s->arg, m.from, (const uint8_t *)sdp, (size_t)slen);
 }
 
 static void answer_read(struct sig *s, const uint8_t *v, size_t v_len)
@@ -1014,13 +995,19 @@ static void answer_read(struct sig *s, const uint8_t *v, size_t v_len)
 
 	if (!s->rc)
 		return;
-	slot_key(s, my_grade(s), s->rc->cid, key);
+	slot_key(s, my_grade(s), key);
 	if (rdv_open(key, v, v_len, &m))
 		return;
 	s->gets_ok++;
 	s->last_get_ms = now_ms();
-	if (!rdv_client_own_slot(s->rc, &m))
+	if (!rdv_client_own_slot(s->rc, &m)) {
+		if (m.kind == RDV_ANSWER || m.kind == RDV_REFUSE)
+			dbg_logf("sig: an answer to no offer of ours "
+				 "(re=%u ours=%u prev=%u)", (unsigned)m.re,
+				 (unsigned)s->rc->offer_seq,
+				 (unsigned)s->rc->prev_offer_seq);
 		return;
+	}
 	if (m.kind == RDV_REFUSE) {
 		dbg_logf("sig: the host refused us (%u)",
 			 (unsigned)s->rc->refusal);
@@ -1044,52 +1031,41 @@ static void on_slot_get(void *arg, const uint8_t *v, size_t v_len, int64_t seq,
 	op->done = 1;
 	if (!v)
 		return;
-	if (op->kind == KEYS_SLOT_HOST)
-		node_note(s, op, node, node_len);
+	node_note(s, op, node, node_len);
 	if (!first)
 		return;
-	switch (op->kind) {
-	case KEYS_SLOT_HOST:
-		host_slot_read(s, v, v_len, seq);
-		break;
-	case KEYS_SLOT_BELL:
-		bell_read(s, v, v_len);
-		break;
-	case KEYS_SLOT_CLAIM:
-		claimant_read(s, op->cid, v, v_len);
-		break;
-	case KEYS_SLOT_ANSWER:
+	/* What the cell holds is discovered, not asked for: a turn that opens
+	 * under neither of our keys is another claimant's. */
+	if (!host_slot_read(s, v, v_len, seq))
+		return;
+	if (s->is_host)
+		claimant_read(s, v, v_len);
+	else
 		answer_read(s, v, v_len);
-		break;
-	default:
-		break;
-	}
 }
 
 static void on_slot_put(void *arg, int stored, const struct sockaddr *node,
 			socklen_t node_len)
 {
 	struct sig_op *op = arg;
-	struct rdv_claimant *c;
 	struct sig *s = op->s;
 
 	(void)node;
 	(void)node_len;
 	op->done = 1;
 	switch (op->kind) {
-	case KEYS_SLOT_HOST:
+	case RDV_TOMB:
+		dbg_logf("sig: tombstone stored %s -> %d node(s)",
+			 op->wide ? "where the key belongs" :
+				    "on the rendezvous node", stored);
+		if (stored > 0 && op->wide)
+			s->end_placed_wide = 1;
+		else if (stored > 0)
+			s->end_placed_direct = 1;
+		break;
+	case RDV_HOSTINFO:
 		if (!s->is_host)
 			break;
-		if (ending(s)) {
-			dbg_logf("sig: tombstone stored %s -> %d node(s)",
-				 op->wide ? "where the key belongs" :
-					    "on the rendezvous node", stored);
-			if (stored > 0 && op->wide)
-				s->end_placed_wide = 1;
-			else if (stored > 0)
-				s->end_placed_direct = 1;
-			break;
-		}
 		if (stored > 0) {
 			s->mine_stored = 1;
 			s->h_stale = 0;
@@ -1100,14 +1076,12 @@ static void on_slot_put(void *arg, int stored, const struct sockaddr *node,
 				s->rdv_stage = 3;	/* stored: now reading it back */
 		}
 		break;
-	case KEYS_SLOT_ANSWER:
+	case RDV_ANSWER:
 		if (stored > 0 || !s->rh)
 			break;
-		c = rdv_host_find(s->rh, op->cid);
-		if (c && c->state != RDV_C_GONE)
-			c->pending = 1;
+		rdv_host_unsent(s->rh, op->cid);
 		break;
-	case KEYS_SLOT_CLAIM:
+	case RDV_OFFER:
 		if (stored > 0)
 			s->mine_stored = 1;
 		break;
@@ -1116,13 +1090,28 @@ static void on_slot_put(void *arg, int stored, const struct sockaddr *node,
 	}
 }
 
+/* A claimant takes the cell only when the host's own statement is in it: not
+ * even its own offer may be rewritten, or the refresh would keep landing on
+ * the answer to it before the answer has been read. */
+static int turn_is_ours(const struct sig *s, const uint8_t *cur, size_t cur_len)
+{
+	struct rdv_msg m;
+
+	if (!cur || !cur_len)
+		return 1;
+	if (rdv_open(s->keys.sig_key, cur, cur_len, &m))
+		return 0;
+	return m.kind == RDV_HOSTINFO || m.kind == RDV_TOMB;
+}
+
 static int merge_mine(void *arg, const uint8_t *cur, size_t cur_len,
 		      int64_t seq, uint8_t *out, size_t *out_len, size_t max)
 {
 	struct sig_op *op = arg;
 
-	(void)cur_len;
 	if (op->seq_seen >= 0 && cur && seq > op->seq_seen)
+		return -1;
+	if (op->kind == RDV_OFFER && !turn_is_ours(op->s, cur, cur_len))
 		return -1;
 	if (op->val_len > max)
 		return -1;
@@ -1131,16 +1120,16 @@ static int merge_mine(void *arg, const uint8_t *cur, size_t cur_len,
 	return 0;
 }
 
-static int slot_get(struct sig *s, char kind, const uint8_t *cid, int wide)
+static int slot_get(struct sig *s, int wide)
 {
 	char salt[KEYS_SALT_LEN];
 	struct sig_op *op;
 	int rc;
 
-	op = op_alloc(s, kind, cid, wide, 0);
+	op = op_alloc(s, 0, NULL, wide, 0);
 	if (!op)
 		return -1;
-	slot_salt(s, kind, cid, salt);
+	slot_salt(s, salt);
 	if (wide)
 		rc = bep44_get(s->engine, s->keys.bep44_pk, salt, on_slot_get,
 			       op);
@@ -1152,6 +1141,7 @@ static int slot_get(struct sig *s, char kind, const uint8_t *cid, int wide)
 	return rc;
 }
 
+/* `kind` is the statement written, for what the store's outcome means. */
 static int slot_put(struct sig *s, char kind, const uint8_t *cid, int wide,
 		    const uint8_t *val, size_t val_len, int64_t seq_seen)
 {
@@ -1167,14 +1157,15 @@ static int slot_put(struct sig *s, char kind, const uint8_t *cid, int wide,
 	memcpy(op->val, val, val_len);
 	op->val_len = val_len;
 	op->seq_seen = seq_seen;
-	slot_salt(s, kind, cid, salt);
+	slot_salt(s, salt);
 	if (wide)
-		rc = bep44_update(s->engine, s->keys.bep44_sk, s->keys.bep44_pk,
-				  salt, merge_mine, op, on_slot_put, op);
+		rc = bep44_update(s->engine, s->keys.bep44_sk,
+				  s->keys.bep44_pk, salt, merge_mine, op,
+				  on_slot_put, op);
 	else
 		rc = bep44_update_direct(s->engine, s->keys.bep44_sk,
-					 s->keys.bep44_pk, salt, merge_mine, op,
-					 on_slot_put, op);
+					 s->keys.bep44_pk, salt, merge_mine,
+					 op, on_slot_put, op);
 	if (rc) {
 		op->busy = 0;
 		return rc;
@@ -1184,19 +1175,16 @@ static int slot_put(struct sig *s, char kind, const uint8_t *cid, int wide,
 	return 0;
 }
 
-/* Two stores of one slot in flight read the same sequence and write the same
- * next one, so every node refuses the second; stores of different slots are
- * free to overlap. */
-static int slot_inflight(const struct sig *s, char kind, const uint8_t *cid)
+/* Two stores in flight read the same sequence and write the same next one, so
+ * every node refuses the second. One cell, so any store excludes any other. */
+static int slot_inflight(const struct sig *s)
 {
 	const struct sig_op *op;
 	int i;
 
 	for (i = 0; i < SIG_OPS_MAX; i++) {
 		op = &s->ops[i];
-		if (!op->busy || op->done || !op->is_put || op->kind != kind)
-			continue;
-		if (!cid || !memcmp(op->cid, cid, RDV_CID_LEN))
+		if (op->busy && !op->done && op->is_put)
 			return 1;
 	}
 	return 0;
@@ -1218,13 +1206,13 @@ static int seal_to(const uint8_t key[32], const struct rdv_out *o,
 	return b.err ? -1 : (int)b.len;
 }
 
-/* The host slot's next statement, sealed and due. */
+/* The host's next statement, sealed and due. */
 static void host_info_seal(struct sig *s)
 {
 	struct rdv_out o;
 	int n;
 
-	if (!rdv_host_next(s->rh, NULL, 0, &o) || o.salt_kind != KEYS_SLOT_HOST)
+	if (!rdv_host_next(s->rh, NULL, 0, &o) || o.seal != RDV_SEAL_INFO)
 		return;
 	n = seal_to(s->keys.sig_key, &o, s->hval, sizeof(s->hval));
 	if (n <= 0)
@@ -1235,8 +1223,8 @@ static void host_info_seal(struct sig *s)
 	s->next_hput_ms = 0;
 }
 
-/* Every answer or refusal due goes out now, each to its own slot; one whose
- * slot is still being written, or that has no route yet, waits a tick. */
+/* Each answer or refusal due takes the cell in turn; one that finds a store in
+ * flight, or no route yet, waits a tick. */
 static void host_answers(struct sig *s, unsigned routes)
 {
 	struct rdv_claimant *held[RDV_HOST_MAX];
@@ -1248,25 +1236,24 @@ static void host_answers(struct sig *s, unsigned routes)
 	uint8_t key[32];
 
 	while (nheld < RDV_HOST_MAX && rdv_host_next(s->rh, NULL, 0, &o)) {
-		if (o.salt_kind != KEYS_SLOT_ANSWER || rdv_decode(&m, o.msg, o.len))
+		if (o.seal != RDV_SEAL_CLASS || rdv_decode(&m, o.msg, o.len))
 			continue;
 		c = rdv_host_find(s->rh, m.to);
 		if (!c)
 			continue;
-		if (!(routes & SIG_ROUTE_DIRECT) ||
-		    slot_inflight(s, KEYS_SLOT_ANSWER, m.to)) {
+		if (!routes || slot_inflight(s)) {
 			held[nheld++] = c;
 			continue;
 		}
-		slot_key(s, c->grade == SIG_GRADE_RO ? SIG_GRADE_RO : SIG_GRADE_RW,
-			 m.to, key);
+		slot_key(s, c->grade == SIG_GRADE_RO ? SIG_GRADE_RO :
+						       SIG_GRADE_RW, key);
 		n = seal_to(key, &o, val, sizeof(val));
 		if (n < 0 ||
-		    slot_put(s, KEYS_SLOT_ANSWER, m.to, 0, val, (size_t)n, -1))
+		    slot_put(s, RDV_ANSWER, m.to, 0, val, (size_t)n, -1))
 			held[nheld++] = c;
 	}
 	for (i = 0; i < nheld; i++)
-		held[i]->pending = 1;
+		rdv_host_unsent(s->rh, held[i]->cid);
 }
 
 static void host_tomb_put(struct sig *s, unsigned routes, uint64_t now)
@@ -1274,18 +1261,14 @@ static void host_tomb_put(struct sig *s, unsigned routes, uint64_t now)
 	int held = s->fam[0].rnode_len || s->fam[1].rnode_len;
 
 	/*
-	 * Both routes have to carry it, because they reach different
-	 * readers: the direct store lands on the node the token names,
-	 * which is where a client holding that invitation looks first,
-	 * and the convergent one lands on whoever is closest to the key
-	 * now, which is where a client with an older token ends up and
-	 * where this host's own last statement is sitting. A tombstone
-	 * only one of them can see leaves the other waiting.
+	 * The rendezvous node answers a client holding this invitation first,
+	 * and the k-closest are where a token naming no node leads one, so a
+	 * tombstone only one of them can see leaves the other waiting.
 	 */
 	if (!s->end_placed_direct && held)
-		slot_put(s, KEYS_SLOT_HOST, NULL, 0, s->hval, s->hval_len, -1);
+		slot_put(s, RDV_TOMB, NULL, 0, s->hval, s->hval_len, -1);
 	else if ((routes & SIG_ROUTE_WIDE) && !s->end_placed_wide)
-		slot_put(s, KEYS_SLOT_HOST, NULL, 1, s->hval, s->hval_len, -1);
+		slot_put(s, RDV_TOMB, NULL, 1, s->hval, s->hval_len, -1);
 	s->next_hput_ms = now + SIG_DHT_TOMB_MS;
 }
 
@@ -1293,15 +1276,17 @@ static void host_slot_put(struct sig *s, unsigned routes, uint64_t now)
 {
 	int missing, eager;
 
+	/* The cheap path: the rendezvous node already holds this key, so a
+	 * re-store to it costs a round trip and no lookup. */
 	if (s->h_stale && (routes & SIG_ROUTE_DIRECT) &&
 	    (s->fam[0].rnode_len || s->fam[1].rnode_len)) {
-		slot_put(s, KEYS_SLOT_HOST, NULL, 0, s->hval, s->hval_len, -1);
+		slot_put(s, RDV_HOSTINFO, NULL, 0, s->hval, s->hval_len, -1);
 		s->next_hput_ms = now + SIG_DHT_PUT_MS;
 		return;
 	}
 	/*
 	 * A reachable family with no anchor yet is still being located:
-	 * the convergent store places the host slot on its k-closest nodes
+	 * the convergent store places the cell on its k-closest nodes
 	 * (idiomatic and discoverable) and the validating get captures
 	 * one as the anchor. It repeats until that family is captured --
 	 * the v6 DHT converges later than v4, so an early store misses
@@ -1313,19 +1298,20 @@ static void host_slot_put(struct sig *s, unsigned routes, uint64_t now)
 	 */
 	missing = !s->fam[0].rnode_len || !s->fam[1].rnode_len ||
 		  s->fam[0].relocate || s->fam[1].relocate;
-	if (missing && (routes & SIG_ROUTE_WIDE)) {
+	if (missing && (routes & SIG_ROUTE_WIDE) && !rdv_host_busy(s->rh)) {
 		eager = ((!s->fam[0].rnode_len || s->fam[0].relocate) &&
 			 s->fam[0].up) ||
 			((!s->fam[1].rnode_len || s->fam[1].relocate) &&
 			 s->fam[1].up);
 		if (s->rdv_stage < 2)
-			s->rdv_stage = 2;	/* placing the host slot */
-		slot_put(s, KEYS_SLOT_HOST, NULL, 1, s->hval, s->hval_len, -1);
+			s->rdv_stage = 2;	/* placing the cell */
+		slot_put(s, RDV_HOSTINFO, NULL, 1, s->hval, s->hval_len, -1);
 		s->next_hput_ms = now + (eager ? SIG_DHT_PUT_MS :
 						 SIG_DHT_PUT_SLOW_MS);
 		return;
 	}
-	if ((routes & SIG_ROUTE_WIDE) && now >= s->next_wide_put_ms) {
+	if ((routes & SIG_ROUTE_WIDE) && now >= s->next_wide_put_ms &&
+	    !rdv_host_busy(s->rh)) {
 		/*
 		 * The value where the key says it belongs, not only
 		 * where it first landed. Which nodes are closest drifts
@@ -1334,7 +1320,7 @@ static void host_slot_put(struct sig *s, unsigned routes, uint64_t now)
 		 * finds whoever is closest now, so the value has to be
 		 * there and not merely on the handful we pinned once.
 		 */
-		slot_put(s, KEYS_SLOT_HOST, NULL, 1, s->hval, s->hval_len, -1);
+		slot_put(s, RDV_HOSTINFO, NULL, 1, s->hval, s->hval_len, -1);
 		s->next_wide_put_ms = now + SIG_DHT_WIDE_PUT_MS;
 		s->next_hput_ms = now + SIG_DHT_PUT_MS;
 	}
@@ -1351,11 +1337,11 @@ static void host_pump_puts(struct sig *s, unsigned routes, uint64_t now)
 		s->next_put_ms = now + SIG_DHT_PUT_MS;
 	}
 	if (!s->hval_len || now < s->next_hput_ms ||
-	    slot_inflight(s, KEYS_SLOT_HOST, NULL))
+	    slot_inflight(s))
 		return;
 	if (ending(s))
 		host_tomb_put(s, routes, now);
-	else
+	else if (!rdv_host_cell_held(s->rh))
 		host_slot_put(s, routes, now);
 }
 
@@ -1381,75 +1367,41 @@ static void client_pump_puts(struct sig *s, unsigned routes, uint64_t now)
 
 	if (!s->rc || now < s->next_put_ms)
 		return;
-	if ((routes & SIG_ROUTE_DIRECT) &&
+	if ((routes & SIG_ROUTE_DIRECT) && !slot_inflight(s) &&
 	    rdv_client_next(s->rc, s->my_packed, s->my_packed_len, &o)) {
-		if (o.salt_kind == KEYS_SLOT_BELL)
-			memcpy(key, s->keys.sig_key, 32);
-		else
-			slot_key(s, my_grade(s), s->rc->cid, key);
+		slot_key(s, my_grade(s), key);
 		n = seal_to(key, &o, val, sizeof(val));
 		if (n > 0)
-			slot_put(s, o.salt_kind,
-				 o.have_salt_cid ? o.salt_cid : NULL, 0, val,
-				 (size_t)n, -1);
+			slot_put(s, RDV_OFFER, s->rc->cid, 0, val, (size_t)n,
+				 -1);
 		s->next_put_ms = now + SIG_DHT_PUT_MS;
 		return;
 	}
-	if (!relaying(s) || !s->hcopy_len ||
-	    slot_inflight(s, KEYS_SLOT_HOST, NULL))
+	if (!relaying(s) || !s->hcopy_len || slot_inflight(s))
 		return;
 	if (relay_locating(s) && (routes & SIG_ROUTE_WIDE)) {
-		slot_put(s, KEYS_SLOT_HOST, NULL, 1, s->hcopy, s->hcopy_len,
+		slot_put(s, RDV_HOSTINFO, NULL, 1, s->hcopy, s->hcopy_len,
 			 s->hcopy_seq);
 		s->next_put_ms = now + SIG_DHT_PUT_MS;
 	} else if (routes & SIG_ROUTE_DIRECT) {
-		slot_put(s, KEYS_SLOT_HOST, NULL, 0, s->hcopy, s->hcopy_len,
+		slot_put(s, RDV_HOSTINFO, NULL, 0, s->hcopy, s->hcopy_len,
 			 s->hcopy_seq);
 		s->next_put_ms = now + SIG_DHT_RELAY_MS;
 	}
 }
 
-/* The doorbell every other read; between them a claimant's slot worth reading
- * alternates with the host's own, so the anchor is still proven under load. */
+/* One cell, so one read tells the host everything: its own statement still
+ * standing, or whichever claimant has taken the turn. */
 static void host_read(struct sig *s)
 {
-	struct rdv_claimant *c;
-	unsigned turn;
-	int k, i;
-
-	turn = s->read_turn++ % 4;
-	if (turn == 0 || turn == 2) {
-		slot_get(s, KEYS_SLOT_BELL, NULL, 0);
-		return;
-	}
-	if (turn == 1 && s->rh) {
-		for (k = 0; k < RDV_HOST_MAX; k++) {
-			i = (s->claim_cursor + 1 + k) % RDV_HOST_MAX;
-			c = &s->rh->c[i];
-			if (c->state == RDV_C_FREE)
-				continue;
-			if (c->state != RDV_C_HARVESTED && !c->knock)
-				continue;
-			c->knock = 0;
-			s->claim_cursor = i;
-			slot_get(s, KEYS_SLOT_CLAIM, c->cid, 0);
-			return;
-		}
-	}
-	slot_get(s, KEYS_SLOT_HOST, NULL, 0);
+	s->read_turn++;
+	slot_get(s, 0);
 }
 
 static void client_read(struct sig *s)
 {
-	int want_answer;
-
-	want_answer = s->rc && !s->rc->live && s->rc->have_host &&
-		      s->rc->state != RDV_CL_REFUSED;
-	if ((s->read_turn++ & 1) && want_answer) {
-		slot_get(s, KEYS_SLOT_ANSWER, s->rc->cid, 0);
-		return;
-	}
-	slot_get(s, KEYS_SLOT_HOST, NULL, 0);
+	s->read_turn++;
+	slot_get(s, 0);
 }
 
 static int warming(const struct sig *s)
@@ -1480,7 +1432,7 @@ static void dht_pump(struct sig *s, uint64_t now)
 		s->next_get_ms = now + SIG_DHT_GET_MS;
 	}
 	if ((routes & SIG_ROUTE_WIDE) && now >= s->next_wide_get_ms) {
-		slot_get(s, KEYS_SLOT_HOST, NULL, 1);
+		slot_get(s, 1);
 		seen = s->is_host ? s->mine_stored : (s->rc && s->rc->have_host);
 		s->next_wide_get_ms = now +
 			((seen && !relay_locating(s) && !warming(s)) ?
@@ -1591,11 +1543,11 @@ static void deliver_claim_mcast(struct sig *s, const uint8_t *data, size_t len,
 	data += RDV_CID_LEN;
 	len -= RDV_CID_LEN;
 	grade = SIG_GRADE_RW;
-	slot_key(s, grade, cid, key);
+	slot_key(s, grade, key);
 	n = mcast_open(key, "c", data, len, &dport, &m);
 	if (n) {
 		grade = SIG_GRADE_RO;
-		slot_key(s, grade, cid, key);
+		slot_key(s, grade, key);
 		n = mcast_open(key, "c", data, len, &dport, &m);
 	}
 	if (n || m.kind != RDV_OFFER || memcmp(m.from, cid, RDV_CID_LEN))
@@ -1665,7 +1617,7 @@ static int mcast_frame(struct sig *s, uint8_t *out, size_t max,
 		return -1;
 	memcpy(out, s->rc->cid, RDV_CID_LEN);
 	o = RDV_CID_LEN;
-	slot_key(s, my_grade(s), s->rc->cid, key);
+	slot_key(s, my_grade(s), key);
 	n = msg_seal_ad(out + o, max - o, key, (const uint8_t *)"c", 1, plain,
 			(size_t)n + 2);
 	if (n < 0)

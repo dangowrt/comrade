@@ -7,7 +7,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define RDV_VERSION 1
+#define RDV_VERSION 2
 #define RDV_CID_LEN 8
 #define RDV_MAX_PAYLOAD 900
 #define RDV_HDR_LEN (1 + 1 + 4 + RDV_CID_LEN + RDV_CID_LEN + 4 + 4 + 2)
@@ -17,11 +17,10 @@
 
 enum rdv_kind {
 	RDV_HOSTINFO = 1,
-	RDV_BELL,
 	RDV_OFFER,
 	RDV_ANSWER,
 	RDV_REFUSE,
-	RDV_TOMB			/* host slot: the session is over */
+	RDV_TOMB			/* the session is over */
 };
 
 enum rdv_refusal {
@@ -46,13 +45,17 @@ int rdv_decode(struct rdv_msg *m, const uint8_t *in, size_t len);
 int rdv_addressed_to(const uint8_t to[RDV_CID_LEN],
 		     const uint8_t cid[RDV_CID_LEN]);
 
-/* salt_kind/salt_cid name the slot, matching keys_slot_salt(). */
+/* Which key the statement is sealed under: the host's own under the session
+ * key, which either class derives, a claimant's under its class key. */
+enum rdv_seal {
+	RDV_SEAL_INFO = 0,
+	RDV_SEAL_CLASS
+};
+
 struct rdv_out {
 	uint8_t msg[RDV_MAX_MSG];
 	size_t len;
-	char salt_kind;
-	uint8_t salt_cid[RDV_CID_LEN];
-	int have_salt_cid;
+	uint8_t seal;
 };
 
 enum rdv_cstate {
@@ -70,9 +73,9 @@ struct rdv_claimant {
 	uint8_t state;
 	uint8_t have_seq;
 	uint8_t pending;
+	uint8_t holds;			/* the cell carries the answer to it */
 	uint8_t refusal;
-	uint8_t grade;			/* the credential class its slot opened under */
-	uint8_t knock;			/* rang again: its slot is worth a read */
+	uint8_t grade;			/* the credential class it opened under */
 	uint8_t answer[RDV_MAX_PAYLOAD];
 	uint16_t answer_len;
 };
@@ -92,14 +95,26 @@ void rdv_host_init(struct rdv_host *h, const uint8_t cid[RDV_CID_LEN],
 		   uint32_t gen, int grant);
 void rdv_host_set_gen(struct rdv_host *h, uint32_t gen);
 void rdv_host_entomb(struct rdv_host *h);
-void rdv_host_bell(struct rdv_host *h, const struct rdv_msg *m);
 int rdv_host_slot(struct rdv_host *h, const struct rdv_msg *m);
+/* Does a claimant's answer stand unread in the cell? Nothing else may be
+ * written over it, the host's own refresh included, until it is released. */
+int rdv_host_cell_held(const struct rdv_host *h);
+/* Is a claimant engaged? A background store of the host's own statement waits
+ * for that, so it cannot land on an exchange in progress. */
+int rdv_host_busy(const struct rdv_host *h);
+/* The cell is the host's again: the claimant has the answer, or will ask for
+ * another. Called once the claimant has been heard from, or its punch ends, so
+ * the next claimant can take its turn without waiting on a clock. */
+void rdv_host_release(struct rdv_host *h, const uint8_t cid[RDV_CID_LEN]);
 struct rdv_claimant *rdv_host_find(struct rdv_host *h,
 				   const uint8_t cid[RDV_CID_LEN]);
 void rdv_host_answer(struct rdv_host *h, const uint8_t cid[RDV_CID_LEN],
 		     const uint8_t *payload, size_t len);
 void rdv_host_refuse(struct rdv_host *h, const uint8_t cid[RDV_CID_LEN],
 		     int reason);
+
+/* Hand back an emission that never went out, so it is owed again. */
+void rdv_host_unsent(struct rdv_host *h, const uint8_t cid[RDV_CID_LEN]);
 void rdv_host_keep(struct rdv_host *h, const uint8_t cid[RDV_CID_LEN]);
 void rdv_host_forget(struct rdv_host *h, const uint8_t cid[RDV_CID_LEN]);
 int rdv_host_next(struct rdv_host *h, const uint8_t *info, size_t info_len,
@@ -122,12 +137,15 @@ struct rdv_client {
 	uint32_t host_gen;
 	uint32_t seq;
 	uint32_t offer_seq;
+	uint32_t prev_offer_seq;	/* the one it supersedes */
 	uint32_t answer_seq;
 	uint8_t state;
 	uint8_t have_host;
 	uint8_t have_answer_seq;
 	uint8_t live;
-	uint8_t turn;			/* alternates bell and offer */
+	/* The offer left in the cell is gone, so the next one asks afresh
+	 * rather than repeating a sequence the host has already seen. */
+	uint8_t reask;
 	uint8_t refusal;
 	uint8_t host_gone;		/* the host said so, in its own slot */
 	uint8_t nprev;
