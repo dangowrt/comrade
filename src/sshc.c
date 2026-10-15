@@ -262,6 +262,7 @@ static int run_test(ssh_session s, ssh_channel chan, const struct sshc_opts *o)
 	struct sshfwd *fwd = NULL;
 	size_t got = 0;
 	int rc = -1;
+	int n;
 
 	if (event && (o->nfwd_l || o->nfwd_r))
 		fwd = fwd_up(s, event, o);
@@ -272,12 +273,23 @@ static int run_test(ssh_session s, ssh_channel chan, const struct sshc_opts *o)
 	    (int)o->send_len)
 		goto out;
 
+	/* A client with no terminal is no less entitled to come back than one
+	 * with a dashboard, so this waits the way the interactive loops do
+	 * rather than blocking on a peer that may already be gone. */
 	while (got < o->send_len && got < o->recv_cap) {
-		int n = ssh_channel_read(chan, o->recv + got,
-					 (uint32_t)(o->recv_cap - got), 0);
-
-		if (n < 0)
+		if (rejoin_now(o)) {
+			rc = SSHC_RECONNECT;
 			goto out;
+		}
+		if (!ssh_channel_is_open(chan) || ssh_channel_is_eof(chan))
+			break;
+		n = ssh_channel_read_timeout(chan, o->recv + got,
+					     (uint32_t)(o->recv_cap - got), 0,
+					     200);
+		if (n == SSH_ERROR)
+			goto out;
+		if (n == SSH_AGAIN)
+			continue;
 		if (n == 0)
 			break;
 		got += (size_t)n;
