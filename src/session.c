@@ -5230,7 +5230,9 @@ int session_run(const struct session_cfg *cfg)
 		 * spent. Either way there is nothing left to wait for, which is
 		 * the whole reason the tombstone exists.
 		 */
-		if (!cfg->is_host && sig_peer_ended(s.pm.sig)) {
+		/* The in-band word beats the tombstone by the time a store
+		 * takes, so it ends the wait wherever the client is. */
+		if (!cfg->is_host && (s.peer_ended || sig_peer_ended(s.pm.sig))) {
 			ended = s.was_live ? SESSION_ENDED : SESSION_GONE;
 			break;
 		}
