@@ -3003,7 +3003,7 @@ static void resume_tick(struct conn *c)
  * finished the publish behind the operator's back would be the background
  * process this whole path exists to avoid.
  */
-#define SESSION_TOMB_MS 4000
+#define SESSION_TOMB_MS 15000
 
 /*
  * The shared session is over: leave that where the invitation points.
