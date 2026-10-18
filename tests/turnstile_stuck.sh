@@ -36,13 +36,20 @@ if [ "${COMRADE_E2E_NET:-0}" != 1 ]; then
 fi
 
 tmp=$(mktemp -d)
-cleanup() { kill "$hpid" "$wedge" $cpids 2>/dev/null; swarm_stop; rm -rf "$tmp"; }
+keep() {
+	if [ "${COMRADE_E2E_KEEP:-0}" = 1 ]; then
+		echo "logs kept in $tmp"
+	else
+		rm -rf "$tmp"
+	fi
+}
+cleanup() { kill "$hpid" "$wedge" $cpids 2>/dev/null; swarm_stop; keep; }
 trap cleanup EXIT INT TERM
 wedge=""; cpids=""
 
 # Host: pure DHT turnstile, wedge the first pickup, serve the later joiners, then
 # exit once it has served enough of them.
-"$E2E" host --stuck 1 --serve 3 --timeout 120 \
+COMRADE_DEBUG="$tmp/host.dbg" "$E2E" host --stuck 1 --serve 3 --timeout 120 \
 	>"$tmp/host.out" 2>"$tmp/host.err" &
 hpid=$!
 
@@ -71,8 +78,8 @@ sleep 4
 # connect -- impossible unless the host released on pickup.
 j=0
 while [ "$j" -lt 3 ]; do
-	"$E2E" client "$tok" --hold-ms 500 --timeout 60 \
-		>"$tmp/c$j.out" 2>"$tmp/c$j.err" &
+	COMRADE_DEBUG="$tmp/c$j.dbg" "$E2E" client "$tok" --hold-ms 500 \
+		--timeout 60 >"$tmp/c$j.out" 2>"$tmp/c$j.err" &
 	cpids="$cpids $!"
 	j=$((j + 1))
 done
