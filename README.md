@@ -195,7 +195,8 @@ remaining work is primarily hardening, additional packaging, and a
 handful of protocol and platform improvements.
 
 - **Connection establishment** across every covered path: rendezvous
-  through one BEP 44 cell written in turns by the host and each joiner,
+  through one BEP 44 cell carrying the host's own statement beside the turn
+  each joiner takes in it,
   with a one-time host-side DHT convergence captured
   in the token so a client joins in about two seconds; ICE hole punching;
   and a direct UDP transport (lanlink) that carries same-segment link-local

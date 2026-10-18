@@ -22,8 +22,9 @@ unmarked is implemented as described. Each mark is removed when its change
 lands.
 
 **Wire compatibility.** Nothing here is stable across 0.1.x. This revision
-(`TOKEN_VERSION = 5`, §3) returns the rendezvous to **one** BEP 44 target
-(§4, §5), where every writer replaces the whole value in turns, seals a
+(`TOKEN_VERSION = 6`, §3) returns the rendezvous to **one** BEP 44 target
+(§4, §5), whose value holds the host's own statement beside the one turn a
+claimant exchange takes, seals a
 claimant's statements to its credential class alone (§4.2), and carries the
 same addressed envelope in the multicast announcements (§6). Two peers
 must be built from the same revision; there is no version negotiation and
@@ -213,7 +214,7 @@ Fixed **90-byte** payload (`TOKEN_RAW_LEN`), packed in order:
 
 | field | bytes | meaning |
 |-------|-------|---------|
-| version | 1 | `TOKEN_VERSION = 4` |
+| version | 1 | `TOKEN_VERSION = 6` |
 | flags | 1 | see below |
 | rdv `R` | 16 | rendezvous secret (KDF input, §2) |
 | auth `A` | 16 | session auth secret (SSH password, §10) |
@@ -335,25 +336,53 @@ re-lookup. More than one target would void that.
                                   msg="comrade1 cell")[0..8])   # 17 chars, no NUL
 ```
 
-Every writer replaces the **whole** value, in turns:
+The value is a bencoded dictionary with two places, and **every writer keeps
+the place it did not author** (`sig.c:cell_pack`, `cell_part`):
 
-| the cell holds | written by | read by | carries |
-|---|---|---|---|
-| `HOSTINFO` | the host | everyone | its instance id and generation; `TOMB` when the session has ended (§4.1) |
-| `OFFER` | one claimant | the host | that claimant's candpack (§7) |
-| `ANSWER` / `REFUSE` | the host | that claimant | the host's candpack for it, or a refusal reason |
+```
+  d 1:c <sealed turn statement> 1:h <sealed host statement> e
+```
 
-A claimant may write only when the cell holds the host's own statement: that is
-how its turn is granted, and it is the whole of the admission queue.
-Establishment is therefore sequential, one claimant at a time, which is what
+| place | holds | written by | read by | carries |
+|---|---|---|---|---|
+| `h` | `HOSTINFO`, or `TOMB` | the host | everyone | its instance id and generation, and the rendezvous nodes it is operating; `TOMB` when the session has ended (§4.1) |
+| `c` | `OFFER` | one claimant | the host | that claimant's candpack (§7) |
+| `c` | `ANSWER` / `REFUSE` | the host | that claimant | the host's candpack for it, or a refusal reason |
+
+The host's own statement is therefore readable whoever holds the turn, which is
+what lets the host keep placing it where a converging client will look (§5)
+without costing a claimant its turn. One claimant at a time holds `c`: that is
+the whole of the admission queue, so establishment is sequential, which is what
 `--max-clients` does **not** limit (that counts simultaneously *connected*
-clients, §12). The host hands the cell back by writing its statement again,
-once its punch for that claimant has connected or ended.
+clients, §12).
 
-A claimant whose answer the cell lost asks again under a **new** `seq`
-(`rdv.c:offer_seq`, driven by `reask`), since repeating one the host has
-already read would be refused as a replay and the claimant would wait for
-ever. The host's answer to the offer a claimant has just superseded is still
+A claimant writes `c` when it is free, and to replace an ask of its own under a
+different number; it never writes over what the host put there, and never
+restates the ask already standing. An answer written over before it is read
+leaves both ends waiting on each other, and a restated ask is a store that
+changes nothing and costs a round. The host hands the turn back by writing `h`
+while no claimant is engaged (`rdv_host_busy`), which happens as soon as a
+punch connects for one and the claimant has been heard from, or when it ends
+(`rdv_host_release`); a `TOMB` clears the turn outright.
+
+The host answers **by the route the ask arrived on** (`wide_ask`): a claimant
+that joined on a token naming no node is reachable through the key's k-closest
+and nowhere else, so an answer stored only on the host's own pinned node would
+never reach it.
+
+**The host's statement advertises its own rendezvous nodes**
+(`sig.c:host_info_nodes`, read by `host_nodes_seed`), one per family in the
+`CTL_RDV_PLEN` shape the in-band advert uses (§10): `family(1) port(2)
+addr(16)`. A claimant that reached the cell by converging on the key pins them
+and goes direct from its next statement on, which is what a token naming a node
+gives a later joiner (§3) and what `CTLM_RDV` gives a connected peer. Without
+it a cold claimant pays a lookup for every statement in the exchange.
+
+A claimant that finds the turn free while its ask stood there asks again under
+a **new** `seq` (`rdv.c:offer_seq`, driven by `rdv_client_ask_gone`), since
+repeating one the host has already read would be refused as a replay and the
+claimant would wait for ever. A copy below the newest it has seen says nothing
+about the turn now and is ignored. The host's answer to the offer a claimant has just superseded is still
 taken (`prev_offer_seq`), or an answer in flight and a fresh ask would pass
 each other indefinitely.
 
@@ -365,7 +394,7 @@ carries fresh credentials and the name has to survive one.
 **The envelope** (`rdv.c:rdv_encode`), the plaintext of the cell:
 
 ```
-  version(1)=2 | kind(1) | gen(4) | from(8) | to(8) | seq(4) | re(4) | len(2) | payload(len)
+  version(1)=3 | kind(1) | gen(4) | from(8) | to(8) | seq(4) | re(4) | len(2) | payload(len)
 ```
 
 `kind`: `1 HOSTINFO, 2 OFFER, 3 ANSWER, 4 REFUSE, 5 TOMB`. `from` is
@@ -373,41 +402,47 @@ the sender's instance id, `to` the recipient's or all-zero for whoever reads.
 `gen` is the host's generation (§7, §12) on everything the host writes and,
 on an `OFFER`, the host generation the claimant is answering. `seq` is the
 sender's statement number; `re` is, on an `ANSWER` or `REFUSE`, the `seq` of
-the `OFFER` it answers, and 0 elsewhere; `len <= RDV_MAX_PAYLOAD = 900`.
+the `OFFER` it answers, and 0 elsewhere; `len <= RDV_MAX_PAYLOAD = 760` in the
+turn place and `RDV_HOST_PAYLOAD = 64` in the host's.
 `TOMB` carries no payload; `REFUSE` carries one byte,
 `1 full` (the grant is spent) or `2 clash` (two claimants under one id).
 
 **Sealing.** The host's statements are `seal(sig_key, envelope)` (§1): every
 holder of the invitation reads them. A claimant's are sealed to its class,
-§4.2. A sealed value is at most `932 + 40 = 972` bytes, inside
-`BEP44_MAX_VALUE = 1000` (`rdv.c`, static assertion), so one statement carries
-up to 900 bytes of packed description, and it has the whole value to itself.
+§4.2. The two sealed places and the frame around them share
+`BEP44_MAX_VALUE = 1000` bytes (`rdv.c`, static assertion): `792 + 40` for the
+turn, `96 + 40` for the host's statement, and `RDV_CELL_OVERHEAD = 20` for the
+bencoding.
 
 **The exchange** (the claimant offers first):
 
-1. The host writes `HOSTINFO` when it starts, whenever its generation changes,
-   and whenever the cell is its own again after a turn. That is the cell's
-   resting state, and a claimant can only discover the host while it is there.
-2. A claimant reads the cell, learns the host's id and generation, and writes
-   its `OFFER` **only while the cell holds the host's statement**. It keeps
-   asking for as long as it has **no live path** (`sig_withdraw` stops it,
-   `sig_post` re-arms it) and the host has neither answered nor refused, under
-   a new `seq` each time the cell has lost its previous ask.
+1. The host writes `HOSTINFO` into `h` when it starts, whenever its generation
+   changes, and on its re-store cadence (§5). It is there for a claimant to
+   discover the host by whatever the turn holds.
+2. A claimant reads the cell, learns the host's id and generation from `h`, and
+   writes its `OFFER` into `c` **while the turn is free**. It keeps asking for
+   as long as it has **no live path** (`sig_withdraw` stops it, `sig_post`
+   re-arms it) and the host has neither answered nor refused, under a new `seq`
+   each time the turn has lost its previous ask.
 3. The host reads the cell. An `OFFER` with a sequence above the last taken
    from that claimant is handed to the turnstile (§12), which mints an ICE
-   agent for that claimant alone and replaces the value with its candpack, or
-   with `REFUSE` when the grant is spent. One store is in flight at a time
-   (`sig.c:slot_inflight`), so the resting state is observable between turns.
+   agent for that claimant alone and writes its candpack into `c`, or `REFUSE`
+   when the grant is spent. One store is in flight at a time
+   (`sig.c:slot_inflight`), so the turn is observable between statements.
 4. The claimant reads the cell. An `ANSWER` addressed to it, from the host
    instance it offered to, answering the offer it has standing now or the one
    that just superseded it (`re`), with a sequence above the last it took, is
    primed into its agent; a `REFUSE` to that offer ends the join
    (`SESSION_FULL`). Anything older is a no-op: a replica still serving it
    would otherwise prime a punch at an agent the host has since spent.
-5. Once that claimant's punch connects or ends, the host writes `HOSTINFO`
-   again and the next claimant's turn can begin (`rdv_host_release`). A
-   claimant that never read its answer is thereby self-healing: the punch for
-   it ends, the resting state returns, and it asks afresh.
+5. Once that claimant has been heard from on the punch, or its punch ends, the
+   host hands the turn back and the next claimant's can begin
+   (`rdv_host_release`). A pong is what proves the answer was read: a punch
+   connecting proves only the host's half of it, since the host holds the
+   claimant's credentials from the ask and the claimant's agent answers checks
+   whether or not it ever read the answer. A claimant that never read its
+   answer is thereby self-healing: the punch for it ends, the turn frees, and
+   it asks afresh.
 
 **The invariant.** No protocol state is derived by comparing a replicated
 value against local expectation: a peer advances only on a statement addressed
@@ -428,7 +463,9 @@ one shared cell safe:
   (`rdv_client_host_slot` resets the offer sequence), so a host that restarted,
   roamed or re-served is asked again by a claimant whose answer it no longer
   knows about.
-- **L4** nothing is inferred from absence.
+- **L4** nothing about the *other end* is inferred from absence. A claimant
+  that finds the turn free concludes only that its own ask is no longer there,
+  and asks again under a new number, which is idempotent either way.
 
 An **unchanged offer keeps its sequence while it still stands**
 (`rdv.c:offer_seq`): the host answers a sequence once, so a repeat of one it
@@ -566,13 +603,14 @@ carries no BEP44 support.
   reported none, and omitted where nothing was found at all. A node whose copy
   fell behind is thereby caught up rather than refusing every later store with
   301, and whatever a peer wrote to it alone is still read from it.
-- **Every write replaces the whole value** (`sig.c:slot_put`, `merge_mine`):
-  the lookup earns the write tokens and finds the stored sequence, and the
-  value stored is exactly what this end means to say, whatever the store held.
-  Nothing is ever merged: there are no partitions in the value for another
-  party to own. The cell is last-writer-wins, so two claimants asking in one
-  round cost the loser a retry on its next tick (L1, §4), never a session; a
-  claimant may write only while the cell holds the host's statement (§4). A
+- **Every write keeps the place it did not author** (`sig.c:slot_put`,
+  `merge_mine`, `cell_pack`): the lookup earns the write tokens and finds both
+  the stored sequence and the value, and what is stored is this end's own
+  statement in its own place beside the other place exactly as read. The host's
+  statement therefore survives a claimant's turn, and a claimant's turn
+  survives the host's re-store. Each place is last-writer-wins, so two
+  claimants asking in one round cost the loser a retry on its next tick (L1,
+  §4), never a session; who may write the turn is §4's rule. A
   client that relays the host's statement for a
   family the host cannot reach (`sig_relay`, §10) re-stores the host's bytes
   exactly as last read, and stands down where the store already holds a copy

@@ -668,7 +668,7 @@ message(STATUS "DHT: ${COMRADE_DHT_HOW}")
 add_library(comrade_sig STATIC src/sig.c src/sig_mcast.c)
 target_include_directories(comrade_sig PUBLIC src)
 target_link_libraries(comrade_sig PUBLIC comrade_dht comrade_rdv comrade_crypto
-	comrade_dbg comrade_compat)
+	comrade_ctlproto comrade_dbg comrade_compat)
 
 add_library(comrade_nat STATIC src/nat.c)
 target_include_directories(comrade_nat PUBLIC src)

@@ -7,9 +7,13 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define RDV_VERSION 2
+#define RDV_VERSION 3
 #define RDV_CID_LEN 8
-#define RDV_MAX_PAYLOAD 900
+/* The cell holds two sealed statements and the bencoded frame around them, so
+ * the two places share BEP 44's one-kilobyte value (PROTOCOL.md 4). */
+#define RDV_MAX_PAYLOAD 760
+#define RDV_HOST_PAYLOAD 64
+#define RDV_CELL_OVERHEAD 20
 #define RDV_HDR_LEN (1 + 1 + 4 + RDV_CID_LEN + RDV_CID_LEN + 4 + 4 + 2)
 #define RDV_MAX_MSG (RDV_HDR_LEN + RDV_MAX_PAYLOAD)
 #define RDV_ERR_VERSION (-2)
@@ -96,11 +100,8 @@ void rdv_host_init(struct rdv_host *h, const uint8_t cid[RDV_CID_LEN],
 void rdv_host_set_gen(struct rdv_host *h, uint32_t gen);
 void rdv_host_entomb(struct rdv_host *h);
 int rdv_host_slot(struct rdv_host *h, const struct rdv_msg *m);
-/* Does a claimant's answer stand unread in the cell? Nothing else may be
- * written over it, the host's own refresh included, until it is released. */
-int rdv_host_cell_held(const struct rdv_host *h);
-/* Is a claimant engaged? A background store of the host's own statement waits
- * for that, so it cannot land on an exchange in progress. */
+/* Is a claimant engaged? The host's own statement keeps the turn place while
+ * one is, and hands it back to whoever asks next when none is. */
 int rdv_host_busy(const struct rdv_host *h);
 /* The cell is the host's again: the claimant has the answer, or will ask for
  * another. Called once the claimant has been heard from, or its punch ends, so
@@ -133,7 +134,7 @@ struct rdv_client {
 	uint8_t cid[RDV_CID_LEN];
 	uint8_t host_cid[RDV_CID_LEN];
 	uint8_t prev_cid[RDV_PREV_MAX][RDV_CID_LEN];	/* host instances before */
-	int64_t h_seq;			/* the host slot's highest store sequence */
+	int64_t h_seq;			/* the cell's highest store sequence */
 	uint32_t host_gen;
 	uint32_t seq;
 	uint32_t offer_seq;
@@ -161,6 +162,8 @@ void rdv_client_init(struct rdv_client *c, const uint8_t cid[RDV_CID_LEN]);
 int rdv_client_host_slot(struct rdv_client *c, const struct rdv_msg *m,
 			 int64_t seq);
 int rdv_client_own_slot(struct rdv_client *c, const struct rdv_msg *m);
+/* The cell's turn place is free, whoever emptied it; `seq` as above. */
+void rdv_client_ask_gone(struct rdv_client *c, int64_t seq);
 void rdv_client_set_live(struct rdv_client *c, int live);
 int rdv_client_next(struct rdv_client *c, const uint8_t *offer,
 		    size_t offer_len, struct rdv_out *o);

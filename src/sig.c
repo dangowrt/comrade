@@ -11,6 +11,7 @@
 #include "bep44.h"
 #include "dbg.h"
 #include "candpack.h"
+#include "ctlproto.h"
 #include "dhtnode.h"
 #include "keys.h"
 #include "rdv.h"
@@ -102,6 +103,7 @@ struct sig_op {
 	int64_t seq_seen;
 	char kind;
 	uint8_t busy, done, wide, is_put;
+	uint8_t free_turn;		/* the host's statement hands the turn back */
 };
 
 struct sig {
@@ -660,8 +662,11 @@ int sig_reinforce(struct sig *s, int family, const struct sockaddr *sa,
 		return -1;
 	if (bep44_pin_add(s->engine, NULL, sa, len))
 		return -1;
-	if (f->rnode_len != len || memcmp(&f->rnode, sa, len))
+	if (f->rnode_len != len || memcmp(&f->rnode, sa, len)) {
 		f->anchor_seen = 0;
+		if (s->is_host && s->rh)
+			s->rh->info_pending = 1;
+	}
 	memcpy(&f->rnode, sa, len);		/* adopt it as the located rendezvous, ... */
 	f->rnode_len = len;
 	f->relocate = 0;
@@ -812,16 +817,12 @@ static void op_sweep(struct sig *s)
 			s->ops[i].busy = 0;
 }
 
-static int rdv_open(const uint8_t key[32], const uint8_t *v, size_t v_len,
+static int rdv_open(const uint8_t key[32], const uint8_t *sealed, size_t slen,
 		    struct rdv_msg *m)
 {
 	uint8_t plain[RDV_MAX_MSG];
-	const uint8_t *sealed;
-	size_t slen;
 	int n, rc;
 
-	if (benc_str_get(v, v_len, &sealed, &slen))
-		return -1;
 	n = msg_open(plain, sizeof(plain), key, sealed, slen);
 	if (n < 0)
 		return -1;
@@ -830,6 +831,46 @@ static int rdv_open(const uint8_t key[32], const uint8_t *v, size_t v_len,
 		dbg_logf("sig: slot message is rdv v%u, this build reads v%u "
 			 "-- ignored", (unsigned)plain[0], (unsigned)RDV_VERSION);
 	return rc;
+}
+
+/* The cell carries two places: the host's own statement, which every holder
+ * opens and which is how a client finds the host at all, and the one turn a
+ * claimant exchange takes. A writer keeps the place it did not author. */
+#define CELL_HOST "h"
+#define CELL_TURN "c"
+
+static int cell_part(const uint8_t *v, size_t v_len, const char *place,
+		     const uint8_t **p, size_t *len)
+{
+	const uint8_t *val;
+	size_t val_len;
+
+	*p = NULL;
+	*len = 0;
+	if (!v || !v_len)
+		return -1;
+	if (benc_dict_find(v, v_len, place, &val, &val_len))
+		return -1;
+	return benc_str_get(val, val_len, p, len);
+}
+
+static int cell_pack(uint8_t *out, size_t max, const uint8_t *host,
+		     size_t host_len, const uint8_t *turn, size_t turn_len)
+{
+	struct benc_buf b;
+
+	benc_buf_init(&b, out, max);
+	benc_raw_add(&b, "d", 1);
+	if (turn && turn_len) {
+		benc_key_add(&b, CELL_TURN);
+		benc_str_add(&b, turn, turn_len);
+	}
+	if (host && host_len) {
+		benc_key_add(&b, CELL_HOST);
+		benc_str_add(&b, host, host_len);
+	}
+	benc_raw_add(&b, "e", 1);
+	return b.err ? -1 : (int)b.len;
 }
 
 /* No instance id enters a class key, so a claimant the host has never met is
@@ -906,17 +947,37 @@ static void node_note(struct sig *s, const struct sig_op *op,
 	if (captured) {
 		bep44_pin_add(s->engine, NULL, node, node_len);
 		s->located_any = 1;
+		/* A statement sealed before this one carries no node for a
+		 * claimant to work the cell through, so it is said again. */
+		if (s->is_host && s->rh)
+			s->rh->info_pending = 1;
 	}
 }
 
-/* Nonzero when the cell holds something other than the host's own statement,
- * for the caller to try the class keys on. */
+/* The nodes the host says it is operating: pin them, so the next statement
+ * goes to the node it reads rather than through a lookup of our own. */
+static void host_nodes_seed(struct sig *s, const uint8_t *pl, size_t plen)
+{
+	struct sockaddr_storage ss;
+	socklen_t len;
+	size_t o;
+
+	for (o = 0; o + CTL_RDV_PLEN <= plen; o += CTL_RDV_PLEN) {
+		if (!ctl_rdv_decode(pl + o, CTL_RDV_PLEN, &ss, &len) || !len)
+			continue;
+		sig_seed_node(s, (const struct sockaddr *)&ss, len);
+	}
+}
+
+/* The host place of the cell: the statement a client meets the host by. */
 static int host_slot_read(struct sig *s, const uint8_t *v, size_t v_len,
 			  int64_t seq)
 {
 	struct rdv_msg m;
 	int moved;
 
+	if (!v || !v_len)
+		return 1;
 	if (rdv_open(s->keys.sig_key, v, v_len, &m))
 		return 1;
 	if (m.kind != RDV_HOSTINFO && m.kind != RDV_TOMB)
@@ -951,6 +1012,7 @@ static int host_slot_read(struct sig *s, const uint8_t *v, size_t v_len,
 	}
 	s->info_seen_ms = s->last_get_ms;
 	s->tomb_seen_ms = 0;
+	host_nodes_seed(s, m.payload, m.payload_len);
 	if (moved) {
 		dbg_logf("sig: host instance %02x%02x%02x%02x gen %u",
 			 m.from[0], m.from[1], m.from[2], m.from[3],
@@ -986,7 +1048,8 @@ static void claimant_read(struct sig *s, const uint8_t *v, size_t v_len)
 		s->cb(s->arg, m.from, (const uint8_t *)sdp, (size_t)slen);
 }
 
-static void answer_read(struct sig *s, const uint8_t *v, size_t v_len)
+static void answer_read(struct sig *s, const uint8_t *v, size_t v_len,
+			int64_t seq)
 {
 	char sdp[SIG_SDP_MAX];
 	struct rdv_msg m;
@@ -996,16 +1059,22 @@ static void answer_read(struct sig *s, const uint8_t *v, size_t v_len)
 	if (!s->rc)
 		return;
 	slot_key(s, my_grade(s), key);
-	if (rdv_open(key, v, v_len, &m))
+	/* Whatever the turn carries, it is not the ask we left there. */
+	if (rdv_open(key, v, v_len, &m)) {
+		rdv_client_ask_gone(s->rc, seq);
 		return;
+	}
 	s->gets_ok++;
 	s->last_get_ms = now_ms();
+	if (!memcmp(m.from, s->rc->cid, RDV_CID_LEN))
+		return;
 	if (!rdv_client_own_slot(s->rc, &m)) {
 		if (m.kind == RDV_ANSWER || m.kind == RDV_REFUSE)
 			dbg_logf("sig: an answer to no offer of ours "
 				 "(re=%u ours=%u prev=%u)", (unsigned)m.re,
 				 (unsigned)s->rc->offer_seq,
 				 (unsigned)s->rc->prev_offer_seq);
+		rdv_client_ask_gone(s->rc, seq);
 		return;
 	}
 	if (m.kind == RDV_REFUSE) {
@@ -1025,8 +1094,10 @@ static void on_slot_get(void *arg, const uint8_t *v, size_t v_len, int64_t seq,
 			const struct sockaddr *node, socklen_t node_len)
 {
 	struct sig_op *op = arg;
-	struct sig *s = op->s;
 	int first = !op->done;
+	struct sig *s = op->s;
+	const uint8_t *part;
+	size_t part_len;
 
 	op->done = 1;
 	if (!v)
@@ -1034,14 +1105,19 @@ static void on_slot_get(void *arg, const uint8_t *v, size_t v_len, int64_t seq,
 	node_note(s, op, node, node_len);
 	if (!first)
 		return;
-	/* What the cell holds is discovered, not asked for: a turn that opens
-	 * under neither of our keys is another claimant's. */
-	if (!host_slot_read(s, v, v_len, seq))
+	if (!cell_part(v, v_len, CELL_HOST, &part, &part_len))
+		host_slot_read(s, part, part_len, seq);
+	if (cell_part(v, v_len, CELL_TURN, &part, &part_len)) {
+		if (!s->is_host && s->rc)
+			rdv_client_ask_gone(s->rc, seq);
 		return;
+	}
+	/* Whose turn it is is discovered, not asked for: one that opens under
+	 * neither of our keys is another claimant's. */
 	if (s->is_host)
-		claimant_read(s, v, v_len);
+		claimant_read(s, part, part_len);
 	else
-		answer_read(s, v, v_len);
+		answer_read(s, part, part_len, seq);
 }
 
 static void on_slot_put(void *arg, int stored, const struct sockaddr *node,
@@ -1090,33 +1166,66 @@ static void on_slot_put(void *arg, int stored, const struct sockaddr *node,
 	}
 }
 
-/* A claimant takes the cell only when the host's own statement is in it: not
- * even its own offer may be rewritten, or the refresh would keep landing on
- * the answer to it before the answer has been read. */
-static int turn_is_ours(const struct sig *s, const uint8_t *cur, size_t cur_len)
+/*
+ * A claimant takes the turn when it is free, to replace an ask of its own
+ * under a different number, and over an answer the host addressed to somebody
+ * else, which that claimant has had its round at. An answer addressed to us we
+ * read: written over before that, it leaves both ends waiting on each other.
+ * A rival's ask standing there is its turn, and waiting is the queue.
+ */
+static int turn_is_ours(const struct sig *s, const uint8_t *turn,
+			size_t turn_len)
 {
 	struct rdv_msg m;
+	int grade;
 
-	if (!cur || !cur_len)
+	if (!turn || !turn_len || !s->rc)
 		return 1;
-	if (rdv_open(s->keys.sig_key, cur, cur_len, &m))
+	if (claimant_open(s, turn, turn_len, &m, &grade))
 		return 0;
-	return m.kind == RDV_HOSTINFO || m.kind == RDV_TOMB;
+	if (!memcmp(m.from, s->rc->cid, RDV_CID_LEN))
+		return m.seq != s->rc->offer_seq;
+	if (!s->rc->have_host || memcmp(m.from, s->rc->host_cid, RDV_CID_LEN))
+		return 0;
+	return memcmp(m.to, s->rc->cid, RDV_CID_LEN) != 0;
+}
+
+static int writes_host_place(char kind)
+{
+	return kind == RDV_HOSTINFO || kind == RDV_TOMB;
 }
 
 static int merge_mine(void *arg, const uint8_t *cur, size_t cur_len,
 		      int64_t seq, uint8_t *out, size_t *out_len, size_t max)
 {
+	const uint8_t *host, *turn;
+	size_t host_len, turn_len;
 	struct sig_op *op = arg;
+	int n;
 
 	if (op->seq_seen >= 0 && cur && seq > op->seq_seen)
 		return -1;
-	if (op->kind == RDV_OFFER && !turn_is_ours(op->s, cur, cur_len))
+	cell_part(cur, cur_len, CELL_HOST, &host, &host_len);
+	cell_part(cur, cur_len, CELL_TURN, &turn, &turn_len);
+	if (writes_host_place(op->kind)) {
+		host = op->val;
+		host_len = op->val_len;
+		/* A tombstone ends the session, and a host with nobody engaged
+		 * hands the turn back to whoever asks next. */
+		if (op->kind == RDV_TOMB || op->free_turn) {
+			turn = NULL;
+			turn_len = 0;
+		}
+	} else {
+		if (op->kind == RDV_OFFER && !turn_is_ours(op->s, turn, turn_len))
+			return -1;
+		turn = op->val;
+		turn_len = op->val_len;
+	}
+	n = cell_pack(out, max, host, host_len, turn, turn_len);
+	if (n <= 0)
 		return -1;
-	if (op->val_len > max)
-		return -1;
-	memcpy(out, op->val, op->val_len);
-	*out_len = op->val_len;
+	*out_len = (size_t)n;
 	return 0;
 }
 
@@ -1154,6 +1263,8 @@ static int slot_put(struct sig *s, char kind, const uint8_t *cid, int wide,
 	op = op_alloc(s, kind, cid, wide, 1);
 	if (!op)
 		return -1;
+	if (s->is_host && s->rh && writes_host_place(kind))
+		op->free_turn = !rdv_host_busy(s->rh);
 	memcpy(op->val, val, val_len);
 	op->val_len = val_len;
 	op->seq_seen = seq_seen;
@@ -1190,29 +1301,40 @@ static int slot_inflight(const struct sig *s)
 	return 0;
 }
 
-/* A BEP 44 value is bencoded: the sealed envelope travels as one string. */
 static int seal_to(const uint8_t key[32], const struct rdv_out *o,
 		   uint8_t *out, size_t max)
 {
-	uint8_t sealed[SIG_VALUE_MAX];
-	struct benc_buf b;
-	int n;
+	return msg_seal(out, max, key, o->msg, o->len);
+}
 
-	n = msg_seal(sealed, sizeof(sealed), key, o->msg, o->len);
-	if (n < 0)
-		return -1;
-	benc_buf_init(&b, out, max);
-	benc_str_add(&b, sealed, (size_t)n);
-	return b.err ? -1 : (int)b.len;
+/* The nodes the host is operating, for a claimant that converged on the key to
+ * go direct with instead of paying a lookup for every statement. */
+static size_t host_info_nodes(const struct sig *s, uint8_t *out, size_t max)
+{
+	static const int famv[2] = { 4, 6 };
+	size_t n = 0;
+	int i;
+
+	for (i = 0; i < 2; i++) {
+		if (!s->fam[i].rnode_len || n + CTL_RDV_PLEN > max)
+			continue;
+		ctl_rdv_encode(out + n, famv[i],
+			       (const struct sockaddr *)&s->fam[i].rnode);
+		n += CTL_RDV_PLEN;
+	}
+	return n;
 }
 
 /* The host's next statement, sealed and due. */
 static void host_info_seal(struct sig *s)
 {
+	uint8_t info[RDV_HOST_PAYLOAD];
 	struct rdv_out o;
+	size_t ilen;
 	int n;
 
-	if (!rdv_host_next(s->rh, NULL, 0, &o) || o.seal != RDV_SEAL_INFO)
+	ilen = host_info_nodes(s, info, sizeof(info));
+	if (!rdv_host_next(s->rh, info, ilen, &o) || o.seal != RDV_SEAL_INFO)
 		return;
 	n = seal_to(s->keys.sig_key, &o, s->hval, sizeof(s->hval));
 	if (n <= 0)
@@ -1298,7 +1420,7 @@ static void host_slot_put(struct sig *s, unsigned routes, uint64_t now)
 	 */
 	missing = !s->fam[0].rnode_len || !s->fam[1].rnode_len ||
 		  s->fam[0].relocate || s->fam[1].relocate;
-	if (missing && (routes & SIG_ROUTE_WIDE) && !rdv_host_busy(s->rh)) {
+	if (missing && (routes & SIG_ROUTE_WIDE)) {
 		eager = ((!s->fam[0].rnode_len || s->fam[0].relocate) &&
 			 s->fam[0].up) ||
 			((!s->fam[1].rnode_len || s->fam[1].relocate) &&
@@ -1310,8 +1432,7 @@ static void host_slot_put(struct sig *s, unsigned routes, uint64_t now)
 						 SIG_DHT_PUT_SLOW_MS);
 		return;
 	}
-	if ((routes & SIG_ROUTE_WIDE) && now >= s->next_wide_put_ms &&
-	    !rdv_host_busy(s->rh)) {
+	if ((routes & SIG_ROUTE_WIDE) && now >= s->next_wide_put_ms) {
 		/*
 		 * The value where the key says it belongs, not only
 		 * where it first landed. Which nodes are closest drifts
@@ -1341,7 +1462,7 @@ static void host_pump_puts(struct sig *s, unsigned routes, uint64_t now)
 		return;
 	if (ending(s))
 		host_tomb_put(s, routes, now);
-	else if (!rdv_host_cell_held(s->rh))
+	else
 		host_slot_put(s, routes, now);
 }
 

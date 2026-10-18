@@ -7,8 +7,10 @@
 #include "keys.h"
 #include "rdv.h"
 
-_Static_assert(RDV_MAX_MSG + SEAL_OVERHEAD <= BEP44_MAX_VALUE,
-	       "a sealed slot message must fit one mutable item");
+_Static_assert(RDV_MAX_MSG + SEAL_OVERHEAD +
+	       (RDV_HDR_LEN + RDV_HOST_PAYLOAD + SEAL_OVERHEAD) +
+	       RDV_CELL_OVERHEAD <= BEP44_MAX_VALUE,
+	       "both sealed places must fit one mutable item");
 
 static const uint8_t rdv_zero[RDV_CID_LEN];
 
@@ -171,11 +173,6 @@ static int answer_stands(const struct rdv_host *h, int skip)
 	return 0;
 }
 
-int rdv_host_cell_held(const struct rdv_host *h)
-{
-	return answer_stands(h, -1);
-}
-
 int rdv_host_busy(const struct rdv_host *h)
 {
 	int i;
@@ -201,6 +198,7 @@ void rdv_host_release(struct rdv_host *h, const uint8_t cid[RDV_CID_LEN])
 int rdv_host_slot(struct rdv_host *h, const struct rdv_msg *m)
 {
 	struct rdv_claimant *c;
+	int i;
 
 	if (m->kind != RDV_OFFER)
 		return 0;
@@ -216,8 +214,10 @@ int rdv_host_slot(struct rdv_host *h, const struct rdv_msg *m)
 		return 0;
 	c->last_seq = m->seq;
 	c->have_seq = 1;
-	/* Its ask is in the cell, so whatever was answered there is gone. */
-	c->holds = 0;
+	/* This ask is what the turn carries now, so no answer stands there any
+	 * more, whoever it was addressed to. */
+	for (i = 0; i < RDV_HOST_MAX; i++)
+		h->c[i].holds = 0;
 	if (c->state == RDV_C_ANSWERED) {
 		/* It asks again, so the answer it holds is of no use to it. */
 		c->state = RDV_C_HARVESTED;
@@ -333,8 +333,8 @@ int rdv_host_next(struct rdv_host *h, const uint8_t *info, size_t info_len,
 
 	memset(o, 0, sizeof(*o));
 	memset(&m, 0, sizeof(m));
-	if (h->info_pending && (h->gone || !rdv_host_cell_held(h))) {
-		if (info_len > RDV_MAX_PAYLOAD)
+	if (h->info_pending) {
+		if (info_len > RDV_HOST_PAYLOAD)
 			return 0;
 		m.kind = h->gone ? RDV_TOMB : RDV_HOSTINFO;
 		m.gen = h->gen;
@@ -417,13 +417,12 @@ static int client_copy_acts(struct rdv_client *c, const struct rdv_msg *m,
 int rdv_client_host_slot(struct rdv_client *c, const struct rdv_msg *m,
 			 int64_t seq)
 {
-	int moved, fresh;
+	int moved;
 
 	if (m->kind != RDV_TOMB && m->kind != RDV_HOSTINFO)
 		return 0;
 	if (!memcmp(m->from, rdv_zero, RDV_CID_LEN))
 		return 0;
-	fresh = seq < 0 || seq > c->h_seq;
 	if (!client_copy_acts(c, m, seq))
 		return -1;
 	if (m->kind == RDV_TOMB) {
@@ -433,11 +432,6 @@ int rdv_client_host_slot(struct rdv_client *c, const struct rdv_msg *m,
 		return 0;
 	}
 	c->host_gone = 0;
-	/* A statement written since we last looked, while we are still
-	 * unanswered: the offer we left in the cell is gone, so asking again
-	 * is a new question and not a replay of one already read. */
-	if (fresh && c->state == RDV_CL_OFFERED)
-		c->reask = 1;
 	moved = !c->have_host || memcmp(c->host_cid, m->from, RDV_CID_LEN) ||
 		m->gen != c->host_gen;
 	if (!moved)
@@ -460,6 +454,17 @@ int rdv_client_host_slot(struct rdv_client *c, const struct rdv_msg *m,
 	c->offer_seq = 0;
 	c->refusal = RDV_REFUSE_NONE;
 	return 1;
+}
+
+/* The turn is free while we believed our ask stood there: it is gone, so the
+ * next one is a new question and not a replay of one already read. A copy
+ * behind the newest we have seen says nothing about the turn now. */
+void rdv_client_ask_gone(struct rdv_client *c, int64_t seq)
+{
+	if (seq >= 0 && seq < c->h_seq)
+		return;
+	if (c->state == RDV_CL_OFFERED)
+		c->reask = 1;
 }
 
 int rdv_client_own_slot(struct rdv_client *c, const struct rdv_msg *m)
