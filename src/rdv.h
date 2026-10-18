@@ -78,6 +78,7 @@ struct rdv_claimant {
 	uint8_t have_seq;
 	uint8_t pending;
 	uint8_t holds;			/* the cell carries the answer to it */
+	uint8_t wide_ask;		/* its ask came by the convergent route */
 	uint8_t refusal;
 	uint8_t grade;			/* the credential class it opened under */
 	uint8_t answer[RDV_MAX_PAYLOAD];

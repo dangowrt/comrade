@@ -1022,7 +1022,8 @@ static int host_slot_read(struct sig *s, const uint8_t *v, size_t v_len,
 	return 0;
 }
 
-static void claimant_read(struct sig *s, const uint8_t *v, size_t v_len)
+static void claimant_read(struct sig *s, const uint8_t *v, size_t v_len,
+			  int wide)
 {
 	struct rdv_claimant *c;
 	char sdp[SIG_SDP_MAX];
@@ -1038,8 +1039,12 @@ static void claimant_read(struct sig *s, const uint8_t *v, size_t v_len)
 	if (!rdv_host_slot(s->rh, &m))
 		return;
 	c = rdv_host_find(s->rh, m.from);
-	if (c)
+	if (c) {
 		c->grade = (uint8_t)grade;
+		/* It is reachable the way its ask arrived, and a claimant on a
+		 * token naming no node is reachable no other way. */
+		c->wide_ask = (uint8_t)(wide != 0);
+	}
 	slen = sdp_of(&m, sdp, sizeof(sdp));
 	if (slen < 0)
 		return;
@@ -1115,7 +1120,7 @@ static void on_slot_get(void *arg, const uint8_t *v, size_t v_len, int64_t seq,
 	/* Whose turn it is is discovered, not asked for: one that opens under
 	 * neither of our keys is another claimant's. */
 	if (s->is_host)
-		claimant_read(s, part, part_len);
+		claimant_read(s, part, part_len, op->wide);
 	else
 		answer_read(s, part, part_len, seq);
 }
@@ -1371,7 +1376,8 @@ static void host_answers(struct sig *s, unsigned routes)
 						       SIG_GRADE_RW, key);
 		n = seal_to(key, &o, val, sizeof(val));
 		if (n < 0 ||
-		    slot_put(s, RDV_ANSWER, m.to, 0, val, (size_t)n, -1))
+		    slot_put(s, RDV_ANSWER, m.to, c->wide_ask, val, (size_t)n,
+			     -1))
 			held[nheld++] = c;
 	}
 	for (i = 0; i < nheld; i++)
