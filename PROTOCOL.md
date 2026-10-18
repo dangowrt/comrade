@@ -1316,9 +1316,14 @@ the `ANSWER` addressed to that claimant (`sig_answer`); the host then gathers th
 next agent. So every claimant is answered with **credentials minted for it
 alone**, nothing is shared between claimants, and nothing is rotated.
 `punch_scan` advances each in-flight punch: a connected one becomes a worker
-(its dashboard row opens there); a failed one, or one past `HOST_PUNCH_MS`
-(`ICE_ATTEMPT_MS` for a resumption of a proven worker), is freed. A stuck punch
-never blocks the next joiner, since the next joiner has an agent of its own.
+(its dashboard row opens there), and a punch is freed when ICE gives its pairs
+up and not on a clock, because the claimant may still be waiting for the answer
+it punches against and when that reaches it is nobody's to predict. A punch
+whose claimant has gone quiet is freed when another needs its slot
+(`punch_evict_idle`: the oldest that is neither a resumption nor asking now),
+so the bound on punches is the worker budget rather than a deadline. A stuck
+punch never blocks the next joiner, since the next joiner has an agent of its
+own.
 A punch in flight gains the egress addresses the pool learns later by being
 answered again with its description fanned across them (`host_reanswer`).
 

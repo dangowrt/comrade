@@ -1416,7 +1416,9 @@ int peering_ice_failed(const struct peering *pr)
 
 int peering_ice_moved(const struct peering *pr, uint32_t peer_gen)
 {
-	return peer_gen > pr->ice.remote_gen;
+	/* Newer than nothing is not newer: with no description primed there is
+	 * no generation of the peer's to have moved on from. */
+	return pr->ice.remote_gen && peer_gen > pr->ice.remote_gen;
 }
 
 int peering_offer_judge(struct peering *pr, const uint8_t *data, size_t len,

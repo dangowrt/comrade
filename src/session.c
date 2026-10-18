@@ -54,28 +54,6 @@ static int fam_idx(int family)
 #define ICE_ATTEMPT_MS 90000
 
 /*
- * The same for a host's punch at a claimant joining afresh, where the wait
- * costs somebody else. That punch holds the claimant's identity, and every
- * further claim from it is refused as already in flight -- so a client that
- * dies mid-punch, or gives up and comes back, is turned away for as long as
- * this lasts.
- *
- * Only the punch. Both ends stamp it where they set the peer's description, so
- * the mailbox exchange before it -- an offer being stored, a claim being
- * noticed, a convergent lookup for a token that named no node -- is outside
- * this and stays unbounded, as it must: how long the DHT takes is not ours to
- * predict. Once both hold each other's candidates the scale is a human one,
- * and a terminal session whose round trip nears ten seconds is unusable
- * however patient we are.
- *
- * A resumption is not this case and keeps the backstop above. The claimant is
- * a client already admitted, coming back after a move, so it is not competing
- * for admission with anyone -- and it is rebuilding its signalling and
- * re-gathering as it comes, which is exactly the slow, unpredictable path this
- * must not cut short.
- */
-#define HOST_PUNCH_MS 15000
-/*
  * How many punches for one claimant may be in flight at once. A returning
  * client's fresh attempt is launched alongside the running one, not in place
  * of it, so the ranking carries whichever connects; a low cap bounds the poll
@@ -4386,23 +4364,12 @@ static void punch_scan(struct sess *s, struct worker *ws, int *dash_seq)
 			conn_register(s, c);
 			if (worker_spawn(ws, c))
 				conn_free(c);		/* table full */
-		/*
-		 * A resumption gets the long budget because a client coming
-		 * back may be slow to reappear -- but only one that has a
-		 * session to come back to. Resuming a worker that never carried
-		 * anything is a first punch in all but name, and giving it the
-		 * long budget holds the claimant's identity for a minute and a
-		 * half while the client it belongs to is asking once a second
-		 * and being told a punch is already running for it.
-		 */
-		} else if (now_ms() - c->punch_start_ms >
-			   ((c->punch_resume && conn_is_proven(c->punch_resume)) ?
-			    ICE_ATTEMPT_MS : HOST_PUNCH_MS) ||
-			   (!c->punch_stuck && peering_ice_failed(&c->pr))) {
-			dbg_logf("host: punch %s -> drop %.8s after %ums",
-				 c->punch_stuck ? "wedged (test)" :
-				 peering_ice_failed(&c->pr) ? "failed" :
-				 "timed out", c->punch_ufrag,
+		/* Spent is the only reason to stop: the claimant may still be
+		 * waiting for the answer this punches against, and when that
+		 * reaches it is not ours to know. */
+		} else if (!c->punch_stuck && peering_ice_failed(&c->pr)) {
+			dbg_logf("host: punch spent -> drop %.8s after %ums",
+				 c->punch_ufrag,
 				 (unsigned)(now_ms() - c->punch_start_ms));
 			if (c->punch_resume) {
 				__atomic_sub_fetch(&c->punch_resume->resume_pending,
@@ -4462,6 +4429,69 @@ static void punch_reap_oldest(struct sess *s, const char *ufrag)
 	if (victim < 0)
 		return;
 	punch_release(s, victim);
+}
+
+/* A free punch slot, and how much is in flight against the worker budget. */
+static int punch_slot_find(const struct sess *s, const struct worker *ws,
+			   int *inflight)
+{
+	int i, slot = -1, n = 0;
+
+	for (i = 0; i < HOST_MAX_WORKERS; i++) {
+		if (ws[i].used)
+			n++;
+		if (s->punching[i]) {
+			n++;
+			continue;
+		}
+		if (slot < 0)
+			slot = i;
+	}
+	*inflight = n;
+	return slot;
+}
+
+/* Is this claimant's ask in the queue right now? */
+static int offer_queued_ufrag(const struct sess *s, const char *ufrag)
+{
+	char u[40];
+	int i;
+
+	for (i = 0; i < RDV_HOST_MAX; i++) {
+		if (!s->offers[i].used)
+			continue;
+		cand_sdp_ufrag(s->offers[i].sdp, u, sizeof(u));
+		if (!strcmp(u, ufrag))
+			return 1;
+	}
+	return 0;
+}
+
+/* Nothing is dropped on a clock, so a punch whose claimant has gone quiet is
+ * freed when somebody else wants its slot: the oldest that is neither a
+ * resumption nor asking now. */
+static int punch_evict_idle(struct sess *s)
+{
+	uint64_t oldest = 0;
+	int i, victim = -1;
+	struct conn *c;
+
+	for (i = 0; i < HOST_MAX_WORKERS; i++) {
+		c = s->punching[i];
+		if (!c || c->punch_resume ||
+		    offer_queued_ufrag(s, c->punch_ufrag))
+			continue;
+		if (victim < 0 || c->punch_start_ms < oldest) {
+			oldest = c->punch_start_ms;
+			victim = i;
+		}
+	}
+	if (victim < 0)
+		return 0;
+	dbg_logf("host: punch %.8s evicted -- its slot is wanted",
+		 s->punching[victim]->punch_ufrag);
+	punch_release(s, victim);
+	return 1;
 }
 
 /* A claimant offering a new password has stopped answering the old one, so a
@@ -4566,7 +4596,7 @@ static int host_offer_take(struct sess *s, struct worker *ws,
 			   struct conn *listen, int idx, int served,
 			   int active, int *stuck_left)
 {
-	int pslot = -1, inflight = 0, i, again, adm, lanq, made;
+	int pslot = -1, inflight = 0, again, adm, lanq, made;
 	const struct session_cfg *cfg = s->cfg;
 	uint8_t *cid = s->offers[idx].cid;
 	char *sdp = s->offers[idx].sdp;
@@ -4615,16 +4645,9 @@ static int host_offer_take(struct sess *s, struct worker *ws,
 		return 0;
 	if (again)
 		punch_reap_stale(s, cu, cp);
-	for (i = 0; i < HOST_MAX_WORKERS; i++) {
-		if (ws[i].used)
-			inflight++;
-		if (s->punching[i]) {
-			inflight++;
-			continue;
-		}
-		if (pslot < 0)
-			pslot = i;
-	}
+	pslot = punch_slot_find(s, ws, &inflight);
+	if ((pslot < 0 || inflight >= HOST_MAX_WORKERS) && punch_evict_idle(s))
+		pslot = punch_slot_find(s, ws, &inflight);
 	if (pslot < 0 || inflight >= HOST_MAX_WORKERS)
 		return 0;
 	if (punch_count(s, cu) >= PUNCH_PARALLEL_MAX) {
@@ -5400,8 +5423,9 @@ int session_run(const struct session_cfg *cfg)
 			}
 			break;
 		case ST_SIGNAL:
-			/* A segment path needs no answer to be probed on. */
-			if (!cfg->is_host && !s.remote_set &&
+			/* A segment path needs no answer to be probed on, but an
+			 * answer already in hand is primed first. */
+			if (!cfg->is_host && !s.remote_set && !s.have_peer_sdp &&
 			    conn_lan_paths(&s.c, 0) > 0) {
 				s.ice_attempt_start = now_ms();
 				st = ST_WAIT_ICE;
@@ -5470,6 +5494,13 @@ int session_run(const struct session_cfg *cfg)
 				break;
 			}
 			hcid = sig_peer_cid(s.pm.sig);
+			/* Answered after a segment path brought us here: priming
+			 * is ST_SIGNAL's, and going back for it keeps the
+			 * credentials the answer was written to. */
+			if (!cfg->is_host && !s.remote_set && s.have_peer_sdp) {
+				st = ST_SIGNAL;
+				break;
+			}
 			if (!cfg->is_host &&
 			    (peering_ice_moved(&s.c.pr, sig_peer_gen(s.pm.sig)) ||
 			     (s.remote_set && hcid &&
@@ -5479,10 +5510,15 @@ int session_run(const struct session_cfg *cfg)
 				break;
 			}
 			if (!cfg->is_host && path_probe_expired(&s.c)) {
-				dbg_logf("session: nothing answered -- offering "
+				/* The same thing again under the same
+				 * credentials: a fresh gather would mint a
+				 * password and void an answer in flight. */
+				dbg_logf("session: nothing answered -- saying it "
 					 "again");
-				st = client_regather(&s) ? ST_FAIL : ST_GATHER;
-				break;
+				s.net.pool.posted = fan_local_sdp(&s);
+				sig_post(s.pm.sig, (const uint8_t *)local_sdp(&s),
+					 strlen(local_sdp(&s)));
+				s.ice_attempt_start = now_ms();
 			}
 			if (path_ready(&s.c)) {
 				if (s.peer_state < SESSION_PEER_LIVE) {
