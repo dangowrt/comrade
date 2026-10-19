@@ -450,6 +450,8 @@ struct sess {
 					 * net_ch, held until a roam's burst of
 					 * interface changes settles */
 	uint64_t net_hold_ms;		/* release once quiet this long */
+	uint64_t net_quiet_ms;		/* no second move acted on before this */
+	uint8_t net_synth;		/* manufactured: not held back by that */
 	/* The epoch the latest gather was started for, per family: the network
 	 * the description in hand describes. What an agent reports is stamped
 	 * from its own ice_ctx, which outlives this being taken by the next. */
@@ -2722,20 +2724,35 @@ static void report_links(struct sess *s)
  * on the netmon poll, so a temporary address coming or going under a live link
  * does not mark it moved.
  */
+/* One move acted on per this long, measured on the rig: an association
+ * delivers its v4 changes over three to four seconds, far enough apart to pass
+ * the interface-quiet hold below, and each one re-gathered. Daniel's value. */
+#define NET_REGATHER_HOLD_MS 3000
+
 static int net_moved(struct sess *s)
 {
 	unsigned ch = s->net_ch;
+	uint64_t now = now_ms();
 
-	s->net_ch = 0;
 	/* Only a v4 change re-establishes: a v6 or interface flap must not
 	 * disrupt a live v4 link or discard its accumulated egress pool
 	 * (netstate tracks v6 candidates on its own). */
-	if (!(ch & NETMON_CH_V4))
+	if (!(ch & NETMON_CH_V4)) {
+		s->net_ch = 0;
 		return 0;
+	}
+	/* One move acted on per settle window, both roles: an association
+	 * arrives as several v4 changes seconds apart, and each gather mints
+	 * credentials that void the answer the peer is working on. */
+	if (!s->net_synth && s->net_quiet_ms && now < s->net_quiet_ms)
+		return 0;
+	s->net_ch = 0;
+	s->net_synth = 0;
 	/* The move is acted on now; drop any burst remnant still coalescing in
 	 * net_pending so a trailing v6/iface flap cannot re-commit this v4 and
 	 * fire a second, redundant re-gather. A genuine later change re-arms. */
 	s->net_pending = 0;
+	s->net_quiet_ms = now + NET_REGATHER_HOLD_MS;
 	__atomic_add_fetch(&s->netgen, 1, __ATOMIC_RELAXED);
 	return 1;
 }
@@ -2819,6 +2836,8 @@ static void net_watch(struct sess *s, uint64_t now)
 			 !!(ch & NETMON_CH_V4), !!(ch & NETMON_CH_V6),
 			 !!(ch & NETMON_CH_IFACE));
 		s->net_pending |= ch;
+		if (synth)
+			s->net_synth = 1;
 		s->net_hold_ms = synth ? now : now + NET_HOLD_MS;
 	}
 	if (s->net_pending && now >= s->net_hold_ms &&
