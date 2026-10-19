@@ -2927,7 +2927,11 @@ static void resume_tick(struct conn *c)
 	switch (c->rs_state) {
 	case 0:
 		conn_park_ice(c, now);
-		conn_fresh_pwd(c);
+		/* A claim nothing has answered is asked again, not asked anew:
+		 * the host re-states its answer to a repeat (rdv_host_keep), so
+		 * a fresh password would only void the one in flight. */
+		if (s->remote_set)
+			conn_fresh_pwd(c);
 		s->have_peer_sdp = 0;
 		s->remote_set = 0;
 		s->peer_restart = 0;
@@ -2997,7 +3001,8 @@ static void resume_tick(struct conn *c)
 			 * pair until it proves one or gives the pair up; re-gather
 			 * only when this end moved or the agent is spent, not on a
 			 * clock that would abort a punch still landing. */
-			if (!s->remote_set || s->net_ch || peering_ice_failed(&c->pr)) {
+			if (!s->remote_set || s->net_ch ||
+			    peering_ice_failed(&c->pr)) {
 				c->rs_state = 0;
 				return;
 			}
