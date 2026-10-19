@@ -2775,6 +2775,14 @@ static uint32_t resume_backoff(struct conn *c)
 #define NET_HOLD_MS 750
 #define NET_HOLD_POLL_MS 250
 
+/* A v4 address that has appeared and proven nothing is a network still coming
+ * up, and acting on it mints credentials that void the answer the peer is
+ * working on. An association is a burst of exactly that. */
+static int net_settled(const struct sess *s)
+{
+	return netstate_conn(&s->pm.ns, 4) != NET_CONN_PENDING;
+}
+
 /* Split from net_pump so the in-place resume can watch the interfaces too. */
 static void net_watch(struct sess *s, uint64_t now)
 {
@@ -2813,7 +2821,8 @@ static void net_watch(struct sess *s, uint64_t now)
 		s->net_pending |= ch;
 		s->net_hold_ms = synth ? now : now + NET_HOLD_MS;
 	}
-	if (s->net_pending && now >= s->net_hold_ms) {
+	if (s->net_pending && now >= s->net_hold_ms &&
+	    (synth || net_settled(s))) {
 		s->net_ch |= s->net_pending;
 		s->net_pending = 0;
 	} else if (s->net_pending) {
