@@ -11,6 +11,7 @@
 #include "bep44.h"
 #include "dbg.h"
 #include "candpack.h"
+#include "candpolicy.h"
 #include "ctlproto.h"
 #include "dhtnode.h"
 #include "keys.h"
@@ -146,6 +147,7 @@ struct sig {
 	void *direct_arg;
 	uint8_t my_packed[RDV_MAX_PAYLOAD];
 	size_t my_packed_len;
+	char my_ufrag[40];		/* the identity the last offer carried */
 	uint32_t my_gen;
 
 	int locate;
@@ -359,11 +361,20 @@ static void sig_mb_note(const char *tag, const uint8_t *cid, const char *sdp)
 		 cid[2], cid[3], flat);
 }
 
+void sig_ident_changed(struct sig *s)
+{
+	if (!s || s->is_host || !s->rc)
+		return;
+	rdv_client_ident_changed(s->rc);
+	s->my_ufrag[0] = '\0';
+}
+
 int sig_post(struct sig *s, const uint8_t *data, size_t len)
 {
 	uint8_t packed[RDV_MAX_PAYLOAD];
 	char sdp[SIG_SDP_MAX];
 	int plen, changed;
+	char ufrag[40];
 
 	if (s->is_host || !s->rc || len >= sizeof(sdp))
 		return -1;
@@ -375,6 +386,10 @@ int sig_post(struct sig *s, const uint8_t *data, size_t len)
 		return -1;
 	changed = s->my_packed_len != (size_t)plen ||
 		  memcmp(s->my_packed, packed, (size_t)plen);
+	cand_sdp_ufrag(sdp, ufrag, sizeof(ufrag));
+	if (s->my_ufrag[0] && strcmp(s->my_ufrag, ufrag))
+		rdv_client_ident_changed(s->rc);
+	snprintf(s->my_ufrag, sizeof(s->my_ufrag), "%s", ufrag);
 	memcpy(s->my_packed, packed, (size_t)plen);
 	s->my_packed_len = (size_t)plen;
 	rdv_client_set_live(s->rc, 0);
@@ -1073,23 +1088,32 @@ static void answer_read(struct sig *s, const uint8_t *v, size_t v_len,
 	s->last_get_ms = now_ms();
 	if (!memcmp(m.from, s->rc->cid, RDV_CID_LEN))
 		return;
-	if (!rdv_client_own_slot(s->rc, &m)) {
+	if (!rdv_client_would_take(s->rc, &m)) {
 		if (m.kind == RDV_ANSWER || m.kind == RDV_REFUSE)
-			dbg_logf("sig: an answer to no offer of ours "
-				 "(re=%u ours=%u prev=%u)", (unsigned)m.re,
-				 (unsigned)s->rc->offer_seq,
-				 (unsigned)s->rc->prev_offer_seq);
+			dbg_logf("sig: not ours to take -- %s (re=%u ours=%u "
+				 "prev=%u taken=%u)",
+				 rdv_client_refusal_name(
+					 rdv_client_refusal(s->rc, &m)),
+				 (unsigned)m.re, (unsigned)s->rc->offer_seq,
+				 (unsigned)s->rc->prev_offer_seq,
+				 (unsigned)s->rc->answer_seq);
 		rdv_client_ask_gone(s->rc, seq);
 		return;
 	}
+	/* Decoded before it is taken: an answer we cannot read must leave us
+	 * asking, not holding a sequence nothing will ever come of. */
+	slen = m.kind == RDV_REFUSE ? 0 : sdp_of(&m, sdp, sizeof(sdp));
+	if (slen < 0) {
+		rdv_client_answer_unusable(s->rc, &m);
+		return;
+	}
+	if (!rdv_client_own_slot(s->rc, &m))
+		return;
 	if (m.kind == RDV_REFUSE) {
 		dbg_logf("sig: the host refused us (%u)",
 			 (unsigned)s->rc->refusal);
 		return;
 	}
-	slen = sdp_of(&m, sdp, sizeof(sdp));
-	if (slen < 0)
-		return;
 	sig_mb_note("GET answer", m.from, sdp);
 	if (s->cb)
 		s->cb(s->arg, m.from, (const uint8_t *)sdp, (size_t)slen);
@@ -1150,6 +1174,8 @@ static void on_slot_put(void *arg, int stored, const struct sockaddr *node,
 		if (stored > 0) {
 			s->mine_stored = 1;
 			s->h_stale = 0;
+			if (op->free_turn && s->rh)
+				rdv_host_turn_kept(s->rh);
 		}
 		if (stored > 0 && op->wide) {
 			s->next_hput_ms = now_ms() + SIG_DHT_RESTORE_MS;
@@ -1173,26 +1199,25 @@ static void on_slot_put(void *arg, int stored, const struct sockaddr *node,
 
 /*
  * A claimant takes the turn when it is free, to replace an ask of its own
- * under a different number, and over an answer the host addressed to somebody
- * else, which that claimant has had its round at. An answer addressed to us we
- * read: written over before that, it leaves both ends waiting on each other.
- * A rival's ask standing there is its turn, and waiting is the queue.
+ * under a different number, over an answer the host addressed to somebody else,
+ * and over one addressed to it that it has already taken -- a client coming
+ * back from a move has to get its new ask in without waiting on the host to
+ * hand the turn back. An answer it has not read, it reads: written over before
+ * that, it leaves both ends waiting on each other. A rival's ask standing
+ * there is its turn, and waiting is the queue.
  */
 static int turn_is_ours(const struct sig *s, const uint8_t *turn,
 			size_t turn_len)
 {
 	struct rdv_msg m;
+	int opened;
 	int grade;
 
 	if (!turn || !turn_len || !s->rc)
 		return 1;
-	if (claimant_open(s, turn, turn_len, &m, &grade))
-		return 0;
-	if (!memcmp(m.from, s->rc->cid, RDV_CID_LEN))
-		return m.seq != s->rc->offer_seq;
-	if (!s->rc->have_host || memcmp(m.from, s->rc->host_cid, RDV_CID_LEN))
-		return 0;
-	return memcmp(m.to, s->rc->cid, RDV_CID_LEN) != 0;
+	opened = !claimant_open(s, turn, turn_len, &m, &grade);
+
+	return rdv_client_may_replace(s->rc, &m, opened);
 }
 
 static int writes_host_place(char kind)
@@ -1269,7 +1294,7 @@ static int slot_put(struct sig *s, char kind, const uint8_t *cid, int wide,
 	if (!op)
 		return -1;
 	if (s->is_host && s->rh && writes_host_place(kind))
-		op->free_turn = !rdv_host_busy(s->rh);
+		op->free_turn = rdv_host_turn_spent(s->rh);
 	memcpy(op->val, val, val_len);
 	op->val_len = val_len;
 	op->seq_seen = seq_seen;

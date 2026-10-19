@@ -2345,6 +2345,9 @@ static void conn_gen_ice(struct conn *c)
 		snprintf(c->claim_ufrag, sizeof(c->claim_ufrag), "%s",
 			 c->pr.ice.ufrag);
 		pthread_mutex_unlock(&c->claim_lock);
+		/* Before the next offer is posted, since an answer to the one
+		 * it supersedes can arrive in between. */
+		sig_ident_changed(c->sess->pm.sig);
 	}
 	/* What a probe proved was proved for one claimant identity, so a fresh
 	 * one voids every measurement; the endpoints themselves stand. */

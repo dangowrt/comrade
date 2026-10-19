@@ -56,6 +56,9 @@ void sig_dispatch(struct sig *s, const struct pollfd *fds, int nfds);
 int sig_ready(struct sig *s);
 
 int sig_post(struct sig *s, const uint8_t *data, size_t len);
+/* This end has minted a fresh ICE identity: an answer to the offer the next
+ * one supersedes is addressed to credentials it has stopped presenting. */
+void sig_ident_changed(struct sig *s);
 
 int sig_subscribe(struct sig *s, sig_recv_cb *cb, void *arg);
 

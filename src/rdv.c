@@ -173,6 +173,16 @@ static int answer_stands(const struct rdv_host *h, int skip)
 	return 0;
 }
 
+int rdv_host_turn_spent(const struct rdv_host *h)
+{
+	return h->turn_spent;
+}
+
+void rdv_host_turn_kept(struct rdv_host *h)
+{
+	h->turn_spent = 0;
+}
+
 int rdv_host_busy(const struct rdv_host *h)
 {
 	int i;
@@ -193,6 +203,7 @@ void rdv_host_release(struct rdv_host *h, const uint8_t cid[RDV_CID_LEN])
 	if (c && c->pending)
 		return;
 	h->info_pending = 1;
+	h->turn_spent = 1;
 }
 
 int rdv_host_slot(struct rdv_host *h, const struct rdv_msg *m)
@@ -215,7 +226,8 @@ int rdv_host_slot(struct rdv_host *h, const struct rdv_msg *m)
 	c->last_seq = m->seq;
 	c->have_seq = 1;
 	/* This ask is what the turn carries now, so no answer stands there any
-	 * more, whoever it was addressed to. */
+	 * more, whoever it was addressed to, and it is not the host's to clear. */
+	h->turn_spent = 0;
 	for (i = 0; i < RDV_HOST_MAX; i++)
 		h->c[i].holds = 0;
 	if (c->state == RDV_C_ANSWERED) {
@@ -318,6 +330,7 @@ void rdv_host_forget(struct rdv_host *h, const uint8_t cid[RDV_CID_LEN])
 	c->holds = 0;
 	c->answer_len = 0;
 	h->info_pending = 1;
+	h->turn_spent = 1;
 }
 
 static void out_slot(struct rdv_out *o, int seal)
@@ -467,26 +480,68 @@ void rdv_client_ask_gone(struct rdv_client *c, int64_t seq)
 		c->reask = 1;
 }
 
-int rdv_client_own_slot(struct rdv_client *c, const struct rdv_msg *m)
+int rdv_client_refusal(const struct rdv_client *c, const struct rdv_msg *m)
 {
 	if (m->kind != RDV_ANSWER && m->kind != RDV_REFUSE)
-		return 0;
-	if (!rdv_addressed_to(m->to, c->cid))
-		return 0;
-	if (memcmp(m->to, c->cid, RDV_CID_LEN))
-		return 0;
+		return RDV_TAKE_NOT_AN_ANSWER;
+	if (!rdv_addressed_to(m->to, c->cid) ||
+	    memcmp(m->to, c->cid, RDV_CID_LEN))
+		return RDV_TAKE_ADDRESSED_ELSEWHERE;
 	if (c->have_host && memcmp(m->from, c->host_cid, RDV_CID_LEN))
-		return 0;
+		return RDV_TAKE_ANOTHER_HOST;
 	/* The offer standing now, or the one it just superseded: a host that
 	 * read the earlier ask answers it, and refusing that answer leaves
 	 * both ends asking and answering past each other. Anything older is a
-	 * replica serving a dead punch. */
+	 * replica serving a dead punch, and anything already taken is spent. */
 	if (!c->offer_seq)
-		return 0;
+		return RDV_TAKE_NOTHING_ASKED;
 	if (m->re != c->offer_seq &&
 	    !(c->prev_offer_seq && m->re == c->prev_offer_seq))
-		return 0;
+		return RDV_TAKE_ANOTHER_OFFER;
 	if (c->have_answer_seq && m->seq <= c->answer_seq)
+		return RDV_TAKE_ALREADY_TAKEN;
+
+	return RDV_TAKE_OK;
+}
+
+const char *rdv_client_refusal_name(int refusal)
+{
+	static const char *const n[] = {
+		"takeable", "not an answer", "addressed to somebody else",
+		"from another host instance", "we have asked nothing",
+		"names an offer that is not ours", "already taken"
+	};
+
+	if (refusal < 0 || refusal > RDV_TAKE_ALREADY_TAKEN)
+		return "unknown";
+
+	return n[refusal];
+}
+
+int rdv_client_would_take(const struct rdv_client *c, const struct rdv_msg *m)
+{
+	return rdv_client_refusal(c, m) == RDV_TAKE_OK;
+}
+
+int rdv_client_may_replace(const struct rdv_client *c, const struct rdv_msg *m,
+			   int opened)
+{
+	if (!c)
+		return 0;
+	if (!opened)
+		return 1;
+	/* Our own ask, still standing: rewriting it says nothing. */
+	if (!memcmp(m->from, c->cid, RDV_CID_LEN))
+		return m->seq != c->offer_seq;
+	if (!c->have_host || memcmp(m->from, c->host_cid, RDV_CID_LEN))
+		return 1;
+
+	return !rdv_client_would_take(c, m);
+}
+
+int rdv_client_own_slot(struct rdv_client *c, const struct rdv_msg *m)
+{
+	if (!rdv_client_would_take(c, m))
 		return 0;
 	c->answer_seq = m->seq;
 	c->have_answer_seq = 1;
@@ -501,6 +556,24 @@ int rdv_client_own_slot(struct rdv_client *c, const struct rdv_msg *m)
 	memcpy(c->answer, m->payload, m->payload_len);
 	c->answer_len = m->payload_len;
 	return 1;
+}
+
+/* Spent, not taken: the turn rule stops guarding a payload this end cannot
+ * read, and the ask goes again. */
+void rdv_client_answer_unusable(struct rdv_client *c, const struct rdv_msg *m)
+{
+	if (!c || !rdv_client_would_take(c, m))
+		return;
+	c->answer_seq = m->seq;
+	c->have_answer_seq = 1;
+	c->answer_len = 0;
+	c->reask = 1;
+}
+
+void rdv_client_ident_changed(struct rdv_client *c)
+{
+	if (c)
+		c->prev_offer_seq = 0;
 }
 
 void rdv_client_set_live(struct rdv_client *c, int live)

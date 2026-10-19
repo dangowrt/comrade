@@ -93,6 +93,7 @@ struct rdv_host {
 	int answered;
 	struct rdv_claimant c[RDV_HOST_MAX];
 	uint8_t info_pending;
+	uint8_t turn_spent;		/* handed back, and nobody has taken it */
 	uint8_t gone;
 };
 
@@ -101,9 +102,13 @@ void rdv_host_init(struct rdv_host *h, const uint8_t cid[RDV_CID_LEN],
 void rdv_host_set_gen(struct rdv_host *h, uint32_t gen);
 void rdv_host_entomb(struct rdv_host *h);
 int rdv_host_slot(struct rdv_host *h, const struct rdv_msg *m);
-/* Is a claimant engaged? The host's own statement keeps the turn place while
- * one is, and hands it back to whoever asks next when none is. */
+/* Is a claimant engaged? */
 int rdv_host_busy(const struct rdv_host *h);
+/* May the host's next statement clear the turn? Only once, and only because
+ * the turn was handed back and nobody has asked since: a statement written for
+ * any other reason keeps whatever stands there. */
+int rdv_host_turn_spent(const struct rdv_host *h);
+void rdv_host_turn_kept(struct rdv_host *h);
 /* The cell is the host's again: the claimant has the answer, or will ask for
  * another. Called once the claimant has been heard from, or its punch ends, so
  * the next claimant can take its turn without waiting on a clock. */
@@ -158,11 +163,43 @@ struct rdv_client {
 };
 
 void rdv_client_init(struct rdv_client *c, const uint8_t cid[RDV_CID_LEN]);
+/* The next offer carries fresh ICE credentials, so an answer to the one it
+ * supersedes names an identity this end no longer presents. */
+void rdv_client_ident_changed(struct rdv_client *c);
+
+/* Why a statement in the turn place is not ours to take. The reasons are
+ * distinct conditions, and naming the one that fired is the difference
+ * between a usable log line and a misleading one. */
+enum rdv_take {
+	RDV_TAKE_OK = 0,
+	RDV_TAKE_NOT_AN_ANSWER,
+	RDV_TAKE_ADDRESSED_ELSEWHERE,
+	RDV_TAKE_ANOTHER_HOST,
+	RDV_TAKE_NOTHING_ASKED,
+	RDV_TAKE_ANOTHER_OFFER,
+	RDV_TAKE_ALREADY_TAKEN
+};
+
+int rdv_client_refusal(const struct rdv_client *c, const struct rdv_msg *m);
+const char *rdv_client_refusal_name(int refusal);
+
+/* May a claimant write its ask over what stands in the turn place? `opened`
+ * is 0 where the statement could not be opened, as another credential class's
+ * cannot be. The place is a doorbell, not a lock: the host keeps the queue. */
+int rdv_client_may_replace(const struct rdv_client *c, const struct rdv_msg *m,
+			   int opened);
+
 /* `seq` is the store's sequence for the copy read, -1 where it has none. -1
  * back is a copy older than one already acted on, 1 a host new or moved. */
 int rdv_client_host_slot(struct rdv_client *c, const struct rdv_msg *m,
 			 int64_t seq);
+/* Would this statement be taken as our answer? The test rdv_client_own_slot
+ * applies, without applying it: what a claimant must not write over. */
+int rdv_client_would_take(const struct rdv_client *c, const struct rdv_msg *m);
 int rdv_client_own_slot(struct rdv_client *c, const struct rdv_msg *m);
+
+/* Record an answer whose payload does not decode as spent, leaving us asking. */
+void rdv_client_answer_unusable(struct rdv_client *c, const struct rdv_msg *m);
 /* The cell's turn place is free, whoever emptied it; `seq` as above. */
 void rdv_client_ask_gone(struct rdv_client *c, int64_t seq);
 void rdv_client_set_live(struct rdv_client *c, int live);
