@@ -1280,20 +1280,22 @@ int peering_net_stun_pick(const struct peering_net *m, unsigned attempt,
 			  char *host, size_t hostlen, uint16_t *port)
 {
 	const char *cand, *colon, *e;
-	int i, picked = 0;
+	int i, pass, picked = 0;
 	char ip[64];
 
 	if (m->nservers < 1)
 		return -1;
 	e = m->servers[attempt % (unsigned)m->nservers];
-	for (i = 0; i < m->nservers && !picked; i++) {
-		cand = m->servers[(attempt + (unsigned)i) %
-				  (unsigned)m->nservers];
-		if (stun_server_ip4(cand, ip, sizeof(ip), 0)) {
-			e = cand;
-			picked = 1;
+	for (pass = 0; pass < 2 && !picked; pass++)
+		for (i = 0; i < m->nservers && !picked; i++) {
+			cand = m->servers[(attempt + (unsigned)i) %
+					  (unsigned)m->nservers];
+			if (pass ? stun_server_ip4(cand, ip, sizeof(ip), 0)
+				 : stun_server_live4(cand, ip, sizeof(ip))) {
+				e = cand;
+				picked = 1;
+			}
 		}
-	}
 	if (!picked)
 		return -1;
 	colon = strrchr(e, ':');

@@ -325,6 +325,10 @@ void peering_net_reap(struct peering_net *m, int family);
  * Only ever a pre-resolved address, never the name: a name is resolved inside
  * the agent on a thread its teardown joins, so one that does not resolve holds
  * the whole loop for the lookup. -1 until the warm pass has cached one.
+ *
+ * An address a probe round has heard from wins over one that merely resolves,
+ * for every attempt, since the pool holds routable addresses that answer
+ * nothing and an agent needs 23.5s to find that out for itself.
  */
 int peering_net_stun_pick(const struct peering_net *m, unsigned attempt,
 			  char *host, size_t hostlen, uint16_t *port);

@@ -4,6 +4,7 @@
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
+#include <pthread.h>
 
 #include "wsock.h"
 
@@ -569,6 +570,126 @@ static void the_server_an_attempt_asks_walks_the_list(void)
 	peering_net_destroy(&m);
 }
 
+/* An upper bound only: the round is ended by the answer, not by this. */
+#define RESPONDER_WAIT_MS 5000
+
+struct responder {
+	sock_t fd;
+	volatile int done;
+};
+
+static const uint8_t mapped[4] = { 203, 0, 113, 9 };
+
+static void *answer_one_binding(void *arg)
+{
+	static const uint8_t magic[4] = { 0x21, 0x12, 0xa4, 0x42 };
+	struct sockaddr_storage from;
+	struct responder *r = arg;
+	uint8_t buf[512], out[32];
+	struct pollfd pf;
+	socklen_t flen;
+	size_t o = 0;
+	int n, i;
+
+	flen = sizeof(from);
+	pf.fd = r->fd;
+	pf.events = POLLIN;
+	pf.revents = 0;
+	if (sock_poll(&pf, 1, RESPONDER_WAIT_MS) < 1)
+		return NULL;
+	n = (int)recvfrom(r->fd, (char *)buf, sizeof(buf), 0,
+			  (struct sockaddr *)&from, &flen);
+	if (n < 20)
+		return NULL;
+	out[o++] = 0x01; out[o++] = 0x01;
+	out[o++] = 0x00; out[o++] = 0x0c;
+	memcpy(out + o, magic, 4);
+	o += 4;
+	memcpy(out + o, buf + 8, STUN_PROBE_TXID_LEN);
+	o += STUN_PROBE_TXID_LEN;
+	out[o++] = 0x00; out[o++] = 0x20;
+	out[o++] = 0x00; out[o++] = 0x08;
+	out[o++] = 0x00; out[o++] = 0x01;
+	out[o++] = (uint8_t)((54321 >> 8) ^ magic[0]);
+	out[o++] = (uint8_t)((54321 & 0xff) ^ magic[1]);
+	for (i = 0; i < 4; i++)
+		out[o++] = (uint8_t)(mapped[i] ^ magic[i]);
+	sendto(r->fd, (const char *)out, o, 0, (struct sockaddr *)&from, flen);
+	r->done = 1;
+
+	return NULL;
+}
+
+static void probe_hit(void *arg, int family, const uint8_t addr[16],
+		      const uint8_t local[16], int locallen, uint16_t port)
+{
+	int *hits = arg;
+
+	(void)family;
+	(void)addr;
+	(void)local;
+	(void)locallen;
+	(void)port;
+	(*hits)++;
+}
+
+/* The pool holds routable addresses that answer nothing, and an agent spends a
+ * whole gather finding that out. */
+static void a_server_that_answers_outranks_one_that_resolves(void)
+{
+	char live[32] = "", dead[32] = "", host[128];
+	uint8_t seed[STUN_PROBE_TXID_LEN];
+	struct sockaddr_in sin;
+	struct peering_net m;
+	struct responder r;
+	char *servers[2];
+	socklen_t slen;
+	uint16_t port;
+	int hits = 0;
+	pthread_t th;
+
+	memset(&r, 0, sizeof(r));
+	memset(&sin, 0, sizeof(sin));
+	memset(seed, 0x5a, sizeof(seed));
+	sin.sin_family = AF_INET;
+	sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	r.fd = socket(AF_INET, SOCK_DGRAM, 0);
+	assert(sock_valid(r.fd));
+	assert(!bind(r.fd, (struct sockaddr *)&sin, sizeof(sin)));
+	slen = sizeof(sin);
+	assert(!getsockname(r.fd, (struct sockaddr *)&sin, &slen));
+	snprintf(live, sizeof(live), "127.0.0.1:%u", ntohs(sin.sin_port));
+	snprintf(dead, sizeof(dead), "127.0.0.2:%u", ntohs(sin.sin_port));
+	servers[0] = dead;
+	servers[1] = live;
+
+	assert(stun_server_ip4(dead, host, sizeof(host), 1) == 1);
+	assert(stun_server_ip4(live, host, sizeof(host), 1) == 1);
+	assert(!stun_server_live4(dead, host, sizeof(host)));
+	assert(!stun_server_live4(live, host, sizeof(host)));
+
+	assert(!pthread_create(&th, NULL, answer_one_binding, &r));
+	stun_probe_run(AF_INET, servers, 2, RESPONDER_WAIT_MS, seed, &r.done,
+		       probe_hit, &hits);
+	assert(!pthread_join(th, NULL));
+	assert(hits >= 1);
+	sock_close(r.fd);
+
+	assert(stun_server_live4(live, host, sizeof(host)) == 1);
+	assert(!strcmp(host, "127.0.0.1"));
+	assert(!stun_server_live4(dead, host, sizeof(host)));
+
+	/* The walk starts at the entry that answers nothing, from either end,
+	 * and the port names which one was handed over. */
+	peering_net_init(&m, servers, 2, 1);
+	assert(!peering_net_stun_pick(&m, 0, host, sizeof(host), &port));
+	assert(port == ntohs(sin.sin_port));
+	assert(!strcmp(host, "127.0.0.1"));
+	assert(!peering_net_stun_pick(&m, 1, host, sizeof(host), &port));
+	assert(port == ntohs(sin.sin_port));
+	peering_net_destroy(&m);
+}
+
 /* An identity this end fixes itself, so it survives a re-gather and the peer
  * keeps hammering one target. */
 static void an_identity_is_minted_to_gather_under(void)
@@ -967,6 +1088,7 @@ int main(void)
 	rotating_to_the_next_server_is_earned_and_bounded();
 	the_link_verdict_follows_the_evidence();
 	the_server_an_attempt_asks_walks_the_list();
+	a_server_that_answers_outranks_one_that_resolves();
 	an_identity_is_minted_to_gather_under();
 	which_end_may_adopt_is_read_from_the_mailbox();
 	a_host_asks_a_reachable_peer_to_rendezvous();

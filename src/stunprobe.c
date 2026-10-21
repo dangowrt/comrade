@@ -148,6 +148,7 @@ struct stun_cache_entry {
 	int family;
 	struct sockaddr_storage sa;
 	socklen_t len;
+	int answered;
 };
 
 static struct stun_cache_entry stun_cache[STUN_CACHE_MAX];
@@ -229,11 +230,24 @@ static void cache_replace(const char *name, const struct sockaddr_storage *sa,
 			  const socklen_t *len, const int *fam, int cnt)
 {
 	struct stun_cache_entry *e;
-	int i;
+	int live[STUN_WARM_ADDRS];
+	int i, k;
 
 	if (strlen(name) >= sizeof(e->name))
 		return;
+	if (cnt > STUN_WARM_ADDRS)
+		cnt = STUN_WARM_ADDRS;
+	memset(live, 0, sizeof(live));
 	pthread_mutex_lock(&stun_cache_lock);
+	/* A re-resolve says nothing about reachability, so an address that
+	 * survives one keeps what the probe rounds proved about it. */
+	for (i = 0; i < cnt; i++)
+		for (k = 0; k < stun_cache_n; k++)
+			if (stun_cache[k].family == fam[i] &&
+			    stun_cache[k].len == len[i] &&
+			    !memcmp(&stun_cache[k].sa, &sa[i],
+				    (size_t)len[i]))
+				live[i] = stun_cache[k].answered;
 	for (i = 0; i < stun_cache_n; ) {
 		if (!strcmp(stun_cache[i].name, name))
 			stun_cache[i] = stun_cache[--stun_cache_n];
@@ -246,7 +260,23 @@ static void cache_replace(const char *name, const struct sockaddr_storage *sa,
 		e->family = fam[i];
 		memcpy(&e->sa, &sa[i], sizeof(e->sa));
 		e->len = len[i];
+		e->answered = live[i];
 	}
+	pthread_mutex_unlock(&stun_cache_lock);
+}
+
+/* A validated binding response came from this address: the one thing that
+ * tells a server apart from a routable address which answers nothing. */
+static void cache_mark_answered(const struct sockaddr_storage *sa,
+				socklen_t len)
+{
+	int i;
+
+	pthread_mutex_lock(&stun_cache_lock);
+	for (i = 0; i < stun_cache_n; i++)
+		if (stun_cache[i].len == len &&
+		    !memcmp(&stun_cache[i].sa, sa, (size_t)len))
+			stun_cache[i].answered = 1;
 	pthread_mutex_unlock(&stun_cache_lock);
 }
 
@@ -391,6 +421,30 @@ int stun_server_ip4(const char *server, char *out, size_t outn, int allow_net)
 	if (n < 1)
 		return 0;
 	sin = (const struct sockaddr_in *)&ss;
+	return inet_ntop(AF_INET, &sin->sin_addr, out, (socklen_t)outn) ? 1 : 0;
+}
+
+int stun_server_live4(const char *server, char *out, size_t outn)
+{
+	struct sockaddr_storage ss[STUN_WARM_ADDRS];
+	socklen_t len[STUN_WARM_ADDRS];
+	const struct sockaddr_in *sin;
+	int found = -1;
+	int i, n, k;
+
+	n = cache_get_all(server, AF_INET, ss, len, STUN_WARM_ADDRS);
+	pthread_mutex_lock(&stun_cache_lock);
+	for (i = 0; i < n && found < 0; i++)
+		for (k = 0; k < stun_cache_n; k++)
+			if (stun_cache[k].answered &&
+			    stun_cache[k].len == len[i] &&
+			    !memcmp(&stun_cache[k].sa, &ss[i],
+				    (size_t)len[i]))
+				found = i;
+	pthread_mutex_unlock(&stun_cache_lock);
+	if (found < 0)
+		return 0;
+	sin = (const struct sockaddr_in *)&ss[found];
 	return inet_ntop(AF_INET, &sin->sin_addr, out, (socklen_t)outn) ? 1 : 0;
 }
 
@@ -610,8 +664,8 @@ void stun_probe_run(int family, char *const *servers, int nservers,
 	struct sockaddr_storage *dst;
 	uint64_t t0, next_send = 0;
 	socklen_t *dlen;
+	int r, llen, t;
 	uint16_t port;
-	int r, llen;
 	sock_t fd;
 
 	if (n <= 0)
@@ -674,8 +728,12 @@ void stun_probe_run(int family, char *const *servers, int nservers,
 					     NULL, NULL);
 			if (r > 0 &&
 			    !stun_probe_mapped_fam(buf, (size_t)r, seed,
-						   want_fam, addr, &port))
+						   want_fam, addr, &port)) {
+				t = buf[8 + STUN_PROBE_TXID_LEN - 1];
+				if (t < ndst)
+					cache_mark_answered(&dst[t], dlen[t]);
 				hit(arg, family, addr, local, llen, port);
+			}
 		}
 	}
 	sock_close(fd);

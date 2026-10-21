@@ -68,6 +68,11 @@ int stun_probe_mapped_fam(const uint8_t *pkt, size_t len,
  * the cache only. Returns 1 on success, 0 if not (yet) known. */
 int stun_server_ip4(const char *server, char *out, size_t outn, int allow_net);
 
+/* The same, restricted to an address a probe round has had a binding response
+ * from. Cache only, so nothing is live until the first round has run.
+ * Returns 1 on success, 0 if not. */
+int stun_server_live4(const char *server, char *out, size_t outn);
+
 /* The servers of `family` a round can ask, walked from `start` and wrapping:
  * up to `max` of the caller's own pointers into `out` (NULL counts alone), and
  * how many. A round reads the cache, so an unresolved name is unaskable. */
