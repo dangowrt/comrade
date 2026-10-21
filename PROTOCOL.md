@@ -780,6 +780,35 @@ v4 (the cell is sealed) + libjuice RFC 8445 peer-reflexive source learning. KCP
 output sends via the peer's own agent (`juice_send` targets that agent's
 remote).
 
+### Both ends take the controlling role, and that is settled
+
+comrade assigns no ICE role, and libjuice offers no way to set one: `juice.h`
+exports no role call, and the mode is decided by whichever of its entry points
+is reached first while the mode is unknown. `agent_gather_candidates()` and
+`agent_get_local_description()` take CONTROLLING;
+`agent_set_remote_description()` takes CONTROLLED. `nat_setup()` gathers at
+agent creation on both ends, so both are CONTROLLING before any description is
+exchanged, and the mode is no longer unknown when one arrives. The host could
+not do otherwise in any case: its listener agent is gathered before the
+claimant it will serve exists.
+
+Every connect therefore resolves an RFC 8445 role conflict by tiebreaker, and
+libjuice logs `ICE role conflict (both controlling)` when it does. **This is
+normal and has been measured as harmless; it is not a fault and not a lead.**
+Across every roam-rig run held under `pmate-local-test/results` (2026-10-21):
+
+- 560 role conflicts, of which 525 (94%) are followed by a working path
+  within 10 s on the same process.
+- Per roam, conflict against outcome: 12 recovered and 2 failed with a
+  conflict in the window, against 5 recovered and 5 failed without one. A
+  conflict marks checks flowing in both directions, so it tracks success; its
+  absence tracks the failures where nothing flowed at all.
+
+Assigning roles deliberately would need a libjuice role setter upstream, and
+the asymmetry to use is already there (the claimant offers, so it is
+controlling; the host answers, so it is controlled). That is a tidiness
+argument, not a fix for anything observed.
+
 ---
 
 ## 9. KCP transport (`src/stream.c`, kcp 2.1.1)
