@@ -2093,6 +2093,18 @@ static void sdp_pwd(const char *sdp, char *out)
 		sscanf(p, "ice-pwd:%39s", out);
 }
 
+/* A pong, and nothing less: a punch connecting proves only this end's half,
+ * and "lost" cannot stand in because a link that was never up never goes
+ * down. */
+static int conn_is_proven(struct conn *c)
+{
+	struct ctlplane_live live;
+
+	ctlplane_liveness(&c->pr.cp, &live);
+
+	return live.pong_seen;
+}
+
 static int conn_is_lost(struct conn *c)
 {
 	int lost;
@@ -2102,11 +2114,11 @@ static int conn_is_lost(struct conn *c)
 }
 
 /*
- * A claimant already served over lanlink is refused a second admission -- once
- * per client, not once per transport. Unless the connection serving it is
- * lost: then the claim is that client returning, over whichever transport
- * reaches us now (a host that roamed off the shared segment hears its old
- * LAN clients over the DHT), and admission or resumption is what it needs.
+ * A claimant a lanlink connection is carrying is refused a second admission --
+ * once per client, not once per transport. Carrying is the whole test: a
+ * segment claim can reach us over a path nothing of ours reaches back on, and
+ * a client whose connection is lost or was never proven is one to admit or
+ * resume over whichever transport reaches us now.
  */
 static int lan_ufrag_claimed(const struct sess *s, const char *ufrag)
 {
@@ -2117,7 +2129,8 @@ static int lan_ufrag_claimed(const struct sess *s, const char *ufrag)
 	for (i = 0; i < HOST_MAX_WORKERS; i++)
 		if (s->lan_conns[i] &&
 		    !strcmp(s->lan_conns[i]->claim_ufrag, ufrag))
-			return !conn_is_lost(s->lan_conns[i]);
+			return conn_is_proven(s->lan_conns[i]) &&
+			       !conn_is_lost(s->lan_conns[i]);
 	for (i = 0; i < s->lan_pending_n; i++)
 		if (!strcmp(s->lan_pending[i].ufrag, ufrag))
 			return 1;
@@ -4084,21 +4097,6 @@ static struct conn *worker_by_ufrag(struct worker *ws, const char *ufrag)
 	return NULL;
 }
 
-
-/*
- * Has anything ever come back over this connection? A punch connecting proves
- * the host's half of it and says nothing whatever about the client's, so until
- * a pong has arrived there is no evidence a session exists here at all -- and
- * "lost" cannot stand in, since a link that was never up never goes down.
- */
-static int conn_is_proven(struct conn *c)
-{
-	struct ctlplane_live live;
-
-	ctlplane_liveness(&c->pr.cp, &live);
-
-	return live.pong_seen;
-}
 
 /* Is this claimant queued for LAN admission (not yet a worker)? */
 static int lan_pending_ufrag(const struct sess *s, const char *ufrag)
