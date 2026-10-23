@@ -5393,7 +5393,9 @@ int session_run(const struct session_cfg *cfg)
 		 * carry it, so an answer to the identity we hold may be on its
 		 * way: the rotation keeps it.
 		 */
-		if ((st == ST_GATHER || st == ST_SIGNAL) && stun_stall(&s)) {
+		if ((st == ST_GATHER || st == ST_SIGNAL ||
+		     (st == ST_WAIT_ICE && !path_ready(&s.c))) &&
+		    stun_stall(&s)) {
 			dbg_logf("stun: no public v4 through pool server %d -- "
 				 "asking the next (%d of %d)",
 				 s.net.ice_attempt % s.stun_count,
