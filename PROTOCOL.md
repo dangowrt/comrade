@@ -1064,9 +1064,8 @@ number of samples per window. A statistic of one kind is never compared with
 one of another kind: `cost` with `cost`, `base` with `base`.
 
 `floor`, so costs within one quantum of each other share a bucket. Rounding up
-would put 0ms and 1ms a whole bucket -- the switch margin -- apart, at exactly
-the boundary where a LAN's measurement noise lives, and equal paths would
-drift.
+would put 0ms and 1ms a whole bucket apart, at exactly the boundary where a
+LAN's measurement noise lives, and equal paths would drift.
 
 A path whose local transport cannot carry a datagram at that moment -- an `ICE`
 path whose agent has nominated no pair -- is not a candidate at all rather than
@@ -1083,14 +1082,22 @@ tie-break are what keep measurement noise from splitting the two ends.
 Divergence remains possible while a measurement update is in flight, and is
 harmless by invariant 2.
 
-**Switching** is immediate when the path in use goes `DEAD`. Otherwise a
-candidate must win by `PATH_SWITCH_MARGIN` buckets for `PATH_SWITCH_HOLD`
-consecutive evaluations, so near-equal paths cannot flap. Selection is evaluated
-once per `PATH_KEEP_MS`, which is what gives `PATH_SWITCH_HOLD` its unit. The
-margin-and-hold applies only **between paths in the same warmth tier**: a
-demotion of the incumbent is immediate and ungated, so a dying path never holds
-the session for extra evaluations at exactly the wrong moment. Both ends apply
-the identical rule to the identical numbers and so flip together.
+**Switching** by the ranking is the escape route and the cold start, and
+nothing else: there is no incumbent, the incumbent's transport can no longer
+send, or the incumbent has fallen out of its warmth tier. Each of those must
+never wait, so none of them is gated on anything, and both ends apply the
+identical rule to the identical numbers and so flip together.
+
+A path that is merely better inside the incumbent's own tier is a
+**discretionary** move, and the ranking does not make it. It is asked for as a
+question: a challenger must beat the incumbent on the loaded and the unloaded
+bucket at once, strictly, which is Babel's conjunction (RFC 8966 Appendix A.3)
+in place of a margin and a dwell. Strictness on a quantised value makes a tie a
+refusal, so the `id` tie-break orders cold paths and can never move a session,
+and the unloaded figure is what decides while the loaded one vetoes a move onto
+a path somebody else is congesting at that moment. Duration comes from the base
+window, a count of probe outcomes, so no evaluation cadence, no dwell timer and
+no margin constant exist.
 
 | constant | value | meaning |
 |---|---|---|
@@ -1102,8 +1109,6 @@ the identical rule to the identical numbers and so flip together.
 | `PATH_LOSS_PENALTY_MS` | 200 | cost added by total loss |
 | `PATH_COST_QUANTUM_MS` | 5 | ranking bucket width, both statistics |
 | `PATH_LOSS_WINDOW` | 16 | probe outcomes the loss ratio and `base` span |
-| `PATH_SWITCH_MARGIN` | 1 | buckets a candidate must win by |
-| `PATH_SWITCH_HOLD` | 2 | consecutive evaluations it must hold (one per `PATH_KEEP_MS`) |
 | `PATH_ADOPT_RATE` | 8/s, depth 8 | token bucket for unknown-source probes, per listening socket |
 
 #### Adding a path mid-session

@@ -300,7 +300,6 @@ void path_table_init(struct path_table *t)
 {
 	memset(t, 0, sizeof(*t));
 	t->sel = -1;
-	t->cand = -1;
 }
 
 int path_table_count(const struct path_table *t)
@@ -435,10 +434,6 @@ struct path *path_table_add(struct path_table *t, enum path_kind kind,
 	if (slot < 0)
 		return NULL;
 	p = &t->p[slot];
-	if (t->cand == slot) {
-		t->cand = -1;
-		t->hold = 0;
-	}
 	memset(p, 0, sizeof(*p));
 	p->used = 1;
 	/* A path over a borrowed agent carries nothing until the agent has
@@ -509,10 +504,6 @@ void path_table_drop_agent(struct path_table *t, struct nat_agent *agent)
 		memset(&t->p[i], 0, sizeof(t->p[i]));
 		if (t->sel == i)
 			t->sel = -1;
-		if (t->cand == i) {
-			t->cand = -1;
-			t->hold = 0;
-		}
 	}
 }
 
@@ -526,10 +517,6 @@ void path_table_drop_kind(struct path_table *t, enum path_kind kind)
 		memset(&t->p[i], 0, sizeof(t->p[i]));
 		if (t->sel == i)
 			t->sel = -1;
-		if (t->cand == i) {
-			t->cand = -1;
-			t->hold = 0;
-		}
 	}
 }
 
@@ -563,9 +550,6 @@ void path_table_reset_stats(struct path_table *t, uint64_t now)
 		 * answer while it was being asked. */
 		p->trying_since_ms = now;
 	}
-	t->cand = -1;
-	t->hold = 0;
-	t->next_eval_ms = 0;
 }
 
 int path_table_any_qualified(const struct path_table *t)
@@ -816,43 +800,13 @@ int path_select(struct path_table *t, uint64_t now)
 	best = path_best(t, now);
 	if (best < 0) {
 		t->sel = -1;
-		t->cand = -1;
-		t->hold = 0;
 		return -1;
 	}
 	if (t->sel < 0 || !t->p[t->sel].used || !t->p[t->sel].usable ||
 	    path_warmth_of(&t->p[best], now) <
-	    path_warmth_of(&t->p[t->sel], now)) {
+	    path_warmth_of(&t->p[t->sel], now))
 		t->sel = best;
-		t->cand = -1;
-		t->hold = 0;
-		t->next_eval_ms = now + PATH_KEEP_MS;
-		return t->sel;
-	}
-	if (best == t->sel) {
-		t->cand = -1;
-		t->hold = 0;
-		return t->sel;
-	}
-	if (now < t->next_eval_ms)
-		return t->sel;
-	t->next_eval_ms = now + PATH_KEEP_MS;
-	if (path_bucket(&t->p[t->sel]) - path_bucket(&t->p[best]) <
-	    PATH_SWITCH_MARGIN) {
-		t->cand = -1;
-		t->hold = 0;
-		return t->sel;
-	}
-	if (t->cand != best) {
-		t->cand = best;
-		t->hold = 0;
-	}
-	t->hold++;
-	if (t->hold >= PATH_SWITCH_HOLD) {
-		t->sel = best;
-		t->cand = -1;
-		t->hold = 0;
-	}
+
 	return t->sel;
 }
 

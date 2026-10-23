@@ -752,15 +752,24 @@ static void bucketed(struct path *p, int srtt_ms)
 	p->loss_n = 0;
 }
 
+/* The ring, set directly: these cases are about the arithmetic of the
+ * decision, not about how samples get in. */
+static void based(struct path *p, int base_ms)
+{
+	p->rtt[0] = (uint16_t)base_ms;
+	p->rtt_n = 1;
+	p->rtt_i = 0;
+	p->peer_base_srtt_ms = 0;
+}
+
 /*
- * Near-equal paths must not flap: a candidate has to win by PATH_SWITCH_MARGIN
- * buckets over PATH_SWITCH_HOLD consecutive evaluations, one evaluation per
- * PATH_KEEP_MS, and a single miss resets the count. But hysteresis gates only a
- * contest inside one warmth tier -- a demotion of the incumbent moves the
- * session at once, so a dying path never holds it for extra evaluations at
- * exactly the wrong moment.
+ * Selection is the escape route and the cold start: no incumbent, an incumbent
+ * whose transport cannot send, or one that has fallen out of its warmth tier.
+ * A better path inside the tier never moves it, however long it stays better,
+ * because that move is discretionary and is asked for separately
+ * (path_challenger) rather than taken by the ranking.
  */
-static void hysteresis_check(void)
+static void selection_moves_only_when_it_must(void)
 {
 	struct path_table t;
 	uint64_t now = 0;
@@ -775,86 +784,30 @@ static void hysteresis_check(void)
 	bucketed(&t.p[1], 60);
 	assert(path_select(&t, 0) == 0);
 
-	/* The challenger takes the lead: one evaluation is not enough. */
+	/* The challenger takes a clear lead and keeps it: the ranking leaves
+	 * the session where it is, and reports the challenger when asked. */
 	bucketed(&t.p[1], 10);
-	for (i = 0; i < 2; i++) {
+	based(&t.p[1], 10);
+	based(&t.p[0], 40);
+	for (i = 0; i < 6; i++) {
 		now += PATH_KEEP_MS;
 		warm(&t.p[0], now);
 		warm(&t.p[1], now);
-		assert(path_select(&t, now) == (i ? 1 : 0));
+		assert(path_select(&t, now) == 0);
 	}
+	assert(path_challenger(&t, now) == 1);
 
-	/* A single miss resets the count, so the wait starts over. */
-	bucketed(&t.p[0], 5);
-	now += PATH_KEEP_MS;
-	warm(&t.p[0], now);
-	warm(&t.p[1], now);
-	assert(path_select(&t, now) == 1);	/* first winning evaluation */
-	bucketed(&t.p[0], 10);			/* the margin is lost */
-	now += PATH_KEEP_MS;
-	warm(&t.p[0], now);
-	warm(&t.p[1], now);
-	assert(path_select(&t, now) == 1);
-	bucketed(&t.p[0], 5);
-	now += PATH_KEEP_MS;
-	warm(&t.p[0], now);
-	warm(&t.p[1], now);
-	assert(path_select(&t, now) == 1);	/* counting starts again */
-	now += PATH_KEEP_MS;
-	warm(&t.p[0], now);
-	warm(&t.p[1], now);
-	assert(path_select(&t, now) == 0);
-
-	/* Within a tier the evaluation period is what gives the hold its unit:
-	 * calling ten times as often must not shorten the wait. */
-	bucketed(&t.p[0], 40);
-	bucketed(&t.p[1], 1);
-	for (i = 0; i < 20; i++) {
-		now += PATH_KEEP_MS / 10;
-		warm(&t.p[0], now);
-		warm(&t.p[1], now);
-		assert(path_select(&t, now) == (i >= 19 ? 1 : 0));
-	}
-
-	/* Hysteresis does not gate warmth: the moment the incumbent falls out
-	 * of the tier the session moves, mid-hold and mid-period. */
-	path_table_init(&t);
-	add(&t, "2001:db8::1", 5000, 0);
-	add(&t, "2001:db8::2", 5000, 0);
-	now = 100000;
-	warm(&t.p[0], now);
-	warm(&t.p[1], now);
-	bucketed(&t.p[0], 1);
-	bucketed(&t.p[1], 400);
-	assert(path_select(&t, now) == 0);
+	/* A demotion of the incumbent is not discretionary. */
 	now += PATH_WARM_MS + 1;
 	warm(&t.p[1], now);
-	assert(path_warmth_of(&t.p[0], now) == PATH_COLD);
 	assert(path_select(&t, now) == 1);
 
-	/* A DEAD incumbent is left at once, even for an untried path. */
-	path_table_init(&t);
-	add(&t, "2001:db8::1", 5000, 0);
-	now = 100000;
+	/* Nor is a transport that can no longer send. */
+	t.p[1].usable = 0;
 	warm(&t.p[0], now);
-	bucketed(&t.p[0], 1);
 	assert(path_select(&t, now) == 0);
-	now += PATH_DEAD_MS + 1;
-	/* Offered once the incumbent is dead, so it is genuinely untried
-	 * rather than one that has been asked all this time without ever
-	 * answering -- which is dead in its own right. */
-	add(&t, "2001:db8::2", 5000, now);
-	assert(path_warmth_of(&t.p[0], now) == PATH_DEAD);
-	assert(path_warmth_of(&t.p[1], now) == PATH_UNQUALIFIED);
-	assert(path_select(&t, now) == 1);
 }
 
-/*
- * A millisecond is measurement noise on a LAN, not a margin: two paths whose
- * costs sit within one quantum of each other share a bucket, so the incumbent
- * is never drifted away from for jitter. Rounding the cost up put 0ms and 1ms
- * a whole bucket apart, and the session wandered between equal paths.
- */
 static void jitter_within_a_bucket_does_not_drift(void)
 {
 	struct path_table t;
@@ -874,11 +827,14 @@ static void jitter_within_a_bucket_does_not_drift(void)
 
 	bucketed(&t.p[sel], 1);
 	bucketed(&t.p[other], 0);
+	based(&t.p[sel], 1);
+	based(&t.p[other], 0);
 	for (i = 0; i < 6; i++) {
 		now += PATH_KEEP_MS;
 		warm(&t.p[0], now);
 		warm(&t.p[1], now);
 		assert(path_select(&t, now) == sel);
+		assert(path_challenger(&t, now) == -1);
 	}
 }
 
@@ -986,8 +942,10 @@ static void adopt_check(void)
 	assert(path_warmth_of(p, now) == PATH_UNQUALIFIED);
 	assert(path_select(&t, now) == 0);
 
-	/* Nor does it take it the moment it measures better: the margin has to
-	 * hold, so an endpoint turning up mid-session cannot yank the binding. */
+	/* Nor does it take it the moment it measures better: an endpoint
+	 * turning up mid-session cannot yank the binding, and moving to it is
+	 * a discretionary move that the ranking does not make. It is reported
+	 * as the challenger it is. */
 	now += PATH_KEEP_MS;
 	round_trip(p, now, 1);
 	warm(&t.p[0], now);
@@ -996,7 +954,8 @@ static void adopt_check(void)
 	now += PATH_KEEP_MS;
 	warm(&t.p[0], now);
 	warm(&t.p[1], now);
-	assert(path_select(&t, now) == 1);
+	assert(path_select(&t, now) == 0);
+	assert(path_challenger(&t, now) == 1);
 
 	/* Full, and nothing DEAD: the worst-ranked path that is not carrying the
 	 * session goes, oldest first between equals. */
@@ -1271,16 +1230,6 @@ static void the_base_cost_is_the_worse_view(void)
 	assert(p->peer_base_srtt_ms == 0 && path_base_cost(p) == 0);
 }
 
-/* The ring, set directly: these cases are about the arithmetic of the
- * decision, not about how samples get in. */
-static void based(struct path *p, int base_ms)
-{
-	p->rtt[0] = (uint16_t)base_ms;
-	p->rtt_n = 1;
-	p->rtt_i = 0;
-	p->peer_base_srtt_ms = 0;
-}
-
 /*
  * The case the whole design exists for: the incumbent carries the session and
  * so measures worse than an idle alternative that is not actually faster.
@@ -1419,7 +1368,7 @@ int main(void)
 	loss_outcome_check();
 	tail_check();
 	order_check();
-	hysteresis_check();
+	selection_moves_only_when_it_must();
 	jitter_within_a_bucket_does_not_drift();
 	demotion_scores_the_overdue_probe();
 	usable_check();

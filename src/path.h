@@ -73,8 +73,6 @@ enum path_warmth {
 #define PATH_PEER_SRTT_MAX 2000		/* ms a peer may claim */
 #define PATH_PEER_SRTT_RATIO 4		/* times our own, where we have one */
 #define PATH_COST_QUANTUM_MS 5		/* ranking bucket width */
-#define PATH_SWITCH_MARGIN 1		/* buckets a candidate must win by */
-#define PATH_SWITCH_HOLD 2		/* evaluations it must hold that by */
 #define PATH_ADOPT_RATE 8		/* unknown-source probes admitted a
 					 * second, per listening socket */
 #define PATH_ADOPT_DEPTH 8		/* that bucket's depth */
@@ -316,15 +314,12 @@ struct path {
 };
 
 /*
- * A connection's paths, and the selection state that gives PATH_SWITCH_HOLD its
- * unit. Slot indices are stable across an eviction, so `sel` stays meaningful.
+ * A connection's paths. Slot indices are stable across an eviction, so `sel`
+ * stays meaningful.
  */
 struct path_table {
 	struct path p[PATH_TABLE_MAX];
 	int sel;			/* the path in use, -1 if none */
-	int cand;			/* the challenger, -1 if none */
-	int hold;			/* evaluations it has won the margin */
-	uint64_t next_eval_ms;
 };
 
 void path_table_init(struct path_table *t);
@@ -473,13 +468,11 @@ int path_best(const struct path_table *t, uint64_t now);
 
 /*
  * Choose the path to carry the session, and return its index (-1 when no path
- * can carry one). Switching is immediate when the incumbent's warmth tier is
- * left behind -- a demotion of the incumbent must never wait, so a dying path
- * cannot hold the session for extra evaluations at exactly the wrong moment --
- * and immediate when the incumbent's transport can no longer send at all.
- * Within one tier a candidate must win by PATH_SWITCH_MARGIN buckets over
- * PATH_SWITCH_HOLD consecutive evaluations, one evaluation per PATH_KEEP_MS,
- * so near-equal paths cannot flap.
+ * can carry one). This is the escape route and the cold start, and nothing
+ * else: it moves when there is no incumbent, when the incumbent's transport
+ * can no longer send, and when the incumbent has fallen out of its warmth
+ * tier, each of which must never wait. A better path within the tier is a
+ * discretionary move and is path_challenger's question.
  */
 int path_select(struct path_table *t, uint64_t now);
 
