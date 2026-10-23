@@ -274,7 +274,7 @@ jobs:
           # memcheck step added ahead of this one would otherwise be read as
           # part of it.
           rm -f build/Testing/Temporary/MemoryChecker.*.log
-          ctest --test-dir build -T memcheck --timeout 1800 \
+          ctest --test-dir build -T memcheck --output-on-failure --timeout 1800 \
             -E "_e2e|swarm_" -LE "harness|forkchild" 2>&1 | tee mc.out
           rc=${PIPESTATUS[0]}
           LOGS="$PWD/build/vg-logs"
@@ -288,7 +288,8 @@ jobs:
           # lost. ctest numbers its logs by test index, so the first set was
           # copied aside above before this one can reuse a number.
           rm -f build/Testing/Temporary/MemoryChecker.*.log
-          ctest --test-dir build -T memcheck --timeout 1800 -L forkchild \
+          ctest --test-dir build -T memcheck --output-on-failure \
+            --timeout 1800 -L forkchild \
             --overwrite MemoryCheckCommandOptions="--fair-sched=yes --child-silent-after-fork=no --leak-check=no --error-exitcode=1" \
             2>&1 | tee mc2.out
           rc2=${PIPESTATUS[0]}
@@ -375,7 +376,7 @@ jobs:
           # selection valgrind would measure bash's own allocations instead
           # of comrade's. It is the one harness test that exercises the
           # self-confining binary, so leaving it unmeasured was a real hole.
-          ctest --test-dir build -T memcheck --timeout 3600 \
+          ctest --test-dir build -T memcheck --output-on-failure --timeout 3600 \
             -R "_e2e|swarm_|^stop_test$" \
             --overwrite MemoryCheckCommandOptions="--fair-sched=yes --child-silent-after-fork=yes --trace-children=yes --trace-children-skip=*/sh,*/bash,*/sed,*/grep,*/awk,*/cat,*/rm,*/mktemp,*/sleep,*/kill,*/tail,*/head,*/tr,*/date,*/dirname,*/basename,*/wc,*/sort,*/uniq,*/cut,*/env,*/tmux,*/printf,*/expr,*/seq,*/ps --leak-check=no --error-exitcode=1" \
             2>&1 | tee mce2e.out
