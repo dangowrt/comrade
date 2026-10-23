@@ -1120,8 +1120,140 @@ static void unspecified_is_not_unicast(void)
 	assert(path_ep_is_unicast(&ep));
 }
 
+/*
+ * The deciding statistic is the unloaded delay, so it is the minimum over the
+ * window and not an average: our own load can raise a sample and can never
+ * lower one.
+ */
+static void the_base_is_the_minimum_over_the_window(void)
+{
+	struct path_table tb;
+	struct path *p;
+	uint64_t now = 0;
+	int i;
+
+	path_table_init(&tb);
+	p = add(&tb, "2001:db8::1", 5000, 0);
+	assert(path_base_srtt_ms(p) == 0);	/* unknown, not excellent */
+
+	round_trip(p, now, 40);
+	assert(path_base_srtt_ms(p) == 40);
+	now = p->next_probe_ms;
+	round_trip(p, now, 12);
+	assert(path_base_srtt_ms(p) == 12);
+	now = p->next_probe_ms;
+	round_trip(p, now, 70);
+	assert(path_base_srtt_ms(p) == 12);	/* a partly filled ring */
+
+	for (i = 0; i < PATH_LOSS_WINDOW; i++) {
+		now = p->next_probe_ms;
+		round_trip(p, now, 30);
+	}
+	assert(p->rtt_n == PATH_LOSS_WINDOW);
+	assert(path_base_srtt_ms(p) == 30);	/* the 12 has aged out */
+}
+
+/* The window is a count of probe outcomes, so time alone neither fills nor
+ * empties it: a path that has stopped answering keeps the base it earned, and
+ * what evicts a sample is another sample. */
+static void the_base_window_expires_by_sample_not_by_clock(void)
+{
+	struct path_table tb;
+	struct path *p;
+	uint64_t now = 0;
+	int i;
+
+	path_table_init(&tb);
+	p = add(&tb, "2001:db8::1", 5000, 0);
+	round_trip(p, now, 8);
+	for (i = 0; i < PATH_LOSS_WINDOW - 1; i++) {
+		now = p->next_probe_ms;
+		round_trip(p, now, 50);
+	}
+	assert(path_base_srtt_ms(p) == 8);
+
+	now += PATH_DEAD_MS * 4;		/* silence, no outcomes */
+	assert(path_base_srtt_ms(p) == 8);
+
+	now = p->next_probe_ms;
+	round_trip(p, now, 50);			/* one more displaces the 8 */
+	assert(path_base_srtt_ms(p) == 50);
+}
+
+/* One slow sample is what an EWMA is for and what a minimum is against. */
+static void a_spike_moves_the_ewma_and_not_the_base(void)
+{
+	struct path_table tb;
+	struct path *p;
+	uint64_t now = 0;
+	int before, i;
+
+	path_table_init(&tb);
+	p = add(&tb, "2001:db8::1", 5000, 0);
+	for (i = 0; i < 4; i++) {
+		round_trip(p, now, 20);
+		now = p->next_probe_ms;
+	}
+	before = path_srtt_ms(p);
+	assert(path_base_srtt_ms(p) == 20);
+
+	round_trip(p, now, 400);
+	assert(path_srtt_ms(p) > before);
+	assert(path_base_srtt_ms(p) == 20);
+}
+
+/* A path whose delay has really risen must be seen to have risen, within one
+ * window and without a timer. */
+static void a_sustained_rise_is_forgotten_within_a_window(void)
+{
+	struct path_table tb;
+	struct path *p;
+	uint64_t now = 0;
+	int i;
+
+	path_table_init(&tb);
+	p = add(&tb, "2001:db8::1", 5000, 0);
+	round_trip(p, now, 10);
+	for (i = 0; i < PATH_LOSS_WINDOW - 1; i++) {
+		now = p->next_probe_ms;
+		round_trip(p, now, 100);
+		assert(path_base_srtt_ms(p) == 10);
+	}
+	now = p->next_probe_ms;
+	round_trip(p, now, 100);
+	assert(path_base_srtt_ms(p) == 100);
+}
+
+/* base_cost takes the worse of the two views, as cost does, and a re-claim
+ * drops the ring with every other measurement. */
+static void the_base_cost_is_the_worse_view(void)
+{
+	struct path_table tb;
+	struct path *p;
+
+	path_table_init(&tb);
+	p = add(&tb, "2001:db8::1", 5000, 0);
+	round_trip(p, 0, 20);
+	assert(path_base_cost(p) == 20);
+	assert(path_base_bucket(p) == 20 / PATH_COST_QUANTUM_MS);
+
+	p->peer_base_srtt_ms = 60;
+	assert(path_base_cost(p) == 60);
+	p->peer_base_srtt_ms = 5;
+	assert(path_base_cost(p) == 20);
+
+	path_table_reset_stats(&tb, 1000);
+	assert(p->rtt_n == 0 && path_base_srtt_ms(p) == 0);
+	assert(p->peer_base_srtt_ms == 0 && path_base_cost(p) == 0);
+}
+
 int main(void)
 {
+	the_base_is_the_minimum_over_the_window();
+	the_base_window_expires_by_sample_not_by_clock();
+	a_spike_moves_the_ewma_and_not_the_base();
+	a_sustained_rise_is_forgotten_within_a_window();
+	the_base_cost_is_the_worse_view();
 	unspecified_is_not_unicast();
 	endpoint_check();
 	probe_codec_check();

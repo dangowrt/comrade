@@ -545,8 +545,11 @@ void path_table_reset_stats(struct path_table *t, uint64_t now)
 		p->srtt8 = 0;
 		p->peer_srtt_ms = 0;
 		p->peer_loss_ppt = 0;
+		p->peer_base_srtt_ms = 0;
 		p->loss_reg = 0;
 		p->loss_n = 0;
+		p->rtt_n = 0;
+		p->rtt_i = 0;
 		p->last_pong_ms = 0;
 		p->next_probe_ms = 0;
 		p->qualified = 0;
@@ -623,6 +626,18 @@ static void loss_record(struct path *p, int lost)
 		p->loss_n++;
 }
 
+static void rtt_record(struct path *p, int rtt)
+{
+	if (rtt < 0)
+		rtt = 0;
+	if (rtt > 0xffff)
+		rtt = 0xffff;
+	p->rtt_i = p->rtt_n ? (p->rtt_i + 1) % PATH_LOSS_WINDOW : 0;
+	p->rtt[p->rtt_i] = (uint16_t)rtt;
+	if (p->rtt_n < PATH_LOSS_WINDOW)
+		p->rtt_n++;
+}
+
 /* How long a probe must be outstanding before it counts as lost. */
 static uint64_t loss_deadline(const struct path *p)
 {
@@ -666,6 +681,7 @@ int path_probe_pong(struct path *p, uint64_t nonce, uint64_t now)
 		p->srtt8 = rtt * 8;
 	else
 		p->srtt8 += rtt - p->srtt8 / 8;
+	rtt_record(p, rtt);
 	loss_record(p, 0);
 	p->last_pong_ms = now;
 	if (!p->qualified) {
@@ -716,6 +732,31 @@ int path_bucket_of(int cost)
 int path_bucket(const struct path *p)
 {
 	return path_bucket_of(path_cost(p));
+}
+
+int path_base_srtt_ms(const struct path *p)
+{
+	int i, base = -1;
+
+	for (i = 0; i < p->rtt_n; i++)
+		if (base < 0 || p->rtt[i] < base)
+			base = p->rtt[i];
+	return base < 0 ? 0 : base;
+}
+
+int path_base_cost_of(int base_a, int base_b)
+{
+	return base_a > base_b ? base_a : base_b;
+}
+
+int path_base_cost(const struct path *p)
+{
+	return path_base_cost_of(path_base_srtt_ms(p), p->peer_base_srtt_ms);
+}
+
+int path_base_bucket(const struct path *p)
+{
+	return path_bucket_of(path_base_cost(p));
 }
 
 int path_cmp(const struct path *a, const struct path *b, uint64_t now)

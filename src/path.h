@@ -297,8 +297,12 @@ struct path {
 	int srtt8;			/* smoothed round trip * 8 (EWMA 1/8) */
 	int peer_srtt_ms;		/* the peer's own view, from the tail */
 	int peer_loss_ppt;
+	int peer_base_srtt_ms;		/* its unloaded view, from the tail */
 	uint16_t loss_reg;		/* probe outcomes, newest in bit 0 */
 	int loss_n;
+	uint16_t rtt[PATH_LOSS_WINDOW];	/* round trips, newest at rtt_i */
+	int rtt_n;
+	int rtt_i;
 	uint64_t last_pong_ms;
 	uint64_t created_ms;
 	uint64_t trying_since_ms;	/* creation, or the last reset of proof */
@@ -424,6 +428,29 @@ int path_cost_of(int srtt_a, int loss_a, int srtt_b, int loss_b);
 int path_cost(const struct path *p);
 int path_bucket_of(int cost);
 int path_bucket(const struct path *p);
+
+/*
+ * The same shape over the unloaded delay instead of the smoothed one, so a
+ * path does not read as worse for carrying our own session.
+ *
+ *   base(P)        = min of the last PATH_LOSS_WINDOW round trips
+ *   base_cost(P)   = max(base_local, base_peer)
+ *   base_bucket(P) = floor(base_cost / PATH_COST_QUANTUM_MS)
+ *
+ * A minimum is what our own load cannot lower, which an average and an EWMA
+ * both can be raised by; the window is a count of probe outcomes, not a
+ * duration, so it expires by event and the width the loss ratio already spans
+ * serves for both. No loss term: congestion loss on the carrying path is
+ * partly our own, and loss keeps its teeth in the warmth tiers and in
+ * path_best's exclusion of a path that has lost a whole half-window.
+ *
+ * 0 means nothing has round-tripped yet. It is unknown, not excellent, and a
+ * caller comparing paths must read it as the former.
+ */
+int path_base_srtt_ms(const struct path *p);
+int path_base_cost_of(int base_a, int base_b);
+int path_base_cost(const struct path *p);
+int path_base_bucket(const struct path *p);
 
 /*
  * The total order, so both ends always agree even before any measurement
