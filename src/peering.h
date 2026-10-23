@@ -698,7 +698,7 @@ void peering_owed(struct peering *pr, uint64_t now);
  * KEEP THE PATHS WARM: one round of the probe cadence, on the thread that owns
  * this peer.
  */
-void peering_paths(struct peering *pr, uint64_t now);
+int peering_paths(struct peering *pr, uint64_t now);
 
 /*
  * A frame that arrived on one of this peer's carriers and carries the probe

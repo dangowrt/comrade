@@ -286,8 +286,10 @@ int pathplane_usable(const struct path *p, struct nat_agent *const *live,
 	return agent_listed(live, nlive, p->agent);
 }
 
-void pathplane_tick(struct pathplane *pl, const struct pathplane_sinks *k,
-		    uint64_t now)
+/* The probe round itself: what is due goes out, and what has gone quiet is
+ * scored. The decision that follows it is pathplane_tick's. */
+static void tick_probes(struct pathplane *pl, const struct pathplane_sinks *k,
+			uint64_t now)
 {
 	int kind[PATH_TABLE_MAX], drop[PATH_TABLE_MAX], due[PATH_TABLE_MAX];
 	char wdesc[PATH_TABLE_MAX][PATH_LABEL_MAX + 64];
@@ -588,8 +590,32 @@ int pathplane_claims(struct pathplane *pl, const struct pathplane_sinks *k,
 	return probeplane_fresh(pl->pp, pr) ? 1 : -1;
 }
 
-int pathplane_pick(struct pathplane *pl, const struct pathplane_sinks *k,
-		   uint64_t now, struct pathplane_pick *out)
+static void pin_check(struct pathplane *pl, uint64_t now)
+{
+	int i;
+
+	if (!pl->pinned)
+		return;
+	for (i = 0; i < PATH_TABLE_MAX; i++) {
+		struct path *p = &pl->t.p[i];
+
+		if (!p->used || memcmp(p->id, pl->pin_id, PATH_ID_LEN))
+			continue;
+		/* It carries while it can carry and has not fallen below the
+		 * tier it was pinned in; anything else belongs to the escape
+		 * route, which is ungated. */
+		if (p->usable &&
+		    (int)path_warmth_of(p, now) <= pl->pin_warmth) {
+			pl->t.sel = i;
+			return;
+		}
+		break;
+	}
+	pl->pinned = 0;
+}
+
+int pathplane_decide(struct pathplane *pl, const struct pathplane_sinks *k,
+		     uint64_t now, struct pathplane_pick *out)
 {
 	char from[PATH_LABEL_MAX + 64], to[PATH_LABEL_MAX + 64];
 	struct nat_agent *live[PATHPLANE_LIVE_MAX];
@@ -608,6 +634,8 @@ int pathplane_pick(struct pathplane *pl, const struct pathplane_sinks *k,
 			pathplane_usable(&pl->t.p[i], live, nlive) : 1;
 	prev = pl->t.sel;
 	sel = path_select(&pl->t, now);
+	pin_check(pl, now);
+	sel = pl->t.sel;
 	if (sel >= 0) {
 		struct path *p = &pl->t.p[sel];
 
@@ -633,6 +661,109 @@ int pathplane_pick(struct pathplane *pl, const struct pathplane_sinks *k,
 	}
 
 	return out->kind < 0 ? -1 : 0;
+}
+
+int pathplane_pick(struct pathplane *pl, const struct pathplane_sinks *k,
+		   uint64_t now, struct pathplane_pick *out)
+{
+	struct nat_agent *live[PATHPLANE_LIVE_MAX];
+	int nlive = 0, sel;
+
+	(void)now;
+	if (k->live)
+		nlive = k->live(k->arg, live, PATHPLANE_LIVE_MAX);
+	memset(out, 0, sizeof(*out));
+	out->kind = -1;
+	out->nlive = nlive;
+	pthread_mutex_lock(&pl->lock);
+	sel = pl->t.sel;
+	if (sel >= 0 && pl->t.p[sel].used) {
+		struct path *p = &pl->t.p[sel];
+
+		out->kind = (int)p->kind;
+		out->remote = p->remote;
+		out->agent = p->agent;
+		out->qualified = p->qualified;
+		out->srtt_ms = path_srtt_ms(p);
+		out->blackholed = blackholed(pl, out->kind, &p->remote);
+		snprintf(out->label, sizeof(out->label), "%s", p->label);
+	}
+	pthread_mutex_unlock(&pl->lock);
+
+	return out->kind < 0 ? -1 : 0;
+}
+
+int pathplane_carry_id(struct pathplane *pl, uint8_t out[PATH_ID_LEN])
+{
+	int had = 0;
+
+	memset(out, 0, PATH_ID_LEN);
+	pthread_mutex_lock(&pl->lock);
+	if (pl->t.sel >= 0 && pl->t.p[pl->t.sel].used) {
+		memcpy(out, pl->t.p[pl->t.sel].id, PATH_ID_LEN);
+		had = 1;
+	}
+	pthread_mutex_unlock(&pl->lock);
+
+	return had;
+}
+
+int pathplane_challenger(struct pathplane *pl, uint64_t now,
+			 uint8_t out[PATH_ID_LEN])
+{
+	int had = 0, i;
+
+	memset(out, 0, PATH_ID_LEN);
+	pthread_mutex_lock(&pl->lock);
+	i = path_challenger(&pl->t, now);
+	if (i >= 0) {
+		memcpy(out, pl->t.p[i].id, PATH_ID_LEN);
+		had = 1;
+	}
+	pthread_mutex_unlock(&pl->lock);
+
+	return had;
+}
+
+enum pathplane_pin pathplane_pin(struct pathplane *pl,
+				 const struct pathplane_sinks *k,
+				 const uint8_t id[PATH_ID_LEN], int forced,
+				 uint64_t now)
+{
+	struct nat_agent *live[PATHPLANE_LIVE_MAX];
+	enum pathplane_pin rc = PATHPLANE_PIN_UNKNOWN;
+	char desc[PATH_LABEL_MAX + 64];
+	int nlive = 0, i, moved = 0;
+
+	if (k->live)
+		nlive = k->live(k->arg, live, PATHPLANE_LIVE_MAX);
+	desc[0] = '\0';
+	pthread_mutex_lock(&pl->lock);
+	for (i = 0; i < PATH_TABLE_MAX; i++) {
+		struct path *p = &pl->t.p[i];
+
+		if (!p->used || memcmp(p->id, id, PATH_ID_LEN))
+			continue;
+		p->usable = k->live ? pathplane_usable(p, live, nlive) : 1;
+		if (!p->usable) {
+			rc = PATHPLANE_PIN_UNUSABLE;
+			break;
+		}
+		rc = PATHPLANE_PIN_OK;
+		memcpy(pl->pin_id, id, PATH_ID_LEN);
+		pl->pin_warmth = (int)path_warmth_of(p, now);
+		pl->pinned = 1;
+		moved = pl->t.sel != i;
+		pl->t.sel = i;
+		if (moved)
+			pathplane_desc(p, desc, sizeof(desc));
+		break;
+	}
+	pthread_mutex_unlock(&pl->lock);
+	if (desc[0])
+		dbg_logf("path: pinned %s%s", desc, forced ? " (forced)" : "");
+
+	return rc;
 }
 
 int pathplane_carry_rtt(struct pathplane *pl, int *out)
@@ -864,4 +995,17 @@ int pathplane_holds_settle(struct pathplane *pl,
 	pathplane_holds_free_all(pl, k);
 
 	return -1;
+}
+
+int pathplane_tick(struct pathplane *pl, const struct pathplane_sinks *k,
+		   uint64_t now)
+{
+	struct pathplane_pick pick;
+
+	tick_probes(pl, k, now);
+	/* The decision runs here, on the thread that owns the peer, and
+	 * nowhere else: a reader of the carry must not be able to move it. */
+	pathplane_decide(pl, k, now, &pick);
+
+	return pick.moved && pick.qualified;
 }

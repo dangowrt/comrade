@@ -112,6 +112,60 @@ static int on_agent_failed(void *arg, struct nat_agent *a)
 	return ((struct end *)arg)->fail_agents;
 }
 
+/* A path that has answered, at a given round trip: the ranking's inputs set
+ * directly, this being a test about obeying a statement rather than about
+ * measuring. */
+static void warm_path(struct path *p, uint64_t now, int srtt_ms)
+{
+	p->qualified = 1;
+	p->last_pong_ms = now;
+	p->srtt8 = srtt_ms * 8;
+	p->rtt[0] = (uint16_t)srtt_ms;
+	p->rtt_n = 1;
+	p->rtt_i = 0;
+}
+
+/* No carrier is alive: an ICE path's transport cannot send a thing. */
+static int on_live_none(void *arg, struct nat_agent **out, int max)
+{
+	(void)arg;
+	(void)out;
+	(void)max;
+
+	return 0;
+}
+
+/* The id of a used path other than the one `not_this` names. */
+static int other_path_id(struct pathplane *pl, const uint8_t not_this[PATH_ID_LEN],
+			 uint8_t out[PATH_ID_LEN])
+{
+	int i;
+
+	for (i = 0; i < PATH_TABLE_MAX; i++)
+		if (pl->t.p[i].used &&
+		    memcmp(pl->t.p[i].id, not_this, PATH_ID_LEN)) {
+			memcpy(out, pl->t.p[i].id, PATH_ID_LEN);
+			return 1;
+		}
+
+	return 0;
+}
+
+/* The id of the path one agent owns. */
+static int agent_path_id(struct pathplane *pl, struct nat_agent *agent,
+			 uint8_t out[PATH_ID_LEN])
+{
+	int i;
+
+	for (i = 0; i < PATH_TABLE_MAX; i++)
+		if (pl->t.p[i].used && pl->t.p[i].agent == agent) {
+			memcpy(out, pl->t.p[i].id, PATH_ID_LEN);
+			return 1;
+		}
+
+	return 0;
+}
+
 static void end_init(struct end *e, uint8_t last, const char *ident)
 {
 	memset(e, 0, sizeof(*e));
@@ -425,14 +479,14 @@ static void the_carry_is_read_off_the_ranking(void)
 
 	end_init(&a, 1, "abcd");
 	end_init(&b, 2, "abcd");
-	assert(pathplane_pick(&a.pl, &a.k, 1000, &pick) == -1);
+	assert(pathplane_decide(&a.pl, &a.k, 1000, &pick) == -1);
 	assert(pick.kind == -1);		/* nothing to carry on */
 	assert(!pathplane_proven(&a.pl, 1000));
 	assert(!pathplane_carry_rtt(&a.pl, &rtt));
 
 	assert(!pathplane_add_ep(&a.pl, &a.k, PATH_SEGMENT, &b.here, NULL, 0,
 				 1000));
-	assert(!pathplane_pick(&a.pl, &a.k, 1000, &pick));
+	assert(!pathplane_decide(&a.pl, &a.k, 1000, &pick));
 	assert(pick.kind == PATH_SEGMENT);
 	assert(pick.moved);			/* it began carrying here */
 	assert(!pick.qualified);		/* but nothing has answered */
@@ -442,7 +496,7 @@ static void the_carry_is_read_off_the_ranking(void)
 	pathplane_tick(&a.pl, &a.k, 1000);
 	assert(deliver(&a, &b, 1010));
 	assert(deliver(&b, &a, 1020));
-	assert(!pathplane_pick(&a.pl, &a.k, 1020, &pick));
+	assert(!pathplane_decide(&a.pl, &a.k, 1020, &pick));
 	assert(pick.qualified);
 	assert(!pick.moved);			/* the same path still */
 	assert(pathplane_proven(&a.pl, 1020) == 1);
@@ -509,7 +563,7 @@ static void the_carrier_that_carries_is_not_reaped(void)
 	{
 		struct pathplane_pick pick;
 
-		assert(!pathplane_pick(&a.pl, &a.k, 1000, &pick));
+		assert(!pathplane_decide(&a.pl, &a.k, 1000, &pick));
 		assert(pick.kind == PATH_ICE);
 	}
 	assert(pathplane_hold_carrying(&a.pl) == 0);
@@ -551,7 +605,7 @@ static void a_blackholed_path_stops_being_probed(void)
 	assert(pathplane_blackhole_armed(&a.pl));
 	pathplane_tick(&a.pl, &a.k, 1000 + PATH_KEEP_MS);
 	assert(a.sends == 1);			/* the probe was not sent */
-	assert(!pathplane_pick(&a.pl, &a.k, 1000, &pick));
+	assert(!pathplane_decide(&a.pl, &a.k, 1000, &pick));
 	assert(pick.blackholed);
 
 	pathplane_blackhole_lift(&a.pl);
@@ -597,7 +651,7 @@ static void a_link_coming_back_settles_which_carrier_is_used(void)
 	{
 		struct pathplane_pick pick;
 
-		assert(!pathplane_pick(&a.pl, &a.k, 1000, &pick));
+		assert(!pathplane_decide(&a.pl, &a.k, 1000, &pick));
 	}
 	assert(pathplane_holds_settle(&a.pl, &a.k, &live, &live_ctx) == 1);
 	assert(live == held);
@@ -627,7 +681,7 @@ static void a_set_aside_carrier_that_answers_nothing_is_let_go(void)
 	{
 		struct pathplane_pick pick;
 
-		assert(!pathplane_pick(&a.pl, &a.k, 1000, &pick));
+		assert(!pathplane_decide(&a.pl, &a.k, 1000, &pick));
 		assert(pick.kind == PATH_SEGMENT);
 	}
 	assert(pathplane_holds_settle(&a.pl, &a.k, &live, &live_ctx) == -1);
@@ -639,8 +693,144 @@ static void a_set_aside_carrier_that_answers_nothing_is_let_go(void)
 	end_done(&b);
 }
 
+/*
+ * A statement about transmit names a path by the id both ends derive, and it
+ * is obeyed only for a path this end holds and can send on. Refusing says
+ * which of the two it was and changes nothing.
+ */
+static void a_pin_moves_the_carry_or_says_why_not(void)
+{
+	uint8_t id[PATH_ID_LEN], carry[PATH_ID_LEN], other[PATH_ID_LEN];
+	struct pathplane_pick pick;
+	struct end a, b, c;
+
+	end_init(&a, 1, "abcd");
+	end_init(&b, 2, "abcd");
+	end_init(&c, 3, "abcd");
+	a.k.live = NULL;			/* every path can carry */
+	assert(!pathplane_add_ep(&a.pl, &a.k, PATH_SEGMENT, &b.here, NULL, 0,
+				 1000));
+	assert(!pathplane_add_ep(&a.pl, &a.k, PATH_SEGMENT, &c.here, NULL, 0,
+				 1000));
+	/* The id is an opaque label here: both ends derive it from the
+	 * endpoint pair, and this test is about obeying one. The first path
+	 * measures better, so the ranking wants it and will keep wanting it. */
+	a.pl.t.p[0].id[0] = 0x11;
+	a.pl.t.p[1].id[0] = 0x22;
+	warm_path(&a.pl.t.p[0], 1000, 10);
+	warm_path(&a.pl.t.p[1], 1000, 90);
+	assert(!pathplane_decide(&a.pl, &a.k, 1000, &pick));
+	assert(pathplane_carry_id(&a.pl, carry) == 1);
+	assert(carry[0] == 0x11);
+
+	/* An id no path of ours carries is refused, and the carry stands. */
+	memset(id, 0xff, sizeof(id));
+	assert(pathplane_pin(&a.pl, &a.k, id, 0, 1000) ==
+	       PATHPLANE_PIN_UNKNOWN);
+	assert(pathplane_carry_id(&a.pl, other) == 1);
+	assert(!memcmp(other, carry, sizeof(carry)));
+
+	/* The other path this end holds: pinning it moves the carry there. */
+	assert(other_path_id(&a.pl, carry, id) == 1);
+	assert(pathplane_pin(&a.pl, &a.k, id, 0, 1000) == PATHPLANE_PIN_OK);
+	assert(pathplane_carry_id(&a.pl, other) == 1);
+	assert(!memcmp(other, id, sizeof(id)));
+
+	/* And it stays there across decisions, which is what a pin is for: the
+	 * ranking prefers the other path and would take the carry back. */
+	{
+		uint64_t at;
+		int i;
+
+		for (i = 1; i <= 4; i++) {
+			at = 1000 + (uint64_t)i * PATH_KEEP_MS;
+			warm_path(&a.pl.t.p[0], at, 10);
+			warm_path(&a.pl.t.p[1], at, 90);
+			assert(!pathplane_decide(&a.pl, &a.k, at, &pick));
+			assert(pathplane_carry_id(&a.pl, other) == 1);
+			assert(other[0] == 0x22);
+		}
+	}
+
+	end_done(&a);
+	end_done(&b);
+	end_done(&c);
+}
+
+/* A pin is a statement about a path that can carry. One whose transport can no
+ * longer send is refused, and a pinned path that falls out of its tier is let
+ * go rather than held onto. */
+static void a_pin_is_dropped_when_its_path_is(void)
+{
+	uint8_t id[PATH_ID_LEN], carry[PATH_ID_LEN];
+	struct nat_agent *agent = (struct nat_agent *)0x1001;
+	struct pathplane_pick pick;
+	struct end a, b;
+
+	end_init(&a, 1, "abcd");
+	end_init(&b, 2, "abcd");
+	a.k.live = NULL;
+	assert(!pathplane_add_ep(&a.pl, &a.k, PATH_SEGMENT, &b.here, NULL, 0,
+				 1000));
+	a.pl.t.p[0].id[0] = 0x33;
+	assert(!pathplane_decide(&a.pl, &a.k, 1000, &pick));
+	assert(pathplane_carry_id(&a.pl, carry) == 1);
+	assert(pathplane_pin(&a.pl, &a.k, carry, 0, 1000) ==
+	       PATHPLANE_PIN_OK);
+
+	/* An ICE path whose agent holds no pair cannot send, so a statement
+	 * naming it is refused with the reason. */
+	pathplane_add_ice(&a.pl, agent, 1000);
+	a.k.live = on_live_none;		/* and no agent is live */
+	assert(agent_path_id(&a.pl, agent, id) == 1);
+	id[0] = 0x44;
+	{
+		int i;
+
+		for (i = 0; i < PATH_TABLE_MAX; i++)
+			if (a.pl.t.p[i].used && a.pl.t.p[i].agent == agent)
+				a.pl.t.p[i].id[0] = 0x44;
+	}
+	assert(pathplane_pin(&a.pl, &a.k, id, 0, 1000) ==
+	       PATHPLANE_PIN_UNUSABLE);
+	assert(pathplane_carry_id(&a.pl, carry) == 1);
+
+	end_done(&a);
+	end_done(&b);
+}
+
+/* Reading which path carries must never move it: a status line redraws itself
+ * far more often than a decision should be made, and with a negotiated choice
+ * a redraw would state a move to the peer. */
+static void reading_the_carry_does_not_decide_it(void)
+{
+	struct pathplane_pick pick;
+	struct end a, b;
+
+	end_init(&a, 1, "abcd");
+	end_init(&b, 2, "abcd");
+	a.k.live = NULL;
+	assert(!pathplane_add_ep(&a.pl, &a.k, PATH_SEGMENT, &b.here, NULL, 0,
+				 1000));
+	/* A path exists and nothing has decided yet, so there is no carry to
+	 * report and reading does not create one. */
+	assert(pathplane_pick(&a.pl, &a.k, 1000, &pick) == -1);
+	assert(pathplane_pick(&a.pl, &a.k, 1000, &pick) == -1);
+	assert(!pathplane_decide(&a.pl, &a.k, 1000, &pick));
+	assert(pick.moved);
+	/* Now it reports, and reporting is all it does. */
+	assert(!pathplane_pick(&a.pl, &a.k, 1000, &pick));
+	assert(!pick.moved);
+
+	end_done(&a);
+	end_done(&b);
+}
+
 int main(void)
 {
+	a_pin_moves_the_carry_or_says_why_not();
+	a_pin_is_dropped_when_its_path_is();
+	reading_the_carry_does_not_decide_it();
 	a_path_qualifies_only_once_it_answers();
 	a_link_coming_back_settles_which_carrier_is_used();
 	a_set_aside_carrier_that_answers_nothing_is_let_go();

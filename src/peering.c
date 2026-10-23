@@ -785,9 +785,9 @@ void peering_sinks(struct peering *pr, const struct pathplane_sinks *pk,
 	pr->ck = *ck;
 }
 
-void peering_paths(struct peering *pr, uint64_t now)
+int peering_paths(struct peering *pr, uint64_t now)
 {
-	pathplane_tick(&pr->pl, &pr->pk, now);
+	return pathplane_tick(&pr->pl, &pr->pk, now);
 }
 
 int peering_recv(struct peering *pr, const uint8_t *data, size_t len,

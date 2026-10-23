@@ -906,10 +906,6 @@ static int conn_pick(struct conn *c, struct pathplane_pick *out)
 	 * of date, which is what a status line is anyway.
 	 */
 	c->pr.ice.up = out->nlive > 0;
-	/* A path becoming the one that carries is the moment to retransmit the
-	 * stream's backlog. */
-	if (out->moved && out->qualified)
-		__atomic_add_fetch(&c->carry_epoch, 1, __ATOMIC_RELAXED);
 
 	return rc;
 }
@@ -3302,7 +3298,11 @@ static int conn_run(struct conn *c, int drive_sig)
 		/* Every path is kept warm for the whole session, not merely the
 		 * one carrying it, so a switch is an immediate reordering rather
 		 * than a rediscovery. */
-		peering_paths(&c->pr, now_ms());
+		/* A path becoming the one that carries is the moment to
+		 * retransmit the stream's backlog, and the decision is made
+		 * here, on this connection's own thread. */
+		if (peering_paths(&c->pr, now_ms()))
+			__atomic_add_fetch(&c->carry_epoch, 1, __ATOMIC_RELAXED);
 		conn_holds_gc(c, now_ms());
 		conn_route_dedup(c);
 		if (__atomic_load_n(&c->carry_epoch, __ATOMIC_RELAXED) !=
@@ -5559,7 +5559,9 @@ int session_run(const struct session_cfg *cfg)
 			}
 			break;
 		case ST_WAIT_ICE:
-			peering_paths(&s.c.pr, now_ms());
+			if (peering_paths(&s.c.pr, now_ms()))
+				__atomic_add_fetch(&s.c.carry_epoch, 1,
+						   __ATOMIC_RELAXED);
 			/* The wait is where a peer that has restarted finds us,
 			 * and the pairing it names is ST_SIGNAL's to make. */
 			if (s.peer_restart) {

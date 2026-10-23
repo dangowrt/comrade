@@ -106,6 +106,12 @@ struct pathplane_hold {
 
 struct pathplane {
 	struct path_table t;
+	/* The path the peer's statement named, while it holds one: a pin is a
+	 * statement about transmit, so it is dropped the moment the path it
+	 * names cannot carry or leaves the tier it was chosen in. */
+	uint8_t pin_id[PATH_ID_LEN];
+	int pinned;
+	int pin_warmth;			/* the tier it was pinned in */
 	/*
 	 * Covers the table and nothing else: a transport's receive thread, a
 	 * host's demux and the owner's own loop all reach it. It is never held
@@ -314,6 +320,41 @@ int pathplane_pick(struct pathplane *pl, const struct pathplane_sinks *k,
 		   uint64_t now, struct pathplane_pick *out);
 
 /*
+ * The same report, having first re-evaluated which path carries. Only this
+ * form decides, and only the thread that owns the peer may call it: a status
+ * line rendering itself must never be able to move a session, let alone
+ * state a move to the peer.
+ */
+int pathplane_decide(struct pathplane *pl, const struct pathplane_sinks *k,
+		     uint64_t now, struct pathplane_pick *out);
+
+/* The id of the path carrying now, 0 when none carries. */
+int pathplane_carry_id(struct pathplane *pl, uint8_t out[PATH_ID_LEN]);
+
+/* The id of the path that beats the one carrying on both statistics, 0 when
+ * none does (path_challenger). */
+int pathplane_challenger(struct pathplane *pl, uint64_t now,
+			 uint8_t out[PATH_ID_LEN]);
+
+/* Why a pin was refused, as the answer to a statement reports it. */
+enum pathplane_pin {
+	PATHPLANE_PIN_OK = 0,
+	PATHPLANE_PIN_UNKNOWN,		/* no path of ours carries that id */
+	PATHPLANE_PIN_UNUSABLE		/* we hold it; it cannot send now */
+};
+
+/*
+ * Transmit on the path this id names, because the peer says that is where it
+ * transmits. Refused, changing nothing, when no path holds the id or its
+ * transport cannot send: an answer carries the reason, and the peer re-states
+ * on its next event rather than being left to assume.
+ */
+enum pathplane_pin pathplane_pin(struct pathplane *pl,
+				 const struct pathplane_sinks *k,
+				 const uint8_t id[PATH_ID_LEN], int forced,
+				 uint64_t now);
+
+/*
  * Can this path's transport carry a datagram right now? A path off ICE always
  * can; an ICE path only while the agent that owns it holds a pair. `live` is
  * what the playbook's own sink would answer, gathered before the table was
@@ -366,8 +407,10 @@ int pathplane_claims(struct pathplane *pl, const struct pathplane_sinks *k,
  * quiet, and probe whatever is due. Nothing at all until this end has an
  * identity to probe under.
  */
-void pathplane_tick(struct pathplane *pl, const struct pathplane_sinks *k,
-		    uint64_t now);
+/* Returns 1 when the carry moved to a path something has answered on, which
+ * is the moment the stream's backlog is worth retransmitting. */
+int pathplane_tick(struct pathplane *pl, const struct pathplane_sinks *k,
+		   uint64_t now);
 
 /*
  * A probe that arrived on a carrier: the caller has already found the tag, see
