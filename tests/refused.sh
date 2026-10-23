@@ -52,22 +52,25 @@ while [ "$i" -lt "$(e2e_loops 120)" ]; do
 done
 [ -n "$tok" ] || { echo "no rendezvous token after ${i}s"; exit 1; }
 
-# The first claimant has to be admitted before the second asks, or which of
-# the two is refused is a race the test would be asserting the outcome of.
+# The first claimant has to be in a session before the second asks, or which
+# of the two is refused is a race the test would be asserting the outcome of.
+# The host's own punch is one-sided and says nothing about what the claimant
+# read, and ending the hold below on a claimant still handshaking leaves
+# nothing to wind up.
 COMRADE_DEBUG="$tmp/c1.dbg" "$E2E" client "$tok" --hold-ms 90000 \
 	--timeout 120 > "$tmp/c1.out" 2>&1 &
 c1=$!
 i=0
 while [ "$i" -lt "$(e2e_loops 90)" ]; do
-	grep -q "punch connected -> spawn worker" "$tmp/host.dbg" 2>/dev/null &&
-		break
+	grep -q "sshc: channel open ok" "$tmp/c1.dbg" 2>/dev/null && break
 	kill -0 "$c1" 2>/dev/null || break
 	sleep 1
 	i=$((i + 1))
 done
-grep -q "punch connected -> spawn worker" "$tmp/host.dbg" 2>/dev/null || {
-	echo "the first claimant was never admitted"
+grep -q "sshc: channel open ok" "$tmp/c1.dbg" 2>/dev/null || {
+	echo "the first claimant never got into a session"
 	grep 'host: ' "$tmp/host.dbg" | tail -8
+	tail -8 "$tmp/c1.dbg"
 	exit 1
 }
 
@@ -101,6 +104,7 @@ grep -q "sig: the host refused us" "$tmp/c2.dbg" || {
 grep -q "E2E PASS client" "$tmp/c1.out" || {
 	echo "the admitted client never finished its session:"
 	tail -3 "$tmp/c1.out"
+	tail -8 "$tmp/c1.dbg"
 	rc=1
 }
 [ "$rc" = 0 ] && echo "refused: the grant's second claimant was told so in its slot"
