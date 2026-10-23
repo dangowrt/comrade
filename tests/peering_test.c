@@ -615,7 +615,7 @@ static void *answer_one_binding(void *arg)
 	for (i = 0; i < 4; i++)
 		out[o++] = (uint8_t)(mapped[i] ^ magic[i]);
 	sendto(r->fd, (const char *)out, o, 0, (struct sockaddr *)&from, flen);
-	r->done = 1;
+	__atomic_store_n(&r->done, 1, __ATOMIC_RELAXED);
 
 	return NULL;
 }
