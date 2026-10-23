@@ -361,6 +361,9 @@ struct sess {
 	/* client: the answer that arrived carries credentials other than the
 	 * ones primed, so the agent is rebuilt around it. */
 	volatile int peer_restart;
+	/* client: a candidate gathered since the ask went out, so the ask the
+	 * cell holds is not what this end can be reached at. */
+	int desc_grew;
 	struct rdv_host rh;		/* host: the rendezvous as it stands */
 	struct rdv_client rc;		/* client: our standing in it */
 	unsigned rdv_run;		/* host: which session_run of this process */
@@ -1435,12 +1438,26 @@ static void offer_refresh(struct sess *s)
  * publish. */
 static void trickle_flush(struct sess *s, int repost)
 {
+	char filtered[NAT_SDP_MAX];
 	char buf[NAT_SDP_MAX];
+	char raw[NAT_SDP_MAX];
 
 	if (!peering_desc_drain(&s->net.desc, buf, sizeof(buf)))
 		return;
-	if (repost)
+	if (repost) {
 		offer_refresh(s);
+		return;
+	}
+	if (s->cfg->is_host || !s->c.pr.ice.agent ||
+	    nat_local_description(s->c.pr.ice.agent, raw, sizeof(raw)))
+		return;
+	peering_desc_gathered(&s->net.desc, raw);
+	if (!sdp_ready(s))
+		return;
+	sdp_filter(peering_desc_local(&s->net.desc), s->cfg->family, filtered,
+		   sizeof(filtered));
+	peering_desc_set(&s->net.desc, filtered);
+	s->desc_grew = 1;
 }
 
 /*
@@ -5542,6 +5559,17 @@ int session_run(const struct session_cfg *cfg)
 				dbg_logf("session: the host moved -- offering again");
 				st = client_regather(&s) ? ST_FAIL : ST_GATHER;
 				break;
+			}
+			/* A candidate gathered since the ask went out, under
+			 * the credentials already asked under: the peer has
+			 * nowhere to reach this end until it is said. */
+			if (!cfg->is_host && s.desc_grew) {
+				s.desc_grew = 0;
+				dbg_logf("session: a candidate came late -- "
+					 "saying where we are");
+				s.net.pool.posted = fan_local_sdp(&s);
+				sig_post(s.pm.sig, (const uint8_t *)local_sdp(&s),
+					 strlen(local_sdp(&s)));
 			}
 			if (!cfg->is_host && path_probe_expired(&s.c)) {
 				/* The same thing again under the same
