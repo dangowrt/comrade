@@ -1247,6 +1247,131 @@ static void the_base_cost_is_the_worse_view(void)
 	assert(p->peer_base_srtt_ms == 0 && path_base_cost(p) == 0);
 }
 
+/* The ring, set directly: these cases are about the arithmetic of the
+ * decision, not about how samples get in. */
+static void based(struct path *p, int base_ms)
+{
+	p->rtt[0] = (uint16_t)base_ms;
+	p->rtt_n = 1;
+	p->rtt_i = 0;
+	p->peer_base_srtt_ms = 0;
+}
+
+/*
+ * The case the whole design exists for: the incumbent carries the session and
+ * so measures worse than an idle alternative that is not actually faster.
+ * Winning the loaded comparison alone is what an idle path does for free.
+ */
+static void an_idle_challenger_needs_both_comparisons(void)
+{
+	struct path_table t;
+
+	path_table_init(&t);
+	add(&t, "2001:db8::1", 5000, 0);
+	add(&t, "2001:db8::2", 5000, 0);
+	warm(&t.p[0], 0);
+	warm(&t.p[1], 0);
+	bucketed(&t.p[0], 10);			/* it is the quick one... */
+	based(&t.p[0], 10);
+	bucketed(&t.p[1], 40);
+	based(&t.p[1], 40);
+	assert(path_select(&t, 0) == 0);	/* ...so it carries */
+
+	/* Now it carries, so its own load shows up in the loaded figure while
+	 * the unloaded one says the path itself has not changed, and the idle
+	 * alternative is measured as the better path for being idle. */
+	bucketed(&t.p[0], 40);
+	based(&t.p[0], 10);
+	bucketed(&t.p[1], 10);
+	based(&t.p[1], 10);
+	assert(path_challenger(&t, 0) == -1);
+
+	/* Genuinely quicker unloaded, and still quicker loaded: that is a win. */
+	based(&t.p[1], 2);
+	assert(path_challenger(&t, 0) == 1);
+
+	/* A tie on either comparison is not a win, on strict <. */
+	based(&t.p[1], 10);
+	bucketed(&t.p[1], 40);
+	assert(path_challenger(&t, 0) == -1);
+	based(&t.p[1], 2);
+	bucketed(&t.p[1], 40);			/* raw ties */
+	assert(path_challenger(&t, 0) == -1);
+}
+
+/* The id orders cold paths and must never move a session: two paths equal on
+ * both statistics have no challenger however their ids compare. */
+static void the_id_tiebreak_never_switches(void)
+{
+	struct path_table t;
+
+	path_table_init(&t);
+	add(&t, "2001:db8::1", 5000, 0);
+	add(&t, "2001:db8::2", 5000, 0);
+	warm(&t.p[0], 0);
+	warm(&t.p[1], 0);
+	bucketed(&t.p[0], 20);
+	bucketed(&t.p[1], 20);
+	based(&t.p[0], 20);
+	based(&t.p[1], 20);
+	t.p[0].id[0] = 0x20;			/* an order exists between them */
+	t.p[1].id[0] = 0x10;			/* and the challenger sorts first */
+	assert(path_cmp(&t.p[1], &t.p[0], 0) < 0);
+	assert(path_select(&t, 0) >= 0);
+	assert(path_challenger(&t, 0) == -1);
+}
+
+/* A path that has not round-tripped has no base, and 0 there means unknown. It
+ * cannot win a comparison it has no figure for. */
+static void an_unknown_base_is_no_challenger(void)
+{
+	struct path_table t;
+
+	path_table_init(&t);
+	add(&t, "2001:db8::1", 5000, 0);
+	add(&t, "2001:db8::2", 5000, 0);
+	warm(&t.p[0], 0);
+	warm(&t.p[1], 0);
+	bucketed(&t.p[0], 10);
+	based(&t.p[0], 10);
+	bucketed(&t.p[1], 40);
+	assert(path_select(&t, 0) == 0);
+
+	/* It carries, and the other end of the table claims to be quick
+	 * without ever having answered a probe. */
+	bucketed(&t.p[0], 40);
+	bucketed(&t.p[1], 1);
+	assert(path_base_srtt_ms(&t.p[1]) == 0);
+	assert(path_challenger(&t, 0) == -1);
+}
+
+/* Leaving a warmth tier is not discretionary: the contest is within the
+ * incumbent's tier, and path_select keeps moving at once without it. */
+static void a_demotion_is_not_a_contest(void)
+{
+	struct path_table t;
+	uint64_t now = 0;
+
+	path_table_init(&t);
+	add(&t, "2001:db8::1", 5000, 0);
+	add(&t, "2001:db8::2", 5000, 0);
+	warm(&t.p[0], 0);
+	warm(&t.p[1], 0);
+	bucketed(&t.p[0], 10);
+	based(&t.p[0], 10);
+	bucketed(&t.p[1], 40);
+	based(&t.p[1], 40);
+	assert(path_select(&t, 0) == 0);
+
+	/* The incumbent goes quiet: a tier apart, so no challenger is reported
+	 * and the selection moves anyway. */
+	now = PATH_WARM_MS + 1;
+	warm(&t.p[1], now);
+	assert(path_warmth_of(&t.p[0], now) != path_warmth_of(&t.p[1], now));
+	assert(path_challenger(&t, now) == -1);
+	assert(path_select(&t, now) == 1);
+}
+
 int main(void)
 {
 	the_base_is_the_minimum_over_the_window();
@@ -1254,6 +1379,10 @@ int main(void)
 	a_spike_moves_the_ewma_and_not_the_base();
 	a_sustained_rise_is_forgotten_within_a_window();
 	the_base_cost_is_the_worse_view();
+	an_idle_challenger_needs_both_comparisons();
+	the_id_tiebreak_never_switches();
+	an_unknown_base_is_no_challenger();
+	a_demotion_is_not_a_contest();
 	unspecified_is_not_unicast();
 	endpoint_check();
 	probe_codec_check();

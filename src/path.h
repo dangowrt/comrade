@@ -480,4 +480,9 @@ int path_best(const struct path_table *t, uint64_t now);
  */
 int path_select(struct path_table *t, uint64_t now);
 
+/* Which path, if any, beats the one in use on the unloaded and the loaded
+ * bucket at once, within its warmth tier: the discretionary move as a
+ * question. -1 when none does, and an unknown base is no challenger. */
+int path_challenger(const struct path_table *t, uint64_t now);
+
 #endif

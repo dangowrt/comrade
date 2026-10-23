@@ -846,6 +846,41 @@ int path_select(struct path_table *t, uint64_t now)
 	return t->sel;
 }
 
+/* Excluded from a discretionary contest for the same reasons path_best
+ * excludes a path outright, plus the incumbent itself. */
+static int challenger_eligible(const struct path_table *t, int i, int sel,
+			       uint64_t now)
+{
+	const struct path *p = &t->p[i];
+
+	if (i == sel || !p->used || !p->usable)
+		return 0;
+	if (p->loss_n >= PATH_LOSS_WINDOW / 2 && path_loss_ppt(p) >= 1000)
+		return 0;
+	if (path_warmth_of(p, now) != path_warmth_of(&t->p[sel], now))
+		return 0;
+	return path_base_srtt_ms(p) > 0;	/* unknown is not excellent */
+}
+
+int path_challenger(const struct path_table *t, uint64_t now)
+{
+	int i, best = -1, sel = t->sel;
+
+	if (sel < 0 || !t->p[sel].used)
+		return -1;
+	for (i = 0; i < PATH_TABLE_MAX; i++) {
+		if (!challenger_eligible(t, i, sel, now))
+			continue;
+		if (path_base_bucket(&t->p[i]) >= path_base_bucket(&t->p[sel]))
+			continue;
+		if (path_bucket(&t->p[i]) >= path_bucket(&t->p[sel]))
+			continue;
+		if (best < 0 || path_cmp(&t->p[i], &t->p[best], now) < 0)
+			best = i;
+	}
+	return best;
+}
+
 /* One bucket's refill and charge, in thousandths so the rate divides. */
 static int bucket_take(int *tokens, uint64_t *ms, uint64_t now)
 {
