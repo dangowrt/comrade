@@ -4561,6 +4561,29 @@ static void punch_reap_stale(struct sess *s, const char *ufrag, const char *pwd)
 	}
 }
 
+/* An agent that gathered before this network gave out a mapping names nowhere
+ * a peer off the segment can reach, and it cannot be told the mapping
+ * afterwards, so the claimant is owed a punch from an agent that has one. */
+static void punch_drop_unreachable(struct sess *s)
+{
+	struct conn *c;
+	int i;
+
+	if (!__atomic_load_n(&s->net.have_srflx4, __ATOMIC_RELAXED))
+		return;
+	for (i = 0; i < HOST_MAX_WORKERS; i++) {
+		c = s->punching[i];
+		if (!c || !c->answer_sdp[0] ||
+		    cand_sdp_reaches_v4(c->answer_sdp))
+			continue;
+		if (c->pr.ice.agent && nat_connected(c->pr.ice.agent))
+			continue;
+		dbg_logf("host: punch %.8s answered no v4 target -- dropped "
+			 "for one that has", c->punch_ufrag);
+		punch_release(s, i);
+	}
+}
+
 /*
  * A host with any signalling backend serves many clients through the turnstile:
  * DHT/ICE joins arrive over the mailbox, and same-segment multicast claimants
@@ -4969,6 +4992,7 @@ static int host_turnstile(struct sess *s)
 		 * taken up.
 		 */
 		pool_pump(s);
+		punch_drop_unreachable(s);
 		if (ts == TS_WAIT_CLAIM && listen && stun_stall(s)) {
 			/* Named, like the claim verdicts: an offer with no
 			 * public address in it looks from here exactly like one

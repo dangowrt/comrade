@@ -261,6 +261,30 @@ int cand_ep_is_local(const uint8_t addr[16], const struct netmon_addr *local,
  * only when its address is globally routable, which is how IPv6 usually
  * arrives, since no reflexive candidate is gathered beside a global host one.
  */
+/* Whether anything in the description gives a peer a v4 target off the
+ * segment: behind a NAT only a reflexive or relayed candidate does, and a
+ * global v6 beside it says nothing about the v4 path. */
+int cand_sdp_reaches_v4(const char *sdp)
+{
+	const char *line = sdp;
+
+	while (*line) {
+		const char *nl = strchr(line, '\n');
+		size_t len = nl ? (size_t)(nl - line + 1) : strlen(line);
+		const char *p = os_memmem(line, len, "candidate:", 10);
+		char addr[64], typ[16];
+
+		if (p && sscanf(p, "candidate:%*s %*d %*s %*u %63s %*d typ %15s",
+				addr, typ) == 2 && !strchr(addr, ':') &&
+		    strcmp(typ, "host"))
+			return 1;
+		if (!nl)
+			break;
+		line = nl + 1;
+	}
+	return 0;
+}
+
 int cand_sdp_reaches_off_segment(const char *sdp)
 {
 	struct cand_policy global;

@@ -74,6 +74,9 @@ void cand_sdp_fan_v4(char *sdp, size_t cap, const uint8_t (*pool)[4],
  */
 int cand_sdp_reaches_off_segment(const char *sdp);
 
+/* Whether a peer off the segment is given any v4 target at all. */
+int cand_sdp_reaches_v4(const char *sdp);
+
 /*
  * The ICE ufrag out of a description, or an empty string.
  *
