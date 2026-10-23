@@ -96,6 +96,28 @@ void ctl_rdv_encode(uint8_t *pl, int family, const struct sockaddr *sa)
 	pl[2] = (uint8_t)port;
 }
 
+void ctl_txsel_encode(uint8_t *pl, uint32_t seq, const uint8_t *id, int flags)
+{
+	pl[0] = (uint8_t)(seq >> 24);
+	pl[1] = (uint8_t)(seq >> 16);
+	pl[2] = (uint8_t)(seq >> 8);
+	pl[3] = (uint8_t)seq;
+	memcpy(pl + 4, id, CTL_TXSEL_ID_LEN);
+	pl[4 + CTL_TXSEL_ID_LEN] = (uint8_t)flags;
+}
+
+int ctl_txsel_decode(const uint8_t *pl, size_t plen, uint32_t *seq, uint8_t *id,
+		     int *flags)
+{
+	if (plen < CTL_TXSEL_PLEN)
+		return 0;
+	*seq = ((uint32_t)pl[0] << 24) | ((uint32_t)pl[1] << 16) |
+	       ((uint32_t)pl[2] << 8) | pl[3];
+	memcpy(id, pl + 4, CTL_TXSEL_ID_LEN);
+	*flags = pl[4 + CTL_TXSEL_ID_LEN];
+	return 1;
+}
+
 void ctl_reach_encode(uint8_t *pl, int slot, int state, int flags)
 {
 	if (slot != 0 && slot != 1)

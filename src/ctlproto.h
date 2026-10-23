@@ -49,6 +49,16 @@
  * counterpart to CTLM_BYE): a detached guest is told to reattach rather than
  * inferring it from a CTLM_BYE that never comes. */
 #define CTLM_DETACHED 9
+/*
+ * payload: seq(4 BE) | path_id(8) | flags(1). "I transmit where this names",
+ * sent by the proposer only, answered by CTLM_TXACK echoing the statement it
+ * answers or refusing it with a flag. path_id is the one both ends derive from
+ * the same unordered reflexive pair, so it names a path without either end
+ * being first, and seq counts this channel's statements from 1: a statement at
+ * or below the highest already held says nothing about the choice now.
+ */
+#define CTLM_TXSEL 10
+#define CTLM_TXACK 11
 #define CTL_HDR 2
 #define CTL_TS_LEN 8
 #define CTL_RDV_PLEN 19
@@ -68,6 +78,14 @@
 #define CTL_RDVST_PLEN (CTL_RDV_PLEN + 1)
 #define CTL_REACH_PLEN 4
 #define CTL_RDVASK_PLEN 1
+#define CTL_TXSEL_ID_LEN 8		/* PATH_ID_LEN, named here so the
+					 * codec needs no path.h */
+#define CTL_TXSEL_PLEN 13
+
+#define CTL_TXSEL_F_FORCED 0x01		/* the incumbent died: the sender has
+					 * moved already, adopt at once */
+#define CTL_TXACK_F_UNKNOWN 0x02	/* no path of mine carries that id */
+#define CTL_TXACK_F_UNUSABLE 0x04	/* I hold it; it cannot send now */
 #define CTL_FRAME_MAX (CTL_HDR + CTL_KEY_PLEN)
 
 /*
@@ -115,6 +133,12 @@ void ctl_reframer_feed(struct ctl_reframer *r, const uint8_t *in, size_t n,
 void ctl_rdv_encode(uint8_t *pl, int family, const struct sockaddr *sa);
 int ctl_rdv_decode(const uint8_t *pl, size_t plen, struct sockaddr_storage *out,
 		   socklen_t *len);
+
+/* A CTL_TXSEL_PLEN payload <-> a statement about which path carries. Decode
+ * returns 0 on a payload too short to hold one. */
+void ctl_txsel_encode(uint8_t *pl, uint32_t seq, const uint8_t *id, int flags);
+int ctl_txsel_decode(const uint8_t *pl, size_t plen, uint32_t *seq, uint8_t *id,
+		     int *flags);
 
 /*
  * A CTL_REACH_PLEN payload <-> one family's pair of bytes. `slot` is 0 for

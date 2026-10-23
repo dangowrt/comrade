@@ -184,6 +184,7 @@ size_t path_probe_build(uint8_t *out, size_t out_len, uint32_t magic,
 		path_ep_pack(&pr->echo, plain + pl);
 		path_put16(plain + pl + 18, pr->srtt_ms);
 		path_put16(plain + pl + 20, pr->loss_ppt);
+		path_put16(plain + pl + 22, pr->base_srtt_ms);
 		pl += PROBE_TAIL_LEN;
 	}
 	path_put32(out, magic);
@@ -221,6 +222,7 @@ int path_probe_parse(struct path_probe *pr, uint32_t magic,
 		path_ep_unpack(&pr->echo, t);
 		pr->srtt_ms = ((int)t[18] << 8) | t[19];
 		pr->loss_ppt = ((int)t[20] << 8) | t[21];
+		pr->base_srtt_ms = ((int)t[22] << 8) | t[23];
 		pr->have_tail = 1;
 	}
 	return 0;
@@ -282,6 +284,7 @@ void path_fill_tail(const struct path *p, struct path_probe *pr)
 	pr->echo = p->in_src;
 	pr->srtt_ms = path_srtt_ms(p);
 	pr->loss_ppt = path_loss_ppt(p);
+	pr->base_srtt_ms = path_base_srtt_ms(p);
 }
 
 void path_apply_tail(struct path *p, const struct path_probe *pr,
@@ -290,7 +293,7 @@ void path_apply_tail(struct path *p, const struct path_probe *pr,
 	if (!pr->have_tail)
 		return;
 	path_set_self_ep(p, &pr->echo, sig_key);
-	path_peer_view(p, pr->srtt_ms, pr->loss_ppt);
+	path_peer_view(p, pr->srtt_ms, pr->loss_ppt, pr->base_srtt_ms);
 }
 
 void path_table_init(struct path_table *t)
@@ -691,7 +694,8 @@ int path_probe_pong(struct path *p, uint64_t nonce, uint64_t now)
 	return 1;
 }
 
-void path_peer_view(struct path *p, int srtt_ms, int loss_ppt)
+void path_peer_view(struct path *p, int srtt_ms, int loss_ppt,
+		    int base_srtt_ms)
 {
 	int mine = path_srtt_ms(p);
 	int cap = PATH_PEER_SRTT_MAX;
@@ -702,12 +706,18 @@ void path_peer_view(struct path *p, int srtt_ms, int loss_ppt)
 		loss_ppt = 0;
 	if (loss_ppt > 1000)
 		loss_ppt = 1000;	/* a proportion, not a number */
+	if (base_srtt_ms < 0)
+		base_srtt_ms = 0;
 	if (p->qualified && mine > 0 && mine * PATH_PEER_SRTT_RATIO < cap)
 		cap = mine * PATH_PEER_SRTT_RATIO;
 	if (srtt_ms > cap)
 		srtt_ms = cap;
+	/* The same ceiling: a claim about a path can only ever argue it down. */
+	if (base_srtt_ms > cap)
+		base_srtt_ms = cap;
 	p->peer_srtt_ms = srtt_ms;
 	p->peer_loss_ppt = loss_ppt;
+	p->peer_base_srtt_ms = base_srtt_ms;
 }
 
 int path_cost_of(int srtt_a, int loss_a, int srtt_b, int loss_b)

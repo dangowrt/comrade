@@ -161,7 +161,8 @@ void path_ep_str(const struct path_ep *ep, char *out, size_t n);
  *
  *   [4 magic][seal(sig_key, plain)]
  *   plain = [1 type][8 nonce][8 seq][1 ulen][ulen claimant ufrag]  head
- *           [16 addr][2 port BE][2 srtt_ms BE][2 loss_ppt BE]      tail, optional
+ *           [16 addr][2 port BE][2 srtt_ms BE][2 loss_ppt BE]
+ *           [2 base_srtt_ms BE]                                   tail, optional
  *
  * The seal is not defending against the peer, who holds the token and is
  * trusted by construction; it stops a stranger who can guess an endpoint from
@@ -211,7 +212,7 @@ void path_ep_str(const struct path_ep *ep, char *out, size_t n);
  */
 #define PROBE_FRESH 3
 #define PROBE_UFRAG_MAX 40
-#define PROBE_TAIL_LEN 22
+#define PROBE_TAIL_LEN 24
 #define PROBE_HEAD_FIXED 18		/* type(1) nonce(8) seq(8) ulen(1) */
 #define PROBE_PLAIN_MAX (PROBE_HEAD_FIXED + PROBE_UFRAG_MAX + PROBE_TAIL_LEN)
 #define PROBE_MAX (4 + PROBE_PLAIN_MAX + SEAL_OVERHEAD)
@@ -225,6 +226,7 @@ struct path_probe {
 	struct path_ep echo;
 	int srtt_ms;
 	int loss_ppt;
+	int base_srtt_ms;		/* its view with nothing loading it */
 };
 
 /* Does this datagram open with the session's probe tag? A KCP datagram opens
@@ -404,7 +406,8 @@ void path_probe_expire(struct path *p, uint64_t now);
  * round trip was recorded), 0 when it matched nothing. */
 int path_probe_pong(struct path *p, uint64_t nonce, uint64_t now);
 /* The peer's own view of this path, from a probe tail. */
-void path_peer_view(struct path *p, int srtt_ms, int loss_ppt);
+void path_peer_view(struct path *p, int srtt_ms, int loss_ppt,
+		    int base_srtt_ms);
 
 enum path_warmth path_warmth_of(const struct path *p, uint64_t now);
 int path_srtt_ms(const struct path *p);

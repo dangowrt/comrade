@@ -149,7 +149,7 @@ static void probe_codec_check(void)
 	uint8_t buf[PROBE_MAX];
 	size_t n;
 
-	assert(PROBE_PLAIN_MAX == 1 + 8 + 8 + 1 + 40 + 22);
+	assert(PROBE_PLAIN_MAX == 1 + 8 + 8 + 1 + 40 + 24);
 
 	memset(&out, 0, sizeof(out));
 	out.type = PROBE_PING;
@@ -174,12 +174,15 @@ static void probe_codec_check(void)
 	out.echo = ep6("2001:db8::99", 61000);
 	out.srtt_ms = 37;
 	out.loss_ppt = 125;
+	out.base_srtt_ms = 29;
 	n = path_probe_build(buf, sizeof(buf), TEST_MAGIC, key, &out);
 	assert(n > 4 && n <= PROBE_MAX);
 	assert(path_probe_parse(&in, TEST_MAGIC, key, buf, n) == 0);
 	assert(in.type == PROBE_PONG && in.have_tail);
 	assert(path_ep_eq(&in.echo, &out.echo));
 	assert(in.srtt_ms == 37 && in.loss_ppt == 125);
+	/* The unloaded figure rides the same tail and must survive it whole. */
+	assert(in.base_srtt_ms == 29);
 
 	/* The longest ufrag still fits alongside the tail. */
 	memset(out.ufrag, 'z', PROBE_UFRAG_MAX);
@@ -188,6 +191,17 @@ static void probe_codec_check(void)
 	assert(n == PROBE_MAX);
 	assert(path_probe_parse(&in, TEST_MAGIC, key, buf, n) == 0);
 	assert(strlen(in.ufrag) == PROBE_UFRAG_MAX && in.have_tail);
+
+	/* A tail that stops short of the full length is not a tail: the reader
+	 * takes none of it rather than half of it. */
+	out.have_tail = 0;
+	snprintf(out.ufrag, sizeof(out.ufrag), "short");
+	n = path_probe_build(buf, sizeof(buf), TEST_MAGIC, key, &out);
+	assert(path_probe_parse(&in, TEST_MAGIC, key, buf, n) == 0);
+	assert(!in.have_tail && !in.base_srtt_ms);
+	out.have_tail = 1;
+	memset(out.ufrag, 'z', PROBE_UFRAG_MAX);
+	out.ufrag[PROBE_UFRAG_MAX] = '\0';
 
 	/* Not a probe, and a probe a stranger could not have sealed. */
 	assert(!path_probe_is(TEST_MAGIC, buf, 3));
@@ -689,7 +703,7 @@ static void order_check(void)
 	p = add(&a, addr[1], 5000, 0);
 	round_trip(p, 0, 12);
 	assert(path_best(&a, 12) == 0);
-	path_peer_view(&a.p[0], 300, 0);
+	path_peer_view(&a.p[0], 300, 0, 0);
 	assert(path_best(&a, 12) == 1);
 	/*
 	 * But only so far. The figure is the peer's claim, not our
@@ -704,13 +718,23 @@ static void order_check(void)
 	 * further, whatever the sixteen bits on the wire can say. */
 	path_table_init(&a);
 	p = add(&a, addr[0], 5000, 0);
-	path_peer_view(p, 65535, 0);
+	path_peer_view(p, 65535, 0, 0);
 	assert(p->peer_srtt_ms == PATH_PEER_SRTT_MAX);
 
 	/* Loss is a proportion, so a thousand parts per thousand is all of
 	 * it; a peer claiming more is claiming nothing extra. */
-	path_peer_view(p, 0, 65535);
+	path_peer_view(p, 0, 65535, 0);
 	assert(p->peer_loss_ppt == 1000);
+
+	/* The unloaded figure is a claim on the same terms, so it meets the
+	 * same ceiling and can argue a path down and never up. */
+	path_peer_view(p, 0, 0, 65535);
+	assert(p->peer_base_srtt_ms == PATH_PEER_SRTT_MAX);
+	round_trip(p, 0, 10);
+	path_peer_view(p, 0, 0, 65535);
+	assert(p->peer_base_srtt_ms == 10 * PATH_PEER_SRTT_RATIO);
+	path_peer_view(p, 0, 0, -1);
+	assert(p->peer_base_srtt_ms == 0);
 }
 
 static void warm(struct path *p, uint64_t now)

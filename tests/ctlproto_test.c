@@ -215,6 +215,47 @@ int main(void)
 	}
 
 	/*
+	 * Which path carries: a numbered statement and the answer echoing it,
+	 * the same shape and so the same codec.
+	 */
+	{
+		uint8_t pl[CTL_TXSEL_PLEN], id[CTL_TXSEL_ID_LEN];
+		uint8_t f[CTL_FRAME_MAX];
+		uint32_t seq = 0;
+		int fl = -1;
+		size_t n;
+
+		memset(id, 0, sizeof(id));
+		id[0] = 0xde;
+		id[CTL_TXSEL_ID_LEN - 1] = 0xad;
+		ctl_txsel_encode(pl, 0x01020304u, id, CTL_TXSEL_F_FORCED);
+		n = ctl_frame(f, CTLM_TXSEL, pl, CTL_TXSEL_PLEN);
+		assert(n == CTL_HDR + CTL_TXSEL_PLEN);
+		assert(n <= CTL_FRAME_MAX);	/* the reframer's bound stands */
+		reset(&r);
+		ctl_reframer_feed(&r, f, n, collect, NULL);
+		assert(nseen == 1 && seen[0].type == CTLM_TXSEL);
+		assert(seen[0].plen == CTL_TXSEL_PLEN);
+		memset(id, 0, sizeof(id));
+		assert(ctl_txsel_decode(seen[0].pl, seen[0].plen, &seq, id, &fl));
+		assert(seq == 0x01020304u);
+		assert(id[0] == 0xde && id[CTL_TXSEL_ID_LEN - 1] == 0xad);
+		assert(fl == CTL_TXSEL_F_FORCED);
+
+		/* The answer rides the same payload, refusing with a flag. */
+		ctl_txsel_encode(pl, 7, id, CTL_TXACK_F_UNKNOWN);
+		n = ctl_frame(f, CTLM_TXACK, pl, CTL_TXSEL_PLEN);
+		reset(&r);
+		ctl_reframer_feed(&r, f, n, collect, NULL);
+		assert(nseen == 1 && seen[0].type == CTLM_TXACK);
+		assert(ctl_txsel_decode(seen[0].pl, seen[0].plen, &seq, id, &fl));
+		assert(seq == 7 && fl == CTL_TXACK_F_UNKNOWN);
+
+		/* A payload too short to hold a statement is not one. */
+		assert(!ctl_txsel_decode(pl, CTL_TXSEL_PLEN - 1, &seq, id, &fl));
+	}
+
+	/*
 	 * Reachability: both families in one message, so a peer learns the
 	 * whole situation at once instead of a family at a time.
 	 */

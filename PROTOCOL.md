@@ -22,7 +22,7 @@ unmarked is implemented as described. Each mark is removed when its change
 lands.
 
 **Wire compatibility.** Nothing here is stable across 0.1.x. This revision
-(`TOKEN_VERSION = 6`, §3) returns the rendezvous to **one** BEP 44 target
+(`TOKEN_VERSION = 7`, §3) returns the rendezvous to **one** BEP 44 target
 (§4, §5), whose value holds the host's own statement beside the one turn a
 claimant exchange takes, seals a
 claimant's statements to its credential class alone (§4.2), and carries the
@@ -214,7 +214,7 @@ Fixed **90-byte** payload (`TOKEN_RAW_LEN`), packed in order:
 
 | field | bytes | meaning |
 |-------|-------|---------|
-| version | 1 | `TOKEN_VERSION = 6` |
+| version | 1 | `TOKEN_VERSION = 7` |
 | flags | 1 | see below |
 | rdv `R` | 16 | rendezvous secret (KDF input, §2) |
 | auth `A` | 16 | session auth secret (SSH password, §10) |
@@ -923,7 +923,8 @@ deciding for the other.
   [4 magic][seal(key, plain)]                  magic = keys.probe_magic (§2)
 
   plain = [1 type][8 nonce][8 seq][1 ulen][ulen claimant ufrag]   head, 18+ulen
-          [16 addr][2 port BE][2 srtt_ms BE][2 loss_ppt BE]       tail, optional
+          [16 addr][2 port BE][2 srtt_ms BE][2 loss_ppt BE]
+          [2 base_srtt_ms BE]                                     tail, optional
   type: 1 = PING, 2 = PONG (echoes the nonce), 3 = FRESH
 ```
 
@@ -932,9 +933,11 @@ datagram opens with `conv` and the magic is forced to differ from it (§2), so a
 datagram opening with the magic is unambiguously not stream data. Neither value
 is a constant, so neither identifies comrade to anyone without the token.
 
-The 22-byte tail is present when the plaintext runs past `18 + ulen`; a peer
+The 24-byte tail is present when the plaintext runs past `18 + ulen`; a peer
 that omits it merely shares no measurements, which costs accuracy and never
-correctness. A `FRESH` carries a tail it never reads, so that the one datagram
+correctness. `base_srtt_ms` is that end's own unloaded figure for the path
+(§9), clamped on arrival by the same two ceilings as `srtt_ms`, so a claim can
+argue a path down and never up. A `FRESH` carries a tail it never reads, so that the one datagram
 which ends a session is not also the only short one on the wire.
 
 **`seq` counts this sender's frames on this connection.** The seal says a frame
@@ -1040,6 +1043,26 @@ same number from the same data:
   bucket(P) = floor(cost(P) / PATH_COST_QUANTUM_MS)
 ```
 
+Each end keeps a second figure for the same path, over the same probes, and
+publishes it in the tail as `base_srtt_ms`:
+
+```
+  base(P)        = min of the last PATH_LOSS_WINDOW round trips
+  base_cost(P)   = max(base_local, base_peer)
+  base_bucket(P) = floor(base_cost(P) / PATH_COST_QUANTUM_MS)
+```
+
+Every term of `cost` rises when a path carries the session, so an idle
+alternative measures better for being idle; a minimum is the figure our own
+load can raise and never lower, which is what makes the two comparable. There
+is no loss term in `base`: congestion loss on the carrying path is partly our
+own. The window is a count of probe outcomes rather than a duration, so it
+expires by event and `base` of a path that has never answered is `0`, meaning
+unknown rather than instant. Both ends probe every path on one cadence, the
+path in use included, so the incumbent and an idle candidate yield the same
+number of samples per window. A statistic of one kind is never compared with
+one of another kind: `cost` with `cost`, `base` with `base`.
+
 `floor`, so costs within one quantum of each other share a bucket. Rounding up
 would put 0ms and 1ms a whole bucket -- the switch margin -- apart, at exactly
 the boundary where a LAN's measurement noise lives, and equal paths would
@@ -1077,7 +1100,8 @@ the identical rule to the identical numbers and so flip together.
 | `PATH_WARM_MS` | 3000 | silence beyond this: `WARM` becomes `COLD` |
 | `PATH_DEAD_MS` | 8000 | silence beyond this: `COLD` becomes `DEAD` |
 | `PATH_LOSS_PENALTY_MS` | 200 | cost added by total loss |
-| `PATH_COST_QUANTUM_MS` | 5 | ranking bucket width |
+| `PATH_COST_QUANTUM_MS` | 5 | ranking bucket width, both statistics |
+| `PATH_LOSS_WINDOW` | 16 | probe outcomes the loss ratio and `base` span |
 | `PATH_SWITCH_MARGIN` | 1 | buckets a candidate must win by |
 | `PATH_SWITCH_HOLD` | 2 | consecutive evaluations it must hold (one per `PATH_KEEP_MS`) |
 | `PATH_ADOPT_RATE` | 8/s, depth 8 | token bucket for unknown-source probes, per listening socket |
@@ -1226,7 +1250,15 @@ for the peer to reuse on a roam); `CTLM_CAND 3`, the same 19-byte payload shape
 and so the same codec, one local endpoint at the sender's lanlink port for the
 peer to probe and hold as a path (§9), re-sent every `CAND_TELL_MS 5000` so an
 interface brought up mid-session is advertised within one period; `CTLM_REACH 4`
-and `CTLM_RDVASK 5` (§11).
+and `CTLM_RDVASK 5` (§11); `CTLM_TXSEL 10` and `CTLM_TXACK 11`, payload
+`seq(4,BE) | path_id(8) | flags(1)` = `CTL_TXSEL_PLEN 13`, the numbered
+statement about which path carries and the answer echoing it (§9). `TXSEL` is
+sent by one end only and `TXACK` by the other; `seq` counts a channel's
+statements from 1 and restarts with the channel, and a statement at or below
+the highest already held says nothing about the choice now. Flags:
+`CTL_TXSEL_F_FORCED 0x01` (the sender has already moved, adopt at once),
+`CTL_TXACK_F_UNKNOWN 0x02` (no path of mine carries that id) and
+`CTL_TXACK_F_UNUSABLE 0x04` (I hold it; it cannot send now).
 
 `CTLM_BYE 8`, no payload: **the shared session behind this connection has
 ended**. The host sends it the moment its end-of-session monitor fires
