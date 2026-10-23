@@ -24,6 +24,13 @@ void ctlplane_reset(struct ctlplane *cp)
 {
 	cp->half_sent = 0;
 	cp->half_seen = 0;
+	pthread_mutex_lock(&cp->lock);
+	cp->txsel_seq_out = 0;
+	cp->txsel_seq_in = 0;
+	cp->txsel_wait = 0;
+	cp->txsel_in_pending = 0;
+	cp->txack_in_pending = 0;
+	pthread_mutex_unlock(&cp->lock);
 }
 
 void ctlplane_live_reset(struct ctlplane *cp, uint64_t now)
@@ -145,6 +152,72 @@ void ctlplane_tell_cand(struct ctlplane *cp, const struct ctlplane_sinks *k,
 	(void)cp;
 	ctl_rdv_encode(pl, family, sa);
 	k->send(k->arg, CTLM_CAND, pl, sizeof(pl));
+}
+
+uint32_t ctlplane_tell_txsel(struct ctlplane *cp, const struct ctlplane_sinks *k,
+			     const uint8_t id[CTL_TXSEL_ID_LEN], int flags)
+{
+	uint8_t pl[CTL_TXSEL_PLEN];
+	uint32_t seq;
+
+	if (k->ready && !k->ready(k->arg))
+		return 0;
+	pthread_mutex_lock(&cp->lock);
+	seq = ++cp->txsel_seq_out;
+	cp->txsel_wait = seq;
+	cp->txack_in_pending = 0;
+	pthread_mutex_unlock(&cp->lock);
+	ctl_txsel_encode(pl, seq, id, flags);
+	k->send(k->arg, CTLM_TXSEL, pl, sizeof(pl));
+	return seq;
+}
+
+void ctlplane_tell_txack(struct ctlplane *cp, const struct ctlplane_sinks *k,
+			 uint32_t seq, const uint8_t id[CTL_TXSEL_ID_LEN],
+			 int flags)
+{
+	uint8_t pl[CTL_TXSEL_PLEN];
+
+	(void)cp;
+	if (k->ready && !k->ready(k->arg))
+		return;
+	ctl_txsel_encode(pl, seq, id, flags);
+	k->send(k->arg, CTLM_TXACK, pl, sizeof(pl));
+}
+
+int ctlplane_take_txsel(struct ctlplane *cp, uint32_t *seq,
+			uint8_t id[CTL_TXSEL_ID_LEN], int *flags)
+{
+	int had;
+
+	pthread_mutex_lock(&cp->lock);
+	had = cp->txsel_in_pending;
+	if (had) {
+		*seq = cp->txsel_seq_in;
+		memcpy(id, cp->txsel_in_id, CTL_TXSEL_ID_LEN);
+		*flags = cp->txsel_in_flags;
+		cp->txsel_in_pending = 0;
+	}
+	pthread_mutex_unlock(&cp->lock);
+	return had;
+}
+
+int ctlplane_take_txack(struct ctlplane *cp, uint32_t *seq,
+			uint8_t id[CTL_TXSEL_ID_LEN], int *flags)
+{
+	int had;
+
+	pthread_mutex_lock(&cp->lock);
+	had = cp->txack_in_pending;
+	if (had) {
+		*seq = cp->txsel_wait;
+		memcpy(id, cp->txack_in_id, CTL_TXSEL_ID_LEN);
+		*flags = cp->txack_in_flags;
+		cp->txack_in_pending = 0;
+		cp->txsel_wait = 0;
+	}
+	pthread_mutex_unlock(&cp->lock);
+	return had;
 }
 
 void ctlplane_tell_reach(struct ctlplane *cp, const struct ctlplane_sinks *k,
@@ -276,6 +349,45 @@ static void on_rdv(struct ctlplane *cp, const uint8_t *pl, size_t plen)
 	pthread_mutex_unlock(&cp->lock);
 }
 
+/* A statement at or below the highest held says nothing about the choice now:
+ * the channel is ordered, so this is the duplicate and the survivor of a reset,
+ * not a reordering. */
+static void on_txsel(struct ctlplane *cp, const uint8_t *pl, size_t plen)
+{
+	uint8_t id[CTL_TXSEL_ID_LEN];
+	uint32_t seq = 0;
+	int flags = 0;
+
+	if (!ctl_txsel_decode(pl, plen, &seq, id, &flags))
+		return;
+	pthread_mutex_lock(&cp->lock);
+	if (seq > cp->txsel_seq_in) {
+		cp->txsel_seq_in = seq;
+		memcpy(cp->txsel_in_id, id, sizeof(id));
+		cp->txsel_in_flags = flags;
+		cp->txsel_in_pending = 1;
+	}
+	pthread_mutex_unlock(&cp->lock);
+}
+
+/* An answer is to one numbered question; any other number is spent. */
+static void on_txack(struct ctlplane *cp, const uint8_t *pl, size_t plen)
+{
+	uint8_t id[CTL_TXSEL_ID_LEN];
+	uint32_t seq = 0;
+	int flags = 0;
+
+	if (!ctl_txsel_decode(pl, plen, &seq, id, &flags))
+		return;
+	pthread_mutex_lock(&cp->lock);
+	if (cp->txsel_wait && seq == cp->txsel_wait) {
+		memcpy(cp->txack_in_id, id, sizeof(id));
+		cp->txack_in_flags = flags;
+		cp->txack_in_pending = 1;
+	}
+	pthread_mutex_unlock(&cp->lock);
+}
+
 int ctlplane_on_msg(struct ctlplane *cp, const struct ctlplane_sinks *k,
 		    int type, const uint8_t *pl, size_t plen, unsigned netgen,
 		    uint64_t now)
@@ -306,6 +418,10 @@ int ctlplane_on_msg(struct ctlplane *cp, const struct ctlplane_sinks *k,
 			cp->rdvask_in |= pl[0] == 6 ? 2 : 1;
 			pthread_mutex_unlock(&cp->lock);
 		}
+	} else if (type == CTLM_TXSEL && plen >= CTL_TXSEL_PLEN) {
+		on_txsel(cp, pl, plen);
+	} else if (type == CTLM_TXACK && plen >= CTL_TXSEL_PLEN) {
+		on_txack(cp, pl, plen);
 	} else if (type == CTLM_CAND && plen >= CTL_RDV_PLEN) {
 		struct sockaddr_storage sa;
 		socklen_t sl = 0;

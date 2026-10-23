@@ -349,6 +349,125 @@ static void a_message_the_plane_does_not_own_is_handed_on(void)
 	end_done(&a);
 }
 
+/*
+ * One numbering per channel, and only the latest statement means anything: a
+ * duplicate, or one that survived a reset, says nothing about the choice now.
+ */
+static void only_the_latest_statement_is_taken(void)
+{
+	uint8_t id[CTL_TXSEL_ID_LEN], got[CTL_TXSEL_ID_LEN];
+	struct end a, b;
+	uint32_t seq = 0, s1, s2;
+	int flags = -1;
+
+	end_init(&a);
+	end_init(&b);
+	memset(id, 0xa5, sizeof(id));
+
+	s1 = ctlplane_tell_txsel(&a.cp, &a.k, id, 0);
+	assert(s1 == 1);
+	assert(last_type(&a) == CTLM_TXSEL);
+	assert(deliver(&a, &b, 1, 1000) == 1);
+	assert(ctlplane_take_txsel(&b.cp, &seq, got, &flags) == 1);
+	assert(seq == s1 && !memcmp(got, id, sizeof(id)) && flags == 0);
+	/* Taken once: a statement is an event, not a standing claim. */
+	assert(!ctlplane_take_txsel(&b.cp, &seq, got, &flags));
+
+	/* The same statement again, replayed: at the highest held, so no. */
+	ctl_txsel_encode(a.pl[0], s1, id, 0);
+	a.type[0] = CTLM_TXSEL;
+	a.plen[0] = CTL_TXSEL_PLEN;
+	a.n = 1;
+	assert(deliver(&a, &b, 1, 1001) == 1);
+	assert(!ctlplane_take_txsel(&b.cp, &seq, got, &flags));
+
+	/* A higher one is the choice now, flags and all. */
+	memset(id, 0x5a, sizeof(id));
+	s2 = ctlplane_tell_txsel(&a.cp, &a.k, id, CTL_TXSEL_F_FORCED);
+	assert(s2 == s1 + 1);
+	assert(deliver(&a, &b, 1, 1002) == 1);
+	assert(ctlplane_take_txsel(&b.cp, &seq, got, &flags) == 1);
+	assert(seq == s2 && flags == CTL_TXSEL_F_FORCED);
+
+	end_done(&a);
+	end_done(&b);
+}
+
+/* An answer belongs to one numbered question. */
+static void an_answer_to_a_spent_number_is_ignored(void)
+{
+	uint8_t id[CTL_TXSEL_ID_LEN], got[CTL_TXSEL_ID_LEN];
+	struct end a, b;
+	uint32_t seq = 0, s1;
+	int flags = -1;
+
+	end_init(&a);
+	end_init(&b);
+	memset(id, 0x11, sizeof(id));
+
+	s1 = ctlplane_tell_txsel(&a.cp, &a.k, id, 0);
+	a.n = 0;				/* the statement itself: sent */
+
+	/* An answer to a number never asked. */
+	ctlplane_tell_txack(&b.cp, &b.k, s1 + 7, id, 0);
+	assert(last_type(&b) == CTLM_TXACK);
+	assert(deliver(&b, &a, 1, 1000) == 1);
+	assert(!ctlplane_take_txack(&a.cp, &seq, got, &flags));
+
+	/* The answer to the one it is waiting on. */
+	ctlplane_tell_txack(&b.cp, &b.k, s1, id, CTL_TXACK_F_UNUSABLE);
+	assert(deliver(&b, &a, 1, 1001) == 1);
+	assert(ctlplane_take_txack(&a.cp, &seq, got, &flags) == 1);
+	assert(seq == s1 && flags == CTL_TXACK_F_UNUSABLE);
+	assert(!memcmp(got, id, sizeof(id)));
+	assert(!ctlplane_take_txack(&a.cp, &seq, got, &flags));
+
+	/* Answered once: the same answer again is spent with its number. */
+	ctlplane_tell_txack(&b.cp, &b.k, s1, id, 0);
+	assert(deliver(&b, &a, 1, 1002) == 1);
+	assert(!ctlplane_take_txack(&a.cp, &seq, got, &flags));
+
+	end_done(&a);
+	end_done(&b);
+}
+
+/* A fresh channel is a fresh pair: the numbering starts again, as the key
+ * halves do, and a statement in flight over the old one is void. */
+static void a_reset_restarts_the_numbering(void)
+{
+	uint8_t id[CTL_TXSEL_ID_LEN], got[CTL_TXSEL_ID_LEN];
+	struct end a, b;
+	uint32_t seq = 0, s1;
+	int flags = -1;
+
+	end_init(&a);
+	end_init(&b);
+	memset(id, 0x22, sizeof(id));
+
+	s1 = ctlplane_tell_txsel(&a.cp, &a.k, id, 0);
+	assert(deliver(&a, &b, 1, 1000) == 1);
+	assert(ctlplane_take_txsel(&b.cp, &seq, got, &flags) == 1);
+
+	ctlplane_reset(&a.cp);
+	ctlplane_reset(&b.cp);
+	assert(ctlplane_tell_txsel(&a.cp, &a.k, id, 0) == 1);	/* from 1 again */
+	assert(deliver(&a, &b, 1, 1001) == 1);
+	/* And the peer takes it, which it could not have done had the highest
+	 * it held survived the reset. */
+	assert(ctlplane_take_txsel(&b.cp, &seq, got, &flags) == 1);
+	assert(seq == 1);
+
+	/* A pending answer does not survive either. */
+	s1 = ctlplane_tell_txsel(&a.cp, &a.k, id, 0);
+	ctlplane_tell_txack(&b.cp, &b.k, s1, id, 0);
+	b.n = 0;
+	ctlplane_reset(&a.cp);
+	assert(!ctlplane_take_txack(&a.cp, &seq, got, &flags));
+
+	end_done(&a);
+	end_done(&b);
+}
+
 int main(void)
 {
 	the_pair_key_is_agreed_half_by_half();
@@ -360,6 +479,9 @@ int main(void)
 	a_request_is_noted_then_sent();
 	an_advertised_endpoint_reaches_the_playbook();
 	a_message_the_plane_does_not_own_is_handed_on();
+	only_the_latest_statement_is_taken();
+	an_answer_to_a_spent_number_is_ignored();
+	a_reset_restarts_the_numbering();
 	printf("ctlplane_test: ok\n");
 
 	return 0;

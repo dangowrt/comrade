@@ -99,6 +99,20 @@ struct ctlplane {
 	int rdvask_in;			/* families the peer asked us about:
 					 * bit 0 v4, bit 1 v6 */
 	int rdvask_out;			/* and the ones we owe it */
+	/*
+	 * Which path carries, as numbered statements. One channel, one
+	 * numbering, restarted with the channel: the halves of the pair key
+	 * are restarted the same way and for the same reason.
+	 */
+	uint32_t txsel_seq_out;		/* statements this end has made */
+	uint32_t txsel_seq_in;		/* the highest it holds */
+	uint32_t txsel_wait;		/* the one it awaits an answer to */
+	int txsel_in_pending;
+	int txack_in_pending;
+	uint8_t txsel_in_id[CTL_TXSEL_ID_LEN];
+	uint8_t txack_in_id[CTL_TXSEL_ID_LEN];
+	int txsel_in_flags;
+	int txack_in_flags;
 	struct ctlplane_live live;
 };
 
@@ -165,6 +179,31 @@ void ctlplane_ping(struct ctlplane *cp, const struct ctlplane_sinks *k,
  */
 void ctlplane_ask_rdv(struct ctlplane *cp, int family);
 void ctlplane_tell_asks(struct ctlplane *cp, const struct ctlplane_sinks *k);
+
+/*
+ * State which path this end transmits on, numbered, and await the answer to
+ * that number. Returns the sequence it went out under, or 0 when nothing could
+ * be sent. A later statement supersedes an earlier one at both ends, so this
+ * may be called again without waiting.
+ */
+uint32_t ctlplane_tell_txsel(struct ctlplane *cp, const struct ctlplane_sinks *k,
+			     const uint8_t id[CTL_TXSEL_ID_LEN], int flags);
+
+/* Answer one statement, echoing the number it answers. */
+void ctlplane_tell_txack(struct ctlplane *cp, const struct ctlplane_sinks *k,
+			 uint32_t seq, const uint8_t id[CTL_TXSEL_ID_LEN],
+			 int flags);
+
+/*
+ * Take a statement, or an answer to the one awaited, once. Returns 0 when
+ * there is none. A statement at or below the highest held, and an answer to
+ * any number but the one awaited, say nothing about the choice now and never
+ * arrive here.
+ */
+int ctlplane_take_txsel(struct ctlplane *cp, uint32_t *seq,
+			uint8_t id[CTL_TXSEL_ID_LEN], int *flags);
+int ctlplane_take_txack(struct ctlplane *cp, uint32_t *seq,
+			uint8_t id[CTL_TXSEL_ID_LEN], int *flags);
 
 /*
  * Both families' rendezvous nodes as the peer last named them, if anything
