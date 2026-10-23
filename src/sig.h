@@ -60,6 +60,9 @@ int sig_post(struct sig *s, const uint8_t *data, size_t len);
  * one supersedes is addressed to credentials it has stopped presenting. */
 void sig_ident_changed(struct sig *s);
 
+/* Ask again, the description unchanged, under a number the host will read. */
+void sig_reask(struct sig *s);
+
 int sig_subscribe(struct sig *s, sig_recv_cb *cb, void *arg);
 
 int sig_answer(struct sig *s, const uint8_t *cid, const uint8_t *data,

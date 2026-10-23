@@ -369,6 +369,16 @@ void sig_ident_changed(struct sig *s)
 	s->my_ufrag[0] = '\0';
 }
 
+/* Say the ask again as one the host has not read: an unchanged description is
+ * written once, and the host reads what stands as a replay. */
+void sig_reask(struct sig *s)
+{
+	if (s->is_host || !s->rc)
+		return;
+	rdv_client_reask(s->rc);
+	s->next_put_ms = 0;
+}
+
 int sig_post(struct sig *s, const uint8_t *data, size_t len)
 {
 	uint8_t packed[RDV_MAX_PAYLOAD];

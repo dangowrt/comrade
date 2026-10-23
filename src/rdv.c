@@ -576,6 +576,14 @@ void rdv_client_ident_changed(struct rdv_client *c)
 		c->prev_offer_seq = 0;
 }
 
+/* The same ask, asked again: it goes in under a number the host has not read,
+ * since one it has is a replay to it however long it has gone unanswered. */
+void rdv_client_reask(struct rdv_client *c)
+{
+	if (c)
+		c->reask = 1;
+}
+
 void rdv_client_set_live(struct rdv_client *c, int live)
 {
 	c->live = live ? 1 : 0;

@@ -5606,6 +5606,7 @@ int session_run(const struct session_cfg *cfg)
 				s.net.pool.posted = fan_local_sdp(&s);
 				sig_post(s.pm.sig, (const uint8_t *)local_sdp(&s),
 					 strlen(local_sdp(&s)));
+				sig_reask(s.pm.sig);
 				s.ice_attempt_start = now_ms();
 			}
 			if (path_ready(&s.c)) {

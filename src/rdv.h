@@ -167,6 +167,9 @@ void rdv_client_init(struct rdv_client *c, const uint8_t cid[RDV_CID_LEN]);
  * supersedes names an identity this end no longer presents. */
 void rdv_client_ident_changed(struct rdv_client *c);
 
+/* Ask again under a fresh number, the description unchanged. */
+void rdv_client_reask(struct rdv_client *c);
+
 /* Why a statement in the turn place is not ours to take. The reasons are
  * distinct conditions, and naming the one that fired is the difference
  * between a usable log line and a misleading one. */
