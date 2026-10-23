@@ -761,7 +761,9 @@ enum pathplane_pin pathplane_pin(struct pathplane *pl,
 	}
 	pthread_mutex_unlock(&pl->lock);
 	if (desc[0])
-		dbg_logf("path: pinned %s%s", desc, forced ? " (forced)" : "");
+		dbg_logf("path: pinned %02x%02x%02x%02x%02x%02x%02x%02x %s%s",
+			 id[0], id[1], id[2], id[3], id[4], id[5], id[6], id[7],
+			 desc, forced ? " (forced)" : "");
 
 	return rc;
 }

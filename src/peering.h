@@ -600,6 +600,18 @@ struct peering {
 	uint32_t reach_told_gen;	/* reachability this peer has been told */
 	uint64_t next_reach_tell_ms;
 	uint64_t next_hb_ms;		/* the next ping */
+	/*
+	 * Which end states where it transmits, fixed for the channel's life,
+	 * and what it has stated. The playbook supplies the role because the
+	 * asymmetry is the establishment primitive's: one end offers and the
+	 * other answers.
+	 */
+	int proposes;
+	int tx_pending;			/* a statement awaits its answer */
+	uint32_t tx_pending_seq;
+	uint8_t tx_pending_id[PATH_ID_LEN];
+	uint8_t tx_told_id[PATH_ID_LEN];	/* the carry the peer was told of */
+	int tx_told;
 };
 
 /*
@@ -609,7 +621,7 @@ struct peering {
  * probeplane_init.
  */
 void peering_init(struct peering *pr, struct peering_model *pm, uint32_t magic,
-		  const uint8_t key[32], uint64_t seq0);
+		  const uint8_t key[32], uint64_t seq0, int proposes);
 void peering_destroy(struct peering *pr);
 
 /*

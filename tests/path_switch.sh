@@ -45,7 +45,14 @@ if [ $? -eq 77 ]; then
 fi
 
 tmp=$(mktemp -d)
-cleanup() { kill "$hpid" "$cpid" 2>/dev/null; rm -rf "$tmp"; }
+keep() {
+	if [ "${COMRADE_E2E_KEEP:-0}" = 1 ]; then
+		echo "logs kept in $tmp"
+	else
+		rm -rf "$tmp"
+	fi
+}
+cleanup() { kill "$hpid" "$cpid" 2>/dev/null; keep; }
 trap cleanup EXIT INT TERM
 hpid=""
 cpid=""
@@ -164,6 +171,24 @@ esac
 for f in "$tmp/client.log" "$tmp/host.log"; do
 	if grep -q 'session: rejoin (roam)' "$f" 2>/dev/null; then
 		echo "FAIL: a path switch was taken for a rejoin ($f)"; rc=1
+	fi
+done
+# Which path transmits is settled between the ends (PROTOCOL.md section 9): the
+# claimant states it and the host answers by pinning the path that id names. So
+# every statement the client made must have been taken up by the host, which is
+# the symmetry assertion -- the two ends transmitting on one path rather than
+# each on its own idea of the best one. Conditional on a statement having been
+# made at all: where neither path ever wins both comparisons there is nothing
+# to settle and nothing to assert.
+for id in $(sed -n 's/.*path: proposing \([0-9a-f]*\).*/\1/p' \
+		"$tmp/client.log" 2>/dev/null); do
+	if ! grep -q "path: the peer transmits on $id" "$tmp/host.log" \
+			2>/dev/null; then
+		echo "FAIL: the client stated it transmits on $id and the" \
+		     "host never took that statement, so the two ends" \
+		     "disagree about which path carries"
+		grep -E 'path: (proposing|pinned|the peer transmits)' \
+			"$tmp/client.log" "$tmp/host.log"; rc=1
 	fi
 done
 grep -q "E2E PASS client" "$tmp/c.out" 2>/dev/null || {

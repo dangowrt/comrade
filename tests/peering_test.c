@@ -367,7 +367,7 @@ static void the_three_planes_are_wired_to_each_other(void)
 	struct peering pr;
 
 	peering_model_init(&pm, 1, 1, NULL, 1000);
-	peering_init(&pr, &pm, 0x50454552u, key, 500);
+	peering_init(&pr, &pm, 0x50454552u, key, 500, 0);
 	assert(pr.pm == &pm);
 	assert(pr.pl.pp == &pr.pp);
 	assert(pr.cp.pp == &pr.pp);
@@ -443,8 +443,8 @@ static void which_end_may_adopt_is_read_from_the_mailbox(void)
 
 	peering_model_init(&host, 1, 1, NULL, 1000);
 	peering_model_init(&client, 0, 1, NULL, 1000);
-	peering_init(&hp, &host, 1, key, 1);
-	peering_init(&cp, &client, 1, key, 1);
+	peering_init(&hp, &host, 1, key, 1, 0);
+	peering_init(&cp, &client, 1, key, 1, 0);
 
 	v6_node_said(&cp, 9, CTL_RDVST_PROVEN);
 	peering_absorb(&cp, 1000);
@@ -483,7 +483,7 @@ static void a_host_asks_a_reachable_peer_to_rendezvous(void)
 	struct peering pr;
 
 	peering_model_init(&pm, 1, 1, NULL, 1000);
-	peering_init(&pr, &pm, 1, key, 1);
+	peering_init(&pr, &pm, 1, key, 1, 0);
 
 	/* It has not spoken, so nothing is presumed of it. */
 	peering_absorb(&pr, 1000);
@@ -518,7 +518,7 @@ static void a_mailbox_off_the_dht_asks_nobody(void)
 	struct peering pr;
 
 	peering_model_init(&pm, 1, 0, NULL, 1000);
-	peering_init(&pr, &pm, 1, key, 1);
+	peering_init(&pr, &pm, 1, key, 1, 0);
 	memset(reach, 0, sizeof(reach));
 	ctl_reach_encode(reach, 1, CTL_REACH_UP, 0);
 	peer_says(&pr, CTLM_REACH, reach, sizeof(reach));
@@ -723,7 +723,7 @@ static void the_link_verdict_follows_the_evidence(void)
 	struct peering pr;
 
 	peering_model_init(&pm, 1, 1, NULL, 1000);
-	peering_init(&pr, &pm, 1, key, 1);
+	peering_init(&pr, &pm, 1, key, 1, 0);
 
 	/* Nothing has answered: being punched and not being reached at all are
 	 * told apart by whether a carrier exists. */
@@ -974,7 +974,7 @@ static void a_datagram_is_the_engine_s_until_it_says_otherwise(void)
 	size_t len;
 
 	peering_model_init(&pm, 1, 1, NULL, 1000);
-	peering_init(&pr, &pm, 0x50454552u, key, 500);
+	peering_init(&pr, &pm, 0x50454552u, key, 500, 0);
 
 	len = probeplane_wrap(&pr.pp, wrapped, sizeof(wrapped), body,
 			      sizeof(body));
@@ -1009,7 +1009,7 @@ static void a_rotation_is_read_against_what_primed_us(void)
 	struct peering pr;
 
 	peering_model_init(&pm, 0, 1, NULL, 1000);
-	peering_init(&pr, &pm, 1, key, 1000);
+	peering_init(&pr, &pm, 1, key, 1000, 0);
 
 	assert(!peering_ice_rotated(&pr, "abcd"));
 
@@ -1039,7 +1039,7 @@ static void an_offer_is_staged_before_it_is_taken(void)
 	char ufrag[40];
 
 	peering_model_init(&pm, 0, 1, NULL, 1000);
-	peering_init(&pr, &pm, 1, key, 1000);
+	peering_init(&pr, &pm, 1, key, 1000, 0);
 
 	/* Nothing primed yet, so the first one is taken and named. */
 	assert(peering_offer_judge(&pr, (const uint8_t *)first, strlen(first),
@@ -1069,8 +1069,408 @@ static void an_offer_is_staged_before_it_is_taken(void)
 	peering_model_destroy(&pm);
 }
 
+/*
+ * Two engines, paired through a hand-carried control channel: the sink that
+ * frames a message hands it straight to the other end, which is all a channel
+ * is here. Measurements are set directly, the question being what the two ends
+ * agree rather than how they measure.
+ */
+struct txend {
+	struct peering_model pm;
+	struct peering pr;
+	struct pathplane_sinks pk;
+	struct ctlplane_sinks ck;
+	struct txend *other;
+	int drop;			/* the channel is gone */
+	int frames;
+	int moves;			/* times its carry changed */
+	uint8_t was[PATH_ID_LEN];
+};
+
+static uint64_t tx_now = 1000;
+
+static void tx_probe_send(void *arg, enum path_kind kind,
+			  struct nat_agent *agent,
+			  const struct sockaddr_in6 *to, const uint8_t *data,
+			  size_t len)
+{
+	(void)arg;
+	(void)kind;
+	(void)agent;
+	(void)to;
+	(void)data;
+	(void)len;
+}
+
+static void tx_ident(void *arg, char *out, size_t n)
+{
+	(void)arg;
+	snprintf(out, n, "txpair");
+}
+
+static void tx_ctl_send(void *arg, int type, const uint8_t *pl, size_t plen)
+{
+	struct txend *e = arg;
+
+	e->frames++;
+	if (e->drop || !e->other || e->other->drop)
+		return;
+	ctlplane_on_msg(&e->other->pr.cp, &e->other->ck, type, pl, plen, 0,
+			tx_now);
+}
+
+static void tx_end_init(struct txend *e, int proposes)
+{
+	static const uint8_t key[32] = { 7 };
+
+	memset(e, 0, sizeof(*e));
+	peering_model_init(&e->pm, !proposes, 1, NULL, tx_now);
+	peering_init(&e->pr, &e->pm, 0x50454552u, key, 1, proposes);
+	e->pk.send = tx_probe_send;
+	e->pk.ident = tx_ident;
+	e->pk.arg = e;
+	e->ck.send = tx_ctl_send;
+	e->ck.arg = e;
+	peering_sinks(&e->pr, &e->pk, &e->ck);
+}
+
+static void tx_end_done(struct txend *e)
+{
+	peering_destroy(&e->pr);
+	peering_model_destroy(&e->pm);
+}
+
+/* One path, named by the id both ends would derive, with its measurements. */
+static void tx_path(struct txend *e, int slot, uint8_t id0, int srtt_ms,
+		    int base_ms, uint64_t pong_ms)
+{
+	struct sockaddr_in6 sa;
+	struct path *p;
+
+	memset(&sa, 0, sizeof(sa));
+	sa.sin6_family = AF_INET6;
+	sa.sin6_port = htons((uint16_t)(5000 + id0));
+	sa.sin6_addr.s6_addr[0] = 0x20;
+	sa.sin6_addr.s6_addr[15] = id0;
+	p = path_table_add(&e->pr.pl.t, PATH_SEGMENT, &sa, NULL, tx_now);
+	assert(p && path_index(&e->pr.pl.t, p) == slot);
+	memset(p->id, 0, PATH_ID_LEN);
+	p->id[0] = id0;
+	p->usable = 1;
+	p->qualified = 1;
+	p->last_pong_ms = pong_ms;
+	p->srtt8 = srtt_ms * 8;
+	p->rtt[0] = (uint16_t)base_ms;
+	p->rtt_n = 1;
+	p->rtt_i = 0;
+}
+
+static void tx_measure(struct txend *e, int slot, int srtt_ms, int base_ms,
+		       uint64_t pong_ms)
+{
+	struct path *p = &e->pr.pl.t.p[slot];
+
+	p->srtt8 = srtt_ms * 8;
+	p->rtt[0] = (uint16_t)base_ms;
+	p->rtt_n = 1;
+	p->last_pong_ms = pong_ms;
+}
+
+/* One round on both ends, counting a carry that changed. */
+static void tx_round(struct txend *a, struct txend *b)
+{
+	struct txend *ends[2];
+	uint8_t id[PATH_ID_LEN];
+	int i;
+
+	ends[0] = a;
+	ends[1] = b;
+	for (i = 0; i < 2; i++) {
+		peering_paths(&ends[i]->pr, tx_now);
+		if (pathplane_carry_id(&ends[i]->pr.pl, id) &&
+		    memcmp(id, ends[i]->was, PATH_ID_LEN)) {
+			memcpy(ends[i]->was, id, PATH_ID_LEN);
+			ends[i]->moves++;
+		}
+	}
+}
+
+static int tx_same_carry(struct txend *a, struct txend *b, uint8_t out[PATH_ID_LEN])
+{
+	uint8_t ia[PATH_ID_LEN], ib[PATH_ID_LEN];
+
+	if (!pathplane_carry_id(&a->pr.pl, ia) ||
+	    !pathplane_carry_id(&b->pr.pl, ib))
+		return 0;
+	if (memcmp(ia, ib, PATH_ID_LEN))
+		return 0;
+	memcpy(out, ia, PATH_ID_LEN);
+
+	return 1;
+}
+
+/*
+ * The whole point: a path that is genuinely better unloaded is moved to, and
+ * both ends transmit on the same one when they are done.
+ */
+static void both_ends_settle_on_one_path(void)
+{
+	uint8_t id[PATH_ID_LEN];
+	struct txend a, b;
+	int i;
+
+	tx_end_init(&a, 1);			/* the claimant proposes */
+	tx_end_init(&b, 0);			/* the host confirms */
+	a.other = &b;
+	b.other = &a;
+	tx_path(&a, 0, 0x11, 40, 40, tx_now);
+	tx_path(&a, 1, 0x22, 10, 10, tx_now);
+	tx_path(&b, 0, 0x11, 40, 40, tx_now);
+	tx_path(&b, 1, 0x22, 10, 10, tx_now);
+
+	/* The cold start puts both on the better path by the shared ranking. */
+	for (i = 0; i < 4; i++)
+		tx_round(&a, &b);
+	assert(tx_same_carry(&a, &b, id));
+	assert(id[0] == 0x22);
+
+	/* The other path becomes the better one, unloaded and loaded. */
+	for (i = 0; i < 6; i++) {
+		tx_measure(&a, 0, 5, 5, tx_now);
+		tx_measure(&b, 0, 5, 5, tx_now);
+		tx_round(&a, &b);
+	}
+	assert(tx_same_carry(&a, &b, id));
+	assert(id[0] == 0x11);			/* negotiated, both ends */
+	assert(a.frames && b.frames);		/* and it took a statement */
+
+	tx_end_done(&a);
+	tx_end_done(&b);
+}
+
+/*
+ * The case the design exists for: the session loads the path it carries, so an
+ * idle alternative measures better for being idle. Nothing moves.
+ */
+static void self_load_does_not_move_the_carry(void)
+{
+	uint8_t id[PATH_ID_LEN], before[PATH_ID_LEN];
+	struct txend a, b;
+	int i;
+
+	tx_end_init(&a, 1);
+	tx_end_init(&b, 0);
+	a.other = &b;
+	b.other = &a;
+	tx_path(&a, 0, 0x11, 10, 10, tx_now);
+	tx_path(&a, 1, 0x22, 60, 60, tx_now);
+	tx_path(&b, 0, 0x11, 10, 10, tx_now);
+	tx_path(&b, 1, 0x22, 60, 60, tx_now);
+	for (i = 0; i < 3; i++)
+		tx_round(&a, &b);
+	assert(tx_same_carry(&a, &b, before));
+	assert(before[0] == 0x11);
+
+	/* It carries, so its loaded figure rises while the path itself has not
+	 * changed, and the idle one is measured at its best. */
+	for (i = 0; i < 10; i++) {
+		tx_measure(&a, 0, 50, 10, tx_now);
+		tx_measure(&b, 0, 50, 10, tx_now);
+		tx_measure(&a, 1, 12, 12, tx_now);
+		tx_measure(&b, 1, 12, 12, tx_now);
+		tx_round(&a, &b);
+	}
+	assert(tx_same_carry(&a, &b, id));
+	assert(!memcmp(id, before, PATH_ID_LEN));
+	assert(a.moves == 1 && b.moves == 1);	/* the cold start, and nothing
+						 * since */
+	tx_end_done(&a);
+	tx_end_done(&b);
+}
+
+/* Recovery is nobody's to gate: a dead incumbent is left by both ends on their
+ * own ranking, before any statement about it can arrive. */
+static void a_dead_incumbent_is_left_without_a_statement(void)
+{
+	uint8_t id[PATH_ID_LEN];
+	struct txend a, b;
+	int i;
+
+	tx_end_init(&a, 1);
+	tx_end_init(&b, 0);
+	a.other = &b;
+	b.other = &a;
+	tx_path(&a, 0, 0x11, 10, 10, tx_now);
+	tx_path(&a, 1, 0x22, 20, 20, tx_now);
+	tx_path(&b, 0, 0x11, 10, 10, tx_now);
+	tx_path(&b, 1, 0x22, 20, 20, tx_now);
+	for (i = 0; i < 3; i++)
+		tx_round(&a, &b);
+	assert(tx_same_carry(&a, &b, id));
+	assert(id[0] == 0x11);
+
+	/* The channel is gone with the path, so nothing can be said at all. */
+	a.drop = 1;
+	b.drop = 1;
+	tx_now += PATH_DEAD_MS + 1;
+	tx_measure(&a, 1, 20, 20, tx_now);
+	tx_measure(&b, 1, 20, 20, tx_now);
+	tx_round(&a, &b);
+	assert(tx_same_carry(&a, &b, id));
+	assert(id[0] == 0x22);			/* both moved, unilaterally */
+
+	/* And a channel that stays down leaves both carrying. */
+	for (i = 0; i < 5; i++) {
+		tx_measure(&a, 1, 20, 20, tx_now);
+		tx_measure(&b, 1, 20, 20, tx_now);
+		tx_round(&a, &b);
+	}
+	assert(tx_same_carry(&a, &b, id));
+
+	tx_end_done(&a);
+	tx_end_done(&b);
+}
+
+/*
+ * The confirmer moves first and the proposer only on evidence the peer took
+ * it. Moving first would mean moving to a path the peer cannot reciprocate on
+ * and then moving back, which is a flap the protocol would have manufactured.
+ */
+static void a_refused_statement_moves_nothing(void)
+{
+	uint8_t id[PATH_ID_LEN];
+	struct txend a, b;
+	int i;
+
+	tx_end_init(&a, 1);
+	tx_end_init(&b, 0);
+	a.other = &b;
+	b.other = &a;
+	/* Both hold the path that carries; only the proposer holds the other. */
+	tx_path(&a, 0, 0x11, 10, 10, tx_now);
+	tx_path(&a, 1, 0x33, 60, 60, tx_now);
+	tx_path(&b, 0, 0x11, 10, 10, tx_now);
+	for (i = 0; i < 4; i++)
+		tx_round(&a, &b);
+	assert(tx_same_carry(&a, &b, id) && id[0] == 0x11);
+
+	/* The one the confirmer has never seen becomes the better path. */
+	for (i = 0; i < 6; i++) {
+		tx_measure(&a, 1, 5, 5, tx_now);
+		tx_round(&a, &b);
+	}
+
+	/* It was proposed and refused, so neither end moved to it. */
+	assert(a.frames && b.frames);
+	assert(pathplane_carry_id(&a.pr.pl, id) && id[0] == 0x11);
+	assert(pathplane_carry_id(&b.pr.pl, id) && id[0] == 0x11);
+
+	/* Once the confirmer holds it too, the same proposal carries. */
+	tx_path(&b, 1, 0x33, 5, 5, tx_now);
+	for (i = 0; i < 6; i++)
+		tx_round(&a, &b);
+	assert(tx_same_carry(&a, &b, id));
+	assert(id[0] == 0x33);
+
+	tx_end_done(&a);
+	tx_end_done(&b);
+}
+
+/*
+ * Loop-freedom, demonstrated rather than argued. The generator of a decision
+ * loop is a rule of the form "I transmit where you transmit" evaluated at both
+ * ends; this design has no such rule, so with the numbers held still the carry
+ * must come to rest even when each end's own measurements prefer the other's
+ * path. A cycle would keep flipping for as long as it was driven.
+ */
+static void the_negotiation_comes_to_rest(void)
+{
+	uint8_t id[PATH_ID_LEN];
+	struct txend a, b;
+	int ma, mb, i;
+
+	tx_end_init(&a, 1);
+	tx_end_init(&b, 0);
+	a.other = &b;
+	b.other = &a;
+	tx_path(&a, 0, 0x11, 20, 20, tx_now);
+	tx_path(&a, 1, 0x22, 20, 20, tx_now);
+	tx_path(&b, 0, 0x11, 20, 20, tx_now);
+	tx_path(&b, 1, 0x22, 20, 20, tx_now);
+
+	/* Crossed and fixed: each end's own numbers prefer what the other
+	 * holds, which is the input a cyclic rule would chase for ever. */
+	for (i = 0; i < 20; i++) {
+		tx_measure(&a, 0, 8, 8, tx_now);
+		tx_measure(&a, 1, 40, 40, tx_now);
+		tx_measure(&b, 0, 40, 40, tx_now);
+		tx_measure(&b, 1, 8, 8, tx_now);
+		tx_round(&a, &b);
+	}
+	ma = a.moves;
+	mb = b.moves;
+	for (i = 0; i < 40; i++) {
+		tx_measure(&a, 0, 8, 8, tx_now);
+		tx_measure(&a, 1, 40, 40, tx_now);
+		tx_measure(&b, 0, 40, 40, tx_now);
+		tx_measure(&b, 1, 8, 8, tx_now);
+		tx_round(&a, &b);
+	}
+	/* Nothing has moved since well before the end of the run. */
+	assert(a.moves == ma && b.moves == mb);
+	assert(tx_same_carry(&a, &b, id));
+	/* And it rests where the end that states it transmits, which is the
+	 * one whose measurements the rule reads. */
+	assert(id[0] == 0x11);
+
+	/* Shaken by measurements that keep changing, it still only ever
+	 * follows them: the count grows with the input and not on its own. */
+	{
+		unsigned seed = 12345;
+		int before = a.moves;
+
+		for (i = 0; i < 200; i++) {
+			int x, y;
+
+			seed = seed * 1103515245u + 12345u;
+			x = (int)((seed >> 16) % 60) + 1;
+			seed = seed * 1103515245u + 12345u;
+			y = (int)((seed >> 16) % 60) + 1;
+			tx_measure(&a, 0, x, x, tx_now);
+			tx_measure(&a, 1, y, y, tx_now);
+			tx_measure(&b, 0, y, y, tx_now);
+			tx_measure(&b, 1, x, x, tx_now);
+			tx_round(&a, &b);
+		}
+		assert(a.moves - before <= 200);
+	}
+
+	/* Still still, once the numbers are. */
+	for (i = 0; i < 20; i++) {
+		tx_measure(&a, 0, 8, 8, tx_now);
+		tx_measure(&a, 1, 40, 40, tx_now);
+		tx_measure(&b, 0, 8, 8, tx_now);
+		tx_measure(&b, 1, 40, 40, tx_now);
+		tx_round(&a, &b);
+	}
+	ma = a.moves;
+	mb = b.moves;
+	for (i = 0; i < 20; i++)
+		tx_round(&a, &b);
+	assert(a.moves == ma && b.moves == mb);
+	assert(tx_same_carry(&a, &b, id) && id[0] == 0x11);
+
+	tx_end_done(&a);
+	tx_end_done(&b);
+}
+
 int main(void)
 {
+	both_ends_settle_on_one_path();
+	self_load_does_not_move_the_carry();
+	a_dead_incumbent_is_left_without_a_statement();
+	a_refused_statement_moves_nothing();
+	the_negotiation_comes_to_rest();
 	/* The model prints the addresses these cases read, and they run on
 	 * Windows too, where the socket library comes up before anything else. */
 	assert(!wsock_init());

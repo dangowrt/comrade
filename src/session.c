@@ -3940,8 +3940,10 @@ static struct conn *conn_alloc(struct sess *s)
 		return NULL;
 	c->sess = s;
 	c->ctl_fd = INVALID_SOCK;
+	/* The claimant offers and so proposes; the host answers and so
+	 * confirms. The asymmetry is the establishment primitive's own. */
 	peering_init(&c->pr, &s->pm, s->keys.probe_magic, s->keys.sig_key,
-		     now_ms());
+		     now_ms(), !s->cfg->is_host);
 	conn_peering_sinks(c);
 	pthread_mutex_init(&c->status_lock, NULL);
 	pthread_mutex_init(&c->stream_lock, NULL);
@@ -5234,7 +5236,7 @@ int session_run(const struct session_cfg *cfg)
 		return 1;
 	pthread_mutex_init(&s.c.status_lock, NULL);	/* s.c.status zeroed = connecting */
 	peering_init(&s.c.pr, &s.pm, s.keys.probe_magic, s.keys.sig_key,
-		     now_ms());
+		     now_ms(), !cfg->is_host);
 	conn_peering_sinks(&s.c);
 	pthread_mutex_init(&s.c.stream_lock, NULL);
 	pthread_mutex_init(&s.c.claim_lock, NULL);

@@ -520,10 +520,11 @@ int peering_net_kick(struct peering_net *m, int family, uint32_t epoch,
 }
 
 void peering_init(struct peering *pr, struct peering_model *pm, uint32_t magic,
-		  const uint8_t key[32], uint64_t seq0)
+		  const uint8_t key[32], uint64_t seq0, int proposes)
 {
 	memset(pr, 0, sizeof(*pr));
 	pr->pm = pm;
+	pr->proposes = proposes ? 1 : 0;
 	probeplane_init(&pr->pp, magic, key, seq0);
 	pathplane_init(&pr->pl, &pr->pp);
 	ctlplane_init(&pr->cp, &pr->pp);
@@ -540,6 +541,8 @@ void peering_reset(struct peering *pr)
 {
 	probeplane_reset(&pr->pp);
 	ctlplane_reset(&pr->cp);
+	pr->tx_pending = 0;
+	pr->tx_told = 0;
 }
 
 void peering_model_init(struct peering_model *pm, int is_host, int dht,
@@ -785,9 +788,95 @@ void peering_sinks(struct peering *pr, const struct pathplane_sinks *pk,
 	pr->ck = *ck;
 }
 
+/*
+ * Obey a statement and answer it. The confirmer moves first and the proposer
+ * moves only on this answer, so the window in which the two differ is one
+ * round trip, which costs nothing: every end accepts stream data on every path
+ * it holds.
+ */
+static void tx_confirm(struct peering *pr, uint64_t now)
+{
+	uint8_t id[PATH_ID_LEN];
+	uint32_t seq = 0;
+	int flags = 0, ack = 0;
+
+	if (!ctlplane_take_txsel(&pr->cp, &seq, id, &flags))
+		return;
+	dbg_logf("path: the peer transmits on %02x%02x%02x%02x%02x%02x%02x%02x%s",
+		 id[0], id[1], id[2], id[3], id[4], id[5], id[6], id[7],
+		 flags & CTL_TXSEL_F_FORCED ? " (it moved already)" : "");
+	switch (pathplane_pin(&pr->pl, &pr->pk, id,
+			      flags & CTL_TXSEL_F_FORCED, now)) {
+	case PATHPLANE_PIN_OK:
+		break;
+	case PATHPLANE_PIN_UNKNOWN:
+		ack = CTL_TXACK_F_UNKNOWN;
+		break;
+	case PATHPLANE_PIN_UNUSABLE:
+		ack = CTL_TXACK_F_UNUSABLE;
+		break;
+	}
+	ctlplane_tell_txack(&pr->cp, &pr->ck, seq, id, ack);
+}
+
+/*
+ * State where this end transmits, and move only where the peer says it took
+ * it. A move the escape route already made is stated as made, not asked
+ * about: nothing needed to recover from a dead path waits on a message.
+ */
+static void tx_propose(struct peering *pr, uint64_t now)
+{
+	uint8_t id[PATH_ID_LEN], carry[PATH_ID_LEN];
+	uint32_t seq = 0;
+	int flags = 0;
+
+	if (ctlplane_take_txack(&pr->cp, &seq, id, &flags)) {
+		pr->tx_pending = 0;
+		if (!flags && !memcmp(id, pr->tx_pending_id, PATH_ID_LEN) &&
+		    pathplane_pin(&pr->pl, &pr->pk, id, 0, now) ==
+		    PATHPLANE_PIN_OK)
+			memcpy(pr->tx_told_id, id, PATH_ID_LEN);
+		else if (flags)
+			dbg_logf("path: the peer cannot take that path (%d)",
+				 flags);
+	}
+	if (!pathplane_carry_id(&pr->pl, carry))
+		return;
+	/* The carry is not where the peer was last told: it moved without
+	 * being asked, which is the escape route, or its id was recomputed. */
+	if (!pr->tx_told || memcmp(carry, pr->tx_told_id, PATH_ID_LEN)) {
+		if (!ctlplane_tell_txsel(&pr->cp, &pr->ck, carry,
+					 CTL_TXSEL_F_FORCED))
+			return;
+		dbg_logf("path: proposing %02x%02x%02x%02x%02x%02x%02x%02x "
+			 "(moved already)", carry[0], carry[1], carry[2],
+			 carry[3], carry[4], carry[5], carry[6], carry[7]);
+		memcpy(pr->tx_told_id, carry, PATH_ID_LEN);
+		pr->tx_told = 1;
+		pr->tx_pending = 0;	/* stated as made: nothing to await */
+		return;
+	}
+	if (pr->tx_pending || !pathplane_challenger(&pr->pl, now, id))
+		return;
+	pr->tx_pending_seq = ctlplane_tell_txsel(&pr->cp, &pr->ck, id, 0);
+	if (!pr->tx_pending_seq)
+		return;
+	memcpy(pr->tx_pending_id, id, PATH_ID_LEN);
+	pr->tx_pending = 1;
+	dbg_logf("path: proposing %02x%02x%02x%02x%02x%02x%02x%02x",
+		 id[0], id[1], id[2], id[3], id[4], id[5], id[6], id[7]);
+}
+
 int peering_paths(struct peering *pr, uint64_t now)
 {
-	return pathplane_tick(&pr->pl, &pr->pk, now);
+	int moved = pathplane_tick(&pr->pl, &pr->pk, now);
+
+	if (pr->proposes)
+		tx_propose(pr, now);
+	else
+		tx_confirm(pr, now);
+
+	return moved;
 }
 
 int peering_recv(struct peering *pr, const uint8_t *data, size_t len,
