@@ -86,6 +86,30 @@ COMRADE_DEBUG="$tmp/client.log" "$E2E" client "$tok" --mcast --no-dht \
 	>"$tmp/c.out" 2>"$tmp/c.err" &
 cpid=$!
 
+# Only paths already qualified when the path died count: one adopted afterwards
+# is a rediscovery, which is what this case exists to show is not needed.
+warm_paths() {
+	sed -n '/path blackholed:/q; s/.*path qualified: \([^ ]*\) .*/\1/p' \
+		"$tmp/client.log" 2>/dev/null | sort -u | wc -l
+}
+
+# How many there were to switch between is settled the moment the path is
+# taken away, and on a single-homed host the answer is one: a session whose
+# only path is gone spends the whole connect deadline looking for a way back
+# that cannot exist, so the verdict is read here instead of after it.
+i=0
+while [ "$i" -lt "$(e2e_loops 60)" ]; do
+	grep -q "path blackholed:" "$tmp/client.log" 2>/dev/null && break
+	kill -0 "$cpid" 2>/dev/null || break
+	sleep 0.5
+	i=$((i + 1))
+done
+if [ "$(warm_paths)" -lt 2 ]; then
+	echo "skipped: this host offers only $(warm_paths) path to the peer," \
+	     "so a switch has nowhere to go"
+	exit 77
+fi
+
 rc=0
 wait "$cpid" || rc=1
 wait "$hpid" 2>/dev/null || rc=1
@@ -95,15 +119,7 @@ if [ -z "$bh" ]; then
 	echo "FAIL: the client never blackholed a path (hook not firing?)"
 	cat "$tmp/c.err"; tail -20 "$tmp/client.log" 2>/dev/null; exit 1
 fi
-# Only paths already qualified when the path died count: one adopted afterwards
-# is a rediscovery, which is what this case exists to show is not needed.
-warm=$(sed -n '/path blackholed:/q; s/.*path qualified: \([^ ]*\) .*/\1/p' \
-	"$tmp/client.log" 2>/dev/null | sort -u | wc -l)
-if [ "$warm" -lt 2 ]; then
-	echo "skipped: this host offers only $warm path to the peer, so a" \
-	     "switch has nowhere to go"
-	exit 77
-fi
+warm=$(warm_paths)
 
 # The switch has to be caused by the path dying, not by the ordinary drift a
 # multi-homed pair does anyway: it must come after the blackhole, name the
