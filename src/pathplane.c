@@ -148,6 +148,17 @@ int pathplane_any_qualified(struct pathplane *pl)
 	return yes;
 }
 
+int pathplane_all_dead(struct pathplane *pl, uint64_t now)
+{
+	int yes;
+
+	pthread_mutex_lock(&pl->lock);
+	yes = path_table_all_dead(&pl->t, now);
+	pthread_mutex_unlock(&pl->lock);
+
+	return yes;
+}
+
 int pathplane_is_probe(const struct pathplane *pl, const uint8_t *data,
 		       size_t len)
 {

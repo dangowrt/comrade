@@ -3426,6 +3426,15 @@ static int conn_run(struct conn *c, int drive_sig)
 				link_lost = 0;
 				dbg_logf("link back");
 			}
+			/* Nothing to resume in place: the handshake under it is
+			 * blocked on a transport that will not speak again. */
+			if (!s->cfg->is_host &&
+			    !ctlplane_pong_seen(&c->pr.cp) &&
+			    pathplane_all_dead(&c->pr.pl, now)) {
+				dbg_logf("attempt: every path died before the "
+					 "session answered -- starting over");
+				done = 1;
+			}
 			c->next_status_ms = now + 500;
 			/* A host reaps a client that has been silent too long --
 			 * the bridge would otherwise never end for one that

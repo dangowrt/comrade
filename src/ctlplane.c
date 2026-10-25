@@ -72,6 +72,16 @@ void ctlplane_liveness(struct ctlplane *cp, struct ctlplane_live *out)
 	pthread_mutex_unlock(&cp->lock);
 }
 
+int ctlplane_pong_seen(struct ctlplane *cp)
+{
+	int v;
+
+	pthread_mutex_lock(&cp->lock);
+	v = cp->live.pong_seen;
+	pthread_mutex_unlock(&cp->lock);
+	return v;
+}
+
 int ctlplane_judge(struct ctlplane *cp, uint64_t now, uint64_t *quiet_since)
 {
 	uint64_t lp;

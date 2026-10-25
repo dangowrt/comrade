@@ -369,6 +369,12 @@ void path_table_drop_agent(struct path_table *t, struct nat_agent *agent);
 void path_table_reset_stats(struct path_table *t, uint64_t now);
 int path_table_any_qualified(const struct path_table *t);
 
+/*
+ * Every path that ever answered has since gone silent past the death
+ * deadline. False while none has answered yet, so a slow start is not a death.
+ */
+int path_table_all_dead(const struct path_table *t, uint64_t now);
+
 /* Our own reflexive endpoint on this path, learnt from a PONG echo. Completes
  * the unordered pair the id is taken over. */
 void path_set_self_ep(struct path *p, const struct path_ep *ep,

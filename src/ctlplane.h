@@ -134,6 +134,9 @@ void ctlplane_heard(struct ctlplane *cp, uint64_t now);
 /* One consistent view of the liveness fields. */
 void ctlplane_liveness(struct ctlplane *cp, struct ctlplane_live *out);
 
+/* Whether the peer has ever answered on this link. */
+int ctlplane_pong_seen(struct ctlplane *cp);
+
 /*
  * The link's verdict now, latching when it was first seen lost. The heartbeat
  * is end to end, so this says whether the session is getting through, never

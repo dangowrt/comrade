@@ -562,6 +562,21 @@ int path_table_any_qualified(const struct path_table *t)
 	return 0;
 }
 
+int path_table_all_dead(const struct path_table *t, uint64_t now)
+{
+	int any = 0;
+	int i;
+
+	for (i = 0; i < PATH_TABLE_MAX; i++) {
+		if (!t->p[i].used || !t->p[i].qualified)
+			continue;
+		if (path_warmth_of(&t->p[i], now) != PATH_DEAD)
+			return 0;
+		any = 1;
+	}
+	return any;
+}
+
 enum path_warmth path_warmth_of(const struct path *p, uint64_t now)
 {
 	uint64_t silent;

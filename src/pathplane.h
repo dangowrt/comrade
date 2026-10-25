@@ -274,6 +274,9 @@ int pathplane_lan_paths(struct pathplane *pl, int routable_only);
 /* Whether anything has answered. */
 int pathplane_any_qualified(struct pathplane *pl);
 
+/* Every path that ever answered has since died (see path_table_all_dead). */
+int pathplane_all_dead(struct pathplane *pl, uint64_t now);
+
 /*
  * The round trip on the path that carries, as its probes measured it on the
  * wire, so it is the figure ping would give. Returns 0 when nothing has
