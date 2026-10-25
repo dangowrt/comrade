@@ -120,7 +120,12 @@ told_both() {
 	done
 	# The reach reports are asserted below too, and a client killed the
 	# moment it is told may not have sent one yet: wait for everything the
-	# assertions want, not for the first of them to arrive.
+	# assertions want, not for the first of them to arrive. A finished
+	# session is one of them, and being told comes first.
+	for _n in 1 2; do
+		grep -q "sshc: echo round trip done" "$tmp/c$_n.dbg" \
+			2>/dev/null || return 1
+	done
 	[ "$(grep -c "reach: peer [0-9][0-9]* v4 " "$tmp/host.dbg")" -ge 2 ]
 }
 i=0

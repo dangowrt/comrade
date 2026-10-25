@@ -299,6 +299,8 @@ static int run_test(ssh_session s, ssh_channel chan, const struct sshc_opts *o)
 	}
 	if (o->recv_len)
 		*o->recv_len = got;
+	if (o->send_len && got >= o->send_len)
+		dbg_logf("sshc: echo round trip done (%zu bytes)", got);
 	rc = 0;
 	/* Hold the session open so a test can keep one client connected while
 	 * another joins -- the case that reveals slot hogging -- and so the

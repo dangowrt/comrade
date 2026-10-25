@@ -65,14 +65,16 @@ done
 [ -n "$tok" ] || { echo "no rendezvous token after ${i}s"; exit 1; }
 
 # Held open long enough for the reap, the grace that answers it and the punch
-# that follows, and stopped as soon as the fresh session is up rather than
-# sitting out the rest of a hold that has nothing left to prove.
+# that follows, and stopped as soon as the fresh session is carrying rather
+# than sitting out the rest of a hold that has nothing left to prove. The
+# transport coming up is too early to stop on: the round trip the verdict
+# below rests on has not happened yet.
 COMRADE_DEBUG="$tmp/client.dbg" "$E2E" client "$tok" \
 	--hold-ms 110000 --timeout 150 > "$tmp/client.out" 2>&1 &
 clientpid=$!
 i=0
 while [ "$i" -lt "$(e2e_loops 120)" ]; do
-	n=$(grep -c "conn_run: sock_pair" "$tmp/client.dbg" 2>/dev/null)
+	n=$(grep -c "sshc: echo round trip done" "$tmp/client.dbg" 2>/dev/null)
 	[ "${n:-0}" -ge 2 ] && break
 	kill -0 "$clientpid" 2>/dev/null || break
 	sleep 1

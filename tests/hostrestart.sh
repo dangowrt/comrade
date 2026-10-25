@@ -58,18 +58,18 @@ done
 COMRADE_DEBUG="$tmp/client.dbg" "$E2E" client "$tok" --hold-ms 150000 \
 	--timeout 200 > "$tmp/client.out" 2>&1 &
 cpid=$!
-# Killed only once the client's SSH session is up: a host that dies while
-# the client is still punching or handshaking leaves nothing behind to be
-# lost.
+# Killed only once the client's session is carrying: a host that dies while
+# the client is still punching, handshaking or waiting on its echo leaves
+# nothing behind to be lost.
 i=0
 while [ "$i" -lt "$(e2e_loops 90)" ]; do
-	grep -q "sshc: channel open ok" "$tmp/client.dbg" 2>/dev/null && break
+	grep -q "sshc: echo round trip done" "$tmp/client.dbg" 2>/dev/null && break
 	kill -0 "$cpid" 2>/dev/null || break
 	sleep 1
 	i=$((i + 1))
 done
-grep -q "sshc: channel open ok" "$tmp/client.dbg" 2>/dev/null || {
-	echo "the client never got into a session with the first host"
+grep -q "sshc: echo round trip done" "$tmp/client.dbg" 2>/dev/null || {
+	echo "the client never carried a session with the first host"
 	grep 'host: ' "$tmp/h1.dbg" | tail -8
 	tail -8 "$tmp/client.dbg"
 	exit 1
@@ -84,11 +84,13 @@ COMRADE_DEBUG="$tmp/h2.dbg" "$E2E" host --serve 3 --token "$tok" \
 	--hostkey "$tmp/hostkey" --timeout 150 > "$tmp/h2.out" 2> "$tmp/h2.err" &
 h2=$!
 
-# Held until the client has been served again, by the second host.
+# Held until the client has been served again, by the second host, and is
+# carrying: the transport coming up is too early, since the round trip the
+# verdict below rests on has not happened yet.
 i=0
 while [ "$i" -lt "$(e2e_loops 120)" ]; do
 	grep -q "punch connected -> spawn worker" "$tmp/h2.dbg" 2>/dev/null &&
-		[ "$(grep -c "conn_run: sock_pair" "$tmp/client.dbg" 2>/dev/null)" -ge 2 ] &&
+		[ "$(grep -c "sshc: echo round trip done" "$tmp/client.dbg" 2>/dev/null)" -ge 2 ] &&
 		break
 	kill -0 "$cpid" 2>/dev/null || break
 	kill -0 "$h2" 2>/dev/null || break

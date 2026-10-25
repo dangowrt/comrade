@@ -55,20 +55,20 @@ done
 # The first claimant has to be in a session before the second asks, or which
 # of the two is refused is a race the test would be asserting the outcome of.
 # The host's own punch is one-sided and says nothing about what the claimant
-# read, and ending the hold below on a claimant still handshaking leaves
-# nothing to wind up.
+# read, and an open channel is still too early: ending the hold below while
+# the echo is outstanding leaves nothing to wind up.
 COMRADE_DEBUG="$tmp/c1.dbg" "$E2E" client "$tok" --hold-ms 90000 \
 	--timeout 120 > "$tmp/c1.out" 2>&1 &
 c1=$!
 i=0
 while [ "$i" -lt "$(e2e_loops 90)" ]; do
-	grep -q "sshc: channel open ok" "$tmp/c1.dbg" 2>/dev/null && break
+	grep -q "sshc: echo round trip done" "$tmp/c1.dbg" 2>/dev/null && break
 	kill -0 "$c1" 2>/dev/null || break
 	sleep 1
 	i=$((i + 1))
 done
-grep -q "sshc: channel open ok" "$tmp/c1.dbg" 2>/dev/null || {
-	echo "the first claimant never got into a session"
+grep -q "sshc: echo round trip done" "$tmp/c1.dbg" 2>/dev/null || {
+	echo "the first claimant never carried a session"
 	grep 'host: ' "$tmp/host.dbg" | tail -8
 	tail -8 "$tmp/c1.dbg"
 	exit 1
