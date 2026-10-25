@@ -281,6 +281,8 @@ static int run_test(ssh_session s, ssh_channel chan, const struct sshc_opts *o)
 			rc = SSHC_RECONNECT;
 			goto out;
 		}
+		if (o->stop && __atomic_load_n(o->stop, __ATOMIC_RELAXED))
+			break;
 		if (!ssh_channel_is_open(chan) || ssh_channel_is_eof(chan))
 			break;
 		n = ssh_channel_read_timeout(chan, o->recv + got,
@@ -288,10 +290,11 @@ static int run_test(ssh_session s, ssh_channel chan, const struct sshc_opts *o)
 					     200);
 		if (n == SSH_ERROR)
 			goto out;
-		if (n == SSH_AGAIN)
+		/* libssh before 0.11 returns 0 from a timeout where its own
+		 * contract says SSH_AGAIN (upstream 2d3b7e07af36), so an end is
+		 * read off the channel above rather than from this count. */
+		if (n <= 0)
 			continue;
-		if (n == 0)
-			break;
 		got += (size_t)n;
 	}
 	if (o->recv_len)
