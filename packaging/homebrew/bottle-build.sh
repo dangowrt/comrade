@@ -65,11 +65,19 @@ rm -f ./*.bottle.tar.gz ./*.bottle.json
 # refuses it later as not built for bottling; install and bottle it before
 # moving on to the next, then finally to comrade, which links against the
 # kegs just installed here.
-log "Build and bottle the dependencies"
-for f in libjuice kcp libdht; do
-  brew install --build-bottle "${TAP}/${f}"
-  brew bottle --json --no-rebuild --root-url="$ROOT_URL" "${TAP}/${f}"
-done
+#
+# Intel carries its own copies inside the comrade formula, because Homebrew
+# ships no Intel bottle for libssh or the OpenSSL it wants, so there is nothing
+# for these to be linked into and one bottle is the whole release there.
+if [ "$(uname -m)" = arm64 ]; then
+  log "Build and bottle the dependencies"
+  for f in libjuice kcp libdht; do
+    brew install --build-bottle "${TAP}/${f}"
+    brew bottle --json --no-rebuild --root-url="$ROOT_URL" "${TAP}/${f}"
+  done
+else
+  log "Intel: the comrade formula carries its dependencies, none to bottle"
+fi
 
 log "Build and bottle comrade"
 brew install --build-bottle "${TAP}/comrade"

@@ -335,9 +335,13 @@ jobs:
             echo "skip=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Bootstrap Intel bottle build dependency
+      # Homebrew ships no Intel bottle for any of these any more, and on a
+      # configuration it calls Tier 3 it declines to build a core formula from
+      # source unless told to. The comrade formula's own Intel dependencies are
+      # resources it builds itself, so only the toolchain is needed here.
+      - name: Bootstrap the Intel bottle build toolchain
         if: matrix.arch == 'x86_64' && steps.guard.outputs.skip != 'true'
-        run: brew install --build-from-source pkgconf
+        run: brew install --build-from-source cmake ninja pkgconf
 
       - name: Build the bottle
         if: steps.guard.outputs.skip != 'true'
