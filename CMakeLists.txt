@@ -737,9 +737,27 @@ target_link_libraries(comrade_bridge PUBLIC comrade_stream comrade_compat)
 # ssh_pki_generate_key() replaced the (now deprecated) ssh_pki_generate()
 # in a recent libssh; Debian stable and Ubuntu LTS still ship the older
 # one. Probe rather than pin a version, so both build.
+# A static libssh names only itself in its pkg-config file, so its backend is
+# named here or the link fails on mbedtls_strerror. everest and p256m are
+# mbedcrypto's own bundled pieces and must follow it.
+if(NOT WIN32)
+	find_library(COMRADE_SSH_LIB NAMES ssh
+		HINTS ${LIBSSH_LIBRARY_DIRS} ${LIBSSH_LIBDIR})
+	if(COMRADE_SSH_LIB MATCHES "\\.a$")
+		foreach(l mbedtls mbedx509 mbedcrypto everest p256m)
+			find_library(COMRADE_SSHDEP_${l} ${l}
+				HINTS ${LIBSSH_LIBRARY_DIRS} ${LIBSSH_LIBDIR})
+			if(COMRADE_SSHDEP_${l})
+				list(APPEND COMRADE_SSH_DEPS
+					${COMRADE_SSHDEP_${l}})
+			endif()
+		endforeach()
+	endif()
+endif()
+
 include(CheckSymbolExists)
 set(CMAKE_REQUIRED_INCLUDES ${LIBSSH_INCLUDE_DIRS})
-set(CMAKE_REQUIRED_LIBRARIES ${LIBSSH_LIBRARIES})
+set(CMAKE_REQUIRED_LIBRARIES ${LIBSSH_LIBRARIES} ${COMRADE_SSH_DEPS})
 if(WIN32)
 	# The probe links for real, so it needs the same static-libssh
 	# treatment the build does: LIBSSH_STATIC (or the symbol resolves
@@ -763,7 +781,7 @@ target_include_directories(comrade_ssh PUBLIC src)
 # The message-based libssh server API is deprecated in favour of the
 # callback API but is clearer and fully functional; migrate later.
 target_compile_options(comrade_ssh PRIVATE -Wno-deprecated-declarations)
-target_link_libraries(comrade_ssh PUBLIC comrade_token comrade_dbg comrade_termfilter comrade_fwdspec comrade_compat comrade_cpty PkgConfig::LIBSSH Threads::Threads)
+target_link_libraries(comrade_ssh PUBLIC comrade_token comrade_dbg comrade_termfilter comrade_fwdspec comrade_compat comrade_cpty PkgConfig::LIBSSH Threads::Threads ${COMRADE_SSH_DEPS})
 find_library(COMRADE_UTIL util)
 if(COMRADE_UTIL)
 	target_link_libraries(comrade_ssh PUBLIC ${COMRADE_UTIL})
