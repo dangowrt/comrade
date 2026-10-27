@@ -193,9 +193,10 @@ if(WIN32)
 	add_compile_definitions(LIBSSH_STATIC JUICE_STATIC)
 
 	# libssh's pkg-config file lists only -lssh; its crypto backend is a
-	# private dependency that a static link still has to name. everest and
-	# p256m are mbedcrypto's own bundled pieces and must follow it.
-	foreach(l mbedtls mbedx509 mbedcrypto everest p256m)
+	# private dependency that a static link still has to name. mbedTLS 3
+	# calls the crypto half mbedcrypto and 4 calls it tfpsacrypto; everest
+	# and p256m are its own bundled pieces and must follow it.
+	foreach(l mbedtls mbedx509 mbedcrypto tfpsacrypto everest p256m)
 		find_library(COMRADE_LIB_${l} ${l})
 		if(COMRADE_LIB_${l})
 			list(APPEND COMRADE_WIN_CRYPTO ${COMRADE_LIB_${l}})
@@ -241,17 +242,21 @@ function(comrade_detect_libssh_crypto out)
 	if(NOT COMRADE_LIBSSH_PATH)
 		return()
 	endif()
+	# mbedTLS 4 renamed its crypto half tfpsacrypto, and a Mach-O records a
+	# full path where an ELF records a bare soname, so neither the name nor
+	# the start of the string can be assumed.
 	file(STRINGS "${COMRADE_LIBSSH_PATH}" NEEDED
-		REGEX "^lib(crypto|gcrypt|mbedcrypto)\\.so" ENCODING UTF-8)
+		REGEX "lib(crypto|gcrypt|mbedcrypto|tfpsacrypto)[-.0-9]*\\.(so|dylib)"
+		ENCODING UTF-8)
 	foreach(dep IN LISTS NEEDED)
-		if(dep MATCHES "^libcrypto")
-			set(${out} "openssl" PARENT_SCOPE)
+		if(dep MATCHES "libmbedcrypto|libtfpsacrypto")
+			set(${out} "mbedtls" PARENT_SCOPE)
 			return()
-		elseif(dep MATCHES "^libgcrypt")
+		elseif(dep MATCHES "libgcrypt")
 			set(${out} "gcrypt" PARENT_SCOPE)
 			return()
-		elseif(dep MATCHES "^libmbedcrypto")
-			set(${out} "mbedtls" PARENT_SCOPE)
+		elseif(dep MATCHES "libcrypto")
+			set(${out} "openssl" PARENT_SCOPE)
 			return()
 		endif()
 	endforeach()
@@ -623,14 +628,16 @@ endif()
 
 #
 # jech/dht comes either as a plain source checkout (-DCOMRADE_DHT_DIR, which
-# compiles dht.c straight in) or as an installed shared library, which is
-# preferred when no checkout is given: distributions package it (OpenWrt's
-# libdht, which transmission already links), and comrade is an ordinary
-# consumer of it. Nothing about the callback design forces the source route --
-# comrade calls only dht.h's public API and defines the four symbols the
-# library deliberately leaves undefined (dht_hash, dht_random_bytes,
-# dht_blacklisted, dht_sendto), which the dynamic linker resolves back into
-# the executable. (Both are located up with the dependency summary.)
+# compiles dht.c straight in) or as an installed library, preferred when no
+# checkout is given: distributions package it, shared (OpenWrt's libdht, which
+# transmission already links) or static (Arch's dht ships libdht.a and the
+# header under dht/), and comrade is an ordinary consumer of either. Nothing
+# about the callback design forces the source route -- comrade calls only
+# dht.h's public API and defines the four symbols the library deliberately
+# leaves undefined (dht_hash, dht_random_bytes, dht_blacklisted, dht_sendto),
+# which an archive resolves at link time and a shared object through the
+# executable's dynamic symbols. (Both are located up with the dependency
+# summary.)
 #
 
 # BEP 44 is a self-contained engine: it speaks the mainline protocol over a
@@ -744,7 +751,7 @@ if(NOT WIN32)
 	find_library(COMRADE_SSH_LIB NAMES ssh
 		HINTS ${LIBSSH_LIBRARY_DIRS} ${LIBSSH_LIBDIR})
 	if(COMRADE_SSH_LIB MATCHES "\\.a$")
-		foreach(l mbedtls mbedx509 mbedcrypto everest p256m)
+		foreach(l mbedtls mbedx509 mbedcrypto tfpsacrypto everest p256m)
 			find_library(COMRADE_SSHDEP_${l} ${l}
 				HINTS ${LIBSSH_LIBRARY_DIRS} ${LIBSSH_LIBDIR})
 			if(COMRADE_SSHDEP_${l})
