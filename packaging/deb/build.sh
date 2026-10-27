@@ -172,7 +172,7 @@ DR="$STAGE/dht"; mkdir -p "$DR$LIBDIR"
 cp -a "$LIBDIR"/libdht.so.0 "$DR$LIBDIR/"
 printf 'Description: Kademlia distributed hash table (mainline DHT) library\n %s\n' \
 	"jech/dht: the BitTorrent mainline DHT as a reusable library." > "$WORK/dht.desc"
-mkdeb libdht0 "$DHT_VERSION" libs "" "$WORK/dht.desc" "$DR"
+mkdeb libdht0 "$DHT_PKG_EPOCH:$DHT_VERSION" libs "" "$WORK/dht.desc" "$DR"
 
 # comrade: install into a package root, then name its dependency on our own
 # three libraries explicitly (the ELF scan cannot map them to a package). No

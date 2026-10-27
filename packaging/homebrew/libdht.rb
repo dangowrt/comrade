@@ -1,9 +1,9 @@
 class Libdht < Formula
   desc "Kademlia/mainline BitTorrent DHT library (jech/dht)"
   homepage "https://github.com/jech/dht"
-  url "https://github.com/jech/dht/archive/0bbb8f4a5bd914b60de5e9fbb51573aa33a1cf18.tar.gz"
-  version "2023.03.18"
-  sha256 "5f126d158979d14bcc17ed0debf4d875d662e8fc3fb3e71b29a8835e4044fdeb"
+  url "https://github.com/jech/dht/archive/refs/tags/dht-0.28.tar.gz"
+  version "0.28"
+  sha256 "2f91db29636ca84503b4bb59d7a4a6a681c3a547e12ef775f83e99b69be92f2d"
   license "MIT"
 
   # dht.c leaves four symbols (dht_hash, dht_random_bytes, dht_blacklisted,

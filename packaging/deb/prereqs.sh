@@ -105,7 +105,7 @@ until git clone --quiet https://github.com/jech/dht "$DDIR"; do
 	i=$((i + 1)); [ "$i" -ge 5 ] && exit 1
 	rm -rf "$DDIR"; sleep 5
 done
-git -C "$DDIR" checkout --quiet "$DHT_COMMIT"
+git -C "$DDIR" checkout --quiet "dht-$DHT_VERSION"
 # jech/dht ships a plain Makefile that builds a test binary, not a library, so
 # the shared object is built directly (the two commands the OpenWrt and Arch
 # recipes use). dht.c leaves four symbols undefined for the application to

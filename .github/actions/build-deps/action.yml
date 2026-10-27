@@ -48,7 +48,7 @@ runs:
           echo "KCP_VERSION=$KCP_VERSION"
           echo "JUICE_VERSION=$JUICE_VERSION"
           echo "MONOCYPHER_VERSION=$MONOCYPHER_VERSION"
-          echo "DHT_COMMIT=$DHT_COMMIT"
+          echo "DHT_VERSION=$DHT_VERSION"
         } >> "$GITHUB_ENV"
 
     # Self-hosted runners are not GitHub's images: sudo can be locked (the
@@ -208,7 +208,7 @@ runs:
           n=$((n+1)); [ "$n" -ge 5 ] && { echo "dht clone failed"; exit 1; }
           echo "retry $n in $((n*5))s"; sleep $((n*5))
         done
-        git -C deps-src/dht checkout "$DHT_COMMIT"
+        git -C deps-src/dht checkout "dht-$DHT_VERSION"
 
     # jech/dht ships a plain Makefile that builds a test binary, not a
     # library, so the shared object is built directly, as packaging/deb

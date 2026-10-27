@@ -44,7 +44,7 @@ $MONO    = Ver 'MONOCYPHER_VERSION'
 $JUICE   = Ver 'JUICE_VERSION'
 $LIBSSH  = Ver 'LIBSSH_VERSION'
 $MBEDTLS = Ver 'MBEDTLS_VERSION'
-$DHT     = Ver 'DHT_COMMIT'
+$DHT     = Ver 'DHT_VERSION'
 
 $src    = Join-Path $Root "src"
 $bld    = Join-Path $Root "build\$Triple"
@@ -99,7 +99,7 @@ Fetch "https://www.libssh.org/files/0.12/libssh-$LIBSSH.tar.xz" "libssh.txz" "li
 if (-not (Test-Path (Join-Path $src "dht"))) {
     Step "fetch dht"
     Run "git" @("clone", "https://github.com/jech/dht", (Join-Path $src "dht"))
-    Run "git" @("-C", (Join-Path $src "dht"), "checkout", $DHT)
+    Run "git" @("-C", (Join-Path $src "dht"), "checkout", "dht-$DHT")
 }
 # kcp pins cmake 4.0 for nothing used here; relax the floor for older CI cmake.
 $kcpcml = Join-Path $src "kcp\CMakeLists.txt"
