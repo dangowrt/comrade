@@ -5,6 +5,8 @@ class Libdht < Formula
   version "0.28"
   sha256 "2f91db29636ca84503b4bb59d7a4a6a681c3a547e12ef775f83e99b69be92f2d"
   license "MIT"
+  # 0.28 sorts below the 2023.03.18 commit pin shipped up to comrade 0.3.1.
+  version_scheme 1
 
   # dht.c leaves four symbols (dht_hash, dht_random_bytes, dht_blacklisted,
   # dht_sendto) for the application to define; the consumer's executable
