@@ -149,8 +149,10 @@ mkdeb() { # pkgname version section "extra-depends" description-file rootdir [re
 	} > "$_root/DEBIAN/control"
 	( cd "$_root" && find . -path ./DEBIAN -prune -o -type f -print0 |
 		xargs -0 md5sum 2>/dev/null | sed 's,  \./,  ,' > DEBIAN/md5sums ) || true
+	# Only the control Version carries the epoch; a Debian file name never
+	# does, and a colon in one is rejected outright by the artifact upload.
 	dpkg-deb --root-owner-group -Zxz --build "$_root" \
-		"$OUTDIR/${_name}_${_ver}_${DEB_ARCH}.deb"
+		"$OUTDIR/${_name}_${_ver#*:}_${DEB_ARCH}.deb"
 }
 
 log "Assemble .deb packages"
