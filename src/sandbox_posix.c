@@ -1739,6 +1739,8 @@ static void sb_rule_prctl(struct sb_prog *p, unsigned int deflt)
 	sb_ld_arg(p, SB_ARG_LO(0));
 	sb_eq_ret(p, PR_SET_NAME, SB_RET_ALLOW);
 	sb_eq_ret(p, PR_GET_NAME, SB_RET_ALLOW);
+	/* libcap's constructor, reached through a libcap-linked NSS module */
+	sb_eq_ret(p, PR_CAPBSET_READ, SB_RET_ALLOW);
 	sb_ret(p, deflt);
 	sb_land_jf(p, at);
 }
@@ -3463,6 +3465,8 @@ static int sbp_prctl(void)
 		return SB_PROBE_FAIL;
 	memset(name, 0, sizeof(name));
 	if (prctl(PR_GET_NAME, name, 0, 0, 0) != 0)
+		return SB_PROBE_FAIL;
+	if (prctl(PR_CAPBSET_READ, 0, 0, 0, 0) < 0)
 		return SB_PROBE_FAIL;
 	return SB_PROBE_OK;
 }
